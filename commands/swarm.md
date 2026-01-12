@@ -8,6 +8,8 @@ allowed-tools: ["Bash", "Read", "Write", "Edit", "Task", "TodoWrite"]
 
 Launch multiple Claude instances working in parallel on different aspects of a complex task.
 
+**Backend**: `~/.claude/hooks/swarm-orchestrator.sh` (✅ Implemented)
+
 ## Usage
 
 ```
