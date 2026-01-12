@@ -12,7 +12,7 @@ Get Claude Sovereign running in 5 minutes.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/claude-sovereign.git
+git clone https://github.com/isaacmorgado/claude-sovereign.git
 cd claude-sovereign
 
 # Run the installer
@@ -275,8 +275,8 @@ After using Claude Sovereign, you should see:
 ## Support
 
 - **Documentation**: [docs/](docs/)
-- **Issues**: [GitHub Issues](https://github.com/yourusername/claude-sovereign/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/claude-sovereign/discussions)
+- **Issues**: [GitHub Issues](https://github.com/isaacmorgado/claude-sovereign/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/isaacmorgado/claude-sovereign/discussions)
 
 ---
 

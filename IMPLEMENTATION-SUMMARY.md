@@ -344,11 +344,11 @@ git push -u origin main
 
 ### Update README URLs
 
-Replace all instances of `yourusername` with your actual GitHub username:
+Replace all instances of `isaacmorgado` with your actual GitHub username:
 
 ```bash
-sed -i '' 's/yourusername/YOUR_ACTUAL_USERNAME/g' README.md
-sed -i '' 's/yourusername/YOUR_ACTUAL_USERNAME/g' QUICKSTART.md
+sed -i '' 's/isaacmorgado/YOUR_ACTUAL_USERNAME/g' README.md
+sed -i '' 's/isaacmorgado/YOUR_ACTUAL_USERNAME/g' QUICKSTART.md
 git add -A
 git commit -m "docs: update GitHub URLs"
 git push

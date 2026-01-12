@@ -109,7 +109,7 @@ Return to completed work
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/claude-sovereign.git
+git clone https://github.com/isaacmorgado/claude-sovereign.git
 cd claude-sovereign
 
 # Run installer
@@ -515,7 +515,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 **⚡ Claude Sovereign - The AI that governs itself ⚡**
 
-[Documentation](docs/) • [GitHub](https://github.com/yourusername/claude-sovereign) • [Issues](https://github.com/yourusername/claude-sovereign/issues)
+[Documentation](docs/) • [GitHub](https://github.com/isaacmorgado/claude-sovereign) • [Issues](https://github.com/isaacmorgado/claude-sovereign/issues)
 
 Made with 🤖 by autonomous AI
 
