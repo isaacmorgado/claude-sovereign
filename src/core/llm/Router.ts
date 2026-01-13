@@ -16,6 +16,8 @@ import type {
 } from './types';
 import type { ProviderRegistry } from './providers/ProviderFactory';
 import { MCPProvider } from './providers/MCPProvider';
+import { RateLimiter } from './RateLimiter';
+import { ErrorHandler } from './ErrorHandler';
 
 /**
  * Model scoring for selection
@@ -28,16 +30,79 @@ interface ModelScore {
 }
 
 /**
+ * Parsed model identifier with provider prefix
+ */
+interface ParsedModel {
+  provider: string | null;
+  model: string;
+}
+
+/**
  * LLM Router for smart model selection
  */
 export class LLMRouter {
-  constructor(private registry: ProviderRegistry) {}
+  private rateLimiter: RateLimiter;
+  private errorHandler: ErrorHandler;
+
+  constructor(
+    private registry: ProviderRegistry,
+    rateLimiter?: RateLimiter,
+    errorHandler?: ErrorHandler
+  ) {
+    this.rateLimiter = rateLimiter || new RateLimiter();
+    this.errorHandler = errorHandler || new ErrorHandler();
+  }
+
+  /**
+   * Parse model string with optional provider prefix
+   * Supports: "provider/model" or just "model"
+   * Examples: "glm/glm-4.7", "dolphin-3", "anthropic/claude-opus-4.5"
+   */
+  private parseModel(modelString: string): ParsedModel {
+    const match = modelString.match(/^([a-z]+)\/(.+)$/);
+    if (match) {
+      return {
+        provider: match[1],
+        model: match[2]
+      };
+    }
+    return {
+      provider: null,
+      model: modelString
+    };
+  }
 
   /**
    * Route a request to the best provider/model
    */
   async route(request: LLMRequest, context: RoutingContext): Promise<LLMResponse> {
-    const selection = this.selectModel(context);
+    // Check if explicit model/provider specified
+    let selection: ModelSelection;
+
+    if (context.preferredModel) {
+      const parsed = this.parseModel(context.preferredModel);
+
+      if (parsed.provider) {
+        // Explicit provider specified - validate it exists
+        const provider = this.registry.get(parsed.provider);
+        if (!provider) {
+          throw new Error(`Provider not available: ${parsed.provider}`);
+        }
+
+        selection = {
+          provider: parsed.provider,
+          model: parsed.model,
+          reason: `Explicit model selection: ${context.preferredModel}`
+        };
+      } else {
+        // Just model name - find which provider has it
+        selection = this.selectModelByName(parsed.model, context);
+      }
+    } else {
+      // Smart selection based on context
+      selection = this.selectModel(context);
+    }
+
     const provider = this.registry.get(selection.provider);
 
     if (!provider) {
@@ -50,7 +115,61 @@ export class LLMRouter {
       model: selection.model
     };
 
-    return provider.complete(routedRequest);
+    // Execute with rate limiting and error handling
+    return this.errorHandler.retryWithBackoff(
+      async (attempt: number) => {
+        // Wait for rate limit token
+        await this.rateLimiter.waitForToken(selection.provider);
+
+        // Execute request
+        try {
+          return await provider.complete(routedRequest);
+        } catch (error: any) {
+          // Classify error for better retry logic
+          const classified = this.errorHandler.classify(error);
+
+          // Add context to error
+          error.providerName = selection.provider;
+          error.modelName = selection.model;
+          error.attempt = attempt;
+          error.classified = classified;
+
+          throw error;
+        }
+      },
+      {
+        maxRetries: 3,
+        initialDelay: 1000,
+        maxDelay: 60000,
+        factor: 2,
+        onRetry: (attempt: number, delay: number, error: Error) => {
+          const classified = this.errorHandler.classify(error);
+          console.warn(
+            `[Router] Retry ${attempt}/${3} after ${delay}ms - ${this.errorHandler.formatError(classified)}`
+          );
+        }
+      }
+    );
+  }
+
+  /**
+   * Select model by name across all providers
+   */
+  private selectModelByName(modelName: string, context: RoutingContext): ModelSelection {
+    const candidates = this.getCandidates(context);
+
+    // Find exact match
+    const match = candidates.find(c => c.model === modelName);
+    if (match) {
+      return {
+        provider: match.provider,
+        model: match.model,
+        reason: `Found model ${modelName} in ${match.provider}`
+      };
+    }
+
+    // No match - fall back to smart selection
+    return this.selectModel(context);
   }
 
   /**

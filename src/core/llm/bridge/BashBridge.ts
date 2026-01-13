@@ -171,6 +171,22 @@ export class MemoryManagerBridge {
     const result = await executeBash(`"${this.hookPath}" get-working`);
     return result.success ? result.stdout : '';
   }
+
+  /**
+   * Search episodes
+   */
+  async searchEpisodes(query: string, limit: number = 5): Promise<string> {
+    const result = await executeBash(`"${this.hookPath}" search-episodes "${query}" | head -n ${limit}`);
+    return result.success ? result.stdout : '';
+  }
+
+  /**
+   * Create checkpoint
+   */
+  async checkpoint(description: string): Promise<boolean> {
+    const result = await executeBash(`"${this.hookPath}" checkpoint "${description}"`);
+    return result.success;
+  }
 }
 
 /**

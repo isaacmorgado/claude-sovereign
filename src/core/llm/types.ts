@@ -184,6 +184,7 @@ export interface ProviderConfig {
   name: string;
   apiKey?: string;
   baseUrl?: string;
+  fallbackUrls?: string[];  // Additional endpoints for failover
   defaultModel?: string;
   timeout?: number;
 }
@@ -236,6 +237,7 @@ export type RoutingPriority = 'speed' | 'quality' | 'cost' | 'balanced';
 export interface RoutingContext {
   taskType: TaskType;
   priority: RoutingPriority;
+  preferredModel?: string;  // Supports "provider/model" syntax (e.g., "glm/glm-4.7")
   requiresUnrestricted?: boolean;
   requiresChinese?: boolean;
   requiresVision?: boolean;
