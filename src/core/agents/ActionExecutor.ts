@@ -96,6 +96,17 @@ export class ActionExecutor {
     const fullPath = path.resolve(this.workingDir, filePath);
     const dir = path.dirname(fullPath);
 
+    // Check if file exists
+    let fileExists = false;
+    let existingContent = '';
+    try {
+      existingContent = await fs.readFile(fullPath, 'utf-8');
+      fileExists = true;
+    } catch (error) {
+      // File doesn't exist, which is fine
+      fileExists = false;
+    }
+
     // Create directory if it doesn't exist
     await fs.mkdir(dir, { recursive: true });
 
@@ -104,11 +115,15 @@ export class ActionExecutor {
 
     return {
       success: true,
-      output: `File written: ${filePath} (${content.length} bytes)`,
+      output: fileExists
+        ? `File updated: ${filePath} (${content.length} bytes)`
+        : `File created: ${filePath} (${content.length} bytes)`,
       metadata: {
         path: fullPath,
         bytes: content.length,
-        lines: content.split('\n').length
+        lines: content.split('\n').length,
+        existed: fileExists,
+        previousBytes: fileExists ? existingContent.length : 0
       }
     };
   }
@@ -205,7 +220,7 @@ export class ActionExecutor {
     const response = await this.llmRouter.route(
       { messages },
       {
-        taskType: 'code',
+        taskType: 'coding',
         priority: 'quality'
       }
     );
