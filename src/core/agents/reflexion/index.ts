@@ -102,6 +102,14 @@ export class ReflexionAgent {
       // Execute the action
       const result: ActionResult = await this.executor.execute(action);
 
+      // Auto-validate TypeScript files after file_write
+      if (action.type === 'file_write' && action.params.path?.endsWith('.ts')) {
+        const validationResult = await this.executor.validateTypeScript([action.params.path]);
+        if (!validationResult.success) {
+          return `${action.type}(${JSON.stringify(action.params)}): ${result.output}\n⚠️ TypeScript validation failed: ${validationResult.error}`;
+        }
+      }
+
       // Return action description and result
       return `${action.type}(${JSON.stringify(action.params)}): ${result.output}`;
     } catch (error) {
