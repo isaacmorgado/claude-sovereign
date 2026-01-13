@@ -304,6 +304,101 @@ workflow=$(~/.claude/hooks/multi-agent-orchestrator.sh orchestrate "$task")
 # [Coordinate: planning → implementation → validation → optimization → documentation]
 ```
 
+### AUTONOMOUS SWARM ORCHESTRATION (NEW - 2026-01-12)
+
+**FULLY AUTONOMOUS**: Coordinator automatically spawns distributed agent swarms for parallel execution.
+
+**Auto-Detection & Spawning**:
+- Coordinator analyzes tasks using `parallel-execution-planner.sh`
+- If 3+ independent parallel groups detected → **auto-spawns swarm** (no manual intervention)
+- Each agent works independently on semantic subtasks
+- Results automatically aggregated with intelligent git merge
+
+**Intelligent Task Decomposition** (Production Implementation):
+Based on research: ax-llm dependency analysis, DAG patterns, phase-based decomposition
+
+**5 Decomposition Strategies**:
+1. **Feature Implementation** (Design → Implement → Test → Integrate)
+   - Pattern: "implement", "build", "create", "add feature"
+   - Agent 1: Research and design
+   - Agent 2: Implement core logic
+   - Agent 3: Write tests
+   - Agent 4: Integration + validation
+   - Dependencies tracked (agent 2 depends on 1, etc.)
+
+2. **Testing/Validation** (Parallel independent tests)
+   - Pattern: "test", "validate", "check"
+   - Splits into: unit → integration → e2e → performance → security tests
+   - No dependencies (all parallel)
+
+3. **Refactoring** (Sequential modules with dependencies)
+   - Pattern: "refactor", "reorganize", "restructure"
+   - Module-by-module with sequential dependencies
+
+4. **Research/Analysis** (Parallel investigation)
+   - Pattern: "research", "analyze", "investigate", "explore"
+   - Parallel aspects: codebase → external solutions → architecture → dependencies → performance
+
+5. **Generic Parallel** (Fallback for unknown patterns)
+   - Equal distribution across N agents
+
+**Code Integration with Git Merge** (Production Implementation):
+Based on research: kubernetes conflict detection, lean prover auto-resolution
+
+**Features**:
+- Per-agent temporary branches
+- Kubernetes-pattern conflict detection (`git diff --name-only --diff-filter=U`)
+- Auto-resolution for known safe files:
+  - Package locks (package-lock.json, yarn.lock) → keep current
+  - Small formatting conflicts (<10 lines) → keep agent changes
+- Integration report with conflict summary
+- Unresolved conflicts flagged for manual review
+
+**Example Autonomous Flow**:
+```
+User: "/auto implement authentication system"
+  ↓
+Coordinator: Detects "implement" → Uses feature decomposition strategy
+  ↓
+Parallel Planner: 5 independent groups detected
+  ↓
+AUTO-SPAWN: swarm_123456 with 5 agents
+  ├─ Agent 1: Research and design architecture
+  ├─ Agent 2: Implement backend/logic (depends on 1)
+  ├─ Agent 3: Implement frontend/interface (depends on 1)
+  ├─ Agent 4: Write comprehensive tests (depends on 2,3)
+  └─ Agent 5: Integration + documentation (depends on 2,3,4)
+  ↓
+Each agent works independently in separate workspace
+  ↓
+Auto-collect results when all complete
+  ↓
+Git integration: Create branches, merge, auto-resolve conflicts
+  ↓
+Integration report: Shows merge status, conflicts resolved/unresolved
+  ↓
+Task complete (zero manual intervention needed)
+```
+
+**Manual Override** (if needed):
+```bash
+/swarm spawn 3 "task description"  # Manual swarm spawn
+~/.claude/hooks/swarm-orchestrator.sh status  # Check swarm status
+~/.claude/hooks/swarm-orchestrator.sh collect  # Collect results
+```
+
+**Integration Points**:
+- ✅ coordinator.sh (lines 445-458): Auto-spawn logic
+- ✅ swarm-orchestrator.sh (lines 29-139): Intelligent decomposition
+- ✅ swarm-orchestrator.sh (lines 314-500): Git merge integration
+- ✅ parallel-execution-planner.sh: Detects parallelization opportunities
+
+**Research Sources**:
+- ax-llm/ax: Dependency graph analysis
+- SolaceLabs/solace-agent-mesh: Multi-agent coordination
+- kubernetes/test-infra: Bulk conflict detection
+- leanprover-community/mathlib4: Selective auto-resolution
+
 ### REINFORCEMENT LEARNING
 
 Use learned patterns to guide decisions:
