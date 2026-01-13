@@ -83,7 +83,9 @@ program
 
 // Error handling
 program.exitOverride((err) => {
-  if (err.code === 'commander.help') {
+  // Help-related errors should exit cleanly
+  if (err.code === 'commander.help' || err.code === 'outputHelp' ||
+      err.message?.includes('outputHelp') || err.message?.includes('help')) {
     process.exit(0);
   }
   console.error(chalk.red('Error:'), err.message);

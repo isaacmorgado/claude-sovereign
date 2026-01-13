@@ -8,13 +8,33 @@ allowed-tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "TodoWr
 
 Toggle fully autonomous Claude operation on or off.
 
-## Usage
+## Important: Shell Hooks vs CLI Commands
+
+**Note:** `/auto start`, `/auto stop`, `/auto status` are **shell hooks** (implemented in [`hooks/auto.sh`](hooks/auto.sh:1)), not CLI subcommands. They are executed by Claude Code's slash command system, not by the `komplete` CLI.
+
+The `komplete` CLI has its own `auto` command:
+```bash
+komplete auto <goal> [options]  # CLI command for autonomous mode
+```
+
+## Usage (Claude Code Slash Commands)
+
+These are slash commands used within Claude Code:
 
 ```
 /auto           # Start autonomous mode (default)
 /auto start     # Start autonomous mode
 /auto stop      # Stop autonomous mode, return to normal
 /auto status    # Check if autonomous mode is active
+```
+
+## Usage (komplete CLI)
+
+```bash
+komplete auto "Implement authentication"           # Start with a goal
+komplete auto "Build API" -m anthropic/claude-3-5-sonnet  # Specify model
+komplete auto "Refactor code" -i 100 -c 20       # 100 iterations, checkpoint every 20
+komplete auto "Test suite" -v                     # Verbose output
 ```
 
 ## Instructions
@@ -640,6 +660,77 @@ If you see `"execute_skill": "compact", "then": "checkpoint"`:
 - **After 10 file changes**: Auto-executes /checkpoint
 - **At 40% context**: Auto-compact memory → auto-execute /checkpoint
 - **Build section complete**: Auto-execute /checkpoint with buildguide update
+
+**Result**: ZERO manual intervention needed. User can step away, system self-manages.
+
+## Integration Points
+
+The `/auto` command integrates with the following components:
+
+### Core Integration Chain
+```
+/auto command → hooks/auto.sh → autonomous-command-router.sh → JSON signal → Claude executes
+```
+
+**Integration Pattern:**
+1. [`hooks/auto.sh`](hooks/auto.sh:1) - Main `/auto` hook implementation
+2. [`hooks/autonomous-command-router.sh`](hooks/autonomous-command-router.sh:1) - Decision engine
+3. JSON Signal - `{"execute_skill": "...", "autonomous": true}` - Triggers command execution
+4. Claude - Executes the specified skill (e.g., `/checkpoint`, `/compact`)
+
+### Available Skills
+- **checkpoint** - Save progress and generate continuation prompt
+- **compact** - Compact memory to optimize context usage
+- **build** - Execute build steps from buildguide.md
+- **swarm** - Spawn distributed agent swarms
+
+### Hook Integration Points
+
+#### coordinator.sh Integration
+- **Function**: `check_autonomous_triggers(trigger, context)`
+- **Function**: `track_file_changes(count)`
+- **Usage**: Call before/after significant actions to trigger auto-checkpoint
+- **Example**:
+  ```bash
+  coordinator.sh check-triggers checkpoint_files "changes:10"
+  coordinator.sh track-changes 5
+  ```
+
+#### swarm-orchestrator.sh Integration
+- **Function**: `check_swarm_completion_triggers(swarm_id, agent_count)`
+- **Usage**: Call after swarm completion to trigger auto-checkpoint
+- **Example**:
+  ```bash
+  swarm-orchestrator.sh check-triggers swarm_123456 5
+  ```
+`
+
+#### auto-continue.sh Integration
+- **Function**: `auto_continue(context_usage, file_changes)`
+- **Usage**: Called periodically to check context thresholds
+- **Triggers**: `/compact` at 40% context, `/checkpoint` after 10 file changes
+
+### Return JSON Signal Format
+
+The autonomous-command-router.sh returns JSON signals:
+
+```json
+{
+  "execute_skill": "checkpoint",
+  "reason": "context_threshold",
+  "autonomous": true
+}
+```
+
+Or for chained commands:
+```json
+{
+  "execute_skill": "compact",
+  "then": "checkpoint",
+  "reason": "context_threshold",
+  "autonomous": true
+}
+```
 
 **Result**: ZERO manual intervention needed. User can step away, system self-manages.
 

@@ -187,7 +187,6 @@ export async function main() {
   }
 }
 
-// Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
-}
+// Note: main() is exported for explicit calling when needed
+// The file should be imported and main() called explicitly rather than
+// relying on automatic execution which can interfere with CLI command parsing
