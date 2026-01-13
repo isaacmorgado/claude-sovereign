@@ -14,6 +14,8 @@ import type { CommandContext, CommandResult, AutoConfig } from '../types';
 import { ReflexionAgent, type ReflexionCycle } from '../../core/agents/reflexion';
 import { MemoryManagerBridge } from '../../core/llm/bridge/BashBridge';
 import { ErrorHandler } from '../../core/llm/ErrorHandler';
+import { ContextManager, COMPACTION_STRATEGIES } from '../../core/llm/ContextManager';
+import type { Message } from '../../core/llm/types';
 
 export class AutoCommand extends BaseCommand {
   name = 'auto';
@@ -22,6 +24,8 @@ export class AutoCommand extends BaseCommand {
   private iterations = 0;
   private memory: MemoryManagerBridge;
   private errorHandler: ErrorHandler;
+  private contextManager?: ContextManager;
+  private conversationHistory: Message[] = [];
 
   constructor() {
     super();
@@ -44,6 +48,17 @@ export class AutoCommand extends BaseCommand {
       // Set up memory context
       await this.memory.setTask(config.goal, 'Autonomous mode execution');
       await this.memory.addContext(`Model: ${config.model || 'auto-routed'}`, 9);
+
+      // Initialize ContextManager with 80% compaction threshold
+      this.contextManager = new ContextManager(
+        {
+          maxTokens: 128000,  // Claude Sonnet 4.5 context window
+          warningThreshold: 70,
+          compactionThreshold: 80,
+          strategy: COMPACTION_STRATEGIES.balanced
+        },
+        context.llmRouter
+      );
 
       // Create ReflexionAgent
       const agent = new ReflexionAgent(config.goal);
@@ -105,6 +120,35 @@ export class AutoCommand extends BaseCommand {
       this.updateSpinner(`Iteration ${this.iterations}/${maxIterations}`);
 
       try {
+        // Check context health and auto-compact if needed
+        if (this.contextManager && this.conversationHistory.length > 0) {
+          const health = this.contextManager.checkContextHealth(this.conversationHistory);
+
+          if (health.status === 'warning') {
+            this.warn(`Context at ${health.percentage.toFixed(1)}% - approaching limit`);
+          }
+
+          if (health.shouldCompact) {
+            this.info(`🔄 Context at ${health.percentage.toFixed(1)}% - compacting...`);
+            const { messages, result } = await this.contextManager.compactMessages(
+              this.conversationHistory,
+              `Goal: ${config.goal}`
+            );
+
+            this.conversationHistory = messages;
+            this.success(
+              `Compacted ${result.originalMessageCount} → ${result.compactedMessageCount} messages ` +
+              `(${(result.compressionRatio * 100).toFixed(0)}% of original)`
+            );
+
+            // Record compaction to memory
+            await this.memory.addContext(
+              `Context compacted: ${result.compressionRatio.toFixed(2)}x compression`,
+              6
+            );
+          }
+        }
+
         // Execute one ReAct + Reflexion cycle
         const cycle = await this.executeReflexionCycle(agent, context, config);
 
@@ -172,6 +216,10 @@ export class AutoCommand extends BaseCommand {
     // Build prompt with context
     const prompt = this.buildCyclePrompt(config.goal, memoryContext, recentEpisodes);
 
+    // Add to conversation history
+    const userMessage: Message = { role: 'user', content: prompt };
+    this.conversationHistory.push(userMessage);
+
     // Use LLM to generate thought
     const llmResponse = await context.llmRouter.route(
       {
@@ -189,6 +237,13 @@ export class AutoCommand extends BaseCommand {
     // Extract text from response (handle different content types)
     const firstContent = llmResponse.content[0];
     const thought = firstContent.type === 'text' ? firstContent.text : 'Unable to extract thought';
+
+    // Add assistant response to history
+    const assistantMessage: Message = {
+      role: 'assistant',
+      content: llmResponse.content
+    };
+    this.conversationHistory.push(assistantMessage);
 
     // Execute the cycle with LLM-generated thought
     const cycle = await agent.cycle(thought);

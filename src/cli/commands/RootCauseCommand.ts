@@ -1,0 +1,203 @@
+/**
+ * /rootcause Command - Root Cause Analysis
+ *
+ * Implements intelligent debugging with:
+ * - Before/after snapshots
+ * - Regression detection
+ * - Memory-based fix suggestions
+ * - GitHub solution search
+ */
+
+import chalk from 'chalk';
+import { BaseCommand } from '../BaseCommand';
+import type { CommandContext, CommandResult } from '../types';
+import { createDebugOrchestrator, type DebugOrchestrator } from '../../core/debug/orchestrator';
+import { MemoryManagerBridge } from '../../core/llm/bridge/BashBridge';
+import * as os from 'os';
+import * as path from 'path';
+
+export interface RootCauseConfig {
+  action: 'analyze' | 'verify';
+  bugDescription?: string;
+  bugType?: string;
+  testCommand?: string;
+  beforeSnapshotId?: string;
+  fixDescription?: string;
+  verbose?: boolean;
+}
+
+export class RootCauseCommand extends BaseCommand {
+  name = 'rootcause';
+  description = 'Perform root cause analysis with regression detection';
+
+  private orchestrator: DebugOrchestrator;
+  private memory: MemoryManagerBridge;
+
+  constructor() {
+    super();
+    const debugDir = path.join(os.homedir(), '.claude', '.debug');
+    this.orchestrator = createDebugOrchestrator(debugDir, true); // GitHub MCP available
+    this.memory = new MemoryManagerBridge();
+  }
+
+  async execute(context: CommandContext, config: RootCauseConfig): Promise<CommandResult> {
+    try {
+      switch (config.action) {
+        case 'analyze':
+          return await this.analyzeBug(context, config);
+        case 'verify':
+          return await this.verifyFix(context, config);
+        default:
+          return this.createFailure(
+            `Unknown action: ${config.action}. Use: analyze, verify`
+          );
+      }
+    } catch (error) {
+      const err = error as Error;
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+
+  /**
+   * Analyze a bug and generate fix suggestions
+   */
+  private async analyzeBug(
+    context: CommandContext,
+    config: RootCauseConfig
+  ): Promise<CommandResult> {
+    if (!config.bugDescription) {
+      return this.createFailure('Bug description is required');
+    }
+
+    this.info(`🔍 Analyzing bug`);
+    this.info(`Description: ${chalk.bold(config.bugDescription)}`);
+    console.log('');
+
+    this.startSpinner('Running smart debug analysis...');
+
+    // Execute smart debug workflow
+    const debugContext = await this.orchestrator.smartDebug({
+      bugDescription: config.bugDescription,
+      bugType: config.bugType || 'general',
+      testCommand: config.testCommand || 'echo "No tests configured"'
+    });
+
+    this.succeedSpinner('Analysis complete');
+
+    // Record to memory
+    await this.memory.recordEpisode(
+      'rootcause_analysis',
+      `Bug: ${config.bugDescription}`,
+      'success',
+      JSON.stringify(debugContext)
+    );
+
+    // Display results
+    console.log('');
+    this.success('Root cause analysis completed');
+    console.log('');
+    console.log(chalk.bold('Before Snapshot:'), chalk.cyan(debugContext.beforeSnapshot));
+    console.log('');
+
+    if (debugContext.similarFixes.similarFixes.length > 0) {
+      console.log(chalk.bold('Similar Fixes from Memory:'));
+      debugContext.similarFixes.similarFixes.forEach((fix: any, i: number) => {
+        console.log(`  ${i + 1}. ${chalk.gray(fix.bugDescription)}`);
+        console.log(`     Fix: ${chalk.green(fix.fixDescription)}`);
+        console.log(`     Success: ${fix.success ? chalk.green('Yes') : chalk.red('No')}`);
+      });
+      console.log('');
+    }
+
+    if (debugContext.githubSolutions && debugContext.githubSolutions.solutions && debugContext.githubSolutions.solutions.length > 0) {
+      console.log(chalk.bold('GitHub Solutions:'));
+      debugContext.githubSolutions.solutions.forEach((solution: any, i: number) => {
+        console.log(`  ${i + 1}. ${chalk.gray(solution.title || 'Solution')}`);
+        console.log(`     Repo: ${chalk.cyan(solution.repo || 'N/A')}`);
+        console.log(`     ${chalk.blue(solution.url || '')}`);
+      });
+      console.log('');
+    }
+
+    console.log(chalk.bold('Fix Prompt:'));
+    console.log(chalk.gray(debugContext.fixPrompt));
+    console.log('');
+
+    return this.createSuccess('Analysis complete', debugContext);
+  }
+
+  /**
+   * Verify a fix and detect regressions
+   */
+  private async verifyFix(
+    context: CommandContext,
+    config: RootCauseConfig
+  ): Promise<CommandResult> {
+    if (!config.beforeSnapshotId) {
+      return this.createFailure('Before snapshot ID is required');
+    }
+
+    if (!config.testCommand) {
+      return this.createFailure('Test command is required');
+    }
+
+    this.info(`✅ Verifying fix`);
+    this.info(`Before Snapshot: ${chalk.cyan(config.beforeSnapshotId)}`);
+    console.log('');
+
+    this.startSpinner('Creating after snapshot and checking for regressions...');
+
+    // Verify the fix
+    const recommendation = await this.orchestrator.verifyFix({
+      beforeSnapshotId: config.beforeSnapshotId,
+      testCommand: config.testCommand,
+      fixDescription: config.fixDescription || 'Fix applied'
+    });
+
+    if (recommendation.status === 'success') {
+      this.succeedSpinner('Fix verified - no regressions detected');
+    } else if (recommendation.regressionsDetected) {
+      this.failSpinner('Regressions detected!');
+    } else {
+      this.failSpinner('Verification failed');
+    }
+
+    // Record to memory
+    await this.memory.recordEpisode(
+      'fix_verification',
+      config.fixDescription || 'Fix applied',
+      recommendation.status === 'success' ? 'success' : 'failed',
+      JSON.stringify(recommendation)
+    );
+
+    // Display results
+    console.log('');
+    console.log(chalk.bold('Status:'), recommendation.status === 'success'
+      ? chalk.green('Success')
+      : chalk.red('Failed'));
+    console.log(chalk.bold('Regressions:'), recommendation.regressionsDetected
+      ? chalk.red('Detected')
+      : chalk.green('None'));
+    console.log('');
+    console.log(chalk.bold('Recommendation:'));
+    console.log(chalk.gray(recommendation.recommendation));
+    console.log('');
+
+    if (recommendation.actions.length > 0) {
+      console.log(chalk.bold('Suggested Actions:'));
+      recommendation.actions.forEach((action, i) => {
+        console.log(`  ${i + 1}. ${chalk.gray(action)}`);
+      });
+      console.log('');
+    }
+
+    if (config.verbose && recommendation.regressionsDetected) {
+      console.log(chalk.bold('Regression Details:'));
+      console.log(chalk.gray(JSON.stringify(recommendation, null, 2)));
+      console.log('');
+    }
+
+    return this.createSuccess('Verification complete', recommendation);
+  }
+}

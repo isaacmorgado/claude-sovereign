@@ -8802,132 +8802,6 @@ class MemoryManagerBridge {
     return result.success;
   }
 }
-// src/core/llm/bridge/TypeScriptBridge.ts
-class TypeScriptBridge {
-  static async complete(args) {
-    try {
-      const registry = await createDefaultRegistry();
-      const router = new LLMRouter(registry);
-      const request = {
-        messages: [{ role: "user", content: args.prompt }],
-        system: args.system,
-        model: args.model
-      };
-      const context = {
-        taskType: args.taskType || "general",
-        priority: args.priority || "balanced",
-        requiresUnrestricted: args.requiresUnrestricted
-      };
-      const response = await router.route(request, context);
-      return JSON.stringify({
-        success: true,
-        text: this.extractText(response),
-        usage: response.usage,
-        model: response.model
-      });
-    } catch (error2) {
-      return JSON.stringify({
-        success: false,
-        error: error2.message
-      });
-    }
-  }
-  static async selectModel(context) {
-    try {
-      const registry = await createDefaultRegistry();
-      const router = new LLMRouter(registry);
-      const selection = router.selectModel(context);
-      return JSON.stringify({
-        success: true,
-        selection
-      });
-    } catch (error2) {
-      return JSON.stringify({
-        success: false,
-        error: error2.message
-      });
-    }
-  }
-  static async listModels() {
-    try {
-      const registry = await createDefaultRegistry();
-      const models = {};
-      for (const providerName of registry.list()) {
-        const provider = registry.get(providerName);
-        if (provider) {
-          models[providerName] = await provider.listModels();
-        }
-      }
-      return JSON.stringify({
-        success: true,
-        models
-      });
-    } catch (error2) {
-      return JSON.stringify({
-        success: false,
-        error: error2.message
-      });
-    }
-  }
-  static extractText(response) {
-    return response.content.filter((block) => block.type === "text").map((block) => block.text).join(`
-`);
-  }
-}
-async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0];
-  try {
-    if (command === "complete") {
-      const params = {};
-      for (let i = 1;i < args.length; i += 2) {
-        const key = args[i].replace(/^--/, "").replace(/-/g, "_");
-        const value = args[i + 1];
-        if (key === "requires_unrestricted") {
-          params[key] = value === "true";
-        } else {
-          params[key] = value;
-        }
-      }
-      const result = await TypeScriptBridge.complete(params);
-      console.log(result);
-    } else if (command === "select-model") {
-      const context = {
-        taskType: "general",
-        priority: "balanced"
-      };
-      for (let i = 1;i < args.length; i += 2) {
-        const key = args[i].replace(/^--/, "").replace(/-/g, "_");
-        const value = args[i + 1];
-        if (key === "requires_unrestricted" || key === "requires_chinese" || key === "requires_vision") {
-          context[key] = value === "true";
-        } else {
-          context[key] = value;
-        }
-      }
-      const result = await TypeScriptBridge.selectModel(context);
-      console.log(result);
-    } else if (command === "list-models") {
-      const result = await TypeScriptBridge.listModels();
-      console.log(result);
-    } else {
-      console.log(JSON.stringify({
-        success: false,
-        error: `Unknown command: ${command}`
-      }));
-      process.exit(1);
-    }
-  } catch (error2) {
-    console.log(JSON.stringify({
-      success: false,
-      error: error2.message
-    }));
-    process.exit(1);
-  }
-}
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
-}
 // src/core/llm/index.ts
 async function createLLMClient() {
   const registry = await createDefaultRegistry();
@@ -9461,7 +9335,7 @@ function isUnicodeSupported() {
 }
 
 // node_modules/log-symbols/index.js
-var main2 = {
+var main = {
   info: source_default2.blue("ℹ"),
   success: source_default2.green("✔"),
   warning: source_default2.yellow("⚠"),
@@ -9473,7 +9347,7 @@ var fallback = {
   warning: source_default2.yellow("‼"),
   error: source_default2.red("×")
 };
-var logSymbols = isUnicodeSupported() ? main2 : fallback;
+var logSymbols = isUnicodeSupported() ? main : fallback;
 var log_symbols_default = logSymbols;
 
 // node_modules/ora/node_modules/strip-ansi/node_modules/ansi-regex/index.js
@@ -10039,6 +9913,210 @@ class ReflexionAgent {
   }
 }
 
+// src/core/llm/ContextManager.ts
+var COMPACTION_STRATEGIES = {
+  aggressive: {
+    name: "aggressive",
+    keepRecent: 3,
+    targetRatio: 0.3
+  },
+  balanced: {
+    name: "balanced",
+    keepRecent: 5,
+    targetRatio: 0.5
+  },
+  conservative: {
+    name: "conservative",
+    keepRecent: 8,
+    targetRatio: 0.7
+  }
+};
+
+class ContextManager {
+  config;
+  router;
+  constructor(config = {}, router) {
+    this.config = {
+      maxTokens: config.maxTokens || 128000,
+      warningThreshold: config.warningThreshold || 70,
+      compactionThreshold: config.compactionThreshold || 80,
+      strategy: config.strategy || COMPACTION_STRATEGIES.balanced
+    };
+    this.router = router;
+  }
+  estimateTokens(messages) {
+    let tokens = 0;
+    for (const message of messages) {
+      if (typeof message.content === "string") {
+        tokens += Math.ceil(message.content.length / 4);
+      } else {
+        for (const block of message.content) {
+          if (block.type === "text") {
+            tokens += Math.ceil(block.text.length / 4);
+          } else if (block.type === "tool_result") {
+            tokens += Math.ceil(block.content.length / 4);
+          }
+        }
+      }
+      tokens += 10;
+    }
+    return tokens;
+  }
+  checkContextHealth(messages) {
+    const currentTokens = this.estimateTokens(messages);
+    const percentage = currentTokens / this.config.maxTokens * 100;
+    if (percentage >= this.config.compactionThreshold) {
+      return {
+        status: "critical",
+        currentTokens,
+        percentage,
+        shouldCompact: true,
+        recommendation: `Context at ${percentage.toFixed(1)}% - compaction required`
+      };
+    } else if (percentage >= this.config.warningThreshold) {
+      return {
+        status: "warning",
+        currentTokens,
+        percentage,
+        shouldCompact: false,
+        recommendation: `Context at ${percentage.toFixed(1)}% - approaching limit`
+      };
+    } else {
+      return {
+        status: "healthy",
+        currentTokens,
+        percentage,
+        shouldCompact: false,
+        recommendation: `Context healthy (${percentage.toFixed(1)}%)`
+      };
+    }
+  }
+  async compactMessages(messages, systemPrompt) {
+    if (!this.router) {
+      throw new Error("LLM Router required for compaction");
+    }
+    const strategy = this.config.strategy;
+    const originalTokens = this.estimateTokens(messages);
+    const recentMessages = messages.slice(-strategy.keepRecent);
+    const oldMessages = messages.slice(0, -strategy.keepRecent);
+    if (oldMessages.length === 0) {
+      return {
+        messages,
+        result: {
+          originalMessageCount: messages.length,
+          compactedMessageCount: messages.length,
+          originalTokens,
+          compactedTokens: originalTokens,
+          compressionRatio: 1
+        }
+      };
+    }
+    const summaryPrompt = this.buildSummaryPrompt(oldMessages, systemPrompt);
+    try {
+      const response = await this.router.route({
+        messages: [{ role: "user", content: summaryPrompt }],
+        system: "You are a conversation summarizer. Create concise, information-dense summaries.",
+        max_tokens: Math.ceil(originalTokens * strategy.targetRatio)
+      }, {
+        taskType: "general",
+        priority: "speed",
+        requiresUnrestricted: false
+      });
+      const firstContent = response.content[0];
+      const summary = firstContent.type === "text" ? firstContent.text : "Unable to create summary";
+      const compactedMessages = [
+        {
+          role: "user",
+          content: `[Previous conversation summary]
+
+${summary}
+
+[End of summary. Recent messages follow:]`
+        },
+        ...recentMessages
+      ];
+      const compactedTokens = this.estimateTokens(compactedMessages);
+      return {
+        messages: compactedMessages,
+        result: {
+          originalMessageCount: messages.length,
+          compactedMessageCount: compactedMessages.length,
+          originalTokens,
+          compactedTokens,
+          compressionRatio: compactedTokens / originalTokens
+        }
+      };
+    } catch (error2) {
+      console.warn("[ContextManager] Summarization failed, using truncation fallback");
+      return {
+        messages: recentMessages,
+        result: {
+          originalMessageCount: messages.length,
+          compactedMessageCount: recentMessages.length,
+          originalTokens,
+          compactedTokens: this.estimateTokens(recentMessages),
+          compressionRatio: recentMessages.length / messages.length
+        }
+      };
+    }
+  }
+  buildSummaryPrompt(messages, systemPrompt) {
+    const conversationText = messages.map((msg) => {
+      const role = msg.role === "user" ? "User" : "Assistant";
+      const content = typeof msg.content === "string" ? msg.content : msg.content.map((block) => {
+        if (block.type === "text")
+          return block.text;
+        if (block.type === "tool_result")
+          return `[Tool result: ${block.content.substring(0, 100)}...]`;
+        return "";
+      }).join(`
+`);
+      return `${role}: ${content}`;
+    }).join(`
+
+`);
+    return `
+Summarize the following conversation concisely while preserving all critical information:
+- Key decisions and conclusions
+- Important facts and context
+- Action items and results
+- Technical details and error information
+
+${systemPrompt ? `System context: ${systemPrompt}
+` : ""}
+
+Conversation:
+${conversationText}
+
+Provide a dense, information-rich summary that captures the essential content in as few words as possible:
+`.trim();
+  }
+  async autoCompact(messages, systemPrompt) {
+    const health = this.checkContextHealth(messages);
+    if (health.shouldCompact) {
+      const { messages: compactedMessages, result } = await this.compactMessages(messages, systemPrompt);
+      return {
+        messages: compactedMessages,
+        wasCompacted: true,
+        result
+      };
+    }
+    return {
+      messages,
+      wasCompacted: false
+    };
+  }
+  updateConfig(config) {
+    this.config = {
+      ...this.config,
+      ...config
+    };
+  }
+  getConfig() {
+    return { ...this.config };
+  }
+}
+
 // src/cli/commands/AutoCommand.ts
 class AutoCommand extends BaseCommand {
   name = "auto";
@@ -10046,6 +10124,8 @@ class AutoCommand extends BaseCommand {
   iterations = 0;
   memory;
   errorHandler;
+  contextManager;
+  conversationHistory = [];
   constructor() {
     super();
     this.memory = new MemoryManagerBridge;
@@ -10061,6 +10141,12 @@ class AutoCommand extends BaseCommand {
       console.log("");
       await this.memory.setTask(config.goal, "Autonomous mode execution");
       await this.memory.addContext(`Model: ${config.model || "auto-routed"}`, 9);
+      this.contextManager = new ContextManager({
+        maxTokens: 128000,
+        warningThreshold: 70,
+        compactionThreshold: 80,
+        strategy: COMPACTION_STRATEGIES.balanced
+      }, context.llmRouter);
       const agent = new ReflexionAgent(config.goal);
       const result = await this.runAutonomousLoop(agent, context, config);
       if (result.success) {
@@ -10093,6 +10179,19 @@ Suggested actions:`));
       this.iterations++;
       this.updateSpinner(`Iteration ${this.iterations}/${maxIterations}`);
       try {
+        if (this.contextManager && this.conversationHistory.length > 0) {
+          const health = this.contextManager.checkContextHealth(this.conversationHistory);
+          if (health.status === "warning") {
+            this.warn(`Context at ${health.percentage.toFixed(1)}% - approaching limit`);
+          }
+          if (health.shouldCompact) {
+            this.info(`\uD83D\uDD04 Context at ${health.percentage.toFixed(1)}% - compacting...`);
+            const { messages, result } = await this.contextManager.compactMessages(this.conversationHistory, `Goal: ${config.goal}`);
+            this.conversationHistory = messages;
+            this.success(`Compacted ${result.originalMessageCount} → ${result.compactedMessageCount} messages ` + `(${(result.compressionRatio * 100).toFixed(0)}% of original)`);
+            await this.memory.addContext(`Context compacted: ${result.compressionRatio.toFixed(2)}x compression`, 6);
+          }
+        }
         const cycle = await this.executeReflexionCycle(agent, context, config);
         this.displayCycle(cycle, config.verbose || false);
         goalAchieved = await this.checkGoalAchievement(agent, context, config.goal);
@@ -10120,6 +10219,8 @@ Suggested actions:`));
     const memoryContext = await this.memory.getWorking();
     const recentEpisodes = await this.memory.searchEpisodes(config.goal, 5);
     const prompt = this.buildCyclePrompt(config.goal, memoryContext, recentEpisodes);
+    const userMessage = { role: "user", content: prompt };
+    this.conversationHistory.push(userMessage);
     const llmResponse = await context.llmRouter.route({
       messages: [{ role: "user", content: prompt }],
       system: "You are an autonomous AI agent executing tasks. Think step by step."
@@ -10131,6 +10232,11 @@ Suggested actions:`));
     });
     const firstContent = llmResponse.content[0];
     const thought = firstContent.type === "text" ? firstContent.text : "Unable to extract thought";
+    const assistantMessage = {
+      role: "assistant",
+      content: llmResponse.content
+    };
+    this.conversationHistory.push(assistantMessage);
     const cycle = await agent.cycle(thought);
     await this.memory.addContext(`Iteration ${this.iterations}: ${cycle.thought}`, 7);
     return cycle;
@@ -10210,6 +10316,88 @@ Has the goal been achieved? Answer with just "YES" or "NO" and brief explanation
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+// src/core/agents/swarm/Coordinator.ts
+class SwarmCoordinator {
+  swarms = new Map;
+  initializeSwarm(swarmId, task, agentCount, workDir) {
+    const agents = Array.from({ length: agentCount }, (_, i) => ({
+      agentId: i + 1,
+      status: "pending"
+    }));
+    const state = {
+      swarmId,
+      task,
+      agentCount,
+      status: "active",
+      startedAt: new Date().toISOString(),
+      workDir,
+      agents,
+      results: []
+    };
+    this.swarms.set(swarmId, state);
+    return state;
+  }
+  updateAgentStatus(swarmId, agentId, status, taskId) {
+    const swarm = this.swarms.get(swarmId);
+    if (!swarm)
+      return;
+    const agent = swarm.agents.find((a) => a.agentId === agentId);
+    if (!agent)
+      return;
+    agent.status = status;
+    if (taskId)
+      agent.taskId = taskId;
+    if (status === "running" && !agent.startedAt) {
+      agent.startedAt = new Date().toISOString();
+    } else if ((status === "success" || status === "failed") && !agent.completedAt) {
+      agent.completedAt = new Date().toISOString();
+    }
+    this.updateSwarmStatus(swarmId);
+  }
+  addAgentResult(swarmId, result) {
+    const swarm = this.swarms.get(swarmId);
+    if (!swarm)
+      return;
+    swarm.results.push(result);
+    this.updateAgentStatus(swarmId, result.agentId, result.status);
+  }
+  updateSwarmStatus(swarmId) {
+    const swarm = this.swarms.get(swarmId);
+    if (!swarm)
+      return;
+    const allComplete = swarm.agents.every((a) => a.status === "success" || a.status === "failed");
+    const anyFailed = swarm.agents.some((a) => a.status === "failed");
+    if (allComplete) {
+      swarm.status = anyFailed ? "failed" : "complete";
+      swarm.completedAt = new Date().toISOString();
+    }
+  }
+  getSwarmState(swarmId) {
+    return this.swarms.get(swarmId);
+  }
+  isComplete(swarmId) {
+    const swarm = this.swarms.get(swarmId);
+    return swarm?.status === "complete" || swarm?.status === "failed";
+  }
+  getCompletionStatus(swarmId) {
+    const swarm = this.swarms.get(swarmId);
+    if (!swarm) {
+      return { complete: false, success: 0, failed: 0, pending: 0 };
+    }
+    const success = swarm.agents.filter((a) => a.status === "success").length;
+    const failed = swarm.agents.filter((a) => a.status === "failed").length;
+    const pending = swarm.agents.filter((a) => a.status === "pending" || a.status === "running").length;
+    return {
+      complete: pending === 0,
+      success,
+      failed,
+      pending
+    };
+  }
+  clearSwarm(swarmId) {
+    this.swarms.delete(swarmId);
+  }
+}
 // src/index.ts
 var program2 = new Command;
 program2.name("komplete").description("Ultimate AI coding assistant with autonomous capabilities").version("1.0.0");
@@ -10253,7 +10441,7 @@ program2.command("init").description("Initialize komplete in current project").a
   console.log(source_default.gray("Created .komplete/ directory with configuration"));
 });
 program2.exitOverride((err) => {
-  if (err.code === "commander.help") {
+  if (err.code === "commander.help" || err.code === "outputHelp" || err.message?.includes("outputHelp") || err.message?.includes("help")) {
     process.exit(0);
   }
   console.error(source_default.red("Error:"), err.message);
