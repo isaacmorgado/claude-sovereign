@@ -39,6 +39,7 @@ REINFORCEMENT_LEARNING="${HOME}/.claude/hooks/reinforcement-learning.sh"
 ENHANCED_AUDIT_TRAIL="${HOME}/.claude/hooks/enhanced-audit-trail.sh"
 PARALLEL_EXECUTION_PLANNER="${HOME}/.claude/hooks/parallel-execution-planner.sh"
 SWARM_ORCHESTRATOR="${HOME}/.claude/hooks/swarm-orchestrator.sh"
+AUTONOMOUS_COMMAND_ROUTER="${HOME}/.claude/hooks/autonomous-command-router.sh"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -713,6 +714,43 @@ coordinate_task() {
 }
 
 # =============================================================================
+# AUTONOMOUS COMMAND ROUTER INTEGRATION
+# =============================================================================
+
+check_autonomous_triggers() {
+    local trigger_type="$1"
+    local context="${2:-}"
+
+    log "Checking autonomous triggers: $trigger_type"
+
+    if [[ ! -x "$AUTONOMOUS_COMMAND_ROUTER" ]]; then
+        log "Autonomous command router not available"
+        return 1
+    fi
+
+    # Get decision from router
+    local decision
+    decision=$("$AUTONOMOUS_COMMAND_ROUTER" execute "$trigger_type" "$context" 2>/dev/null || echo '{"execute_skill":"none"}')
+
+    log "Router decision: $decision"
+
+    # Output decision for Claude to process
+    echo "$decision"
+}
+
+track_file_changes() {
+    local file_count="${1:-0}"
+
+    # Track file changes in coordination state
+    if [[ -f "$COORD_STATE" ]] && command -v jq &>/dev/null; then
+        jq --argjson count "$file_count" \
+            '.fileChanges = ($fileChanges // 0) + $count' \
+            "$COORD_STATE" > "${COORD_STATE}.tmp" && mv "${COORD_STATE}.tmp" "$COORD_STATE"
+        log "Tracked file changes: $file_count"
+    fi
+}
+
+# =============================================================================
 # AUTONOMOUS ORCHESTRATION
 # =============================================================================
 
@@ -785,6 +823,12 @@ case "${1:-help}" in
     status)
         cat "$COORD_STATE"
         ;;
+    check-triggers)
+        check_autonomous_triggers "${2:-manual}" "${3:-}"
+        ;;
+    track-changes)
+        track_file_changes "${2:-0}"
+        ;;
     help|*)
         echo "Central Coordinator - Intelligence Layer"
         echo ""
@@ -795,9 +839,13 @@ case "${1:-help}" in
         echo "  coordinate <task> [type] [context]    - Coordinate single task"
         echo "  orchestrate                           - Autonomous orchestration"
         echo "  status                                - Get coordinator status"
+        echo "  check-triggers <type> [context]        - Check autonomous command triggers"
+        echo "  track-changes <count>                  - Track file changes for auto-checkpoint"
         echo ""
         echo "Examples:"
         echo "  $0 coordinate 'implement auth' feature"
         echo "  $0 orchestrate  # Run autonomous orchestration"
+        echo "  $0 check-triggers checkpoint_files 'changes:10'"
+        echo "  $0 track-changes 5"
         ;;
 esac

@@ -18,15 +18,15 @@ echo ""
 echo "📋 Prerequisites Check:"
 echo ""
 
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo -e "${RED}✗ ANTHROPIC_API_KEY not set${NC}"
+if [ -z "$BIGMODEL_API_KEY" ]; then
+    echo -e "${RED}✗ BIGMODEL_API_KEY not set${NC}"
     echo ""
     echo "Please set your API key:"
-    echo "  export ANTHROPIC_API_KEY=\"sk-ant-...\""
+    echo "  export BIGMODEL_API_KEY=\"your-key-here\""
     echo ""
     exit 1
 else
-    echo -e "${GREEN}✓ ANTHROPIC_API_KEY set (${#ANTHROPIC_API_KEY} chars)${NC}"
+    echo -e "${GREEN}✓ BIGMODEL_API_KEY set (${#BIGMODEL_API_KEY} chars)${NC}"
 fi
 
 if [ ! -f "dist/index.js" ]; then

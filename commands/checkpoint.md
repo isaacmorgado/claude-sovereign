@@ -10,6 +10,9 @@ Save current session state to CLAUDE.md for long-term persistence AND output a c
 
 ## Instructions
 
+**Note**: Use `/compact` command before checkpointing at context threshold to optimize memory usage. See [`/compact`](compact.md) command documentation.
+
+
 Do THREE things:
 
 ### 0. Check for Pipeline State (Do This First)

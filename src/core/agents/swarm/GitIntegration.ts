@@ -6,6 +6,13 @@
  * Based on: kubernetes conflict detection, lean prover auto-resolution
  */
 
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+
+const execAsync = promisify(exec);
+
 export interface ConflictResolution {
   file: string;
   resolved: boolean;
@@ -36,6 +43,28 @@ export interface IntegrationSummary {
  * Git integration for swarm code merging
  */
 export class GitIntegration {
+  /**
+   * Execute a git command
+   */
+  private async execGit(args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const command = `git ${args.join(' ')}`;
+      const { stdout, stderr } = await execAsync(command, { cwd });
+
+      return {
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+        exitCode: 0
+      };
+    } catch (error: any) {
+      // exec throws on non-zero exit codes
+      return {
+        stdout: error.stdout?.toString() || '',
+        stderr: error.stderr?.toString() || '',
+        exitCode: error.code || 1
+      };
+    }
+  }
   /**
    * Integrate changes from multiple agents
    */
@@ -85,34 +114,105 @@ export class GitIntegration {
     const autoResolved: ConflictResolution[] = [];
     const unresolved: ConflictResolution[] = [];
 
-    // TODO: Implement actual git operations
-    // This is a placeholder for the structure
-    // In production, this would use a git library or spawn git commands
+    try {
+      // Check if branch exists
+      const branchCheck = await this.execGit(['rev-parse', '--verify', branch], workDir);
+      if (branchCheck.exitCode !== 0) {
+        // Branch doesn't exist
+        return {
+          success: false,
+          agentId,
+          branch,
+          conflictsDetected: false,
+          autoResolved,
+          unresolved,
+          report: `Agent ${agentId}: Branch ${branch} not found`
+        };
+      }
 
-    return {
-      success: true,
-      agentId,
-      branch,
-      conflictsDetected: false,
-      autoResolved,
-      unresolved,
-      report: `Agent ${agentId}: Integration successful`
-    };
+      // Attempt to merge the branch
+      const mergeResult = await this.execGit(['merge', branch, '--no-commit', '--no-ff'], workDir);
+
+      // Check for conflicts
+      const conflictedFiles = await this.detectConflicts(workDir);
+      const conflictsDetected = conflictedFiles.length > 0;
+
+      if (conflictsDetected) {
+        // Auto-resolve known safe conflicts
+        const resolution = await this.autoResolveConflicts(conflictedFiles, workDir);
+        autoResolved.push(...resolution.resolved);
+        unresolved.push(...resolution.unresolved);
+
+        // Stage auto-resolved files
+        for (const resolved of resolution.resolved) {
+          if (this.isPackageLock(resolved.file)) {
+            await this.execGit(['checkout', '--ours', resolved.file], workDir);
+          } else {
+            await this.execGit(['checkout', '--theirs', resolved.file], workDir);
+          }
+          await this.execGit(['add', resolved.file], workDir);
+        }
+
+        // If all conflicts resolved, complete the merge
+        if (resolution.unresolved.length === 0) {
+          await this.execGit(['commit', '-m', `Merged ${branch} (auto-resolved)`], workDir);
+        } else {
+          // Abort merge if unresolved conflicts remain
+          await this.execGit(['merge', '--abort'], workDir);
+        }
+      } else {
+        // No conflicts, complete the merge
+        await this.execGit(['commit', '-m', `Merged ${branch}`], workDir);
+      }
+
+      return {
+        success: unresolved.length === 0,
+        agentId,
+        branch,
+        conflictsDetected,
+        autoResolved,
+        unresolved,
+        report: unresolved.length === 0
+          ? `Agent ${agentId}: Integration successful (${autoResolved.length} auto-resolved)`
+          : `Agent ${agentId}: Integration aborted (${unresolved.length} unresolved conflicts)`
+      };
+    } catch (error) {
+      const err = error as Error;
+      return {
+        success: false,
+        agentId,
+        branch,
+        conflictsDetected: false,
+        autoResolved,
+        unresolved,
+        report: `Agent ${agentId}: Error - ${err.message}`
+      };
+    }
   }
 
   /**
    * Detect conflicts in a merge
    */
-  private async detectConflicts(): Promise<string[]> {
-    // TODO: Implement using git diff --name-only --diff-filter=U
+  private async detectConflicts(workDir: string): Promise<string[]> {
+    // Use git diff to find unmerged (conflicted) files
     // Kubernetes pattern for conflict detection
-    return [];
+    const result = await this.execGit(['diff', '--name-only', '--diff-filter=U'], workDir);
+
+    if (result.exitCode !== 0) {
+      return [];
+    }
+
+    // Split by newlines and filter empty lines
+    return result.stdout
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
   }
 
   /**
    * Auto-resolve known safe conflicts
    */
-  private async autoResolveConflicts(conflictedFiles: string[]): Promise<{
+  private async autoResolveConflicts(conflictedFiles: string[], workDir: string): Promise<{
     resolved: ConflictResolution[];
     unresolved: ConflictResolution[];
   }> {
@@ -132,7 +232,7 @@ export class GitIntegration {
       }
 
       // Auto-resolve: Small formatting conflicts
-      const conflictCount = await this.countConflictMarkers(file);
+      const conflictCount = await this.countConflictMarkers(file, workDir);
       if (conflictCount > 0 && conflictCount <= 3) {
         // Single conflict region has 3 markers (<<<<<<, ======, >>>>>>)
         resolved.push({
@@ -166,9 +266,27 @@ export class GitIntegration {
   /**
    * Count conflict markers in file
    */
-  private async countConflictMarkers(file: string): Promise<number> {
-    // TODO: Implement by reading file and counting lines matching ^(<{7}|={7}|>{7})
-    return 0;
+  private async countConflictMarkers(file: string, workDir: string): Promise<number> {
+    try {
+      const filePath = path.join(workDir, file);
+      const content = await fs.readFile(filePath, 'utf-8');
+      const lines = content.split('\n');
+
+      // Count lines that start with conflict markers
+      // <<<<<<< (start of conflict)
+      // ======= (separator)
+      // >>>>>>> (end of conflict)
+      let count = 0;
+      for (const line of lines) {
+        if (/^(<{7}|={7}|>{7})/.test(line)) {
+          count++;
+        }
+      }
+
+      return count;
+    } catch (error) {
+      return 0;
+    }
   }
 
   /**

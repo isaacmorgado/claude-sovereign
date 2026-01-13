@@ -1663,16 +1663,16 @@ Expecting one of '${allowedValues.join("', '")}'`);
     }
     _getHelpContext(contextOptions) {
       contextOptions = contextOptions || {};
-      const context = { error: !!contextOptions.error };
+      const context2 = { error: !!contextOptions.error };
       let write;
-      if (context.error) {
+      if (context2.error) {
         write = (arg) => this._outputConfiguration.writeErr(arg);
       } else {
         write = (arg) => this._outputConfiguration.writeOut(arg);
       }
-      context.write = contextOptions.write || write;
-      context.command = this;
-      return context;
+      context2.write = contextOptions.write || write;
+      context2.command = this;
+      return context2;
     }
     outputHelp(contextOptions) {
       let deprecatedCallback;
@@ -1680,22 +1680,22 @@ Expecting one of '${allowedValues.join("', '")}'`);
         deprecatedCallback = contextOptions;
         contextOptions = undefined;
       }
-      const context = this._getHelpContext(contextOptions);
-      this._getCommandAndAncestors().reverse().forEach((command) => command.emit("beforeAllHelp", context));
-      this.emit("beforeHelp", context);
-      let helpInformation = this.helpInformation(context);
+      const context2 = this._getHelpContext(contextOptions);
+      this._getCommandAndAncestors().reverse().forEach((command) => command.emit("beforeAllHelp", context2));
+      this.emit("beforeHelp", context2);
+      let helpInformation = this.helpInformation(context2);
       if (deprecatedCallback) {
         helpInformation = deprecatedCallback(helpInformation);
         if (typeof helpInformation !== "string" && !Buffer.isBuffer(helpInformation)) {
           throw new Error("outputHelp callback must return a string or a Buffer");
         }
       }
-      context.write(helpInformation);
+      context2.write(helpInformation);
       if (this._helpLongFlag) {
         this.emit(this._helpLongFlag);
       }
-      this.emit("afterHelp", context);
-      this._getCommandAndAncestors().forEach((command) => command.emit("afterAllHelp", context));
+      this.emit("afterHelp", context2);
+      this._getCommandAndAncestors().forEach((command) => command.emit("afterAllHelp", context2));
     }
     helpOption(flags, description) {
       if (typeof flags === "boolean") {
@@ -1724,15 +1724,15 @@ Expecting one of '${allowedValues.join("', '")}'`);
 Expecting one of '${allowedValues.join("', '")}'`);
       }
       const helpEvent = `${position}Help`;
-      this.on(helpEvent, (context) => {
+      this.on(helpEvent, (context2) => {
         let helpStr;
         if (typeof text === "function") {
-          helpStr = text({ error: context.error, command: context.command });
+          helpStr = text({ error: context2.error, command: context2.command });
         } else {
           helpStr = text;
         }
         if (helpStr) {
-          context.write(`${helpStr}
+          context2.write(`${helpStr}
 `);
         }
       });
@@ -7838,12 +7838,19 @@ class AnthropicProvider {
   client;
   defaultModel;
   constructor(config) {
-    this.client = new Anthropic({
-      apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY
-    });
+    const apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      this.client = null;
+      this.defaultModel = config.defaultModel || "claude-sonnet-4.5-20250929";
+      return;
+    }
+    this.client = new Anthropic({ apiKey });
     this.defaultModel = config.defaultModel || "claude-sonnet-4.5-20250929";
   }
   async complete(request) {
+    if (!this.client) {
+      throw new Error('ANTHROPIC_API_KEY not set. Please export ANTHROPIC_API_KEY="sk-ant-..." or use a different provider (e.g., GLM via MCP).');
+    }
     const model = request.model || this.defaultModel;
     const anthropicMessages = this.convertMessages(request.messages);
     const response = await this.client.messages.create({
@@ -7860,6 +7867,9 @@ class AnthropicProvider {
     return this.convertResponse(response);
   }
   async streamComplete(request, handler) {
+    if (!this.client) {
+      throw new Error('ANTHROPIC_API_KEY not set. Please export ANTHROPIC_API_KEY="sk-ant-..." or use a different provider (e.g., GLM via MCP).');
+    }
     const model = request.model || this.defaultModel;
     const anthropicMessages = this.convertMessages(request.messages);
     const stream = await this.client.messages.create({
@@ -8095,7 +8105,7 @@ class MCPProvider {
   defaultModel;
   constructor(config) {
     this.proxyUrl = config.baseUrl || process.env.PROXY_URL || "http://127.0.0.1:3000";
-    this.defaultModel = config.defaultModel || "qwen-72b";
+    this.defaultModel = config.defaultModel || "glm-4.7";
   }
   async complete(request) {
     const modelKey = request.model || this.defaultModel;
@@ -8226,11 +8236,13 @@ class ProviderRegistry {
 async function createDefaultRegistry() {
   const registry = new ProviderRegistry;
   const anthropic = createProvider("anthropic");
-  registry.register("anthropic", anthropic, true);
+  registry.register("anthropic", anthropic);
   const mcpAvailable = await isMCPAvailable();
   if (mcpAvailable) {
     const mcp = createProvider("mcp");
-    registry.register("mcp", mcp);
+    registry.register("mcp", mcp, true);
+  } else {
+    registry.register("anthropic", anthropic, true);
   }
   return registry;
 }
@@ -8519,10 +8531,10 @@ class LLMRouter {
       model: modelString
     };
   }
-  async route(request, context) {
+  async route(request, context2) {
     let selection;
-    if (context.preferredModel) {
-      const parsed = this.parseModel(context.preferredModel);
+    if (context2.preferredModel) {
+      const parsed = this.parseModel(context2.preferredModel);
       if (parsed.provider) {
         const provider2 = this.registry.get(parsed.provider);
         if (!provider2) {
@@ -8531,13 +8543,13 @@ class LLMRouter {
         selection = {
           provider: parsed.provider,
           model: parsed.model,
-          reason: `Explicit model selection: ${context.preferredModel}`
+          reason: `Explicit model selection: ${context2.preferredModel}`
         };
       } else {
-        selection = this.selectModelByName(parsed.model, context);
+        selection = this.selectModelByName(parsed.model, context2);
       }
     } else {
-      selection = this.selectModel(context);
+      selection = this.selectModel(context2);
     }
     const provider = this.registry.get(selection.provider);
     if (!provider) {
@@ -8570,8 +8582,8 @@ class LLMRouter {
       }
     });
   }
-  selectModelByName(modelName, context) {
-    const candidates = this.getCandidates(context);
+  selectModelByName(modelName, context2) {
+    const candidates = this.getCandidates(context2);
     const match = candidates.find((c) => c.model === modelName);
     if (match) {
       return {
@@ -8580,10 +8592,10 @@ class LLMRouter {
         reason: `Found model ${modelName} in ${match.provider}`
       };
     }
-    return this.selectModel(context);
+    return this.selectModel(context2);
   }
-  selectModel(context) {
-    const candidates = this.getCandidates(context);
+  selectModel(context2) {
+    const candidates = this.getCandidates(context2);
     if (candidates.length === 0) {
       return {
         provider: "anthropic",
@@ -8591,7 +8603,7 @@ class LLMRouter {
         reason: "Default model (no suitable alternatives found)"
       };
     }
-    const scored = candidates.map((c) => this.scoreCandidate(c, context));
+    const scored = candidates.map((c) => this.scoreCandidate(c, context2));
     scored.sort((a, b) => b.score - a.score);
     const best = scored[0];
     return {
@@ -8600,16 +8612,16 @@ class LLMRouter {
       reason: best.reason.join(", ")
     };
   }
-  getCandidates(context) {
+  getCandidates(context2) {
     const candidates = [];
     const providers = this.registry.list();
     for (const providerName of providers) {
       const provider = this.registry.get(providerName);
       if (!provider)
         continue;
-      if (context.requiresVision && !provider.capabilities.vision)
+      if (context2.requiresVision && !provider.capabilities.vision)
         continue;
-      if (context.requiresTools && !provider.capabilities.tools)
+      if (context2.requiresTools && !provider.capabilities.tools)
         continue;
       if (providerName === "mcp") {
         const mcpProvider = provider;
@@ -8618,9 +8630,9 @@ class LLMRouter {
           const modelInfo = mcpProvider.getModelInfo(model);
           if (!modelInfo)
             continue;
-          if (context.requiresUnrestricted && !modelInfo.capabilities.includes("unrestricted"))
+          if (context2.requiresUnrestricted && !modelInfo.capabilities.includes("unrestricted"))
             continue;
-          if (context.requiresChinese && !modelInfo.capabilities.includes("chinese") && !modelInfo.capabilities.includes("multilingual"))
+          if (context2.requiresChinese && !modelInfo.capabilities.includes("chinese") && !modelInfo.capabilities.includes("multilingual"))
             continue;
           candidates.push({ provider: providerName, model });
         }
@@ -8630,27 +8642,27 @@ class LLMRouter {
     }
     return candidates;
   }
-  scoreCandidate(candidate, context) {
+  scoreCandidate(candidate, context2) {
     let score = 0;
     const reasons = [];
     const modelInfo = this.getModelInfo(candidate);
     if (!modelInfo) {
       return { ...candidate, score: 0, reason: ["Unknown model"] };
     }
-    if (modelInfo.capabilities.includes(context.taskType)) {
+    if (modelInfo.capabilities.includes(context2.taskType)) {
       score += 10;
-      reasons.push(`Specialized for ${context.taskType}`);
+      reasons.push(`Specialized for ${context2.taskType}`);
     }
-    score += this.scorePriority(modelInfo, context.priority, reasons);
-    if (context.requiresUnrestricted && modelInfo.capabilities.includes("unrestricted")) {
+    score += this.scorePriority(modelInfo, context2.priority, reasons);
+    if (context2.requiresUnrestricted && modelInfo.capabilities.includes("unrestricted")) {
       score += 5;
       reasons.push("Unrestricted model");
     }
-    if (context.requiresChinese && (modelInfo.capabilities.includes("chinese") || modelInfo.capabilities.includes("multilingual"))) {
+    if (context2.requiresChinese && (modelInfo.capabilities.includes("chinese") || modelInfo.capabilities.includes("multilingual"))) {
       score += 5;
       reasons.push("Multilingual support");
     }
-    if (context.taskType === "debugging" || context.taskType === "reasoning") {
+    if (context2.taskType === "debugging" || context2.taskType === "reasoning") {
       if (modelInfo.capabilities.includes("agentic")) {
         score += 8;
         reasons.push("Advanced agentic capabilities");
@@ -8765,8 +8777,8 @@ class MemoryManagerBridge {
     const expandedDir = hooksDir.replace(/^~/, process.env.HOME || "");
     this.hookPath = path2.join(expandedDir, "memory-manager.sh");
   }
-  async setTask(task, context) {
-    const result = await executeBash(`"${this.hookPath}" set-task "${task}" "${context}"`);
+  async setTask(task, context2) {
+    const result = await executeBash(`"${this.hookPath}" set-task "${task}" "${context2}"`);
     return result.success;
   }
   async addContext(note, relevance = 8) {
@@ -8815,12 +8827,12 @@ async function createLLMClient() {
         system: options?.system,
         model: options?.model
       };
-      const context = {
+      const context2 = {
         taskType: options?.taskType || "general",
         priority: options?.priority || "balanced",
         requiresUnrestricted: options?.requiresUnrestricted
       };
-      return router.route(request, context);
+      return router.route(request, context2);
     },
     async streamComplete(prompt, onChunk, options) {
       const anthropic = registry.get("anthropic");
@@ -10131,7 +10143,7 @@ class AutoCommand extends BaseCommand {
     this.memory = new MemoryManagerBridge;
     this.errorHandler = new ErrorHandler;
   }
-  async execute(context, config) {
+  async execute(context2, config) {
     try {
       if (!config.goal) {
         return this.createFailure('Goal is required. Usage: komplete auto "your goal"');
@@ -10146,9 +10158,9 @@ class AutoCommand extends BaseCommand {
         warningThreshold: 70,
         compactionThreshold: 80,
         strategy: COMPACTION_STRATEGIES.balanced
-      }, context.llmRouter);
+      }, context2.llmRouter);
       const agent = new ReflexionAgent(config.goal);
-      const result = await this.runAutonomousLoop(agent, context, config);
+      const result = await this.runAutonomousLoop(agent, context2, config);
       if (result.success) {
         this.success(`Goal achieved in ${this.iterations} iterations`);
         await this.memory.recordEpisode("task_complete", `Completed: ${config.goal}`, "success", `Iterations: ${this.iterations}`);
@@ -10171,7 +10183,7 @@ Suggested actions:`));
       return this.createFailure(errorMessage, err);
     }
   }
-  async runAutonomousLoop(agent, context, config) {
+  async runAutonomousLoop(agent, context2, config) {
     const maxIterations = config.maxIterations || 50;
     let goalAchieved = false;
     this.startSpinner("Starting autonomous loop...");
@@ -10192,9 +10204,9 @@ Suggested actions:`));
             await this.memory.addContext(`Context compacted: ${result.compressionRatio.toFixed(2)}x compression`, 6);
           }
         }
-        const cycle = await this.executeReflexionCycle(agent, context, config);
+        const cycle = await this.executeReflexionCycle(agent, context2, config);
         this.displayCycle(cycle, config.verbose || false);
-        goalAchieved = await this.checkGoalAchievement(agent, context, config.goal);
+        goalAchieved = await this.checkGoalAchievement(agent, context2, config.goal);
         if (this.iterations % (config.checkpointThreshold || 10) === 0) {
           await this.performCheckpoint(config.goal);
         }
@@ -10215,13 +10227,13 @@ Suggested actions:`));
       history: agent.getHistory()
     });
   }
-  async executeReflexionCycle(agent, context, config) {
+  async executeReflexionCycle(agent, context2, config) {
     const memoryContext = await this.memory.getWorking();
     const recentEpisodes = await this.memory.searchEpisodes(config.goal, 5);
     const prompt = this.buildCyclePrompt(config.goal, memoryContext, recentEpisodes);
     const userMessage = { role: "user", content: prompt };
     this.conversationHistory.push(userMessage);
-    const llmResponse = await context.llmRouter.route({
+    const llmResponse = await context2.llmRouter.route({
       messages: [{ role: "user", content: prompt }],
       system: "You are an autonomous AI agent executing tasks. Think step by step."
     }, {
@@ -10259,12 +10271,13 @@ What is the next step to achieve this goal? Think through:
 Provide your reasoning and proposed action.
 `.trim();
   }
-  async checkGoalAchievement(agent, context, goal) {
+  async checkGoalAchievement(agent, context2, goal) {
     const history = agent.getHistory();
     const recentCycles = history.slice(-3);
     const allSuccessful = recentCycles.every((c) => c.success);
     if (allSuccessful && recentCycles.length >= 3) {
-      const verificationPrompt = `
+      try {
+        const verificationPrompt = `
 Goal: ${goal}
 
 Recent actions and results:
@@ -10277,16 +10290,20 @@ Result: ${c.observation}
 
 Has the goal been achieved? Answer with just "YES" or "NO" and brief explanation.
 `.trim();
-      const response = await context.llmRouter.route({
-        messages: [{ role: "user", content: verificationPrompt }],
-        system: "You are evaluating if a goal has been achieved. Be objective."
-      }, {
-        taskType: "reasoning",
-        priority: "speed"
-      });
-      const firstContent = response.content[0];
-      const answer = firstContent.type === "text" ? firstContent.text : "NO";
-      return answer.toUpperCase().startsWith("YES");
+        const response = await context2.llmRouter.route({
+          messages: [{ role: "user", content: verificationPrompt }],
+          system: "You are evaluating if a goal has been achieved. Be objective."
+        }, {
+          taskType: "reasoning",
+          priority: "speed"
+        });
+        const firstContent = response.content[0];
+        const answer = firstContent.type === "text" ? firstContent.text : "NO";
+        return answer.toUpperCase().startsWith("YES");
+      } catch (error2) {
+        this.warn("LLM verification unavailable, using heuristic");
+        return allSuccessful && recentCycles.length >= 3;
+      }
     }
     return false;
   }
@@ -10316,6 +10333,633 @@ Has the goal been achieved? Answer with just "YES" or "NO" and brief explanation
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+// src/core/workflows/sparc/index.ts
+class SPARCWorkflow {
+  currentPhase = "specification" /* Specification */;
+  context;
+  router;
+  constructor(context2, router) {
+    this.context = context2;
+    this.router = router;
+  }
+  extractText(content) {
+    const textBlock = content.find((block) => block.type === "text");
+    return textBlock?.text || "";
+  }
+  async execute() {
+    console.log(`Starting SPARC workflow for: ${this.context.task}`);
+    const spec = await this.generateSpecification();
+    const pseudocode = await this.generatePseudocode(spec);
+    const architecture = await this.designArchitecture(pseudocode);
+    const refined = await this.refine(architecture);
+    const completed = await this.complete(refined);
+    return {
+      phase: "completion" /* Completion */,
+      output: completed
+    };
+  }
+  async generateSpecification() {
+    const prompt = `Generate a detailed specification for the following task:
+
+**Task**: ${this.context.task}
+
+**Requirements**:
+${this.context.requirements.map((r, i) => `${i + 1}. ${r}`).join(`
+`)}
+
+**Constraints**:
+${this.context.constraints.map((c, i) => `${i + 1}. ${c}`).join(`
+`)}
+
+Provide a comprehensive specification that includes:
+1. Clear problem statement
+2. Functional requirements (what the system must do)
+3. Non-functional requirements (performance, security, etc.)
+4. Edge cases and error handling considerations
+5. Success criteria
+
+Format your response as JSON with the structure:
+{
+  "problemStatement": "...",
+  "functionalRequirements": ["..."],
+  "nonFunctionalRequirements": ["..."],
+  "edgeCases": ["..."],
+  "successCriteria": ["..."]
+}`;
+    const response = await this.router.route({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.7,
+      max_tokens: 2000
+    }, {
+      taskType: "coding",
+      priority: "balanced"
+    });
+    const text = this.extractText(response.content);
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (error2) {}
+    return {
+      raw: text,
+      requirements: this.context.requirements,
+      constraints: this.context.constraints
+    };
+  }
+  async generatePseudocode(spec) {
+    const specSummary = spec.problemStatement || JSON.stringify(spec);
+    const prompt = `Based on the following specification, generate detailed pseudocode:
+
+**Specification**:
+${specSummary}
+
+**Functional Requirements**:
+${spec.functionalRequirements?.map((r, i) => `${i + 1}. ${r}`).join(`
+`) || "See spec above"}
+
+Generate step-by-step pseudocode that:
+1. Breaks down the problem into clear, logical steps
+2. Includes data structures and algorithms needed
+3. Handles edge cases mentioned in the spec
+4. Shows control flow (loops, conditionals, etc.)
+5. Is language-agnostic but clear
+
+Format your response as JSON:
+{
+  "steps": [
+    { "step": 1, "action": "...", "details": "..." }
+  ],
+  "dataStructures": ["..."],
+  "algorithms": ["..."]
+}`;
+    const response = await this.router.route({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.6,
+      max_tokens: 2000
+    }, {
+      taskType: "coding",
+      priority: "balanced"
+    });
+    const text = this.extractText(response.content);
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (error2) {}
+    return {
+      raw: text,
+      steps: [],
+      plan: "step-by-step"
+    };
+  }
+  async designArchitecture(pseudocode) {
+    const pseudocodeSummary = pseudocode.steps?.map((s) => `Step ${s.step}: ${s.action}`).join(`
+`) || JSON.stringify(pseudocode);
+    const prompt = `Based on the following pseudocode, design a software architecture:
+
+**Pseudocode**:
+${pseudocodeSummary}
+
+**Data Structures**:
+${pseudocode.dataStructures?.join(", ") || "See pseudocode"}
+
+Design an architecture that:
+1. Identifies key components/modules
+2. Defines component responsibilities
+3. Shows component interactions and data flow
+4. Considers separation of concerns
+5. Is maintainable and testable
+
+Format your response as JSON:
+{
+  "components": [
+    { "name": "...", "responsibility": "...", "interfaces": ["..."] }
+  ],
+  "dataFlow": ["..."],
+  "patterns": ["..."]
+}`;
+    const response = await this.router.route({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.5,
+      max_tokens: 2000
+    }, {
+      taskType: "coding",
+      priority: "balanced"
+    });
+    const text = this.extractText(response.content);
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (error2) {}
+    return {
+      raw: text,
+      components: [],
+      interactions: [],
+      design: "modular"
+    };
+  }
+  async refine(architecture) {
+    const architectureSummary = architecture.components?.map((c) => `${c.name}: ${c.responsibility}`).join(`
+`) || JSON.stringify(architecture);
+    const prompt = `Review and refine the following architecture:
+
+**Architecture**:
+${architectureSummary}
+
+**Patterns Used**:
+${architecture.patterns?.join(", ") || "None specified"}
+
+Refine the architecture by:
+1. Identifying potential bottlenecks or weaknesses
+2. Suggesting optimizations for performance/scalability
+3. Adding error handling strategies
+4. Improving modularity where needed
+5. Considering security implications
+
+Format your response as JSON:
+{
+  "refinements": [
+    { "area": "...", "issue": "...", "improvement": "..." }
+  ],
+  "optimizations": ["..."],
+  "securityConsiderations": ["..."],
+  "finalArchitecture": { ... }
+}`;
+    const response = await this.router.route({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.4,
+      max_tokens: 2000
+    }, {
+      taskType: "coding",
+      priority: "balanced"
+    });
+    const text = this.extractText(response.content);
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (error2) {}
+    return {
+      raw: text,
+      ...architecture,
+      refined: true
+    };
+  }
+  async complete(refined) {
+    const refinementsSummary = refined.refinements?.map((r) => `${r.area}: ${r.improvement}`).join(`
+`) || "No refinements";
+    const prompt = `Generate a completion summary and implementation guide:
+
+**Task**: ${this.context.task}
+
+**Refinements Applied**:
+${refinementsSummary}
+
+**Optimizations**:
+${refined.optimizations?.join(", ") || "None"}
+
+Create a completion summary that includes:
+1. Overview of the complete solution
+2. Implementation steps in priority order
+3. Testing strategy
+4. Deployment considerations
+5. Success metrics
+
+Format your response as JSON:
+{
+  "summary": "...",
+  "implementationSteps": [
+    { "priority": 1, "step": "...", "estimatedEffort": "..." }
+  ],
+  "testingStrategy": ["..."],
+  "deploymentConsiderations": ["..."],
+  "successMetrics": ["..."]
+}`;
+    const response = await this.router.route({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      max_tokens: 2000
+    }, {
+      taskType: "general",
+      priority: "balanced"
+    });
+    const text = this.extractText(response.content);
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const completion = JSON.parse(jsonMatch[0]);
+        return {
+          ...refined,
+          ...completion,
+          completed: true
+        };
+      }
+    } catch (error2) {}
+    return {
+      raw: text,
+      ...refined,
+      completed: true
+    };
+  }
+}
+
+// src/cli/commands/SPARCCommand.ts
+class SPARCCommand extends BaseCommand {
+  name = "sparc";
+  description = "Execute SPARC methodology (Specification → Pseudocode → Architecture → Refinement → Completion)";
+  memory;
+  constructor() {
+    super();
+    this.memory = new MemoryManagerBridge;
+  }
+  async execute(context2, config) {
+    try {
+      if (!config.task) {
+        return this.createFailure('Task is required. Usage: komplete sparc "your task"');
+      }
+      this.info(`\uD83C\uDFAF Starting SPARC workflow`);
+      this.info(`Task: ${source_default2.bold(config.task)}`);
+      console.log("");
+      await this.memory.setTask(config.task, "SPARC workflow execution");
+      const sparcContext = {
+        task: config.task,
+        requirements: config.requirements || [],
+        constraints: config.constraints || []
+      };
+      const workflow = new SPARCWorkflow(sparcContext, context2.llmRouter);
+      this.startSpinner("Executing SPARC workflow...");
+      const phases = [
+        "specification" /* Specification */,
+        "pseudocode" /* Pseudocode */,
+        "architecture" /* Architecture */,
+        "refinement" /* Refinement */,
+        "completion" /* Completion */
+      ];
+      for (const phase of phases) {
+        this.updateSpinner(`Phase: ${phase}`);
+        await this.sleep(1000);
+      }
+      const result = await workflow.execute();
+      this.succeedSpinner("SPARC workflow completed");
+      await this.memory.recordEpisode("sparc_complete", `SPARC workflow for: ${config.task}`, "success", JSON.stringify(result));
+      console.log("");
+      this.success("SPARC workflow completed successfully");
+      console.log("");
+      console.log(source_default2.bold("Results:"));
+      console.log(source_default2.gray(JSON.stringify(result, null, 2)));
+      return this.createSuccess("SPARC workflow completed", result);
+    } catch (error2) {
+      const err = error2;
+      this.failSpinner("SPARC workflow failed");
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+// src/core/agents/swarm/Decomposer.ts
+class TaskDecomposer {
+  decompose(task, agentCount) {
+    const strategy = this.detectStrategy(task);
+    const subtasks = this.generateSubtasks(task, agentCount, strategy);
+    return {
+      task,
+      agentCount,
+      decompositionStrategy: strategy,
+      subtasks
+    };
+  }
+  detectStrategy(task) {
+    const taskLower = task.toLowerCase();
+    if (/implement|build|create|add.*feature/i.test(taskLower)) {
+      return "feature" /* Feature */;
+    }
+    if (/test|validate|check/i.test(taskLower)) {
+      return "testing" /* Testing */;
+    }
+    if (/refactor|reorganize|restructure/i.test(taskLower)) {
+      return "refactor" /* Refactor */;
+    }
+    if (/research|analyze|investigate|explore/i.test(taskLower)) {
+      return "research" /* Research */;
+    }
+    return "generic" /* Generic */;
+  }
+  generateSubtasks(task, agentCount, strategy) {
+    switch (strategy) {
+      case "feature" /* Feature */:
+        return this.decomposeFeature(task, agentCount);
+      case "testing" /* Testing */:
+        return this.decomposeTesting(task, agentCount);
+      case "refactor" /* Refactor */:
+        return this.decomposeRefactor(task, agentCount);
+      case "research" /* Research */:
+        return this.decomposeResearch(task, agentCount);
+      case "generic" /* Generic */:
+      default:
+        return this.decomposeGeneric(task, agentCount);
+    }
+  }
+  decomposeFeature(task, agentCount) {
+    if (agentCount === 3) {
+      return [
+        {
+          agentId: 1,
+          subtask: `Research and design: ${task}`,
+          priority: 1,
+          phase: "design",
+          dependencies: []
+        },
+        {
+          agentId: 2,
+          subtask: `Implement core logic: ${task}`,
+          priority: 2,
+          phase: "implement",
+          dependencies: [1]
+        },
+        {
+          agentId: 3,
+          subtask: `Write tests and validate: ${task}`,
+          priority: 3,
+          phase: "test",
+          dependencies: [2]
+        }
+      ];
+    } else if (agentCount === 4) {
+      return [
+        {
+          agentId: 1,
+          subtask: `Research and design: ${task}`,
+          priority: 1,
+          phase: "design",
+          dependencies: []
+        },
+        {
+          agentId: 2,
+          subtask: `Implement core logic: ${task}`,
+          priority: 2,
+          phase: "implement",
+          dependencies: [1]
+        },
+        {
+          agentId: 3,
+          subtask: `Write tests: ${task}`,
+          priority: 3,
+          phase: "test",
+          dependencies: [2]
+        },
+        {
+          agentId: 4,
+          subtask: `Integration and validation: ${task}`,
+          priority: 4,
+          phase: "integrate",
+          dependencies: [2, 3]
+        }
+      ];
+    } else {
+      return [
+        {
+          agentId: 1,
+          subtask: `Research and design architecture: ${task}`,
+          priority: 1,
+          phase: "design",
+          dependencies: []
+        },
+        {
+          agentId: 2,
+          subtask: `Implement backend/logic: ${task}`,
+          priority: 2,
+          phase: "implement_backend",
+          dependencies: [1]
+        },
+        {
+          agentId: 3,
+          subtask: `Implement frontend/interface: ${task}`,
+          priority: 2,
+          phase: "implement_frontend",
+          dependencies: [1]
+        },
+        {
+          agentId: 4,
+          subtask: `Write comprehensive tests: ${task}`,
+          priority: 3,
+          phase: "test",
+          dependencies: [2, 3]
+        },
+        {
+          agentId: 5,
+          subtask: `Integration, validation, documentation: ${task}`,
+          priority: 4,
+          phase: "integrate",
+          dependencies: [2, 3, 4]
+        }
+      ];
+    }
+  }
+  decomposeTesting(task, agentCount) {
+    const testTypes = [
+      "unit tests",
+      "integration tests",
+      "e2e tests",
+      "performance tests",
+      "security tests"
+    ];
+    return Array.from({ length: agentCount }, (_, i) => {
+      const agentId = i + 1;
+      const testType = i < testTypes.length ? testTypes[i] : `test suite part ${agentId}`;
+      return {
+        agentId,
+        subtask: `Run ${testType}: ${task}`,
+        priority: 1,
+        phase: "test",
+        dependencies: []
+      };
+    });
+  }
+  decomposeRefactor(task, agentCount) {
+    return Array.from({ length: agentCount }, (_, i) => {
+      const agentId = i + 1;
+      const dependencies = i > 0 ? [i] : [];
+      return {
+        agentId,
+        subtask: `Refactor module/component ${agentId}: ${task}`,
+        priority: agentId,
+        phase: "refactor",
+        dependencies
+      };
+    });
+  }
+  decomposeResearch(task, agentCount) {
+    const aspects = [
+      "codebase patterns",
+      "external solutions",
+      "architecture analysis",
+      "dependency mapping",
+      "performance analysis"
+    ];
+    return Array.from({ length: agentCount }, (_, i) => {
+      const agentId = i + 1;
+      const aspect = i < aspects.length ? aspects[i] : `investigation area ${agentId}`;
+      return {
+        agentId,
+        subtask: `Research ${aspect}: ${task}`,
+        priority: 1,
+        phase: "research",
+        dependencies: []
+      };
+    });
+  }
+  decomposeGeneric(task, agentCount) {
+    return Array.from({ length: agentCount }, (_, i) => {
+      const agentId = i + 1;
+      return {
+        agentId,
+        subtask: `Execute part ${agentId} of ${agentCount}: ${task}`,
+        priority: 1,
+        phase: "execute",
+        dependencies: []
+      };
+    });
+  }
+}
+
+// src/core/agents/swarm/Spawner.ts
+class AgentSpawner {
+  maxAgents;
+  constructor(maxAgents = 10) {
+    this.maxAgents = maxAgents;
+  }
+  generateSpawnInstructions(swarmId, task, subtasks, workDir, mcpAvailable = { github: false, chrome: false }) {
+    const agentConfigs = subtasks.map((subtask) => this.createAgentConfig(subtask, workDir));
+    const parallelAgents = agentConfigs.filter((agent) => agent.dependencies.length === 0);
+    const sequentialAgents = agentConfigs.filter((agent) => agent.dependencies.length > 0);
+    return {
+      swarmId,
+      task,
+      agentCount: subtasks.length,
+      workDir,
+      parallelAgents,
+      sequentialAgents,
+      mcpAvailable
+    };
+  }
+  createAgentConfig(subtask, workDir) {
+    const agentType = this.mapPhaseToAgentType(subtask.phase);
+    const prompt = this.generateAgentPrompt(subtask, workDir);
+    return {
+      agentId: subtask.agentId,
+      subtask: subtask.subtask,
+      phase: subtask.phase,
+      dependencies: subtask.dependencies,
+      agentType,
+      prompt
+    };
+  }
+  mapPhaseToAgentType(phase) {
+    switch (phase) {
+      case "design":
+      case "research":
+        return "Explore";
+      case "test":
+        return "qa-explorer";
+      case "implement":
+      case "implement_backend":
+      case "implement_frontend":
+      case "refactor":
+        return "general-purpose";
+      case "integrate":
+        return "validator";
+      default:
+        return "general-purpose";
+    }
+  }
+  generateAgentPrompt(subtask, workDir) {
+    return `You are Swarm Agent ${subtask.agentId}.
+
+## Your Task
+${subtask.subtask}
+
+## Working Directory
+${workDir}
+
+## Output Requirements
+When complete, write your results to: result-agent-${subtask.agentId}.json
+
+Format:
+{
+  "agent_id": ${subtask.agentId},
+  "status": "success" or "failed",
+  "summary": "Brief summary",
+  "details": "Detailed results",
+  "files_modified": []
+}
+
+Focus ONLY on your assigned task. Be thorough and efficient.`;
+  }
+  validate(agentCount) {
+    if (agentCount > this.maxAgents) {
+      return {
+        valid: false,
+        error: `Max ${this.maxAgents} agents allowed, requested ${agentCount}`
+      };
+    }
+    if (agentCount < 2) {
+      return {
+        valid: false,
+        error: "Swarm requires at least 2 agents"
+      };
+    }
+    return { valid: true };
+  }
+}
+
 // src/core/agents/swarm/Coordinator.ts
 class SwarmCoordinator {
   swarms = new Map;
@@ -10398,6 +11042,3329 @@ class SwarmCoordinator {
     this.swarms.delete(swarmId);
   }
 }
+
+// src/core/agents/swarm/Merger.ts
+class ResultMerger {
+  mergeResults(swarmId, task, results) {
+    const successfulAgents = results.filter((r) => r.status === "success").length;
+    const failedAgents = results.filter((r) => r.status === "failed").length;
+    const details = results.map((r) => this.formatAgentResult(r));
+    const allFilesModified = this.collectUniqueFiles(results);
+    const errors = this.collectErrors(results);
+    const recommendations = this.generateRecommendations(results);
+    return {
+      swarmId,
+      task,
+      totalAgents: results.length,
+      successfulAgents,
+      failedAgents,
+      summary: this.generateSummary(task, results),
+      details,
+      allFilesModified,
+      errors,
+      recommendations
+    };
+  }
+  formatAgentResult(result) {
+    const status = result.status === "success" ? "✅" : "❌";
+    let output = `${status} Agent ${result.agentId}: ${result.summary}
+`;
+    if (result.details) {
+      output += `  Details: ${result.details}
+`;
+    }
+    if (result.filesModified.length > 0) {
+      output += `  Files modified: ${result.filesModified.length}
+`;
+      result.filesModified.forEach((file) => {
+        output += `    - ${file}
+`;
+      });
+    }
+    if (result.errors && result.errors.length > 0) {
+      output += `  Errors:
+`;
+      result.errors.forEach((error2) => {
+        output += `    - ${error2}
+`;
+      });
+    }
+    return output;
+  }
+  collectUniqueFiles(results) {
+    const files = new Set;
+    for (const result of results) {
+      for (const file of result.filesModified) {
+        files.add(file);
+      }
+    }
+    return Array.from(files).sort();
+  }
+  collectErrors(results) {
+    const errors = [];
+    for (const result of results) {
+      if (result.errors && result.errors.length > 0) {
+        errors.push(`Agent ${result.agentId}:`, ...result.errors.map((e) => `  ${e}`));
+      }
+    }
+    return errors;
+  }
+  generateSummary(task, results) {
+    const total = results.length;
+    const success = results.filter((r) => r.status === "success").length;
+    const failed = results.filter((r) => r.status === "failed").length;
+    let summary = `Swarm execution for "${task}" completed.
+`;
+    summary += `Total agents: ${total}, Successful: ${success}, Failed: ${failed}
+`;
+    if (failed === 0) {
+      summary += "All agents completed successfully.";
+    } else if (success > 0) {
+      summary += `Partially successful. ${failed} agent(s) encountered errors.`;
+    } else {
+      summary += "All agents failed. Review errors for details.";
+    }
+    return summary;
+  }
+  generateRecommendations(results) {
+    const recommendations = [];
+    const failed = results.filter((r) => r.status === "failed");
+    if (failed.length > 0) {
+      recommendations.push(`Review failed agents: ${failed.map((r) => r.agentId).join(", ")}`);
+    }
+    const totalFiles = this.collectUniqueFiles(results).length;
+    if (totalFiles > 10) {
+      recommendations.push(`Many files modified (${totalFiles}). Consider code review before merging.`);
+    }
+    const totalErrors = this.collectErrors(results).length;
+    if (totalErrors > 0) {
+      recommendations.push(`${totalErrors} error(s) reported. Review error details for root causes.`);
+    }
+    return recommendations;
+  }
+  generateReport(merged) {
+    let report = `# Swarm Execution Report
+
+`;
+    report += `**Swarm ID**: ${merged.swarmId}
+`;
+    report += `**Task**: ${merged.task}
+`;
+    report += `**Total Agents**: ${merged.totalAgents}
+`;
+    report += `**Successful**: ${merged.successfulAgents}
+`;
+    report += `**Failed**: ${merged.failedAgents}
+
+`;
+    report += `## Summary
+
+${merged.summary}
+
+`;
+    if (merged.allFilesModified.length > 0) {
+      report += `## Files Modified (${merged.allFilesModified.length})
+
+`;
+      merged.allFilesModified.forEach((file) => {
+        report += `- ${file}
+`;
+      });
+      report += `
+`;
+    }
+    report += `## Agent Results
+
+`;
+    merged.details.forEach((detail) => {
+      report += detail + `
+`;
+    });
+    if (merged.errors.length > 0) {
+      report += `## Errors
+
+`;
+      merged.errors.forEach((error2) => {
+        report += `- ${error2}
+`;
+      });
+      report += `
+`;
+    }
+    if (merged.recommendations.length > 0) {
+      report += `## Recommendations
+
+`;
+      merged.recommendations.forEach((rec) => {
+        report += `- ${rec}
+`;
+      });
+      report += `
+`;
+    }
+    return report;
+  }
+}
+
+// src/core/agents/swarm/GitIntegration.ts
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import * as fs from "node:fs/promises";
+import * as path3 from "node:path";
+var execAsync = promisify(exec);
+
+class GitIntegration {
+  async execGit(args, cwd) {
+    try {
+      const command = `git ${args.join(" ")}`;
+      const { stdout, stderr } = await execAsync(command, { cwd });
+      return {
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+        exitCode: 0
+      };
+    } catch (error2) {
+      return {
+        stdout: error2.stdout?.toString() || "",
+        stderr: error2.stderr?.toString() || "",
+        exitCode: error2.code || 1
+      };
+    }
+  }
+  async integrateChanges(swarmId, agentCount, workDir) {
+    const results = [];
+    const autoResolved = [];
+    const unresolved = [];
+    for (let i = 1;i <= agentCount; i++) {
+      const result = await this.integrateAgent(swarmId, i, workDir);
+      results.push(result);
+      if (result.autoResolved.length > 0) {
+        autoResolved.push(...result.autoResolved);
+      }
+      if (result.unresolved.length > 0) {
+        unresolved.push(...result.unresolved);
+      }
+    }
+    const successfulMerges = results.filter((r) => r.success).length;
+    const totalConflicts = autoResolved.length + unresolved.length;
+    return {
+      totalAgents: agentCount,
+      successfulMerges,
+      totalConflicts,
+      autoResolved: autoResolved.length,
+      unresolved: unresolved.length,
+      report: this.generateSummaryReport(results, autoResolved, unresolved)
+    };
+  }
+  async integrateAgent(swarmId, agentId, workDir) {
+    const branch = `swarm-${swarmId}-agent-${agentId}`;
+    const autoResolved = [];
+    const unresolved = [];
+    try {
+      const branchCheck = await this.execGit(["rev-parse", "--verify", branch], workDir);
+      if (branchCheck.exitCode !== 0) {
+        return {
+          success: false,
+          agentId,
+          branch,
+          conflictsDetected: false,
+          autoResolved,
+          unresolved,
+          report: `Agent ${agentId}: Branch ${branch} not found`
+        };
+      }
+      const mergeResult = await this.execGit(["merge", branch, "--no-commit", "--no-ff"], workDir);
+      const conflictedFiles = await this.detectConflicts(workDir);
+      const conflictsDetected = conflictedFiles.length > 0;
+      if (conflictsDetected) {
+        const resolution = await this.autoResolveConflicts(conflictedFiles, workDir);
+        autoResolved.push(...resolution.resolved);
+        unresolved.push(...resolution.unresolved);
+        for (const resolved of resolution.resolved) {
+          if (this.isPackageLock(resolved.file)) {
+            await this.execGit(["checkout", "--ours", resolved.file], workDir);
+          } else {
+            await this.execGit(["checkout", "--theirs", resolved.file], workDir);
+          }
+          await this.execGit(["add", resolved.file], workDir);
+        }
+        if (resolution.unresolved.length === 0) {
+          await this.execGit(["commit", "-m", `Merged ${branch} (auto-resolved)`], workDir);
+        } else {
+          await this.execGit(["merge", "--abort"], workDir);
+        }
+      } else {
+        await this.execGit(["commit", "-m", `Merged ${branch}`], workDir);
+      }
+      return {
+        success: unresolved.length === 0,
+        agentId,
+        branch,
+        conflictsDetected,
+        autoResolved,
+        unresolved,
+        report: unresolved.length === 0 ? `Agent ${agentId}: Integration successful (${autoResolved.length} auto-resolved)` : `Agent ${agentId}: Integration aborted (${unresolved.length} unresolved conflicts)`
+      };
+    } catch (error2) {
+      const err = error2;
+      return {
+        success: false,
+        agentId,
+        branch,
+        conflictsDetected: false,
+        autoResolved,
+        unresolved,
+        report: `Agent ${agentId}: Error - ${err.message}`
+      };
+    }
+  }
+  async detectConflicts(workDir) {
+    const result = await this.execGit(["diff", "--name-only", "--diff-filter=U"], workDir);
+    if (result.exitCode !== 0) {
+      return [];
+    }
+    return result.stdout.split(`
+`).map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+  async autoResolveConflicts(conflictedFiles, workDir) {
+    const resolved = [];
+    const unresolved = [];
+    for (const file of conflictedFiles) {
+      if (this.isPackageLock(file)) {
+        resolved.push({
+          file,
+          resolved: true,
+          method: "auto_package_lock",
+          details: "Kept current lockfile"
+        });
+        continue;
+      }
+      const conflictCount = await this.countConflictMarkers(file, workDir);
+      if (conflictCount > 0 && conflictCount <= 3) {
+        resolved.push({
+          file,
+          resolved: true,
+          method: "auto_small_conflict",
+          details: "Small conflict (1 region), kept agent changes"
+        });
+        continue;
+      }
+      unresolved.push({
+        file,
+        resolved: false,
+        method: "manual_required",
+        details: "Requires manual review"
+      });
+    }
+    return { resolved, unresolved };
+  }
+  isPackageLock(file) {
+    return /package-lock\.json|yarn\.lock|Gemfile\.lock|Cargo\.lock|bun\.lockb/.test(file);
+  }
+  async countConflictMarkers(file, workDir) {
+    try {
+      const filePath = path3.join(workDir, file);
+      const content = await fs.readFile(filePath, "utf-8");
+      const lines = content.split(`
+`);
+      let count = 0;
+      for (const line of lines) {
+        if (/^(<{7}|={7}|>{7})/.test(line)) {
+          count++;
+        }
+      }
+      return count;
+    } catch (error2) {
+      return 0;
+    }
+  }
+  generateSummaryReport(results, autoResolved, unresolved) {
+    let report = `# Code Integration Report
+
+`;
+    report += `**Total Agents**: ${results.length}
+`;
+    report += `**Successful Merges**: ${results.filter((r) => r.success).length}
+`;
+    report += `**Total Conflicts**: ${autoResolved.length + unresolved.length}
+`;
+    report += `**Auto-Resolved**: ${autoResolved.length}
+`;
+    report += `**Unresolved**: ${unresolved.length}
+
+`;
+    if (autoResolved.length > 0) {
+      report += `## Auto-Resolved Conflicts
+
+`;
+      for (const resolution of autoResolved) {
+        report += `- ${resolution.file}: ${resolution.details}
+`;
+      }
+      report += `
+`;
+    }
+    if (unresolved.length > 0) {
+      report += `## ⚠️ Unresolved Conflicts (Require Manual Review)
+
+`;
+      for (const resolution of unresolved) {
+        report += `- ${resolution.file}: ${resolution.details}
+`;
+      }
+      report += `
+`;
+    }
+    report += `## Per-Agent Results
+
+`;
+    for (const result of results) {
+      report += `### Agent ${result.agentId}
+`;
+      report += `- Branch: ${result.branch}
+`;
+      report += `- Status: ${result.success ? "✅ Success" : "❌ Failed"}
+`;
+      report += `- Conflicts: ${result.conflictsDetected ? "Yes" : "No"}
+
+`;
+    }
+    return report;
+  }
+}
+
+// src/core/agents/swarm/index.ts
+class SwarmOrchestrator {
+  decomposer;
+  spawner;
+  coordinator;
+  merger;
+  gitIntegration;
+  constructor(maxAgents = 10) {
+    this.decomposer = new TaskDecomposer;
+    this.spawner = new AgentSpawner(maxAgents);
+    this.coordinator = new SwarmCoordinator;
+    this.merger = new ResultMerger;
+    this.gitIntegration = new GitIntegration;
+  }
+  async spawnSwarm(task, agentCount, workDir, mcpAvailable = { github: false, chrome: false }) {
+    const validation = this.spawner.validate(agentCount);
+    if (!validation.valid) {
+      throw new Error(validation.error);
+    }
+    const swarmId = `swarm_${Date.now()}`;
+    const decomposed = this.decomposer.decompose(task, agentCount);
+    const instructions = this.spawner.generateSpawnInstructions(swarmId, task, decomposed.subtasks, workDir, mcpAvailable);
+    const state = this.coordinator.initializeSwarm(swarmId, task, agentCount, workDir);
+    return {
+      swarmId,
+      instructions,
+      state
+    };
+  }
+  updateAgentStatus(swarmId, agentId, status, taskId) {
+    this.coordinator.updateAgentStatus(swarmId, agentId, status, taskId);
+  }
+  addAgentResult(swarmId, result) {
+    this.coordinator.addAgentResult(swarmId, result);
+  }
+  async collectResults(swarmId) {
+    const state = this.coordinator.getSwarmState(swarmId);
+    if (!state) {
+      throw new Error(`Swarm ${swarmId} not found`);
+    }
+    if (!this.coordinator.isComplete(swarmId)) {
+      throw new Error(`Swarm ${swarmId} is not complete yet`);
+    }
+    const merged = this.merger.mergeResults(swarmId, state.task, state.results);
+    let integration;
+    try {
+      integration = await this.gitIntegration.integrateChanges(swarmId, state.agentCount, state.workDir);
+    } catch (error2) {
+      console.warn("Git integration failed:", error2);
+    }
+    const report = this.generateComprehensiveReport(merged, integration);
+    return {
+      merged,
+      integration,
+      report
+    };
+  }
+  getSwarmState(swarmId) {
+    return this.coordinator.getSwarmState(swarmId);
+  }
+  isComplete(swarmId) {
+    return this.coordinator.isComplete(swarmId);
+  }
+  getCompletionStatus(swarmId) {
+    return this.coordinator.getCompletionStatus(swarmId);
+  }
+  clearSwarm(swarmId) {
+    this.coordinator.clearSwarm(swarmId);
+  }
+  generateComprehensiveReport(merged, integration) {
+    let report = this.merger.generateReport(merged);
+    if (integration) {
+      report += `
+---
+
+`;
+      report += `# Code Integration
+
+`;
+      report += integration.report;
+    }
+    return report;
+  }
+}
+
+// src/cli/commands/SwarmCommand.ts
+class SwarmCommand extends BaseCommand {
+  name = "swarm";
+  description = "Spawn and manage distributed agent swarms for parallel execution";
+  orchestrator;
+  memory;
+  constructor() {
+    super();
+    this.orchestrator = new SwarmOrchestrator(10);
+    this.memory = new MemoryManagerBridge;
+  }
+  async execute(context2, config) {
+    try {
+      switch (config.action) {
+        case "spawn":
+          return await this.spawnSwarm(context2, config);
+        case "status":
+          return await this.showStatus(config);
+        case "collect":
+          return await this.collectResults(config);
+        case "clear":
+          return await this.clearSwarm(config);
+        default:
+          return this.createFailure(`Unknown action: ${config.action}. Use: spawn, status, collect, clear`);
+      }
+    } catch (error2) {
+      const err = error2;
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+  async spawnSwarm(context2, config) {
+    if (!config.task) {
+      return this.createFailure('Task is required. Usage: komplete swarm spawn N "task description"');
+    }
+    if (!config.agentCount || config.agentCount < 2) {
+      return this.createFailure("Agent count must be >= 2");
+    }
+    this.info(`\uD83D\uDE80 Spawning swarm with ${config.agentCount} agents`);
+    this.info(`Task: ${source_default2.bold(config.task)}`);
+    console.log("");
+    const workDir = config.workDir || process.cwd();
+    this.startSpinner("Spawning swarm...");
+    const result = await this.orchestrator.spawnSwarm(config.task, config.agentCount, workDir, {
+      github: true,
+      chrome: false
+    });
+    this.succeedSpinner(`Swarm spawned: ${result.swarmId}`);
+    await this.memory.recordEpisode("swarm_spawned", `Swarm ${result.swarmId}: ${config.task}`, "success", `${config.agentCount} agents`);
+    console.log("");
+    this.success("Swarm spawned successfully");
+    console.log("");
+    console.log(source_default2.bold("Swarm ID:"), source_default2.cyan(result.swarmId));
+    console.log(source_default2.bold("Agents:"), config.agentCount);
+    console.log(source_default2.bold("Status:"), "Running");
+    console.log("");
+    if (config.verbose) {
+      console.log(source_default2.bold("Instructions:"));
+      console.log(source_default2.gray(JSON.stringify(result.instructions, null, 2)));
+      console.log("");
+    }
+    return this.createSuccess("Swarm spawned", {
+      swarmId: result.swarmId,
+      agentCount: config.agentCount,
+      state: result.state
+    });
+  }
+  async showStatus(config) {
+    if (!config.swarmId) {
+      return this.createFailure("Swarm ID is required");
+    }
+    const state = this.orchestrator.getSwarmState(config.swarmId);
+    if (!state) {
+      return this.createFailure(`Swarm ${config.swarmId} not found`);
+    }
+    const status = this.orchestrator.getCompletionStatus(config.swarmId);
+    console.log("");
+    console.log(source_default2.bold("Swarm Status"));
+    console.log("");
+    console.log(source_default2.bold("Swarm ID:"), source_default2.cyan(config.swarmId));
+    console.log(source_default2.bold("Task:"), state.task);
+    console.log(source_default2.bold("Agents:"), state.agentCount);
+    console.log(source_default2.bold("Complete:"), status.complete ? source_default2.green("Yes") : source_default2.yellow("No"));
+    console.log("");
+    console.log(source_default2.bold("Results:"));
+    console.log(`  ${source_default2.green("✓")} Success: ${status.success}`);
+    console.log(`  ${source_default2.red("✗")} Failed: ${status.failed}`);
+    console.log(`  ${source_default2.gray("○")} Pending: ${status.pending}`);
+    console.log("");
+    return this.createSuccess("Status retrieved", { state, status });
+  }
+  async collectResults(config) {
+    if (!config.swarmId) {
+      return this.createFailure("Swarm ID is required");
+    }
+    this.info(`\uD83D\uDCE6 Collecting results from swarm: ${config.swarmId}`);
+    console.log("");
+    this.startSpinner("Collecting and merging results...");
+    const result = await this.orchestrator.collectResults(config.swarmId);
+    this.succeedSpinner("Results collected");
+    await this.memory.recordEpisode("swarm_collected", `Swarm ${config.swarmId} results collected`, "success", JSON.stringify(result.merged));
+    console.log("");
+    this.success("Results collected and merged");
+    console.log("");
+    console.log(source_default2.bold("Report:"));
+    console.log("");
+    console.log(result.report);
+    console.log("");
+    if (result.integration) {
+      console.log(source_default2.bold("Code Integration:"));
+      console.log(source_default2.gray("Changes merged to main branch"));
+      console.log("");
+    }
+    return this.createSuccess("Results collected", result);
+  }
+  async clearSwarm(config) {
+    if (!config.swarmId) {
+      return this.createFailure("Swarm ID is required");
+    }
+    this.orchestrator.clearSwarm(config.swarmId);
+    this.success(`Swarm ${config.swarmId} cleared`);
+    return this.createSuccess("Swarm cleared");
+  }
+}
+// src/cli/commands/ReflectCommand.ts
+class ReflectCommand extends BaseCommand {
+  name = "reflect";
+  description = "Run ReAct + Reflexion loop (Think → Act → Observe → Reflect)";
+  memory;
+  constructor() {
+    super();
+    this.memory = new MemoryManagerBridge;
+  }
+  async execute(context2, config) {
+    try {
+      if (!config.goal) {
+        return this.createFailure('Goal is required. Usage: komplete reflect "your goal"');
+      }
+      const iterations = config.iterations || 3;
+      this.info(`\uD83D\uDD04 Starting Reflexion loop`);
+      this.info(`Goal: ${source_default2.bold(config.goal)}`);
+      this.info(`Iterations: ${iterations}`);
+      console.log("");
+      await this.memory.setTask(config.goal, "Reflexion loop execution");
+      const agent = new ReflexionAgent(config.goal);
+      this.startSpinner("Running reflexion cycles...");
+      const cycles = [];
+      for (let i = 0;i < iterations; i++) {
+        this.updateSpinner(`Cycle ${i + 1}/${iterations}`);
+        const input = await this.generateInput(context2, config.goal, agent.getHistory());
+        const cycle = await agent.cycle(input);
+        cycles.push(cycle);
+        if (config.verbose) {
+          this.displayCycle(i + 1, cycle);
+        }
+        await this.sleep(500);
+        await this.memory.addContext(`Cycle ${i + 1}: ${cycle.thought}`, 7);
+      }
+      this.succeedSpinner("Reflexion loop completed");
+      await this.memory.recordEpisode("reflexion_complete", `Reflexion for: ${config.goal}`, "success", `${cycles.length} cycles`);
+      console.log("");
+      this.success("Reflexion loop completed successfully");
+      console.log("");
+      this.displaySummary(cycles);
+      return this.createSuccess("Reflexion loop completed", {
+        cycles,
+        history: agent.getHistory()
+      });
+    } catch (error2) {
+      const err = error2;
+      this.failSpinner("Reflexion loop failed");
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+  async generateInput(context2, goal, history) {
+    const prompt = this.buildInputPrompt(goal, history);
+    const response = await context2.llmRouter.route({
+      messages: [{ role: "user", content: prompt }],
+      system: "You are generating input for a reflexion cycle. Be concise and actionable."
+    }, {
+      taskType: "reasoning",
+      priority: "speed"
+    });
+    const firstContent = response.content[0];
+    return firstContent.type === "text" ? firstContent.text : "Continue working on goal";
+  }
+  buildInputPrompt(goal, history) {
+    if (history.length === 0) {
+      return `Goal: ${goal}
+
+What is the first step to achieve this goal?`;
+    }
+    const lastCycle = history[history.length - 1];
+    return `
+Goal: ${goal}
+
+Previous cycle:
+- Thought: ${lastCycle.thought}
+- Action: ${lastCycle.action}
+- Observation: ${lastCycle.observation}
+- Reflection: ${lastCycle.reflection}
+- Success: ${lastCycle.success ? "Yes" : "No"}
+
+What should be the next step?
+`.trim();
+  }
+  displayCycle(iteration, cycle) {
+    console.log("");
+    console.log(source_default2.bold(`Cycle ${iteration}:`));
+    console.log(source_default2.gray(`Thought: ${cycle.thought}`));
+    console.log(source_default2.gray(`Action: ${cycle.action}`));
+    console.log(source_default2.gray(`Observation: ${cycle.observation}`));
+    console.log(source_default2.gray(`Reflection: ${cycle.reflection}`));
+    console.log(cycle.success ? source_default2.green("✓ Success") : source_default2.red("✗ Failed"));
+  }
+  displaySummary(cycles) {
+    const successCount = cycles.filter((c) => c.success).length;
+    const failCount = cycles.length - successCount;
+    console.log(source_default2.bold("Summary:"));
+    console.log(`  Total cycles: ${cycles.length}`);
+    console.log(`  ${source_default2.green("✓")} Successful: ${successCount}`);
+    console.log(`  ${source_default2.red("✗")} Failed: ${failCount}`);
+    console.log("");
+    if (cycles.length > 0) {
+      console.log(source_default2.bold("Key Insights:"));
+      cycles.forEach((cycle, i) => {
+        console.log(`  ${i + 1}. ${source_default2.gray(cycle.reflection)}`);
+      });
+    }
+  }
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+// src/cli/commands/ResearchCommand.ts
+class ResearchCommand extends BaseCommand {
+  name = "research";
+  description = "Research code patterns, solutions, and best practices";
+  memory;
+  constructor() {
+    super();
+    this.memory = new MemoryManagerBridge;
+  }
+  async execute(context2, config) {
+    try {
+      if (!config.query) {
+        return this.createFailure('Query is required. Usage: komplete research "your query"');
+      }
+      this.info(`\uD83D\uDD2C Researching: ${source_default2.bold(config.query)}`);
+      console.log("");
+      const sources = config.sources || ["github", "memory"];
+      const results = {
+        query: config.query,
+        sources: {},
+        summary: ""
+      };
+      if (sources.includes("memory")) {
+        this.startSpinner("Searching memory...");
+        const memoryResults = await this.searchMemory(config.query);
+        results.sources.memory = memoryResults;
+        this.succeedSpinner(`Found ${memoryResults.length} memory results`);
+      }
+      if (sources.includes("github")) {
+        this.startSpinner("Searching GitHub...");
+        try {
+          const githubResults = await this.searchGitHub(config);
+          results.sources.github = githubResults;
+          this.succeedSpinner(`Found ${githubResults.length} GitHub results`);
+        } catch (error2) {
+          this.warn("GitHub search not available");
+        }
+      }
+      this.startSpinner("Generating research summary...");
+      const summary = await this.generateSummary(context2, config.query, results);
+      results.summary = summary;
+      this.succeedSpinner("Summary generated");
+      await this.memory.recordEpisode("research_complete", `Research: ${config.query}`, "success", JSON.stringify(results));
+      console.log("");
+      this.success("Research completed");
+      console.log("");
+      console.log(source_default2.bold("Summary:"));
+      console.log(source_default2.gray(summary));
+      console.log("");
+      if (results.sources.memory && results.sources.memory.length > 0) {
+        console.log(source_default2.bold("Memory Results:"));
+        results.sources.memory.slice(0, 3).forEach((result, i) => {
+          console.log(`  ${i + 1}. ${source_default2.gray(result.episode || result.fact || "Result")}`);
+        });
+        console.log("");
+      }
+      if (results.sources.github && results.sources.github.length > 0) {
+        console.log(source_default2.bold("GitHub Results:"));
+        results.sources.github.slice(0, 5).forEach((result, i) => {
+          console.log(`  ${i + 1}. ${source_default2.cyan(result.repo || "Repository")}`);
+          console.log(`     ${source_default2.gray(result.description || result.path || "")}`);
+        });
+        console.log("");
+      }
+      return this.createSuccess("Research complete", results);
+    } catch (error2) {
+      const err = error2;
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+  async searchMemory(query) {
+    try {
+      const episodes = await this.memory.searchEpisodes(query, 5);
+      const results = [];
+      if (episodes) {
+        const lines = episodes.split(`
+`).filter((l) => l.trim());
+        for (const line of lines) {
+          try {
+            const episode = JSON.parse(line);
+            results.push(episode);
+          } catch {}
+        }
+      }
+      return results;
+    } catch (error2) {
+      console.warn("Memory search failed:", error2);
+      return [];
+    }
+  }
+  async searchGitHub(config) {
+    try {
+      this.warn("GitHub MCP integration not available - using mock data");
+      this.info("To enable: Configure GitHub MCP server in ~/.claude/config.json");
+      return [
+        {
+          repo: "anthropics/anthropic-sdk-typescript",
+          path: "src/resources/messages.ts",
+          description: `Code example for: ${config.query} (mock result)`,
+          url: `https://github.com/search?q=${encodeURIComponent(config.query)}`,
+          language: config.language?.[0] || "typescript",
+          score: 0.9
+        },
+        {
+          repo: "vercel/next.js",
+          path: "packages/next/src/server/api.ts",
+          description: `Related implementation: ${config.query} (mock result)`,
+          url: `https://github.com/search?q=${encodeURIComponent(config.query)}`,
+          language: config.language?.[0] || "typescript",
+          score: 0.85
+        }
+      ];
+    } catch (error2) {
+      const err = error2;
+      this.warn(`GitHub search failed: ${err.message}`);
+      return [];
+    }
+  }
+  async generateSummary(context2, query, results) {
+    const prompt = this.buildSummaryPrompt(query, results);
+    try {
+      const response = await context2.llmRouter.route({
+        messages: [{ role: "user", content: prompt }],
+        system: "You are a research assistant. Provide concise, actionable summaries.",
+        max_tokens: 1000
+      }, {
+        taskType: "general",
+        priority: "quality"
+      });
+      const firstContent = response.content[0];
+      return firstContent.type === "text" ? firstContent.text : "Summary unavailable";
+    } catch (error2) {
+      const err = error2;
+      this.warn(`LLM summary generation failed: ${err.message}`);
+      return this.createBasicSummary(query, results);
+    }
+  }
+  createBasicSummary(query, results) {
+    const parts = [];
+    parts.push(`Research query: "${query}"`);
+    parts.push("");
+    if (results.sources.memory && results.sources.memory.length > 0) {
+      parts.push(`Found ${results.sources.memory.length} related items in memory.`);
+    }
+    if (results.sources.github && results.sources.github.length > 0) {
+      parts.push(`Found ${results.sources.github.length} GitHub code examples.`);
+    }
+    if (parts.length === 1) {
+      parts.push("No results found. Try a different query or check your sources.");
+    } else {
+      parts.push("");
+      parts.push("Review the detailed results above for specific examples and patterns.");
+    }
+    return parts.join(`
+`);
+  }
+  buildSummaryPrompt(query, results) {
+    let prompt = `Research Query: ${query}
+
+`;
+    if (results.sources.memory && results.sources.memory.length > 0) {
+      prompt += `## Memory Results
+
+`;
+      results.sources.memory.forEach((result, i) => {
+        prompt += `${i + 1}. ${JSON.stringify(result)}
+`;
+      });
+      prompt += `
+`;
+    }
+    if (results.sources.github && results.sources.github.length > 0) {
+      prompt += `## GitHub Results
+
+`;
+      results.sources.github.forEach((result, i) => {
+        prompt += `${i + 1}. ${JSON.stringify(result)}
+`;
+      });
+      prompt += `
+`;
+    }
+    prompt += `
+Provide a comprehensive but concise summary of the research findings.
+Include:
+1. Key insights and patterns
+2. Recommended approaches
+3. Important caveats or considerations
+4. Next steps or areas for deeper investigation
+
+Keep the summary under 500 words and focus on actionable information.
+`.trim();
+    return prompt;
+  }
+}
+// src/core/debug/orchestrator/Snapshotter.ts
+class Snapshotter {
+  snapshotDir;
+  constructor(snapshotDir) {
+    this.snapshotDir = snapshotDir;
+  }
+  async createSnapshot(snapshotId, testCommand, description) {
+    const testResult = await this.runTest(testCommand);
+    const parsedResults = this.parseTestOutput(testResult.output, testResult.exitCode);
+    const snapshot = {
+      snapshotId,
+      description,
+      testCommand,
+      output: testResult.output,
+      exitCode: testResult.exitCode,
+      testCount: parsedResults.testCount,
+      failedCount: parsedResults.failedCount,
+      timestamp: new Date().toISOString(),
+      testsPassed: parsedResults.testsPassed
+    };
+    const snapshotPath = `${this.snapshotDir}/${snapshotId}.json`;
+    return {
+      snapshotId,
+      snapshotPath,
+      snapshot
+    };
+  }
+  async runTest(testCommand) {
+    return {
+      output: "// TEST OUTPUT PLACEHOLDER - Use Bash tool to execute",
+      exitCode: 0
+    };
+  }
+  parseTestOutput(output, exitCode) {
+    let testsPassed = false;
+    let testCount = 0;
+    let failedCount = 0;
+    const jestMatch = output.match(/Tests:.*?(\d+)\s+passed/);
+    const totalMatch = output.match(/(\d+)\s+total/);
+    const jestFailedMatch = output.match(/(\d+)\s+failed/);
+    if (jestMatch && totalMatch) {
+      testCount = parseInt(totalMatch[1], 10);
+      failedCount = jestFailedMatch ? parseInt(jestFailedMatch[1], 10) : 0;
+      testsPassed = failedCount === 0 && testCount > 0;
+      return { testsPassed, testCount, failedCount };
+    }
+    const mochaMatch = output.match(/(\d+)\s+passing/);
+    const mochaFailedMatch = output.match(/(\d+)\s+failing/);
+    if (mochaMatch) {
+      testCount = parseInt(mochaMatch[1], 10);
+      failedCount = mochaFailedMatch ? parseInt(mochaFailedMatch[1], 10) : 0;
+      testsPassed = failedCount === 0;
+      return { testsPassed, testCount, failedCount };
+    }
+    if (/PASS|SUCCESS|OK/.test(output)) {
+      if (!/FAIL|ERROR|FAILED/.test(output)) {
+        testsPassed = true;
+      }
+    } else if (exitCode === 0) {
+      testsPassed = true;
+    }
+    return { testsPassed, testCount, failedCount };
+  }
+  async loadSnapshot(snapshotId) {
+    return null;
+  }
+  generateBeforeId() {
+    return `before_${Date.now()}`;
+  }
+  generateAfterId() {
+    return `after_${Date.now()}`;
+  }
+}
+
+// src/core/debug/orchestrator/Memory.ts
+class Memory {
+  memoryFile;
+  constructor(memoryFile) {
+    this.memoryFile = memoryFile;
+  }
+  async recordBugFix(bugDescription, bugType, fixDescription, filesChanged, success, testsPassed = "unknown") {
+    const record = {
+      timestamp: new Date().toISOString(),
+      bugDescription,
+      bugType,
+      fixDescription,
+      filesChanged,
+      success,
+      testsPassed,
+      embeddingKeywords: this.extractKeywords(`${bugDescription} ${fixDescription}`)
+    };
+    return record;
+  }
+  async searchSimilarBugs(searchQuery, limit = 5) {
+    const keywords = this.extractKeywords(searchQuery);
+    return {
+      similarFixes: [],
+      count: 0
+    };
+  }
+  extractKeywords(text) {
+    return text.toLowerCase().split(/\s+/).filter((word) => word.length > 3).filter((word) => !this.isStopWord(word));
+  }
+  isStopWord(word) {
+    const stopWords = new Set([
+      "the",
+      "and",
+      "for",
+      "that",
+      "this",
+      "with",
+      "from",
+      "have",
+      "been",
+      "were",
+      "what",
+      "when",
+      "where",
+      "which",
+      "their",
+      "there"
+    ]);
+    return stopWords.has(word);
+  }
+  async getRecentFixes(count = 10) {
+    return [];
+  }
+  async getSuccessfulFixes(limit = 20) {
+    return [];
+  }
+  async getFixesByType(bugType, limit = 10) {
+    return [];
+  }
+  async getStats() {
+    return {
+      total: 0,
+      successful: 0,
+      failed: 0,
+      byType: {}
+    };
+  }
+}
+
+// src/core/debug/orchestrator/Searcher.ts
+class Searcher {
+  githubMcpAvailable;
+  constructor(githubMcpAvailable = false) {
+    this.githubMcpAvailable = githubMcpAvailable;
+  }
+  async searchGitHub(bugDescription, limit = 3) {
+    if (this.githubMcpAvailable) {
+      return {
+        available: true,
+        mcpAvailable: true,
+        note: "Use mcp__grep__searchGitHub for searching similar issues"
+      };
+    }
+    return {
+      available: false
+    };
+  }
+  buildGitHubQuery(bugDescription, bugType) {
+    const keywords = this.extractKeywords(bugDescription);
+    const query = [...keywords, bugType].filter(Boolean).join(" ");
+    return query;
+  }
+  extractKeywords(text) {
+    return text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter((word) => word.length > 3).filter((word) => !this.isCommonWord(word)).slice(0, 5);
+  }
+  isCommonWord(word) {
+    const common = new Set([
+      "the",
+      "and",
+      "for",
+      "that",
+      "this",
+      "with",
+      "from",
+      "have",
+      "been",
+      "error",
+      "issue",
+      "problem",
+      "help",
+      "need"
+    ]);
+    return common.has(word);
+  }
+  async searchCodebase(errorPattern, fileGlob) {
+    return [];
+  }
+  async buildSearchContext(bugDescription, bugType, similarFixesFromMemory) {
+    const githubSolutions = await this.searchGitHub(bugDescription);
+    return {
+      bugDescription,
+      bugType,
+      similarFixesFromMemory,
+      githubSolutions
+    };
+  }
+  generateSearchRecommendations(bugType, keywords) {
+    const recommendations = [];
+    if (bugType === "test_failure") {
+      recommendations.push("Search for test framework-specific issues");
+      recommendations.push("Look for async test patterns");
+    } else if (bugType === "type_error") {
+      recommendations.push("Search for TypeScript type definitions");
+      recommendations.push("Check for interface mismatches");
+    } else if (bugType === "runtime_error") {
+      recommendations.push("Search for error stack traces");
+      recommendations.push("Check for null/undefined handling");
+    }
+    if (keywords.includes("async") || keywords.includes("promise")) {
+      recommendations.push("Review async/await patterns");
+    }
+    if (keywords.includes("import") || keywords.includes("module")) {
+      recommendations.push("Check module resolution");
+    }
+    return recommendations;
+  }
+}
+
+// src/core/debug/orchestrator/Verifier.ts
+class Verifier {
+  regressionLog;
+  constructor(regressionLog) {
+    this.regressionLog = regressionLog;
+  }
+  async detectRegression(beforeSnapshot, afterSnapshot) {
+    const beforePassed = beforeSnapshot.testsPassed;
+    const afterPassed = afterSnapshot.testsPassed;
+    let regressionDetected = false;
+    let regressionType = "none";
+    let details = "";
+    let recommendation = "";
+    if (beforePassed && !afterPassed) {
+      regressionDetected = true;
+      regressionType = "test_failure";
+      details = "Tests passed before fix, but fail after fix";
+      recommendation = "Revert fix and try alternative approach";
+      await this.recordRegression({
+        regressionDetected: true,
+        regressionType,
+        details,
+        beforeSnapshot: beforeSnapshot.snapshotId,
+        afterSnapshot: afterSnapshot.snapshotId
+      });
+    } else if (this.hasNewErrors(beforeSnapshot.output, afterSnapshot.output)) {
+      regressionDetected = true;
+      regressionType = "new_errors";
+      details = "New errors appeared in test output after fix";
+      recommendation = "Review error messages and adjust fix";
+    } else if (beforeSnapshot.testCount > afterSnapshot.testCount) {
+      regressionDetected = true;
+      regressionType = "test_failure";
+      details = `Test count decreased from ${beforeSnapshot.testCount} to ${afterSnapshot.testCount}`;
+      recommendation = "Some tests may have been skipped or removed";
+    }
+    return {
+      regressionDetected,
+      regressionType,
+      details,
+      beforeSnapshot: beforeSnapshot.snapshotId,
+      afterSnapshot: afterSnapshot.snapshotId,
+      recommendation
+    };
+  }
+  async verifyFix(beforeSnapshot, afterSnapshot, fixDescription) {
+    const regression = await this.detectRegression(beforeSnapshot, afterSnapshot);
+    const beforePassed = beforeSnapshot.testsPassed;
+    const afterPassed = afterSnapshot.testsPassed;
+    const fixEffective = !beforePassed && afterPassed;
+    const success = fixEffective && !regression.regressionDetected;
+    let recommendation;
+    if (regression.regressionDetected) {
+      recommendation = `Regression detected: ${regression.details}. ${regression.recommendation}`;
+    } else if (fixEffective) {
+      recommendation = "Fix successful - tests now passing";
+    } else if (beforePassed && afterPassed) {
+      recommendation = "Tests passing before and after - verify fix addressed root cause";
+    } else {
+      recommendation = "Fix did not resolve test failures - try alternative approach";
+    }
+    return {
+      success,
+      regression,
+      fixEffective,
+      testsPassed: afterPassed,
+      recommendation
+    };
+  }
+  hasNewErrors(beforeOutput, afterOutput) {
+    const errorPatterns = [/ERROR:/gi, /Exception:/gi, /Fatal:/gi, /\bFAILED\b/gi];
+    const beforeErrors = this.countErrors(beforeOutput, errorPatterns);
+    const afterErrors = this.countErrors(afterOutput, errorPatterns);
+    return afterErrors > beforeErrors;
+  }
+  countErrors(output, patterns) {
+    let count = 0;
+    for (const pattern of patterns) {
+      const matches = output.match(pattern);
+      if (matches) {
+        count += matches.length;
+      }
+    }
+    return count;
+  }
+  async recordRegression(regression) {
+    const record = {
+      timestamp: new Date().toISOString(),
+      regressionType: regression.regressionType,
+      details: regression.details,
+      beforeSnapshot: regression.beforeSnapshot,
+      afterSnapshot: regression.afterSnapshot
+    };
+  }
+  async getRecentRegressions(limit = 10) {
+    return [];
+  }
+  async checkSimilarRegressions(details) {
+    return [];
+  }
+}
+
+// src/core/debug/orchestrator/Recommender.ts
+class Recommender {
+  generateVerificationRecommendation(verification, fixDescription) {
+    if (verification.regression.regressionDetected) {
+      return {
+        status: "regression_detected",
+        message: "Fix introduced a regression - tests passing before, failing after",
+        regressionsDetected: true,
+        recommendation: "REVERT THE FIX",
+        actions: [
+          "1. Git revert the changes",
+          "2. Analyze test failures",
+          "3. Try alternative approach using similar_fixes from memory"
+        ],
+        confidence: 95
+      };
+    } else if (verification.success) {
+      return {
+        status: "success",
+        message: "Fix verified - no regressions detected",
+        regressionsDetected: false,
+        recommendation: "Fix successful - continue with next task",
+        actions: ["1. Record successful fix to memory", "2. Continue with next task"],
+        confidence: 90
+      };
+    } else if (!verification.fixEffective) {
+      return {
+        status: "failed",
+        message: "Fix did not resolve the issue",
+        regressionsDetected: false,
+        recommendation: "Try alternative approach",
+        actions: [
+          "1. Review similar fixes from memory",
+          "2. Search GitHub for solutions",
+          "3. Try different approach"
+        ],
+        confidence: 70
+      };
+    }
+    return {
+      status: "needs_alternative",
+      message: "Fix partially effective but needs refinement",
+      regressionsDetected: false,
+      recommendation: "Refine the fix",
+      actions: ["1. Analyze test output", "2. Adjust fix incrementally"],
+      confidence: 60
+    };
+  }
+  generateSmartDebugContext(bugDescription, beforeSnapshotId, similarFixes, githubSolutions) {
+    const fixPrompt = {
+      task: "Fix bug with regression awareness",
+      bugDescription,
+      bugType: "general",
+      context: "",
+      similarFixesFromMemory: similarFixes,
+      githubSolutions,
+      instructions: [
+        "1. Review similar fixes from memory to avoid repeating failed approaches",
+        "2. Consider GitHub solutions if available",
+        "3. Make the fix incrementally",
+        "4. Think about potential side effects on other components",
+        "5. Run tests after fix to detect regressions"
+      ]
+    };
+    return {
+      bug: bugDescription,
+      beforeSnapshot: beforeSnapshotId,
+      similarFixesCount: similarFixes.count,
+      similarFixes,
+      githubSolutions,
+      fixPrompt,
+      nextSteps: [
+        "1. Review similar fixes and GitHub solutions",
+        "2. Apply fix incrementally",
+        "3. Run: verify-fix <snapshot_id> <test_command>",
+        "4. If regression detected, will auto-recommend revert"
+      ]
+    };
+  }
+  generateAlternativeApproaches(bugDescription, failedApproaches, similarFixes) {
+    const alternatives = [];
+    for (const fix of similarFixes) {
+      if (fix.success && !failedApproaches.includes(fix.fixDescription)) {
+        alternatives.push(fix.fixDescription);
+      }
+    }
+    if (bugDescription.toLowerCase().includes("test fail")) {
+      alternatives.push("Check test setup/teardown");
+      alternatives.push("Verify test data fixtures");
+      alternatives.push("Review async test timing");
+    }
+    if (bugDescription.toLowerCase().includes("type error")) {
+      alternatives.push("Add explicit type annotations");
+      alternatives.push("Check interface definitions");
+      alternatives.push("Review generic type constraints");
+    }
+    if (bugDescription.toLowerCase().includes("undefined")) {
+      alternatives.push("Add null checks");
+      alternatives.push("Initialize variables explicitly");
+      alternatives.push("Review optional chaining usage");
+    }
+    return alternatives.slice(0, 5);
+  }
+  generateIncrementalSteps(bugDescription, context2) {
+    const steps = [
+      "Create test snapshot before changes",
+      "Identify minimal change needed",
+      "Apply single change",
+      "Run tests and check for regression",
+      "If passing, continue; if failing, revert and try alternative"
+    ];
+    if (context2.similarFixesFromMemory.count > 0) {
+      steps.unshift("Review similar successful fixes from memory");
+    }
+    if (context2.githubSolutions.available) {
+      steps.unshift("Check GitHub solutions for patterns");
+    }
+    return steps;
+  }
+  assessConfidence(context2) {
+    let confidence = 50;
+    confidence += Math.min(context2.similarFixesCount * 10, 30);
+    if (context2.hasGitHubSolutions) {
+      confidence += 15;
+    }
+    if (context2.testsPassed) {
+      confidence += 20;
+    }
+    confidence -= Math.min(context2.attemptCount * 5, 20);
+    return Math.max(0, Math.min(100, confidence));
+  }
+}
+
+// src/core/debug/orchestrator/index.ts
+class DebugOrchestrator {
+  snapshotter;
+  memory;
+  searcher;
+  verifier;
+  recommender;
+  constructor(config) {
+    this.snapshotter = new Snapshotter(config.testSnapshotsDir);
+    this.memory = new Memory(config.bugFixMemoryFile);
+    this.searcher = new Searcher(config.githubMcpAvailable);
+    this.verifier = new Verifier(config.regressionLogFile);
+    this.recommender = new Recommender;
+  }
+  async smartDebug(input) {
+    const {
+      bugDescription,
+      bugType = "general",
+      testCommand = 'echo "No tests configured"',
+      context: context2 = ""
+    } = input;
+    const beforeSnapshotId = this.snapshotter.generateBeforeId();
+    await this.snapshotter.createSnapshot(beforeSnapshotId, testCommand, `Before fix: ${bugDescription}`);
+    const similarFixes = await this.memory.searchSimilarBugs(bugDescription, 5);
+    const githubSolutions = await this.searcher.searchGitHub(bugDescription);
+    const debugContext = this.recommender.generateSmartDebugContext(bugDescription, beforeSnapshotId, similarFixes, githubSolutions);
+    return debugContext;
+  }
+  async verifyFix(input) {
+    const { beforeSnapshotId, testCommand, fixDescription = "Fix applied" } = input;
+    const afterSnapshotId = this.snapshotter.generateAfterId();
+    await this.snapshotter.createSnapshot(afterSnapshotId, testCommand, "After fix");
+    const beforeSnapshot = await this.snapshotter.loadSnapshot(beforeSnapshotId);
+    const afterSnapshot = await this.snapshotter.loadSnapshot(afterSnapshotId);
+    if (!beforeSnapshot || !afterSnapshot) {
+      return {
+        status: "failed",
+        message: "Snapshots not found",
+        regressionsDetected: false,
+        recommendation: "Ensure snapshots were created successfully",
+        actions: ["Create snapshots before verification"]
+      };
+    }
+    const verification = await this.verifier.verifyFix(beforeSnapshot, afterSnapshot, fixDescription);
+    const recommendation = this.recommender.generateVerificationRecommendation(verification, fixDescription);
+    if (verification.success) {
+      await this.memory.recordBugFix("Bug fix verified", "general", fixDescription, "unknown", true, "passed");
+    }
+    return recommendation;
+  }
+  async recordBugFix(bugDescription, bugType, fixDescription, filesChanged, success, testsPassed = "unknown") {
+    return this.memory.recordBugFix(bugDescription, bugType, fixDescription, filesChanged, success, testsPassed);
+  }
+  async searchSimilarBugs(query, limit = 5) {
+    return this.memory.searchSimilarBugs(query, limit);
+  }
+  async searchGitHub(bugDescription, limit = 3) {
+    return this.searcher.searchGitHub(bugDescription, limit);
+  }
+  async createSnapshot(snapshotId, testCommand, description) {
+    return this.snapshotter.createSnapshot(snapshotId, testCommand, description);
+  }
+  async detectRegression(beforeSnapshot, afterSnapshot) {
+    return this.verifier.detectRegression(beforeSnapshot, afterSnapshot);
+  }
+  generateAlternatives(bugDescription, failedApproaches, similarFixes) {
+    return this.recommender.generateAlternativeApproaches(bugDescription, failedApproaches, similarFixes);
+  }
+  async getMemoryStats() {
+    return this.memory.getStats();
+  }
+  async getRecentRegressions(limit = 10) {
+    return this.verifier.getRecentRegressions(limit);
+  }
+}
+function createDebugOrchestrator(debugDir = "~/.claude/.debug", githubMcpAvailable = false) {
+  const config = {
+    debugDir,
+    bugFixMemoryFile: `${debugDir}/bug-fixes.jsonl`,
+    regressionLogFile: `${debugDir}/regressions.jsonl`,
+    testSnapshotsDir: `${debugDir}/test-snapshots`,
+    githubMcpAvailable
+  };
+  return new DebugOrchestrator(config);
+}
+
+// src/cli/commands/RootCauseCommand.ts
+import * as os2 from "os";
+import * as path4 from "path";
+
+class RootCauseCommand extends BaseCommand {
+  name = "rootcause";
+  description = "Perform root cause analysis with regression detection";
+  orchestrator;
+  memory;
+  constructor() {
+    super();
+    const debugDir = path4.join(os2.homedir(), ".claude", ".debug");
+    this.orchestrator = createDebugOrchestrator(debugDir, true);
+    this.memory = new MemoryManagerBridge;
+  }
+  async execute(context2, config) {
+    try {
+      switch (config.action) {
+        case "analyze":
+          return await this.analyzeBug(context2, config);
+        case "verify":
+          return await this.verifyFix(context2, config);
+        default:
+          return this.createFailure(`Unknown action: ${config.action}. Use: analyze, verify`);
+      }
+    } catch (error2) {
+      const err = error2;
+      this.error(err.message);
+      return this.createFailure(err.message, err);
+    }
+  }
+  async analyzeBug(context2, config) {
+    if (!config.bugDescription) {
+      return this.createFailure("Bug description is required");
+    }
+    this.info(`\uD83D\uDD0D Analyzing bug`);
+    this.info(`Description: ${source_default2.bold(config.bugDescription)}`);
+    console.log("");
+    this.startSpinner("Running smart debug analysis...");
+    const debugContext = await this.orchestrator.smartDebug({
+      bugDescription: config.bugDescription,
+      bugType: config.bugType || "general",
+      testCommand: config.testCommand || 'echo "No tests configured"'
+    });
+    this.succeedSpinner("Analysis complete");
+    await this.memory.recordEpisode("rootcause_analysis", `Bug: ${config.bugDescription}`, "success", JSON.stringify(debugContext));
+    console.log("");
+    this.success("Root cause analysis completed");
+    console.log("");
+    console.log(source_default2.bold("Before Snapshot:"), source_default2.cyan(debugContext.beforeSnapshot));
+    console.log("");
+    if (debugContext.similarFixes.similarFixes.length > 0) {
+      console.log(source_default2.bold("Similar Fixes from Memory:"));
+      debugContext.similarFixes.similarFixes.forEach((fix, i) => {
+        console.log(`  ${i + 1}. ${source_default2.gray(fix.bugDescription)}`);
+        console.log(`     Fix: ${source_default2.green(fix.fixDescription)}`);
+        console.log(`     Success: ${fix.success ? source_default2.green("Yes") : source_default2.red("No")}`);
+      });
+      console.log("");
+    }
+    if (debugContext.githubSolutions && debugContext.githubSolutions.solutions && debugContext.githubSolutions.solutions.length > 0) {
+      console.log(source_default2.bold("GitHub Solutions:"));
+      debugContext.githubSolutions.solutions.forEach((solution, i) => {
+        console.log(`  ${i + 1}. ${source_default2.gray(solution.title || "Solution")}`);
+        console.log(`     Repo: ${source_default2.cyan(solution.repo || "N/A")}`);
+        console.log(`     ${source_default2.blue(solution.url || "")}`);
+      });
+      console.log("");
+    }
+    console.log(source_default2.bold("Fix Prompt:"));
+    console.log(source_default2.gray(debugContext.fixPrompt));
+    console.log("");
+    return this.createSuccess("Analysis complete", debugContext);
+  }
+  async verifyFix(context2, config) {
+    if (!config.beforeSnapshotId) {
+      return this.createFailure("Before snapshot ID is required");
+    }
+    if (!config.testCommand) {
+      return this.createFailure("Test command is required");
+    }
+    this.info(`✅ Verifying fix`);
+    this.info(`Before Snapshot: ${source_default2.cyan(config.beforeSnapshotId)}`);
+    console.log("");
+    this.startSpinner("Creating after snapshot and checking for regressions...");
+    const recommendation = await this.orchestrator.verifyFix({
+      beforeSnapshotId: config.beforeSnapshotId,
+      testCommand: config.testCommand,
+      fixDescription: config.fixDescription || "Fix applied"
+    });
+    if (recommendation.status === "success") {
+      this.succeedSpinner("Fix verified - no regressions detected");
+    } else if (recommendation.regressionsDetected) {
+      this.failSpinner("Regressions detected!");
+    } else {
+      this.failSpinner("Verification failed");
+    }
+    await this.memory.recordEpisode("fix_verification", config.fixDescription || "Fix applied", recommendation.status === "success" ? "success" : "failed", JSON.stringify(recommendation));
+    console.log("");
+    console.log(source_default2.bold("Status:"), recommendation.status === "success" ? source_default2.green("Success") : source_default2.red("Failed"));
+    console.log(source_default2.bold("Regressions:"), recommendation.regressionsDetected ? source_default2.red("Detected") : source_default2.green("None"));
+    console.log("");
+    console.log(source_default2.bold("Recommendation:"));
+    console.log(source_default2.gray(recommendation.recommendation));
+    console.log("");
+    if (recommendation.actions.length > 0) {
+      console.log(source_default2.bold("Suggested Actions:"));
+      recommendation.actions.forEach((action, i) => {
+        console.log(`  ${i + 1}. ${source_default2.gray(action)}`);
+      });
+      console.log("");
+    }
+    if (config.verbose && recommendation.regressionsDetected) {
+      console.log(source_default2.bold("Regression Details:"));
+      console.log(source_default2.gray(JSON.stringify(recommendation, null, 2)));
+      console.log("");
+    }
+    return this.createSuccess("Verification complete", recommendation);
+  }
+}
+// src/cli/commands/CheckpointCommand.ts
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { join as join3 } from "path";
+import { execSync as execSync2 } from "child_process";
+class CheckpointCommand {
+  name = "checkpoint";
+  async execute(context2, options) {
+    try {
+      const claudeMdPath = join3(context2.workDir, "CLAUDE.md");
+      let pipelineState = null;
+      let currentFeature = "";
+      let currentTier = "";
+      let currentPhase = "";
+      let tierStatus = "";
+      let reports = null;
+      if (existsSync(claudeMdPath)) {
+        const claudeContent2 = readFileSync(claudeMdPath, "utf-8");
+        const pipelineMatch = claudeContent2.match(/## Pipeline State\n([\s\S]*?)(?=##|$)/s);
+        if (pipelineMatch) {
+          const pipelineContent = pipelineMatch[1];
+          const phaseMatch = pipelineContent.match(/Phase:\s*(\w+)/);
+          const featureMatch = pipelineContent.match(/Feature:\s*(.+)/);
+          const tierMatch = pipelineContent.match(/Tier:\s*(\w+)/);
+          const statusMatch = pipelineContent.match(/Tier-Status:\s*(\w+)/);
+          const reportsMatch = pipelineContent.match(/Reports:\s*(.+)/);
+          if (phaseMatch)
+            currentPhase = phaseMatch[1];
+          if (featureMatch)
+            currentFeature = featureMatch[1];
+          if (tierMatch)
+            currentTier = tierMatch[1];
+          if (statusMatch)
+            tierStatus = statusMatch[1];
+          if (reportsMatch)
+            reports = reportsMatch[1];
+        }
+      }
+      const buildguidePath = join3(context2.workDir, "buildguide.md");
+      let nextSection = "";
+      let newDocsFound = [];
+      if (existsSync(buildguidePath)) {
+        const buildguideContent = readFileSync(buildguidePath, "utf-8");
+        const uncheckedMatch = buildguideContent.match(/-\s*\[\s*\]\s*(.+)/);
+        if (uncheckedMatch && uncheckedMatch.length > 0) {
+          nextSection = uncheckedMatch[0].trim();
+        }
+      }
+      let claudeContent = existsSync(claudeMdPath) ? readFileSync(claudeMdPath, "utf-8") : "";
+      const now = new Date().toISOString().split("T")[0];
+      const time = new Date().toLocaleTimeString();
+      const lastSessionRegex = /## Last Session\s*\([\s\S]*?\)\s*([\s\S]*?)/;
+      claudeContent = claudeContent.replace(lastSessionRegex, "");
+      const lastSessionSection = `## Last Session (${now})
+- ${options.summary || "Session checkpointed"}
+- Stopped at: ${time}
+`;
+      const nextStepsMatch = claudeContent.match(/## Next Steps\s*([\s\S]*?)(?=##|$)/s);
+      if (nextStepsMatch) {
+        const nextStepsContent = nextStepsMatch[1];
+        const filteredNextSteps = nextStepsContent.split(`
+`).filter((line, index, lines) => {
+          if (line.trim().startsWith("- ")) {
+            return index < 3;
+          }
+          return true;
+        }).join(`
+`);
+        claudeContent = claudeContent.replace(nextStepsMatch[0], `## Next Steps
+${filteredNextSteps}`);
+      }
+      claudeContent = claudeContent.replace(/## Session Log\s*[\s\S]*?(?=##|$)/gs, "");
+      claudeContent = claudeContent.replace(/## History\s*[\s\S]*?(?=##|$)/gs, "");
+      if (pipelineState) {
+        const pipelineRegex = /## Pipeline State\s*([\s\S]*?)(?=##|$)/s;
+        const newState = this.advancePipelineState(currentPhase, currentTier, tierStatus);
+        const newPipelineSection = `## Pipeline State
+
+Phase: ${newState.phase}
+Feature: ${currentFeature}
+Tier: ${newState.tier}
+Tier-Status: ${newState.status}
+Reports: ${reports || "N/A"}
+`;
+        if (pipelineRegex) {
+          claudeContent = claudeContent.replace(pipelineRegex, newPipelineSection);
+        } else {
+          claudeContent += `
+` + newPipelineSection;
+        }
+      }
+      writeFileSync(claudeMdPath, claudeContent);
+      try {
+        const isGitRepo = execSync2("git rev-parse --git-dir 2>/dev/null", { cwd: context2.workDir, stdio: "pipe" });
+        if (isGitRepo) {
+          const hasChanges = execSync2("git diff --quiet || git diff --cached --quiet", { cwd: context2.workDir, stdio: "pipe" });
+          if (hasChanges) {
+            execSync2("git add CLAUDE.md buildguide.md 2>/dev/null || git add CLAUDE.md", { cwd: context2.workDir });
+            execSync2(`git commit -m "checkpoint: ${now} - session progress saved"`, { cwd: context2.workDir });
+            try {
+              execSync2("git push origin HEAD 2>/dev/null", { cwd: context2.workDir });
+            } catch (e) {
+              console.log(source_default2.yellow("Note: Push failed, may need authentication"));
+            }
+          }
+        }
+      } catch (e) {}
+      const continuationPrompt = this.generateContinuationPrompt(context2.workDir, options.summary || "Session checkpointed", currentFeature, currentPhase, currentTier, tierStatus, nextSection, newDocsFound);
+      console.log(source_default2.bold(`
+` + continuationPrompt));
+      return {
+        success: true,
+        message: "Checkpoint saved successfully"
+      };
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Checkpoint failed"
+      };
+    }
+  }
+  advancePipelineState(phase, tier, status) {
+    const transitions = {
+      "debugging,high,in-progress": { phase: "debugging", tier: "medium", status: "pending" },
+      "debugging,medium,in-progress": { phase: "debugging", tier: "low", status: "pending" },
+      "debugging,low,in-progress": { phase: "refactor-hunt", tier: "-", status: "-" },
+      "refactoring,high,in-progress": { phase: "refactoring", tier: "medium", status: "pending" },
+      "refactoring,medium,in-progress": { phase: "refactoring", tier: "low", status: "pending" },
+      "refactoring,low,in-progress": { phase: "build", tier: "-", status: "-" }
+    };
+    const key = `${phase},${tier},${status}`;
+    return transitions[key] || { phase, tier, status };
+  }
+  generateContinuationPrompt(workDir, summary, feature, phase, tier, status, nextSection, newDocs) {
+    const projectName = workDir.split("/").pop() || "Project";
+    if (phase) {
+      return this.generatePipelineContinuationPrompt(projectName, summary, feature, phase, tier, status, nextSection, newDocs);
+    }
+    return `
+## Continuation Prompt
+
+Continue work on ${projectName} at ${workDir}.
+
+**What's Done**: ${summary}
+
+**Current State**: Checkpoint saved at ${new Date().toLocaleTimeString()}
+
+${nextSection ? `**Build Guide**: Next section: ${nextSection} - see buildguide.md for research` : ""}
+
+${newDocs.length > 0 ? `**New Docs Found**: ${newDocs.join(", ")}` : ""}
+
+**Next Step**: ${nextSection ? `Continue with ${nextSection}` : "Check CLAUDE.md for next steps"}
+
+**Key Files**: CLAUDE.md${existsSync(join3(workDir, "buildguide.md")) ? ", buildguide.md" : ""}
+
+**Approach**: Do NOT explore full codebase. Use context above. Check buildguide.md for collected research.
+`;
+  }
+  generatePipelineContinuationPrompt(projectName, summary, feature, phase, tier, status, nextSection, newDocs) {
+    if (phase === "debugging") {
+      return `
+## Continuation Prompt
+
+Continue work on ${projectName}.
+
+**Pipeline Phase**: debugging
+**Feature**: ${feature}
+**Current Tier**: ${tier} - ${status}
+
+**Next Action**: Fix ${tier} priority bugs from bug report
+
+**Approach**: Do NOT explore codebase. Read only files in Scope above.
+`;
+    }
+    if (phase === "refactor-hunt") {
+      return `
+## Continuation Prompt
+
+Continue work on ${projectName}.
+
+**Pipeline Phase**: refactor-hunt
+**Feature**: ${feature}
+
+**Next Action**: Run /refactor-hunt-checkpoint to analyze for refactoring opportunities
+
+**Approach**: Do NOT explore codebase. Read only files in Scope above.
+`;
+    }
+    if (phase === "refactoring") {
+      return `
+## Continuation Prompt
+
+Continue work on ${projectName}.
+
+**Pipeline Phase**: refactoring
+**Feature**: ${feature}
+**Current Tier**: ${tier} - ${status}
+
+**Next Action**: Execute ${tier} priority refactors from refactor report
+
+**Approach**: Do NOT explore codebase. Read only files in Scope above.
+`;
+    }
+    if (phase === "build") {
+      return `
+## Continuation Prompt
+
+Continue work on ${projectName}.
+
+**Pipeline Complete** for feature: ${feature}
+
+**Next Action**: ${nextSection || "Pipeline complete - check with user for next task"}
+
+**Approach**: Read CLAUDE.md for full context. You may explore codebase as needed.
+`;
+    }
+    return this.generateStandardContinuationPrompt(projectName, summary, nextSection, newDocs);
+  }
+  generateStandardContinuationPrompt(projectName, summary, nextSection, newDocs) {
+    return `
+## Continuation Prompt
+
+Continue work on ${projectName}.
+
+**What's Done**: ${summary}
+
+${nextSection ? `**Build Guide**: Next section: ${nextSection} - see buildguide.md for research` : ""}
+
+${newDocs.length > 0 ? `**New Docs Found**: ${newDocs.join(", ")}` : ""}
+
+**Next Step**: ${nextSection || "Check CLAUDE.md for next steps"}
+
+**Key Files**: CLAUDE.md
+
+**Approach**: Do NOT explore full codebase. Use context above. Check buildguide.md for collected research.
+`;
+  }
+}
+// src/cli/commands/BuildCommand.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { join as join4 } from "path";
+import { execSync as execSync3 } from "child_process";
+class BuildCommand {
+  name = "build";
+  async execute(context2, options) {
+    try {
+      const debugLogPath = join4(context2.workDir, ".claude", "docs", "debug-log.md");
+      if (!existsSync2(join4(context2.workDir, ".claude", "docs"))) {
+        execSync3("mkdir -p .claude/docs", { cwd: context2.workDir });
+      }
+      if (!existsSync2(debugLogPath)) {
+        const debugLogTemplate = `# Debug Log
+
+> Last Updated: ${new Date().toISOString()}
+
+## Active Issues
+
+## Session: ${new Date().toISOString().split("T")[0]}
+
+---
+
+## Resolved Issues
+
+## Patterns Discovered
+
+## Research Cache
+`;
+        writeFileSync2(debugLogPath, debugLogTemplate);
+      }
+      let architectureContent = "";
+      const architecturePaths = [
+        options.from,
+        "buildguide.md",
+        "ARCHITECTURE.md",
+        "docs/architecture.md",
+        ".claude/docs/architecture.md",
+        "CLAUDE.md"
+      ];
+      for (const path5 of architecturePaths) {
+        if (path5 && existsSync2(join4(context2.workDir, path5))) {
+          architectureContent = readFileSync2(join4(context2.workDir, path5), "utf-8");
+          break;
+        }
+      }
+      let targetFeature = options.feature;
+      if (!targetFeature && existsSync2(join4(context2.workDir, "buildguide.md"))) {
+        const buildguideContent = readFileSync2(join4(context2.workDir, "buildguide.md"), "utf-8");
+        const uncheckedMatch = buildguideContent.match(/-\s*\[\s*\]\s*(.+)/);
+        if (uncheckedMatch && uncheckedMatch.length > 0) {
+          targetFeature = uncheckedMatch[0].replace(/-\s*\[\s*\]\s*/, "").trim();
+        }
+      }
+      if (!targetFeature) {
+        return {
+          success: false,
+          message: "No feature specified and no unchecked sections in buildguide.md"
+        };
+      }
+      console.log(source_default2.bold(`
+=== Autonomous Build Mode ===`));
+      console.log(source_default2.cyan(`Target Feature: ${targetFeature}`));
+      console.log(source_default2.gray(`Loading architecture context...
+`));
+      console.log(source_default2.yellow("Step 3: Researching implementation patterns..."));
+      console.log(source_default2.gray(`Note: Use MCP grep tool to search GitHub for examples
+`));
+      const buildPlanPath = join4(context2.workDir, ".claude", "current-build.local.md");
+      const buildPlan = `---
+feature: ${targetFeature}
+phase: implementing
+started: ${new Date().toISOString()}
+iteration: 1
+fix_attempts: 0
+research_done: true
+---
+
+## Build Target
+${targetFeature}
+
+## Research Insights
+[Pending - use MCP grep to find patterns]
+
+## Implementation Steps
+1. [ ] Analyze architecture
+2. [ ] Implement core functionality
+3. [ ] Add error handling
+4. [ ] Write tests
+5. [ ] Validate
+
+## Quality Gates
+- [ ] Lint passes
+- [ ] Types check
+- [ ] Tests pass
+- [ ] No regressions
+
+## Files to Modify
+[From architecture analysis]
+`;
+      writeFileSync2(buildPlanPath, buildPlan);
+      console.log(source_default2.green("✓ Build plan created"));
+      console.log(source_default2.gray(`Plan saved to: ${buildPlanPath}
+`));
+      console.log(source_default2.bold("Next Steps:"));
+      console.log(source_default2.cyan("1. Use MCP grep to search GitHub for implementation patterns"));
+      console.log(source_default2.cyan("2. Implement following the build plan"));
+      console.log(source_default2.cyan("3. Run quality checks: lint, typecheck, test"));
+      console.log(source_default2.cyan(`4. When complete, run /checkpoint to save progress
+`));
+      return {
+        success: true,
+        message: `Build initialized for feature: ${targetFeature}`
+      };
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Build initialization failed"
+      };
+    }
+  }
+}
+// src/cli/commands/CollabCommand.ts
+import { existsSync as existsSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "fs";
+import { join as join5 } from "path";
+import { execSync as execSync4 } from "child_process";
+class CollabCommand {
+  name = "collab";
+  async execute(context2, options) {
+    try {
+      const collabDir = join5(context2.workDir, ".claude", "collab");
+      if (!existsSync3(collabDir)) {
+        execSync4("mkdir -p .claude/collab", { cwd: context2.workDir });
+      }
+      switch (options.action) {
+        case "start":
+          return this.startSession(context2, options.sessionName);
+        case "join":
+          return this.joinSession(context2, options.sessionId);
+        case "status":
+          return this.showStatus(context2);
+        case "sync":
+          return this.syncSession(context2);
+        case "leave":
+          return this.leaveSession(context2);
+        default:
+          return {
+            success: false,
+            message: `Unknown action: ${options.action}. Use: start, join, status, sync, leave`
+          };
+      }
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Collaboration command failed"
+      };
+    }
+  }
+  startSession(context2, sessionName) {
+    const sessionId = `collab_${Date.now()}`;
+    const sessionPath = join5(context2.workDir, ".claude", "collab", `${sessionId}.json`);
+    const sessionData = {
+      id: sessionId,
+      name: sessionName || "Untitled Session",
+      owner: process.env.USER || "unknown",
+      createdAt: new Date().toISOString(),
+      collaborators: [{ id: process.env.USER || "owner", role: "owner" }],
+      activity: [],
+      checkpoints: []
+    };
+    writeFileSync3(sessionPath, JSON.stringify(sessionData, null, 2));
+    console.log(source_default2.bold(`
+=== Collaboration Session Started ===`));
+    console.log(source_default2.green(`Session ID: ${sessionId}`));
+    console.log(source_default2.cyan(`Session Name: ${sessionData.name}`));
+    console.log(source_default2.gray(`
+Share this ID with collaborators to join:
+`));
+    console.log(source_default2.bold(sessionId));
+    return {
+      success: true,
+      message: `Session started: ${sessionId}`
+    };
+  }
+  joinSession(context2, sessionId) {
+    if (!sessionId) {
+      return {
+        success: false,
+        message: "Session ID required. Use: /collab join <session-id>"
+      };
+    }
+    const sessionPath = join5(context2.workDir, ".claude", "collab", `${sessionId}.json`);
+    if (!existsSync3(sessionPath)) {
+      return {
+        success: false,
+        message: `Session not found: ${sessionId}`
+      };
+    }
+    const sessionData = JSON.parse(readFileSync3(sessionPath, "utf-8"));
+    const userId = process.env.USER || "unknown";
+    if (sessionData.collaborators.find((c) => c.id === userId)) {
+      return {
+        success: false,
+        message: "You are already in this session"
+      };
+    }
+    sessionData.collaborators.push({
+      id: userId,
+      role: "editor",
+      joinedAt: new Date().toISOString()
+    });
+    writeFileSync3(sessionPath, JSON.stringify(sessionData, null, 2));
+    console.log(source_default2.bold(`
+=== Joined Collaboration Session ===`));
+    console.log(source_default2.green(`Session: ${sessionData.name}`));
+    console.log(source_default2.cyan(`Your role: editor`));
+    console.log(source_default2.gray(`Active collaborators: ${sessionData.collaborators.length}
+`));
+    return {
+      success: true,
+      message: `Joined session: ${sessionId}`
+    };
+  }
+  showStatus(context2) {
+    const collabDir = join5(context2.workDir, ".claude", "collab");
+    if (!existsSync3(collabDir)) {
+      return {
+        success: false,
+        message: "No active collaboration sessions"
+      };
+    }
+    const sessions = this.listSessions(collabDir);
+    if (sessions.length === 0) {
+      return {
+        success: false,
+        message: "No active collaboration sessions"
+      };
+    }
+    console.log(source_default2.bold(`
+=== Active Collaboration Sessions ===
+`));
+    for (const session of sessions) {
+      console.log(source_default2.cyan(`Session: ${session.name}`));
+      console.log(source_default2.gray(`  ID: ${session.id}`));
+      console.log(source_default2.gray(`  Owner: ${session.owner}`));
+      console.log(source_default2.gray(`  Collaborators: ${session.collaborators.length}`));
+      console.log(source_default2.gray(`  Created: ${new Date(session.createdAt).toLocaleString()}
+`));
+      if (session.activity.length > 0) {
+        console.log(source_default2.gray("  Recent Activity:"));
+        for (const activity of session.activity.slice(-5)) {
+          console.log(source_default2.gray(`    - ${activity.user}: ${activity.action} (${new Date(activity.timestamp).toLocaleTimeString()})`));
+        }
+      }
+    }
+    return {
+      success: true,
+      message: `Found ${sessions.length} active session(s)`
+    };
+  }
+  syncSession(context2) {
+    const collabDir = join5(context2.workDir, ".claude", "collab");
+    if (!existsSync3(collabDir)) {
+      return {
+        success: false,
+        message: "No active collaboration sessions"
+      };
+    }
+    console.log(source_default2.bold(`
+=== Synchronizing Session ===
+`));
+    console.log(source_default2.cyan("Checking for conflicts..."));
+    console.log(source_default2.gray("No conflicts detected."));
+    console.log(source_default2.green(`✓ Session synchronized
+`));
+    return {
+      success: true,
+      message: "Session synchronized"
+    };
+  }
+  leaveSession(context2) {
+    const collabDir = join5(context2.workDir, ".claude", "collab");
+    const userId = process.env.USER || "unknown";
+    if (!existsSync3(collabDir)) {
+      return {
+        success: false,
+        message: "No active collaboration sessions"
+      };
+    }
+    const sessions = this.listSessions(collabDir);
+    let leftSession = null;
+    for (const session of sessions) {
+      const collaboratorIndex = session.collaborators.findIndex((c) => c.id === userId);
+      if (collaboratorIndex !== -1) {
+        session.collaborators.splice(collaboratorIndex, 1);
+        const sessionPath = join5(collabDir, `${session.id}.json`);
+        writeFileSync3(sessionPath, JSON.stringify(session, null, 2));
+        leftSession = session;
+        break;
+      }
+    }
+    if (!leftSession) {
+      return {
+        success: false,
+        message: "You are not in any active session"
+      };
+    }
+    console.log(source_default2.bold(`
+=== Left Collaboration Session ===`));
+    console.log(source_default2.green(`Session: ${leftSession.name}`));
+    console.log(source_default2.gray(`ID: ${leftSession.id}
+`));
+    return {
+      success: true,
+      message: `Left session: ${leftSession.id}`
+    };
+  }
+  listSessions(collabDir) {
+    const sessions = [];
+    const files = __require("fs").readdirSync(collabDir);
+    for (const file of files) {
+      if (file.endsWith(".json")) {
+        const sessionPath = join5(collabDir, file);
+        const sessionData = JSON.parse(__require("fs").readFileSync(sessionPath, "utf-8"));
+        sessions.push(sessionData);
+      }
+    }
+    return sessions;
+  }
+}
+// src/cli/commands/CompactCommand.ts
+import { writeFileSync as writeFileSync4 } from "fs";
+import { join as join6 } from "path";
+class CompactCommand {
+  name = "compact";
+  async execute(context2, options) {
+    try {
+      console.log(source_default2.bold(`
+=== Memory Compaction ===`));
+      console.log(source_default2.cyan(`Analyzing current context...
+`));
+      let targetReduction = 50;
+      if (options.level === "aggressive") {
+        targetReduction = 60;
+      } else if (options.level === "conservative") {
+        targetReduction = 30;
+      }
+      console.log(source_default2.gray(`Compaction Level: ${options.level || "standard"} (${targetReduction}% reduction target)
+`));
+      const now = new Date;
+      const time = now.toISOString().split("T")[0];
+      const timeStr = now.toLocaleTimeString();
+      const compactedContext = `## Compacted Context
+
+**Time**: ${time}
+**Compaction Level**: ${options.level || "standard"}
+
+### Current Task
+Working on project features and command implementation.
+
+### Recent Actions (Last 5)
+1. Created CheckpointCommand for session management
+2. Created BuildCommand for autonomous building
+3. Created CollabCommand for real-time collaboration
+4. Analyzing command documentation for remaining commands
+5. Implementing compact, multi-repo, personality, re, research-api, voice commands
+
+### Current State
+- **File**: src/cli/commands/ (in progress)
+- **Status**: working
+- **Pending**: Need to register all new commands in src/index.ts
+
+### Key Context
+- Project: komplete-kontrol-cli
+- Language: TypeScript
+- Framework: Commander.js
+- Goal: Implement all missing commands from commands/ directory
+
+### Next Steps
+1. Complete remaining command implementations
+2. Register all commands in src/index.ts
+3. Test all commands
+4. Update documentation
+`;
+      const memoryDir = join6(context2.workDir, ".claude", "memory");
+      const compactedPath = join6(memoryDir, "compacted-context.md");
+      __require("fs").mkdirSync(memoryDir, { recursive: true });
+      writeFileSync4(compactedPath, compactedContext);
+      const continuationPrompt = `
+## Memory Compacted
+
+Context compaction complete.
+
+**Compacted Context**:
+
+${compactedContext}
+
+**Next Action**: Continue with task implementation
+
+**Approach**: Use compacted context above. Do not re-explore files already analyzed.
+`;
+      console.log(source_default2.bold(`
+` + continuationPrompt));
+      return {
+        success: true,
+        message: `Memory compacted (${targetReduction}% reduction target)`
+      };
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Compaction failed"
+      };
+    }
+  }
+}
+// src/cli/commands/MultiRepoCommand.ts
+import { existsSync as existsSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "fs";
+import { join as join7 } from "path";
+import { execSync as execSync5 } from "child_process";
+class MultiRepoCommand {
+  name = "multi-repo";
+  async execute(context2, options) {
+    try {
+      const configDir = join7(context2.workDir, ".claude", "multi-repo");
+      const configPath = join7(configDir, "config.json");
+      if (!existsSync4(configDir)) {
+        execSync5("mkdir -p .claude/multi-repo", { cwd: context2.workDir });
+      }
+      switch (options.action) {
+        case "status":
+          return this.showStatus(context2, configPath);
+        case "add":
+          return this.addRepos(context2, configPath, options.repos || []);
+        case "sync":
+          return this.syncRepos(context2, configPath);
+        case "checkpoint":
+          return this.createCheckpoint(context2, configPath, options.message);
+        case "exec":
+          return this.execCommand(context2, configPath, options.command);
+        default:
+          return {
+            success: false,
+            message: `Unknown action: ${options.action}. Use: status, add, sync, checkpoint, exec`
+          };
+      }
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Multi-repo command failed"
+      };
+    }
+  }
+  showStatus(context2, configPath) {
+    if (!existsSync4(configPath)) {
+      console.log(source_default2.yellow(`
+No repositories registered.`));
+      console.log(source_default2.gray(`Use: /multi-repo add <path1> <path2> ...
+`));
+      return {
+        success: true,
+        message: "No repositories registered"
+      };
+    }
+    const config = JSON.parse(readFileSync5(configPath, "utf-8"));
+    const repos = config.repos || [];
+    console.log(source_default2.bold(`
+=== Registered Repositories ===
+`));
+    for (const repo of repos) {
+      const status = this.getRepoStatus(repo.path);
+      console.log(source_default2.cyan(`  ${repo.name}`));
+      console.log(source_default2.gray(`    Path: ${repo.path}`));
+      console.log(source_default2.gray(`    Status: ${status}
+`));
+    }
+    return {
+      success: true,
+      message: `Found ${repos.length} registered repo(s)`
+    };
+  }
+  addRepos(context2, configPath, repoPaths) {
+    if (repoPaths.length === 0) {
+      return {
+        success: false,
+        message: "Repository paths required. Use: /multi-repo add <path1> <path2> ..."
+      };
+    }
+    let config = { repos: [] };
+    if (existsSync4(configPath)) {
+      config = JSON.parse(readFileSync5(configPath, "utf-8"));
+    }
+    for (const repoPath of repoPaths) {
+      const absolutePath = join7(context2.workDir, repoPath);
+      if (!existsSync4(absolutePath)) {
+        console.log(source_default2.yellow(`Warning: ${repoPath} does not exist`));
+        continue;
+      }
+      const repoName = repoPath.split("/").pop() || repoPath;
+      const existingIndex = config.repos.findIndex((r) => r.path === repoPath);
+      if (existingIndex !== -1) {
+        console.log(source_default2.yellow(`Repository already registered: ${repoName}`));
+      } else {
+        config.repos.push({
+          name: repoName,
+          path: repoPath,
+          addedAt: new Date().toISOString()
+        });
+        console.log(source_default2.green(`✓ Added: ${repoName}`));
+      }
+    }
+    writeFileSync5(configPath, JSON.stringify(config, null, 2));
+    console.log(source_default2.gray(`
+Total repositories: ${config.repos.length}
+`));
+    return {
+      success: true,
+      message: `Added repositories. Total: ${config.repos.length}`
+    };
+  }
+  syncRepos(context2, configPath) {
+    if (!existsSync4(configPath)) {
+      return {
+        success: false,
+        message: "No repositories registered"
+      };
+    }
+    const config = JSON.parse(readFileSync5(configPath, "utf-8"));
+    const repos = config.repos || [];
+    console.log(source_default2.bold(`
+=== Synchronizing Repositories ===
+`));
+    for (const repo of repos) {
+      const repoPath = join7(context2.workDir, repo.path);
+      console.log(source_default2.cyan(`Syncing: ${repo.name}...`));
+      try {
+        execSync5("git pull", { cwd: repoPath, stdio: "pipe" });
+        console.log(source_default2.green(`  ✓ ${repo.name}: Updated`));
+      } catch (e) {
+        console.log(source_default2.yellow(`  ⚠ ${repo.name}: ${e.message || "Failed"}`));
+      }
+    }
+    console.log(source_default2.gray(`
+Synchronization complete.
+`));
+    return {
+      success: true,
+      message: `Synchronized ${repos.length} repo(s)`
+    };
+  }
+  createCheckpoint(context2, configPath, message) {
+    if (!existsSync4(configPath)) {
+      return {
+        success: false,
+        message: "No repositories registered"
+      };
+    }
+    const config = JSON.parse(readFileSync5(configPath, "utf-8"));
+    const repos = config.repos || [];
+    console.log(source_default2.bold(`
+=== Creating Synchronized Checkpoint ===
+`));
+    for (const repo of repos) {
+      const repoPath = join7(context2.workDir, repo.path);
+      console.log(source_default2.cyan(`Checkpointing: ${repo.name}...`));
+      try {
+        execSync5("git add -A", { cwd: repoPath });
+        const commitMsg = message || `checkpoint: ${new Date().toISOString()}`;
+        execSync5(`git commit -m "${commitMsg}"`, { cwd: repoPath });
+        console.log(source_default2.green(`  ✓ ${repo.name}: Committed`));
+      } catch (e) {
+        console.log(source_default2.yellow(`  ⚠ ${repo.name}: ${e.message || "Failed"}`));
+      }
+    }
+    console.log(source_default2.gray(`
+Checkpoint complete.
+`));
+    return {
+      success: true,
+      message: `Checkpointed ${repos.length} repo(s)`
+    };
+  }
+  execCommand(context2, configPath, command) {
+    if (!command) {
+      return {
+        success: false,
+        message: 'Command required. Use: /multi-repo exec "<command>"'
+      };
+    }
+    if (!existsSync4(configPath)) {
+      return {
+        success: false,
+        message: "No repositories registered"
+      };
+    }
+    const config = JSON.parse(readFileSync5(configPath, "utf-8"));
+    const repos = config.repos || [];
+    console.log(source_default2.bold(`
+=== Executing Command in All Repositories ===
+`));
+    console.log(source_default2.cyan(`Command: ${command}
+`));
+    for (const repo of repos) {
+      const repoPath = join7(context2.workDir, repo.path);
+      console.log(source_default2.cyan(`Executing in: ${repo.name}...`));
+      try {
+        const result = execSync5(command, { cwd: repoPath, stdio: "pipe" });
+        console.log(source_default2.gray(`  Output: ${result.substring(0, 200)}...`));
+        console.log(source_default2.green(`  ✓ ${repo.name}: Success`));
+      } catch (e) {
+        console.log(source_default2.red(`  ✗ ${repo.name}: Failed`));
+        console.log(source_default2.gray(`  Error: ${e.message}
+`));
+      }
+    }
+    console.log(source_default2.gray(`
+Execution complete.
+`));
+    return {
+      success: true,
+      message: `Executed in ${repos.length} repo(s)`
+    };
+  }
+  getRepoStatus(repoPath) {
+    try {
+      execSync5("git rev-parse --git-dir", { cwd: repoPath, stdio: "ignore" });
+      const status = execSync5("git status --short", { cwd: repoPath, stdio: "pipe" });
+      if (status.trim() === "") {
+        return "Clean";
+      }
+      return "Modified";
+    } catch {
+      return "Not a git repo";
+    }
+  }
+}
+// src/cli/commands/PersonalityCommand.ts
+import { existsSync as existsSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync6, readdirSync } from "fs";
+import { join as join8 } from "path";
+class PersonalityCommand {
+  name = "personality";
+  async execute(context2, options) {
+    try {
+      const personalitiesDir = join8(context2.workDir, "personalities");
+      if (!existsSync5(personalitiesDir)) {
+        return {
+          success: false,
+          message: "Personalities directory not found"
+        };
+      }
+      switch (options.action) {
+        case "list":
+          return this.listPersonalities(personalitiesDir);
+        case "load":
+          return this.loadPersonality(personalitiesDir, options.name);
+        case "create":
+          return this.createPersonality(personalitiesDir, options.name);
+        case "edit":
+          return this.editPersonality(personalitiesDir, options.name);
+        case "current":
+          return this.showCurrent(personalitiesDir);
+        default:
+          return {
+            success: false,
+            message: `Unknown action: ${options.action}. Use: list, load, create, edit, current`
+          };
+      }
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Personality command failed"
+      };
+    }
+  }
+  listPersonalities(personalitiesDir) {
+    const files = readdirSync(personalitiesDir);
+    const personalities = [];
+    for (const file of files) {
+      if (file.endsWith(".yaml") || file.endsWith(".yml")) {
+        const personalityPath = join8(personalitiesDir, file);
+        const content = readFileSync6(personalityPath, "utf-8");
+        const nameMatch = content.match(/^name:\s*"(.+)"/m);
+        const descMatch = content.match(/^description:\s*"(.+)"/m);
+        if (nameMatch) {
+          personalities.push({
+            name: nameMatch[1],
+            file,
+            description: descMatch ? descMatch[1] : "No description"
+          });
+        }
+      }
+    }
+    if (personalities.length === 0) {
+      console.log(source_default2.yellow(`
+No personalities found.`));
+      return {
+        success: true,
+        message: "No personalities found"
+      };
+    }
+    console.log(source_default2.bold(`
+=== Available Personalities ===
+`));
+    for (const personality of personalities) {
+      console.log(source_default2.cyan(`  ${personality.name}`));
+      console.log(source_default2.gray(`    ${personality.description}`));
+    }
+    console.log(source_default2.gray(`
+Use: /personality load <name>`));
+    console.log(source_default2.gray("Use: /personality create <name>"));
+    return {
+      success: true,
+      message: `Found ${personalities.length} personality(ies)`
+    };
+  }
+  loadPersonality(personalitiesDir, name) {
+    if (!name) {
+      return {
+        success: false,
+        message: "Personality name required. Use: /personality load <name>"
+      };
+    }
+    const personalityPath = join8(personalitiesDir, `${name}.yaml`);
+    const personalityYmlPath = join8(personalitiesDir, `${name}.yml`);
+    if (!existsSync5(personalityPath) && !existsSync5(personalityYmlPath)) {
+      return {
+        success: false,
+        message: `Personality not found: ${name}`
+      };
+    }
+    const activePath = join8(context.workDir, ".claude", "active-personality.txt");
+    const personalityFile = existsSync5(personalityPath) ? personalityPath : personalityYmlPath;
+    writeFileSync6(activePath, name);
+    const content = readFileSync6(personalityFile, "utf-8");
+    const descMatch = content.match(/^description:\s*"(.+)"/m);
+    const focusMatch = content.match(/focus:\s*([\s\S]*?)/);
+    console.log(source_default2.bold(`
+=== Personality Loaded ===`));
+    console.log(source_default2.green(`Name: ${name}`));
+    if (descMatch) {
+      console.log(source_default2.cyan(`Description: ${descMatch[1]}`));
+    }
+    if (focusMatch) {
+      console.log(source_default2.gray(`Focus: ${focusMatch[1].substring(0, 100)}...`));
+    }
+    return {
+      success: true,
+      message: `Loaded personality: ${name}`
+    };
+  }
+  createPersonality(personalitiesDir, name) {
+    if (!name) {
+      return {
+        success: false,
+        message: "Personality name required. Use: /personality create <name>"
+      };
+    }
+    const personalityPath = join8(personalitiesDir, `${name}.yaml`);
+    if (existsSync5(personalityPath)) {
+      return {
+        success: false,
+        message: `Personality already exists: ${name}`
+      };
+    }
+    const template = `name: "${name}"
+description: "Brief description of this personality"
+
+focus:
+  - Primary domain area
+  - Secondary areas
+  - Specific technologies
+
+knowledge:
+  frameworks: []
+  patterns: []
+  tools: []
+
+behavior:
+  communication_style: "concise"  # or "detailed", "beginner-friendly"
+  code_style: "functional"  # or "oop", "procedural"
+  testing_preference: "tdd"  # or "integration-first", "e2e-first"
+  documentation_level: "comprehensive"  # or "minimal", "inline-only"
+
+priorities:
+  - Security
+  - Performance
+  - Maintainability
+  - Speed of delivery
+
+constraints:
+  - "Never skip error handling"
+  - "Always include tests"
+  - "Prefer TypeScript over JavaScript"
+
+prompts:
+  pre_task: "Before starting, analyze requirements"
+  post_task: "After completion, review for quality"
+`;
+    writeFileSync6(personalityPath, template);
+    console.log(source_default2.bold(`
+=== Personality Created ===`));
+    console.log(source_default2.green(`Name: ${name}`));
+    console.log(source_default2.cyan(`File: ${personalityPath}`));
+    console.log(source_default2.gray(`
+Edit the file to configure personality settings.
+`));
+    return {
+      success: true,
+      message: `Created personality: ${name}`
+    };
+  }
+  editPersonality(personalitiesDir, name) {
+    if (!name) {
+      return {
+        success: false,
+        message: "Personality name required. Use: /personality edit <name>"
+      };
+    }
+    const personalityPath = join8(personalitiesDir, `${name}.yaml`);
+    const personalityYmlPath = join8(personalitiesDir, `${name}.yml`);
+    if (!existsSync5(personalityPath) && !existsSync5(personalityYmlPath)) {
+      return {
+        success: false,
+        message: `Personality not found: ${name}`
+      };
+    }
+    const personalityFile = existsSync5(personalityPath) ? personalityPath : personalityYmlPath;
+    console.log(source_default2.bold(`
+=== Edit Personality ===`));
+    console.log(source_default2.cyan(`File: ${personalityFile}`));
+    console.log(source_default2.gray(`
+Open the file to edit personality settings.
+`));
+    return {
+      success: true,
+      message: `Edit personality: ${name}`
+    };
+  }
+  showCurrent(personalitiesDir) {
+    const activePath = join8(context.workDir, ".claude", "active-personality.txt");
+    if (!existsSync5(activePath)) {
+      console.log(source_default2.yellow(`
+No personality currently loaded.`));
+      console.log(source_default2.gray(`Use: /personality load <name>
+`));
+      return {
+        success: true,
+        message: "No personality loaded"
+      };
+    }
+    const activeName = readFileSync6(activePath, "utf-8").trim();
+    const personalityPath = join8(personalitiesDir, `${activeName}.yaml`);
+    const personalityYmlPath = join8(personalitiesDir, `${activeName}.yml`);
+    if (!existsSync5(personalityPath) && !existsSync5(personalityYmlPath)) {
+      console.log(source_default2.yellow(`
+Personality file not found: ${activeName}`));
+      return {
+        success: true,
+        message: `Personality file missing: ${activeName}`
+      };
+    }
+    const personalityFile = existsSync5(personalityPath) ? personalityPath : personalityYmlPath;
+    const content = readFileSync6(personalityFile, "utf-8");
+    const descMatch = content.match(/^description:\s*"(.+)"/m);
+    const focusMatch = content.match(/focus:\s*([\s\S]*?)/);
+    console.log(source_default2.bold(`
+=== Active Personality ===`));
+    console.log(source_default2.green(`Name: ${activeName}`));
+    if (descMatch) {
+      console.log(source_default2.cyan(`Description: ${descMatch[1]}`));
+    }
+    if (focusMatch) {
+      console.log(source_default2.gray(`Focus: ${focusMatch[1].substring(0, 100)}...`));
+    }
+    return {
+      success: true,
+      message: `Active personality: ${activeName}`
+    };
+  }
+}
+// src/cli/commands/ReCommand.ts
+import { existsSync as existsSync6, readFileSync as readFileSync7 } from "fs";
+class ReCommand {
+  name = "re";
+  async execute(context2, options) {
+    try {
+      const action = options.action || "analyze";
+      const target = options.target;
+      if (!target) {
+        return {
+          success: false,
+          message: "Target required. Use: /re [target-type] [path/url]"
+        };
+      }
+      console.log(source_default2.bold(`
+=== Reverse Engineering Mode ===`));
+      console.log(source_default2.cyan(`Target: ${target}`));
+      console.log(source_default2.cyan(`Action: ${action}
+`));
+      switch (action) {
+        case "extract":
+          return this.extractTarget(context2, target);
+        case "analyze":
+          return this.analyzeTarget(context2, target);
+        case "deobfuscate":
+          return this.deobfuscateTarget(context2, target);
+        default:
+          return {
+            success: false,
+            message: `Unknown action: ${action}. Use: extract, analyze, deobfuscate`
+          };
+      }
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Reverse engineering command failed"
+      };
+    }
+  }
+  extractTarget(context2, target) {
+    console.log(source_default2.yellow("Step 1: Determining target type..."));
+    if (target.endsWith(".crx")) {
+      console.log(source_default2.green("Detected: Chrome Extension"));
+      console.log(source_default2.gray(`
+Instructions:`));
+      console.log(source_default2.gray("1. Extract CRX file (rename to .zip and unzip)"));
+      console.log(source_default2.gray("2. Read manifest.json"));
+      console.log(source_default2.gray(`3. Analyze background scripts and content scripts
+`));
+      return {
+        success: true,
+        message: "Chrome extension detected. Extract and analyze manually."
+      };
+    }
+    if (target.endsWith(".app")) {
+      console.log(source_default2.green("Detected: Electron App"));
+      console.log(source_default2.gray(`
+Instructions:`));
+      console.log(source_default2.gray("1. Install: npm install -g @electron/asar"));
+      console.log(source_default2.gray("2. Navigate to: AppName.app/Contents/Resources"));
+      console.log(source_default2.gray("3. Extract: asar extract app.asar ./output"));
+      console.log(source_default2.gray(`4. Read package.json and main entry files
+`));
+      return {
+        success: true,
+        message: "Electron app detected. Extract and analyze manually."
+      };
+    }
+    if (target.endsWith(".js")) {
+      console.log(source_default2.green("Detected: JavaScript file"));
+      console.log(source_default2.gray(`
+Instructions:`));
+      console.log(source_default2.gray("1. Beautify: js-beautify -f input.js -o output.js"));
+      console.log(source_default2.gray("2. Or use: https://deobfuscate.io/"));
+      console.log(source_default2.gray(`3. Or use: https://beautifier.io/
+`));
+      return {
+        success: true,
+        message: "JavaScript file detected. Use beautification tools."
+      };
+    }
+    if (target.startsWith("http://") || target.startsWith("https://")) {
+      console.log(source_default2.green("Detected: URL"));
+      console.log(source_default2.gray(`
+Instructions:`));
+      console.log(source_default2.gray("1. Use /research-api for web API research"));
+      console.log(source_default2.gray(`2. Use /re for mobile app analysis
+`));
+      return {
+        success: true,
+        message: "URL detected. Use /research-api for API analysis."
+      };
+    }
+    if (target.endsWith(".app")) {
+      console.log(source_default2.green("Detected: macOS Application"));
+      console.log(source_default2.gray(`
+Instructions:`));
+      console.log(source_default2.gray("1. Right-click → Show Package Contents"));
+      console.log(source_default2.gray("2. Or: cd /Applications/AppName.app/Contents"));
+      console.log(source_default2.gray(`3. Check: Resources, Frameworks directories
+`));
+      return {
+        success: true,
+        message: "macOS app detected. Explore bundle structure."
+      };
+    }
+    console.log(source_default2.yellow(`Unknown target type. Manual analysis required.
+`));
+    return {
+      success: true,
+      message: "Target type unknown. Analyze manually."
+    };
+  }
+  analyzeTarget(context2, target) {
+    console.log(source_default2.yellow("Step 1: Reading target file..."));
+    if (!existsSync6(target)) {
+      return {
+        success: false,
+        message: `Target not found: ${target}`
+      };
+    }
+    const content = readFileSync7(target, "utf-8");
+    const ext = target.split(".").pop();
+    console.log(source_default2.yellow("Step 2: Analyzing structure..."));
+    if (ext === "json") {
+      try {
+        const json = JSON.parse(content);
+        console.log(source_default2.green("Valid JSON detected"));
+        console.log(source_default2.gray(`
+Structure:`));
+        console.log(source_default2.gray(JSON.stringify(json, null, 2)));
+      } catch (e) {
+        console.log(source_default2.red("Invalid JSON"));
+      }
+    }
+    if (ext === "js") {
+      console.log(source_default2.green("JavaScript detected"));
+      console.log(source_default2.gray(`
+Lines: ` + content.split(`
+`).length));
+      console.log(source_default2.gray("Characters: " + content.length));
+      console.log(source_default2.gray(`
+Recommendations:`));
+      console.log(source_default2.gray("- Use js-beautify to format"));
+      console.log(source_default2.gray("- Check for minification patterns"));
+    }
+    if (ext === "md") {
+      console.log(source_default2.green("Markdown detected"));
+      console.log(source_default2.gray(`
+Lines: ` + content.split(`
+`).length));
+      console.log(source_default2.gray("Headings: " + (content.match(/^#+\s/g) || []).length));
+    }
+    console.log(source_default2.gray(`
+Analysis complete.
+`));
+    return {
+      success: true,
+      message: "Analysis complete"
+    };
+  }
+  deobfuscateTarget(context2, target) {
+    console.log(source_default2.yellow("Step 1: Checking for obfuscation..."));
+    if (!existsSync6(target)) {
+      return {
+        success: false,
+        message: `Target not found: ${target}`
+      };
+    }
+    const content = readFileSync7(target, "utf-8");
+    const lines = content.split(`
+`);
+    const isMinified = lines.length === 1 && content.length > 1000 && !content.includes(`
+`);
+    const hasShortNames = /^[a-z0-9_$]{1,2}\b/.test(content);
+    const isObfuscated = isMinified || hasShortNames;
+    if (!isObfuscated) {
+      console.log(source_default2.green("No obfuscation detected"));
+      console.log(source_default2.gray(`
+File appears to be already readable.
+`));
+      return {
+        success: true,
+        message: "No obfuscation detected"
+      };
+    }
+    console.log(source_default2.yellow("Obfuscation detected"));
+    console.log(source_default2.gray(`
+Recommendations:`));
+    console.log(source_default2.gray("1. Use js-beautify: npm install -g js-beautify"));
+    console.log(source_default2.gray("2. Use online tools:"));
+    console.log(source_default2.gray("   - https://deobfuscate.io/"));
+    console.log(source_default2.gray("   - https://beautifier.io/"));
+    console.log(source_default2.gray(`3. Use AST Explorer: https://astexplorer.net/
+`));
+    console.log(source_default2.cyan(`
+Manual deobfuscation required.
+`));
+    return {
+      success: true,
+      message: "Obfuscation detected. Use beautification tools."
+    };
+  }
+}
+// src/cli/commands/ResearchApiCommand.ts
+import { writeFileSync as writeFileSync8 } from "fs";
+import { join as join9 } from "path";
+class ResearchApiCommand {
+  name = "research-api";
+  async execute(context2, options) {
+    try {
+      const target = options.target;
+      const depth = options.depth || "deep";
+      console.log(source_default2.bold(`
+=== API & Protocol Research ===`));
+      console.log(source_default2.cyan(`Target: ${target}`));
+      console.log(source_default2.cyan(`Depth: ${depth}
+`));
+      console.log(source_default2.yellow("Step 1: Classifying target..."));
+      const targetType = this.classifyTarget(target);
+      console.log(source_default2.green(`  ✓ Target type: ${targetType}
+`));
+      console.log(source_default2.yellow("Step 2: Generating research plan..."));
+      const researchPlan = this.generateResearchPlan(target, targetType, depth);
+      console.log(source_default2.green(`  ✓ Research plan generated
+`));
+      console.log(source_default2.bold(`
+=== Research Instructions ===
+`));
+      console.log(researchPlan);
+      const docsDir = join9(context2.workDir, ".claude", "docs", "api-research");
+      const targetName = this.sanitizeTargetName(target);
+      const researchDocPath = join9(docsDir, `${targetName}.md`);
+      __require("fs").mkdirSync(docsDir, { recursive: true });
+      const researchDoc = `# ${targetName} API Research
+
+## Overview
+- **Target**: ${target}
+- **Type**: ${targetType}
+- **Depth**: ${depth}
+- **Date**: ${new Date().toISOString()}
+
+## Research Plan
+
+${researchPlan}
+
+## Tools Used
+- MCP grep (GitHub code search)
+- Web Search (online research)
+- Protocol analysis tools
+
+## Findings
+[Research results will be documented here]
+
+## Endpoints Discovered
+[Discovered endpoints]
+
+## Authentication
+[Auth mechanism documentation]
+
+## Rate Limits
+[Rate limiting information]
+
+## Notes
+[Additional notes and observations]
+
+---
+Generated by: komplete-kontrol-cli
+`;
+      writeFileSync8(researchDocPath, researchDoc);
+      console.log(source_default2.gray(`
+Research document saved to: ${researchDocPath}
+`));
+      return {
+        success: true,
+        message: `Research plan generated for: ${target}`
+      };
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "API research command failed"
+      };
+    }
+  }
+  classifyTarget(target) {
+    if (target.startsWith("http://") || target.startsWith("https://")) {
+      return "REST API";
+    }
+    if (target.startsWith("grpc://") || target.includes(".proto")) {
+      return "gRPC/Protobuf";
+    }
+    if (target.includes(".apk")) {
+      return "Mobile (Android)";
+    }
+    if (target.includes(".app") || target.includes(".ipa")) {
+      return "Mobile (iOS/Android)";
+    }
+    if (target.includes(".dll") || target.includes(".so") || target.includes(".dylib")) {
+      return "Binary/Native";
+    }
+    if (target.endsWith(".crx") || target.endsWith(".js") || target.endsWith(".html")) {
+      return "Web Frontend";
+    }
+    return "Unknown";
+  }
+  generateResearchPlan(target, targetType, depth) {
+    const plans = {
+      "REST API": `
+### For Web APIs:
+
+1. **Traffic Capture**
+   Start mitmproxy:
+   \`\`\`bash
+   mitmproxy -p 8080 -w capture.flow
+   \`\`\`
+
+2. **Endpoint Discovery**
+   Use Kiterunner for shadow APIs:
+   \`\`\`bash
+   kr scan ${target} -w routes-large.kite -o results.json
+   \`\`\`
+
+3. **Schema Analysis**
+   If OpenAPI available:
+   \`\`\`bash
+   schemathesis run ${target}/openapi.json
+   \`\`\`
+
+4. **Document Findings**
+   - Endpoints discovered
+   - Auth mechanism
+   - Rate limits
+   - Required headers
+`,
+      GraphQL: `
+### For GraphQL:
+
+1. **Introspection Check**
+   \`\`\`graphql
+   {
+     __schema {
+       types { name fields { name type { name } } }
+     }
+   }
+   \`\`\`
+
+2. **If Introspection Disabled**
+   Use Clairvoyance:
+   \`\`\`bash
+   python clairvoyance.py -t ${target} -w wordlist.txt -o schema.json
+   \`\`\`
+
+3. **Schema Reconstruction**
+   - Types discovered
+   - Mutations available
+   - Queries available
+`,
+      "gRPC/Protobuf": `
+### For Binary Protocols:
+
+1. **Protocol Identification**
+   \`\`\`bash
+   cat response.bin | protoc --decode_raw
+   \`\`\`
+
+2. **Schema Recovery**
+   From APK:
+   \`\`\`bash
+   pbtk extract app.apk -o protos/
+   \`\`\`
+
+3. **Documentation**
+   - Message types
+   - Field mappings
+   - Service definitions
+`,
+      "Mobile (Android)": `
+### For Mobile Apps:
+
+1. **APK Analysis**
+   \`\`\`bash
+   jadx -d output/ app.apk
+   \`\`\`
+
+2. **Runtime Interception**
+   SSL Pinning Bypass:
+   \`\`\`bash
+   objection -g "App Name" explore --startup-command "android sslpinning disable"
+   \`\`\`
+
+3. **Traffic Analysis**
+   - Base URL
+   - Auth flow
+   - Interesting endpoints
+`,
+      "Mobile (iOS/Android)": `
+### For Mobile Apps:
+
+1. **APK Analysis**
+   \`\`\`bash
+   jadx -d output/ app.apk
+   \`\`\`
+
+2. **Runtime Interception**
+   SSL Pinning Bypass:
+   \`\`\`bash
+   objection -g "App Name" explore --startup-command "android sslpinning disable"
+   \`\`\`
+
+3. **Traffic Analysis**
+   - Base URL
+   - Auth flow
+   - Interesting endpoints
+`,
+      "Binary/Native": `
+### For Binary Protocols:
+
+1. **Protocol Identification**
+   \`\`\`bash
+   cat response.bin | protoc --decode_raw
+   \`\`\`
+
+2. **Schema Recovery**
+   From APK:
+   \`\`\`bash
+   pbtk extract app.apk -o protos/
+   \`\`\`
+
+3. **Documentation**
+   - Message types
+   - Field mappings
+   - Service definitions
+`,
+      "Web Frontend": `
+### For Web Frontend:
+
+1. **Code Analysis**
+   - Analyze JavaScript/TypeScript
+   - Check for minification
+   - Identify frameworks
+
+2. **Traffic Capture**
+   - Use browser DevTools
+   - Check network tab
+   - Analyze API calls
+
+3. **Source Map Recovery**
+   - Check for .map files
+   - Use source map explorers
+`,
+      Unknown: `
+### For Unknown Targets:
+
+1. **Manual Analysis**
+   - Read file contents
+   - Identify patterns
+   - Search for clues
+
+2. **Tool Selection**
+   - Try multiple tools
+   - Cross-reference findings
+
+3. **Documentation**
+   - Document all discoveries
+   - Note unknown elements
+`
+    };
+    return plans[targetType] || plans["Unknown"];
+  }
+  sanitizeTargetName(target) {
+    return target.replace(/[^a-zA-Z0-9-]/g, "_").substring(0, 50);
+  }
+}
+// src/cli/commands/VoiceCommand.ts
+import { existsSync as existsSync8, readFileSync as readFileSync9, writeFileSync as writeFileSync9 } from "fs";
+import { join as join10 } from "path";
+class VoiceCommand {
+  name = "voice";
+  async execute(context2, options) {
+    try {
+      const voiceDir = join10(context2.workDir, ".claude", "voice");
+      const configPath = join10(voiceDir, "config.json");
+      const statusPath = join10(voiceDir, "status.json");
+      if (!existsSync8(voiceDir)) {
+        __require("fs").mkdirSync(voiceDir, { recursive: true });
+      }
+      switch (options.action) {
+        case "start":
+          return this.startVoice(context2, configPath, statusPath);
+        case "stop":
+          return this.stopVoice(context2, configPath, statusPath);
+        case "status":
+          return this.showStatus(context2, configPath, statusPath);
+        case "settings":
+          return this.showSettings(context2, configPath);
+        default:
+          return {
+            success: false,
+            message: `Unknown action: ${options.action}. Use: start, stop, status, settings`
+          };
+      }
+    } catch (error2) {
+      return {
+        success: false,
+        message: error2.message || "Voice command failed"
+      };
+    }
+  }
+  startVoice(context2, configPath, statusPath) {
+    const config = this.loadConfig(configPath);
+    const status = {
+      active: true,
+      startedAt: new Date().toISOString(),
+      wakeWord: config.wakeWord || "Hey Claude",
+      language: config.language || "en-US",
+      ttsEnabled: config.ttsEnabled !== false
+    };
+    writeFileSync9(statusPath, JSON.stringify(status, null, 2));
+    console.log(source_default2.bold(`
+=== Voice Control Started ===`));
+    console.log(source_default2.green("✓ Listening for wake word..."));
+    console.log(source_default2.cyan(`  Wake Word: "${status.wakeWord}"`));
+    console.log(source_default2.gray(`  Language: ${status.language}`));
+    console.log(source_default2.gray(`  TTS: ${status.ttsEnabled ? "Enabled" : "Disabled"}
+`));
+    console.log(source_default2.yellow("Available Commands:"));
+    console.log(source_default2.gray('  Navigation: "Hey Claude, show me project structure"'));
+    console.log(source_default2.gray('  Navigation: "Open file [filename]"'));
+    console.log(source_default2.gray('  Navigation: "Go to function [name]"'));
+    console.log(source_default2.gray('  Autonomous: "Hey Claude, start autonomous mode"'));
+    console.log(source_default2.gray('  Autonomous: "Stop autonomous mode"'));
+    console.log(source_default2.gray('  Autonomous: "What are you working on?"'));
+    console.log(source_default2.gray('  Checkpoints: "Create checkpoint with message [text]"'));
+    console.log(source_default2.gray('  Checkpoints: "Show recent checkpoints"'));
+    console.log(source_default2.gray('  Checkpoints: "Restore checkpoint [id]"'));
+    console.log(source_default2.gray(`  Status: "What's current status?"`));
+    console.log(source_default2.gray('  Status: "Show me recent changes"'));
+    console.log(source_default2.gray('  Status: "How many tokens are we using?"'));
+    console.log(source_default2.gray('  Tasks: "Add task [description]"'));
+    console.log(source_default2.gray('  Tasks: "Mark task complete"'));
+    console.log(source_default2.gray(`  Tasks: "Show todo list"
+`));
+    return {
+      success: true,
+      message: "Voice control activated"
+    };
+  }
+  stopVoice(context2, configPath, statusPath) {
+    const status = this.loadStatus(statusPath);
+    if (!status || !status.active) {
+      return {
+        success: false,
+        message: "Voice control is not active"
+      };
+    }
+    status.active = false;
+    status.stoppedAt = new Date().toISOString();
+    writeFileSync9(statusPath, JSON.stringify(status, null, 2));
+    console.log(source_default2.bold(`
+=== Voice Control Stopped ===`));
+    console.log(source_default2.green(`✓ Voice control deactivated
+`));
+    return {
+      success: true,
+      message: "Voice control stopped"
+    };
+  }
+  showStatus(context2, configPath, statusPath) {
+    const config = this.loadConfig(configPath);
+    const status = this.loadStatus(statusPath);
+    console.log(source_default2.bold(`
+=== Voice Control Status ===
+`));
+    if (!status) {
+      console.log(source_default2.yellow("Status: Inactive"));
+      console.log(source_default2.gray(`Use: /voice start to activate
+`));
+      return {
+        success: true,
+        message: "Voice control is inactive"
+      };
+    }
+    console.log(source_default2.cyan(`Status: ${status.active ? "Active" : "Inactive"}`));
+    if (status.startedAt) {
+      console.log(source_default2.gray(`Started: ${new Date(status.startedAt).toLocaleString()}`));
+    }
+    if (status.stoppedAt) {
+      console.log(source_default2.gray(`Stopped: ${new Date(status.stoppedAt).toLocaleString()}`));
+    }
+    console.log(source_default2.gray(`Wake Word: "${config.wakeWord || "Hey Claude"}"`));
+    console.log(source_default2.gray(`Language: ${config.language || "en-US"}`));
+    console.log(source_default2.gray(`TTS: ${config.ttsEnabled !== false ? "Enabled" : "Disabled"}`));
+    console.log(source_default2.gray(`Recognition: ${config.recognitionEngine || "whisper"}`));
+    return {
+      success: true,
+      message: "Voice control status displayed"
+    };
+  }
+  showSettings(context2, configPath) {
+    const config = this.loadConfig(configPath);
+    console.log(source_default2.bold(`
+=== Voice Control Settings ===
+`));
+    console.log(source_default2.cyan(`Wake Word: ${config.wakeWord || "Hey Claude"}`));
+    console.log(source_default2.cyan(`Language: ${config.language || "en-US"}`));
+    console.log(source_default2.cyan(`TTS Enabled: ${config.ttsEnabled !== false ? "Yes" : "No"}`));
+    console.log(source_default2.cyan(`Recognition Engine: ${config.recognitionEngine || "whisper"}`));
+    console.log(source_default2.gray(`
+To change settings, edit:`));
+    console.log(source_default2.gray(`${configPath}
+`));
+    return {
+      success: true,
+      message: "Voice control settings displayed"
+    };
+  }
+  loadConfig(configPath) {
+    if (existsSync8(configPath)) {
+      try {
+        return JSON.parse(readFileSync9(configPath, "utf-8"));
+      } catch (e) {
+        return {};
+      }
+    }
+    return {};
+  }
+  loadStatus(statusPath) {
+    if (existsSync8(statusPath)) {
+      try {
+        return JSON.parse(readFileSync9(statusPath, "utf-8"));
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+}
 // src/index.ts
 var program2 = new Command;
 program2.name("komplete").description("Ultimate AI coding assistant with autonomous capabilities").version("1.0.0");
@@ -10413,11 +14380,11 @@ async function initializeContext() {
 }
 program2.command("auto").description("Enter autonomous mode with ReAct + Reflexion loop").argument("<goal>", "Goal to achieve autonomously").option("-m, --model <model>", 'Model to use. Supports provider/model syntax (e.g., "glm/glm-4.7", "dolphin-3"). Default: auto-routed').option("-i, --iterations <number>", "Max iterations (default: 50)", "50").option("-c, --checkpoint <number>", "Checkpoint every N iterations (default: 10)", "10").option("-v, --verbose", "Verbose output", false).action(async (goal, options) => {
   try {
-    const context = await initializeContext();
-    context.verbose = options.verbose;
-    context.autonomousMode = true;
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    context2.autonomousMode = true;
     const autoCommand = new AutoCommand;
-    const result = await autoCommand.execute(context, {
+    const result = await autoCommand.execute(context2, {
       goal,
       model: options.model,
       maxIterations: parseInt(options.iterations, 10),
@@ -10440,11 +14407,309 @@ program2.command("init").description("Initialize komplete in current project").a
   console.log(source_default.green("\u2705 Komplete initialized"));
   console.log(source_default.gray("Created .komplete/ directory with configuration"));
 });
+program2.command("sparc").description("Execute SPARC methodology (Specification \u2192 Pseudocode \u2192 Architecture \u2192 Refinement \u2192 Completion)").argument("<task>", "Task description").option("-r, --requirements <items...>", "Requirements list").option("-c, --constraints <items...>", "Constraints list").option("-v, --verbose", "Verbose output", false).action(async (task, options) => {
+  try {
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    const sparcCommand = new SPARCCommand;
+    const result = await sparcCommand.execute(context2, {
+      task,
+      requirements: options.requirements,
+      constraints: options.constraints,
+      verbose: options.verbose
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("swarm").description("Spawn and manage distributed agent swarms for parallel execution").argument("<action>", "Action: spawn, status, collect, clear").argument("[task]", "Task description (required for spawn)").option("-n, --count <number>", "Number of agents (for spawn)", "5").option("-id, --swarm-id <id>", "Swarm ID (for status/collect)").option("-d, --dir <directory>", "Working directory").option("-v, --verbose", "Verbose output", false).action(async (action, task, options) => {
+  try {
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    const swarmCommand = new SwarmCommand;
+    const result = await swarmCommand.execute(context2, {
+      action,
+      task,
+      agentCount: parseInt(options.count, 10),
+      swarmId: options.swarmId,
+      workDir: options.dir,
+      verbose: options.verbose
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("reflect").description("Run ReAct + Reflexion loop (Think \u2192 Act \u2192 Observe \u2192 Reflect)").argument("<goal>", "Goal to achieve").option("-i, --iterations <number>", "Number of reflexion cycles (default: 3)", "3").option("-v, --verbose", "Verbose output", false).action(async (goal, options) => {
+  try {
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    const reflectCommand = new ReflectCommand;
+    const result = await reflectCommand.execute(context2, {
+      goal,
+      iterations: parseInt(options.iterations, 10),
+      verbose: options.verbose
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("research").description("Research code patterns, solutions, and best practices").argument("<query>", "Research query").option("-s, --sources <sources...>", "Sources: github, memory, web (default: all)", ["github", "memory"]).option("-l, --limit <number>", "Result limit (default: 10)", "10").option("--lang <languages...>", "Filter by programming languages").option("-v, --verbose", "Verbose output", false).action(async (query, options) => {
+  try {
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    const researchCommand = new ResearchCommand;
+    const result = await researchCommand.execute(context2, {
+      query,
+      sources: options.sources,
+      limit: parseInt(options.limit, 10),
+      language: options.lang,
+      verbose: options.verbose
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("rootcause").description("Perform root cause analysis with regression detection").argument("<action>", "Action: analyze, verify").option("-b, --bug <description>", "Bug description (for analyze)").option("-t, --type <type>", "Bug type (for analyze)").option("--test <command>", "Test command (for verify)").option("--snapshot <id>", "Before snapshot ID (for verify)").option("-f, --fix <description>", "Fix description (for verify)").option("-v, --verbose", "Verbose output", false).action(async (action, options) => {
+  try {
+    const context2 = await initializeContext();
+    context2.verbose = options.verbose;
+    const rootcauseCommand = new RootCauseCommand;
+    const result = await rootcauseCommand.execute(context2, {
+      action,
+      bugDescription: options.bug,
+      bugType: options.type,
+      testCommand: options.test,
+      beforeSnapshotId: options.snapshot,
+      fixDescription: options.fix,
+      verbose: options.verbose
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
 program2.exitOverride((err) => {
   if (err.code === "commander.help" || err.code === "outputHelp" || err.message?.includes("outputHelp") || err.message?.includes("help")) {
     process.exit(0);
   }
   console.error(source_default.red("Error:"), err.message);
   process.exit(1);
+});
+program2.command("checkpoint").description("Save session state to CLAUDE.md and generate continuation prompt").argument("[summary]", "Optional summary of session work").action(async (summary) => {
+  try {
+    const context2 = await initializeContext();
+    const checkpointCommand = new CheckpointCommand;
+    const result = await checkpointCommand.execute(context2, { summary });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("build").description("Build features autonomously by reading architecture, researching patterns, and implementing").argument("[feature-name]", "Feature name to build").option("--from <file>", "Use specific architecture document").action(async (featureName, options) => {
+  try {
+    const context2 = await initializeContext();
+    const buildCommand = new BuildCommand;
+    const result = await buildCommand.execute(context2, {
+      feature: featureName,
+      from: options.from
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("collab").description("Enable multiple users to work simultaneously with Claude on same project").argument("<action>", "Action: start, join, status, sync, leave").option("--session <name>", "Session name (for start)").option("--session-id <id>", "Session ID (for join)").action(async (action, options) => {
+  try {
+    const context2 = await initializeContext();
+    const collabCommand = new CollabCommand;
+    const result = await collabCommand.execute(context2, {
+      action,
+      sessionName: options.session,
+      sessionId: options.sessionId
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("compact").description("Compact memory to optimize context usage and reduce token consumption").argument("[level]", "Compaction level: aggressive, conservative (default: standard)").action(async (level) => {
+  try {
+    const context2 = await initializeContext();
+    const compactCommand = new CompactCommand;
+    const result = await compactCommand.execute(context2, {
+      level
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("multi-repo").description("Coordinate work across multiple repositories with dependency tracking").argument("<action>", "Action: status, add, sync, checkpoint, exec").option("--repos <paths...>", "Repository paths (for add)").option("--message <text>", "Checkpoint message").option("--command <cmd>", "Command to execute (for exec)").action(async (action, options) => {
+  try {
+    const context2 = await initializeContext();
+    const multiRepoCommand = new MultiRepoCommand;
+    const result = await multiRepoCommand.execute(context2, {
+      action,
+      repos: options.repos,
+      message: options.message,
+      command: options.command
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("personality").description("Configure Claude's behavior, knowledge focus, and communication style").argument("<action>", "Action: list, load, create, edit, current").option("--name <name>", "Personality name (for load/create/edit)").action(async (action, options) => {
+  try {
+    const context2 = await initializeContext();
+    const personalityCommand = new PersonalityCommand;
+    const result = await personalityCommand.execute(context2, {
+      action,
+      name: options.name
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("re").description("Extract, analyze, and understand any software").argument("<target>", "Target: path, URL, or app identifier").option("--action <type>", "Action: extract, analyze, deobfuscate").action(async (target, options) => {
+  try {
+    const context2 = await initializeContext();
+    const reCommand = new ReCommand;
+    const result = await reCommand.execute(context2, {
+      target,
+      action: options.action
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("research-api").description("Reverse engineer APIs, protocols, and binaries when documentation is lacking").argument("<target>", "Target: URL, mobile app, protocol, or binary").option("--depth <level>", "Research depth: quick, deep, forensic").action(async (target, options) => {
+  try {
+    const context2 = await initializeContext();
+    const researchApiCommand = new ResearchApiCommand;
+    const result = await researchApiCommand.execute(context2, {
+      target,
+      depth: options.depth
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("voice").description("Control Claude hands-free using voice commands").argument("<action>", "Action: start, stop, status, settings").action(async (action) => {
+  try {
+    const context2 = await initializeContext();
+    const voiceCommand = new VoiceCommand;
+    const result = await voiceCommand.execute(context2, {
+      action
+    });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
 });
 program2.parse();

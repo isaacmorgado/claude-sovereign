@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SWARM_DIR="${HOME}/.claude/swarm"
 SWARM_STATE="${SWARM_DIR}/swarm-state.json"
 LOG_FILE="${HOME}/.claude/logs/swarm.log"
+AUTONOMOUS_COMMAND_ROUTER="${SCRIPT_DIR}/autonomous-command-router.sh"
 
 # Configuration
 MAX_AGENTS="${SWARM_MAX_AGENTS:-10}"
@@ -1129,6 +1130,31 @@ terminate_swarm() {
 }
 
 # ============================================================================
+# AUTONOMOUS COMMAND ROUTER INTEGRATION
+# ============================================================================
+
+check_swarm_completion_triggers() {
+    local swarm_id="$1"
+    local agent_count="$2"
+
+    log "Checking swarm completion triggers for: $swarm_id"
+
+    if [[ ! -x "$AUTONOMOUS_COMMAND_ROUTER" ]]; then
+        log "Autonomous command router not available"
+        return 1
+    fi
+
+    # After swarm completion, check if checkpoint is needed
+    local decision
+    decision=$("$AUTONOMOUS_COMMAND_ROUTER" execute "swarm_complete" "swarm:$swarm_id,agents:$agent_count" 2>/dev/null || echo '{"execute_skill":"none"}')
+
+    log "Router decision: $decision"
+
+    # Output decision for Claude to process
+    echo "$decision"
+}
+
+# ============================================================================
 # CLI Interface
 # ============================================================================
 
@@ -1171,6 +1197,10 @@ case "${1:-help}" in
         terminate_swarm
         ;;
 
+    check-triggers)
+        check_swarm_completion_triggers "${2:-swarm_id}" "${3:-5}"
+        ;;
+
     check-deps|deps)
         check_dependencies
         ;;
@@ -1211,6 +1241,7 @@ STATUS & RESULTS:
   status          Show swarm status and agent states
   collect         Collect and aggregate results from agents
   terminate       Stop all agents and terminate swarm
+  check-triggers   Check autonomous command triggers after swarm completion
 
 DIAGNOSTICS:
   check-deps      Check dependencies (jq, git) and MCP availability
@@ -1221,6 +1252,7 @@ WORKFLOW (Claude executes automatically):
   2. Claude reads output and spawns Task agents IN PARALLEL
   3. Each agent writes results to their result.json
   4. Run: swarm-orchestrator.sh collect
+  5. After collection, autonomous-command-router.sh checks if checkpoint needed
 
 CONFIGURATION:
   SWARM_MAX_AGENTS=10       Max agents per swarm

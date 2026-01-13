@@ -148,15 +148,44 @@ export class ResearchCommand extends BaseCommand {
    * Search GitHub for code examples
    */
   private async searchGitHub(config: ResearchConfig): Promise<any[]> {
-    // Note: This would use GitHub MCP tools if available
-    // For now, return placeholder
-    return [
-      {
-        repo: 'example/repo',
-        path: 'src/example.ts',
-        description: 'Example result (GitHub MCP integration pending)'
-      }
-    ];
+    try {
+      // Attempt to use GitHub MCP if available (via grep MCP server)
+      // This would require the grep MCP server to be configured in Claude Code
+      // For now, we use a structured fallback approach
+
+      // TODO: When GitHub MCP is configured, use:
+      // const results = await mcpClient.searchGitHub(config.query, {
+      //   limit: config.limit || 10,
+      //   languages: config.language
+      // });
+
+      // Fallback: Return structured placeholder that matches expected format
+      this.warn('GitHub MCP integration not available - using mock data');
+      this.info('To enable: Configure GitHub MCP server in ~/.claude/config.json');
+
+      return [
+        {
+          repo: 'anthropics/anthropic-sdk-typescript',
+          path: 'src/resources/messages.ts',
+          description: `Code example for: ${config.query} (mock result)`,
+          url: `https://github.com/search?q=${encodeURIComponent(config.query)}`,
+          language: config.language?.[0] || 'typescript',
+          score: 0.9
+        },
+        {
+          repo: 'vercel/next.js',
+          path: 'packages/next/src/server/api.ts',
+          description: `Related implementation: ${config.query} (mock result)`,
+          url: `https://github.com/search?q=${encodeURIComponent(config.query)}`,
+          language: config.language?.[0] || 'typescript',
+          score: 0.85
+        }
+      ];
+    } catch (error) {
+      const err = error as Error;
+      this.warn(`GitHub search failed: ${err.message}`);
+      return [];
+    }
   }
 
   /**
@@ -169,20 +198,53 @@ export class ResearchCommand extends BaseCommand {
   ): Promise<string> {
     const prompt = this.buildSummaryPrompt(query, results);
 
-    const response = await context.llmRouter.route(
-      {
-        messages: [{ role: 'user', content: prompt }],
-        system: 'You are a research assistant. Provide concise, actionable summaries.',
-        max_tokens: 1000
-      },
-      {
-        taskType: 'general',
-        priority: 'quality'
-      }
-    );
+    try {
+      const response = await context.llmRouter.route(
+        {
+          messages: [{ role: 'user', content: prompt }],
+          system: 'You are a research assistant. Provide concise, actionable summaries.',
+          max_tokens: 1000
+        },
+        {
+          taskType: 'general',
+          priority: 'quality'
+        }
+      );
 
-    const firstContent = response.content[0];
-    return firstContent.type === 'text' ? firstContent.text : 'Summary unavailable';
+      const firstContent = response.content[0];
+      return firstContent.type === 'text' ? firstContent.text : 'Summary unavailable';
+    } catch (error) {
+      const err = error as Error;
+      // If LLM fails, provide a basic summary from the results
+      this.warn(`LLM summary generation failed: ${err.message}`);
+      return this.createBasicSummary(query, results);
+    }
+  }
+
+  /**
+   * Create a basic summary when LLM is unavailable
+   */
+  private createBasicSummary(query: string, results: any): string {
+    const parts: string[] = [];
+    parts.push(`Research query: "${query}"`);
+    parts.push('');
+
+    if (results.sources.memory && results.sources.memory.length > 0) {
+      parts.push(`Found ${results.sources.memory.length} related items in memory.`);
+    }
+
+    if (results.sources.github && results.sources.github.length > 0) {
+      parts.push(`Found ${results.sources.github.length} GitHub code examples.`);
+    }
+
+    if (parts.length === 1) {
+      parts.push('No results found. Try a different query or check your sources.');
+    } else {
+      parts.push('');
+      parts.push('Review the detailed results above for specific examples and patterns.');
+    }
+
+    return parts.join('\n');
   }
 
   /**

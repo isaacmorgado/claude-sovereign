@@ -49,7 +49,7 @@ export class SPARCCommand extends BaseCommand {
         constraints: config.constraints || []
       };
 
-      const workflow = new SPARCWorkflow(sparcContext);
+      const workflow = new SPARCWorkflow(sparcContext, context.llmRouter);
 
       // Execute workflow with progress tracking
       this.startSpinner('Executing SPARC workflow...');

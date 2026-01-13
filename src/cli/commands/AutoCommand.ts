@@ -298,8 +298,9 @@ Provide your reasoning and proposed action.
     const allSuccessful = recentCycles.every(c => c.success);
 
     if (allSuccessful && recentCycles.length >= 3) {
-      // Use LLM to verify goal achievement
-      const verificationPrompt = `
+      try {
+        // Use LLM to verify goal achievement
+        const verificationPrompt = `
 Goal: ${goal}
 
 Recent actions and results:
@@ -312,21 +313,26 @@ Result: ${c.observation}
 Has the goal been achieved? Answer with just "YES" or "NO" and brief explanation.
 `.trim();
 
-      const response = await context.llmRouter.route(
-        {
-          messages: [{ role: 'user', content: verificationPrompt }],
-          system: 'You are evaluating if a goal has been achieved. Be objective.'
-        },
-        {
-          taskType: 'reasoning',
-          priority: 'speed'
-        }
-      );
+        const response = await context.llmRouter.route(
+          {
+            messages: [{ role: 'user', content: verificationPrompt }],
+            system: 'You are evaluating if a goal has been achieved. Be objective.'
+          },
+          {
+            taskType: 'reasoning',
+            priority: 'speed'
+          }
+        );
 
-      // Extract text from response
-      const firstContent = response.content[0];
-      const answer = firstContent.type === 'text' ? firstContent.text : 'NO';
-      return answer.toUpperCase().startsWith('YES');
+        // Extract text from response
+        const firstContent = response.content[0];
+        const answer = firstContent.type === 'text' ? firstContent.text : 'NO';
+        return answer.toUpperCase().startsWith('YES');
+      } catch (error) {
+        // If LLM verification fails, use simple heuristic
+        this.warn('LLM verification unavailable, using heuristic');
+        return allSuccessful && recentCycles.length >= 3;
+      }
     }
 
     return false;
