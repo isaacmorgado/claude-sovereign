@@ -26,13 +26,13 @@ export class PersonalityCommand {
         case 'list':
           return this.listPersonalities(personalitiesDir);
         case 'load':
-          return this.loadPersonality(personalitiesDir, options.name);
+          return this.loadPersonality(context, personalitiesDir, options.name);
         case 'create':
           return this.createPersonality(personalitiesDir, options.name);
         case 'edit':
           return this.editPersonality(personalitiesDir, options.name);
         case 'current':
-          return this.showCurrent(personalitiesDir);
+          return this.showCurrent(context, personalitiesDir);
         default:
           return {
             success: false,
@@ -92,7 +92,7 @@ export class PersonalityCommand {
     };
   }
 
-  private loadPersonality(personalitiesDir: string, name?: string): CommandResult {
+  private loadPersonality(context: CommandContext, personalitiesDir: string, name?: string): CommandResult {
     if (!name) {
       return {
         success: false,
@@ -229,7 +229,7 @@ prompts:
     };
   }
 
-  private showCurrent(personalitiesDir: string): CommandResult {
+  private showCurrent(context: CommandContext, personalitiesDir: string): CommandResult {
     const activePath = join(context.workDir, '.claude', 'active-personality.txt');
 
     if (!existsSync(activePath)) {
