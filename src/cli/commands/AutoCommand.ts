@@ -425,6 +425,34 @@ export class AutoCommand extends BaseCommand {
   }
 
   /**
+   * Perform /re command for reverse engineering tasks
+   */
+  private async performReCommand(context: CommandContext, goal: string): Promise<void> {
+    this.info('🔬 Reverse engineering command triggered');
+
+    try {
+      // Determine target from goal
+      const targetMatch = goal.match(/(?:analyze|extract|deobfuscate|understand)\s+(.+?)(?:\s|$)/i);
+      const target = targetMatch ? targetMatch[1] : '.';
+
+      const result = await this.reCommand.execute(context, {
+        action: 'analyze',
+        target: target
+      });
+      
+      if (result.success) {
+        this.success('Reverse engineering analysis complete');
+      } else {
+        this.warn('Reverse engineering analysis failed (continuing anyway)');
+      }
+      
+      this.lastReIteration = this.iterations;
+    } catch (error) {
+      this.warn('Reverse engineering command failed (continuing anyway)');
+    }
+  }
+
+  /**
    * Execute one ReAct + Reflexion cycle
    */
   private async executeReflexionCycle(

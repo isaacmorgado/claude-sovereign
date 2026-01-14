@@ -1,6 +1,6 @@
 # 🗂️ Project Structure: .
 
-**Generated**: 2026-01-13 17:55:45
+**Generated**: 2026-01-13 18:57:12
 **Purpose**: Quick navigation reference for Claude (token-efficient)
 
 ---
@@ -52,7 +52,10 @@
 │   └── 📄 7731983317421308213
 └── 📄 CACHEDIR.TAG
 ├── 📄 ACCURATE-INTEGRATION-STATUS.md
+├── 📄 AUTO-COMMAND-BLOCKING-ANALYSIS.md
 ├── 📄 AUTO-COMMAND-COMPREHENSIVE-TEST-REPORT.md
+├── 📄 AUTO-COMMAND-ENHANCEMENT-COMPLETE.md
+├── 📄 AUTO-COMMAND-FIX-VERIFIED.md
 ├── 📄 AUTO-COMMAND-TEST-LOG.md
 ├── 📄 AUTO-COMMAND-TEST-REPORT.md
 ├── 📄 AUTO-INTEGRATION-AND-TESTING-SUMMARY.md
@@ -70,12 +73,18 @@
 ├── 📄 checkpoint.md
 ├── 📄 collab.md
 ├── 📄 compact.md
+├── 📄 init.md
 ├── 📄 multi-repo.md
 ├── 📄 personality.md
 ├── 📄 re.md
+├── 📄 reflect.md
 ├── 📄 research-api.md
+├── 📄 research.md
+├── 📄 rootcause.md
+├── 📄 sparc.md
 ├── 📄 swarm.md
 └── 📄 voice.md
+├── 📄 COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
 ├── 📄 COMPREHENSIVE-TEST-FINDINGS.md
 ├── 📁 config/
 └── 📄 CLAUDE.md
@@ -83,12 +92,14 @@
 ├── 📁 docs/
 ├── 📄 100-PERCENT-HANDS-OFF-OPERATION.md
 ├── 📄 40-PERCENT-FLOW-VERIFIED.md
+├── 📄 AUTO-COMMAND-SKILL-INTEGRATION.md
 ├── 📄 GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md
 └── 📄 PROJECT-NAVIGATOR-GUIDE.md
 ├── 📄 END-TO-END-TESTING-STATUS.md
 ├── 📄 FEATURES-V2.md
 ├── 📄 FINAL-VERIFICATION-REPORT.md
 ├── 📄 GLM-INTEGRATION-COMPLETE.md
+├── 📄 hello.ts
 ├── 📄 HONEST-TEST-REPORT.md
 ├── 📁 hooks/
 ├── 📁 .claude/
@@ -128,6 +139,7 @@
 ├── 📁 plans 2/
 └── 📄 ULTIMATE-TOOL-INTEGRATION-PLAN.md
 ├── 📄 QUICK-TEST-GUIDE.md
+├── 📄 QUICKSTART-AUTO-MODE.md
 ├── 📄 QUICKSTART.md
 ├── 📄 RE-TOOLS-AUTO-INTEGRATION-TEST.md
 ├── 📄 RE-TOOLS-INTEGRATION-FINAL-REPORT.md
@@ -146,6 +158,7 @@
 │   │   ├── 📄 BuildCommand.ts
 │   │   ├── 📄 CheckpointCommand.ts
 │   │   ├── 📄 CollabCommand.ts
+│   │   ├── 📄 CommitCommand.ts
 │   │   ├── 📄 CompactCommand.ts
 │   │   ├── 📄 index.ts
 │   │   ├── 📄 MultiRepoCommand.ts
@@ -161,6 +174,7 @@
 │   └── 📄 types.ts
 ├── 📁 core/
 │   ├── 📁 agents/
+│   │   ├── 📄 ActionExecutor.ts
 │   │   ├── 📁 reflexion/
 │   │   └── 📁 swarm/
 │   ├── 📁 debug/
@@ -177,6 +191,12 @@
 │   │   ├── 📄 Router.ts
 │   │   ├── 📄 Streaming.ts
 │   │   ├── 📄 ToolEmulator.ts
+│   │   └── 📄 types.ts
+│   ├── 📁 logging/
+│   │   ├── 📄 cli.ts
+│   │   ├── 📄 FileRotation.ts
+│   │   ├── 📁 formatters/
+│   │   ├── 📄 Logger.ts
 │   │   └── 📄 types.ts
 │   ├── 📁 quality/
 │   │   └── 📁 judge/
@@ -196,10 +216,21 @@
 ├── 📄 test-auto-features.test.ts
 ├── 📄 test-cli-features.ts
 ├── 📄 TEST-EXECUTION-REPORT.md
+├── 📄 test-invalid.ts
 ├── 📄 test-llm-integration.ts
 ├── 📁 test-results/
 ├── 📄 TEST-RESULTS.md
+├── 📄 test.ts
 ├── 📄 TESTING-GUIDE.md
+├── 📁 tests/
+├── 📄 action-executor-test.ts
+├── 📄 comprehensive-auto-test-simple.ts
+├── 📄 comprehensive-auto-test.ts
+├── 📁 core/
+│   └── 📁 logging/
+│   │   ├── 📄 FileRotation.test.ts
+│   │   └── 📄 Logger.test.ts
+└── 📄 typescript-validation-test.ts
 ├── 📄 tsconfig.json
 ├── 📄 TYPESCRIPT-CLI-COMPLETE.md
 ├── 📄 TYPESCRIPT-MIGRATION-STATUS.md
@@ -227,6 +258,8 @@
 • ./config/CLAUDE.md
 • ./CLAUDE.md
 • ./FINAL-VERIFICATION-REPORT.md
+• ./AUTO-COMMAND-FIX-VERIFIED.md
+• ./AUTO-COMMAND-BLOCKING-ANALYSIS.md
 • ./CLI-IMPLEMENTATION-SUMMARY.md
 • ./V2-IMPLEMENTATION-SUMMARY.md
 • ./END-TO-END-TESTING-STATUS.md
@@ -237,9 +270,11 @@
 • ./config/CLAUDE.md
 • ./IMPLEMENTATION-SUMMARY.md
 • ./AUTO-MODE-INTEGRATION-VERIFIED.md
+• ./QUICKSTART-AUTO-MODE.md
 • ./INTEGRATION-FIXES.md
 • ./QUICKSTART.md
 • ./COMMAND-USAGE-GUIDE.md
+• ./COMPREHENSIVE-AUTO-COMMAND-TEST-REPORT-2026-01-13.md
 • ./.claude/auto-continue.local.md
 • ./.claude/project-index.md
 • ./COMPREHENSIVE-TEST-FINDINGS.md
@@ -248,11 +283,14 @@
 • ./docs/GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md
 • ./docs/40-PERCENT-FLOW-VERIFIED.md
 • ./docs/PROJECT-NAVIGATOR-GUIDE.md
+• ./docs/AUTO-COMMAND-SKILL-INTEGRATION.md
 • ./docs/100-PERCENT-HANDS-OFF-OPERATION.md
 • ./RE-TOOLS-AUTO-INTEGRATION-TEST.md
+• ./AUTO-COMMAND-ENHANCEMENT-COMPLETE.md
 • ./FEATURES-V2.md
 • ./README.md
 • ./INTEGRATION-PROGRESS-2026-01-13.md
+• ./COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
 • ./CORRECTED-INTEGRATION-STATUS.md
 • ./GLM-INTEGRATION-COMPLETE.md
 • ./CLI-COMPREHENSIVE-TEST-REPORT.md
@@ -267,11 +305,16 @@
 • ./TEST-EXECUTION-REPORT.md
 • ./commands/voice.md
 • ./commands/collab.md
+• ./commands/rootcause.md
 • ./commands/re.md
 • ./commands/auto.md
+• ./commands/reflect.md
 • ./commands/multi-repo.md
 • ./commands/research-api.md
+• ./commands/init.md
 • ./commands/checkpoint.md
+• ./commands/sparc.md
+• ./commands/research.md
 • ./commands/swarm.md
 • ./commands/build.md
 • ./commands/personality.md
@@ -713,10 +756,10 @@
 ## 📊 Project Statistics
 
 **Languages:**
-• JavaScript/TypeScript: 41130 files
+• JavaScript/TypeScript: 41147 files
 • Python: 1 files
 
-**Estimated LOC:** 577563
+**Estimated LOC:** 579824
 
 
 ---
@@ -739,6 +782,7 @@
 • **plans 2/**
 • **src/**: Source code
 • **test-results/**
+• **tests/**: Test files
 
 ---
 

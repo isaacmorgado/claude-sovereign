@@ -10198,6 +10198,13 @@ class ReflexionAgent {
     try {
       const action = await this.executor.parseThoughtToAction(thought, this.context.goal);
       const result = await this.executor.execute(action);
+      if (action.type === "file_write" && action.params.path?.endsWith(".ts")) {
+        const validationResult = await this.executor.validateTypeScript([action.params.path]);
+        if (!validationResult.success) {
+          return `${action.type}(${JSON.stringify(action.params)}): ${result.output}
+⚠️ TypeScript validation failed: ${validationResult.error}`;
+        }
+      }
       return `${action.type}(${JSON.stringify(action.params)}): ${result.output}`;
     } catch (error2) {
       const err = error2;

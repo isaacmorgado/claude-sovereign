@@ -140,7 +140,7 @@ export class MultiRepoCommand {
       try {
         execSync('git pull', { cwd: repoPath, stdio: 'pipe' });
         console.log(chalk.green(`  ✓ ${repo.name}: Updated`));
-      } catch (e) {
+      } catch (e: any) {
         console.log(chalk.yellow(`  ⚠ ${repo.name}: ${e.message || 'Failed'}`));
       }
     }
@@ -175,7 +175,7 @@ export class MultiRepoCommand {
         const commitMsg = message || `checkpoint: ${new Date().toISOString()}`;
         execSync(`git commit -m "${commitMsg}"`, { cwd: repoPath });
         console.log(chalk.green(`  ✓ ${repo.name}: Committed`));
-      } catch (e) {
+      } catch (e: any) {
         console.log(chalk.yellow(`  ⚠ ${repo.name}: ${e.message || 'Failed'}`));
       }
     }
@@ -214,10 +214,10 @@ export class MultiRepoCommand {
       console.log(chalk.cyan(`Executing in: ${repo.name}...`));
 
       try {
-        const result = execSync(command, { cwd: repoPath, stdio: 'pipe' });
+        const result = execSync(command, { cwd: repoPath, stdio: 'pipe', encoding: 'utf-8' });
         console.log(chalk.gray(`  Output: ${result.substring(0, 200)}...`));
         console.log(chalk.green(`  ✓ ${repo.name}: Success`));
-      } catch (e) {
+      } catch (e: any) {
         console.log(chalk.red(`  ✗ ${repo.name}: Failed`));
         console.log(chalk.gray(`  Error: ${e.message}\n`));
       }
@@ -234,7 +234,7 @@ export class MultiRepoCommand {
   private getRepoStatus(repoPath: string): string {
     try {
       execSync('git rev-parse --git-dir', { cwd: repoPath, stdio: 'ignore' });
-      const status = execSync('git status --short', { cwd: repoPath, stdio: 'pipe' });
+      const status = execSync('git status --short', { cwd: repoPath, stdio: 'pipe', encoding: 'utf-8' });
       if (status.trim() === '') {
         return 'Clean';
       }
