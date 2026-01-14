@@ -1,5 +1,5 @@
 import type { CommandContext, CommandResult } from '../types';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import chalk from 'chalk';
 
@@ -39,7 +39,7 @@ export class ResearchApiCommand {
       const targetName = this.sanitizeTargetName(target);
       const researchDocPath = join(docsDir, `${targetName}.md`);
 
-      require('fs').mkdirSync(docsDir, { recursive: true });
+      mkdirSync(docsDir, { recursive: true });
 
       const researchDoc = `# ${targetName} API Research
 

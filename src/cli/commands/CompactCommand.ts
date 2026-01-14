@@ -1,5 +1,5 @@
 import type { CommandContext, CommandResult } from '../types';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import chalk from 'chalk';
 
@@ -68,7 +68,7 @@ Working on project features and command implementation.
       const memoryDir = join(context.workDir, '.claude', 'memory');
       const compactedPath = join(memoryDir, 'compacted-context.md');
       
-      require('fs').mkdirSync(memoryDir, { recursive: true });
+      mkdirSync(memoryDir, { recursive: true });
       writeFileSync(compactedPath, compactedContext);
 
       // Step 4: Output Continuation Prompt

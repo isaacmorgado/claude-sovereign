@@ -17,42 +17,44 @@ export class InitCommand extends BaseCommand {
     /**
      * Template types for project initialization
      */
-    private templates = {
-        typescript: {
-            name: 'TypeScript',
-            files: [
-                { path: 'tsconfig.json', content: this.getTsConfig() },
-                { path: 'package.json', content: this.getPackageJson() },
-                { path: 'src/index.ts', content: this.getIndexTs() },
-                { path: '.gitignore', content: this.getGitignore() },
-            ],
-        },
-        javascript: {
-            name: 'JavaScript',
-            files: [
-                { path: 'package.json', content: this.getPackageJson() },
-                { path: 'src/index.js', content: this.getIndexJs() },
-                { path: '.gitignore', content: this.getGitignore() },
-            ],
-        },
-        python: {
-            name: 'Python',
-            files: [
-                { path: 'requirements.txt', content: 'pytest>=7.0.0\npytest-cov>=4.0.0' },
-                { path: 'src/__init__.py', content: '' },
-                { path: 'src/main.py', content: this.getMainPy() },
-                { path: '.gitignore', content: this.getPythonGitignore() },
-            ],
-        },
-        rust: {
-            name: 'Rust',
-            files: [
-                { path: 'Cargo.toml', content: this.getCargoToml() },
-                { path: 'src/main.rs', content: this.getMainRs() },
-                { path: '.gitignore', content: this.getRustGitignore() },
-            ],
-        },
-    };
+    private getTemplates(projectName: string) {
+        return {
+            typescript: {
+                name: 'TypeScript',
+                files: [
+                    { path: 'tsconfig.json', content: this.getTsConfig() },
+                    { path: 'package.json', content: this.getPackageJson(projectName) },
+                    { path: 'src/index.ts', content: this.getIndexTs() },
+                    { path: '.gitignore', content: this.getGitignore() },
+                ],
+            },
+            javascript: {
+                name: 'JavaScript',
+                files: [
+                    { path: 'package.json', content: this.getPackageJson(projectName) },
+                    { path: 'src/index.js', content: this.getIndexJs() },
+                    { path: '.gitignore', content: this.getGitignore() },
+                ],
+            },
+            python: {
+                name: 'Python',
+                files: [
+                    { path: 'requirements.txt', content: 'pytest>=7.0.0\npytest-cov>=4.0.0' },
+                    { path: 'src/__init__.py', content: '' },
+                    { path: 'src/main.py', content: this.getMainPy() },
+                    { path: '.gitignore', content: this.getPythonGitignore() },
+                ],
+            },
+            rust: {
+                name: 'Rust',
+                files: [
+                    { path: 'Cargo.toml', content: this.getCargoToml(projectName) },
+                    { path: 'src/main.rs', content: this.getMainRs() },
+                    { path: '.gitignore', content: this.getRustGitignore() },
+                ],
+            },
+        };
+    }
 
     /**
      * Get TypeScript configuration
@@ -79,9 +81,9 @@ export class InitCommand extends BaseCommand {
     /**
      * Get package.json
      */
-    private getPackageJson(): string {
+    private getPackageJson(projectName = 'my-project'): string {
         return JSON.stringify({
-            name: this.args[0] || 'my-project',
+            name: projectName,
             version: '1.0.0',
             description: 'A new project',
             main: 'dist/index.js',
@@ -150,9 +152,9 @@ fn main() {
     /**
      * Get Cargo.toml
      */
-    private getCargoToml(): string {
+    private getCargoToml(projectName = 'my-project'): string {
         return `[package]
-name = "${this.args[0] || 'my-project'}"
+name = "${projectName}"
 version = "1.0.0"
 edition = "2021"
 

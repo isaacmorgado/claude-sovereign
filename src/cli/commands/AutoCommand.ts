@@ -1115,20 +1115,14 @@ Provide your reasoning and proposed action.
 ): Promise<{ snapshot: string; recommendations: any[]; success: boolean }> {
     this.info('🐛 Running debug orchestrator...');
 
-    // Import debug orchestrator from core
-    const { DebugOrchestrator } = await import('../../core/debug/orchestrator/index');
-
-    const orchestrator = new DebugOrchestrator(this.memory);
-    const snapshotId = `snapshot_${Date.now()}`;
-    const snapshot = await orchestrator.createSnapshot(snapshotId, 'npm test', task);
-    const success = true;
-
-    this.info('Debug orchestrator snapshot created');
+    // Debug orchestrator integration - stub implementation
+    // TODO: Properly configure DebugOrchestrator with DebugConfig
+    this.info('Debug orchestrator stub - not yet configured');
 
     return {
-      snapshot: snapshot.snapshotId,
+      snapshot: `snapshot_${Date.now()}`,
       recommendations: [],
-      success
+      success: false
     };
   }
 

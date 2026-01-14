@@ -1,5 +1,5 @@
 import type { CommandContext, CommandResult } from '../types';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import chalk from 'chalk';
@@ -228,12 +228,12 @@ export class CollabCommand {
 
   private listSessions(collabDir: string): any[] {
     const sessions: any[] = [];
-    const files = require('fs').readdirSync(collabDir);
+    const files = readdirSync(collabDir);
     
     for (const file of files) {
       if (file.endsWith('.json')) {
         const sessionPath = join(collabDir, file);
-        const sessionData = JSON.parse(require('fs').readFileSync(sessionPath, 'utf-8'));
+        const sessionData = JSON.parse(readFileSync(sessionPath, 'utf-8'));
         sessions.push(sessionData);
       }
     }

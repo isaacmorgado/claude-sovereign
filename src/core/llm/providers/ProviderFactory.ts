@@ -79,6 +79,13 @@ export class ProviderRegistry {
   has(name: string): boolean {
     return this.providers.has(name);
   }
+
+  /**
+   * Get the internal provider map (for compatibility)
+   */
+  getMap(): Map<string, ILLMProvider> {
+    return this.providers;
+  }
 }
 
 /**

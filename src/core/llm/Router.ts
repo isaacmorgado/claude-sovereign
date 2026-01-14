@@ -110,7 +110,7 @@ export class LLMRouter {
     const result = await this.fallbackChain.execute(
       request,
       context,
-      this.registry
+      this.registry.getMap()
     );
 
     if (result.error) {
@@ -183,7 +183,7 @@ export class LLMRouter {
 
           // Execute request
           try {
-            return await provider.complete(routedRequest, context);
+            return await provider.complete(routedRequest);
           } catch (error: any) {
             // Classify error for better retry logic
             const classified = this.errorHandler.classify(error);

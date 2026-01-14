@@ -15,7 +15,7 @@ export class CheckpointCommand {
     try {
       // Step 0: Check for Pipeline State
       const claudeMdPath = join(context.workDir, 'CLAUDE.md');
-      let pipelineState: any = null;
+      const pipelineState: any = null;
       let currentFeature = '';
       let currentTier = '';
       let currentPhase = '';
@@ -44,7 +44,7 @@ export class CheckpointCommand {
       // Step 0.5: Update buildguide.md (If It Exists)
       const buildguidePath = join(context.workDir, 'buildguide.md');
       let nextSection = '';
-      let newDocsFound: string[] = [];
+      const newDocsFound: string[] = [];
 
       if (existsSync(buildguidePath)) {
         const buildguideContent = readFileSync(buildguidePath, 'utf-8');

@@ -8,18 +8,38 @@
 import { ActionExecutor, type Action, type ActionResult } from '../ActionExecutor';
 import type { LLMRouter } from '../../llm/Router';
 
+/**
+ * A single cycle in the ReAct + Reflexion loop
+ */
 export interface ReflexionCycle {
+  /** The reasoning step: what should be done next */
   thought: string;
+  /** The action taken based on the thought */
   action: string;
+  /** The observed result of the action */
   observation: string;
+  /** Self-critique and lessons learned */
   reflection: string;
+  /** Whether this cycle succeeded */
   success: boolean;
 }
 
+/**
+ * Metadata value types
+ */
+export type MetadataValue = string | number | boolean | null | undefined | MetadataValue[] | { [key: string]: MetadataValue };
+
+/**
+ * Agent execution context
+ */
 export interface Context {
+  /** The high-level goal the agent is working towards */
   goal: string;
+  /** History of all ReAct + Reflexion cycles */
   history: ReflexionCycle[];
-  metadata: Record<string, any>;
+  /** Additional context metadata */
+  metadata: Record<string, MetadataValue>;
+  /** Progress metrics */
   metrics: {
     filesCreated: number;
     filesModified: number;
@@ -30,7 +50,20 @@ export interface Context {
 
 /**
  * ReAct + Reflexion Agent
- * Implements the Think-Act-Observe-Reflect loop with real action execution
+ *
+ * Implements the Think-Act-Observe-Reflect loop with real action execution.
+ * This agent autonomously works towards a goal by:
+ * 1. **Thinking**: Reasoning about what to do next
+ * 2. **Acting**: Executing the chosen action
+ * 3. **Observing**: Recording the outcome
+ * 4. **Reflecting**: Learning from the result
+ *
+ * @example
+ * ```ts
+ * const agent = new ReflexionAgent("Create a TypeScript config file", llmRouter);
+ * const cycle = await agent.cycle("Start with basic tsconfig.json");
+ * console.log(cycle.reflection); // Learn from the outcome
+ * ```
  */
 export class ReflexionAgent {
   private context: Context;
@@ -38,6 +71,13 @@ export class ReflexionAgent {
   private llmRouter?: LLMRouter;
   private preferredModel?: string;
 
+  /**
+   * Create a new ReflexionAgent
+   *
+   * @param goal - The high-level goal to work towards
+   * @param llmRouter - Optional LLM router for generating thoughts (if not provided, uses templates)
+   * @param preferredModel - Optional preferred model to use for reasoning
+   */
   constructor(goal: string, llmRouter?: LLMRouter, preferredModel?: string) {
     this.context = {
       goal,
@@ -62,6 +102,28 @@ export class ReflexionAgent {
 
   /**
    * Execute a complete ReAct + Reflexion cycle
+   *
+   * Runs one iteration of Think → Act → Observe → Reflect.
+   * Each cycle:
+   * - Checks for stagnation and repetition
+   * - Generates reasoning about what to do
+   * - Executes the chosen action
+   * - Observes and validates the result
+   * - Reflects and learns from the outcome
+   *
+   * @param input - The current input or context for this cycle
+   * @returns A completed ReflexionCycle with thought, action, observation, and reflection
+   * @throws {Error} If the agent is stuck (stagnation or repetition detected)
+   *
+   * @example
+   * ```ts
+   * const cycle = await agent.cycle("Implement login function");
+   * if (cycle.success) {
+   *   console.log("Action succeeded:", cycle.observation);
+   * } else {
+   *   console.log("Action failed, reflection:", cycle.reflection);
+   * }
+   * ```
    */
   async cycle(input: string): Promise<ReflexionCycle> {
     this.context.metrics.iterations++;
@@ -420,15 +482,37 @@ What should I do next? Provide specific, actionable reasoning.`;
   }
 
   /**
-   * Evaluate if the cycle was successful
+   * Evaluate if the cycle was successful based on the observation
+   *
+   * @param observation - The observation string from the action
+   * @returns true if the action succeeded, false otherwise
    */
   private evaluateSuccess(observation: string): boolean {
-    // TODO: Implement success evaluation logic
+    // Check for explicit failure indicators
+    if (observation.includes('[ERROR]') || observation.includes('failed')) {
+      return false;
+    }
+
+    // Check for success indicators
+    if (observation.includes('successfully') || observation.includes('created') || observation.includes('updated')) {
+      return true;
+    }
+
+    // Default to true for neutral observations
     return true;
   }
 
   /**
-   * Get the full history of cycles
+   * Get the full history of all ReAct + Reflexion cycles
+   *
+   * @returns Array of all completed cycles, in chronological order
+   *
+   * @example
+   * ```ts
+   * const history = agent.getHistory();
+   * const failures = history.filter(c => !c.success);
+   * console.log(`Failed ${failures.length} times`);
+   * ```
    */
   getHistory(): ReflexionCycle[] {
     return this.context.history;
@@ -436,8 +520,16 @@ What should I do next? Provide specific, actionable reasoning.`;
 
   /**
    * Get current progress metrics
+   *
+   * @returns Object with counts of files created/modified, lines changed, and iterations
+   *
+   * @example
+   * ```ts
+   * const metrics = agent.getMetrics();
+   * console.log(`Created ${metrics.filesCreated} files in ${metrics.iterations} iterations`);
+   * ```
    */
-  getMetrics() {
+  getMetrics(): Context['metrics'] {
     return this.context.metrics;
   }
 

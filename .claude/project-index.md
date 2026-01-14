@@ -1,6 +1,6 @@
 # 🗂️ Project Structure: .
 
-**Generated**: 2026-01-13 22:55:23
+**Generated**: 2026-01-13 23:08:21
 **Purpose**: Quick navigation reference for Claude (token-efficient)
 
 ---
@@ -71,6 +71,7 @@
 ├── 📄 sparc.md
 ├── 📄 swarm.md
 └── 📄 voice.md
+├── 📄 COMPREHENSIVE-TEST-REPORT.md
 ├── 📁 config/
 └── 📄 CLAUDE.md
 ├── 📁 docs/
@@ -313,6 +314,7 @@
 │   └── 📁 logging/
 │   │   ├── 📄 FileRotation.test.ts
 │   │   └── 📄 Logger.test.ts
+├── 📄 init-command-test.ts
 ├── 📁 integration/
 │   └── 📄 reflexion-command.test.ts
 ├── 📁 orchestrator/
@@ -372,6 +374,7 @@
 • ./commands/build.md
 • ./commands/personality.md
 • ./commands/compact.md
+• ./COMPREHENSIVE-TEST-REPORT.md
 • ./CLAUDE.md
 
 ### Entry Points
@@ -799,10 +802,10 @@
 ## 📊 Project Statistics
 
 **Languages:**
-• JavaScript/TypeScript: 41161 files
+• JavaScript/TypeScript: 41162 files
 • Python: 1 files
 
-**Estimated LOC:** 584826
+**Estimated LOC:** 585348
 
 
 ---

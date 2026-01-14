@@ -1,5 +1,5 @@
 import type { CommandContext, CommandResult } from '../types';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import chalk from 'chalk';
 
@@ -17,7 +17,7 @@ export class VoiceCommand {
       const statusPath = join(voiceDir, 'status.json');
       
       if (!existsSync(voiceDir)) {
-        require('fs').mkdirSync(voiceDir, { recursive: true });
+        mkdirSync(voiceDir, { recursive: true });
       }
 
       switch (options.action) {

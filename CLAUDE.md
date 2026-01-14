@@ -51,3 +51,7 @@ Documentation cleanup complete. Project now has professional-grade organization 
 - Decision logic: 4 rules route complex tasks to ReflexionAgent
 - Automatic fallback: Rate limits or errors trigger bash agent-loop
 - Logging: All decisions logged to `~/.claude/orchestrator.log`
+
+
+## Milestones
+- 2026-01-14: Test commit (e8438b7)
