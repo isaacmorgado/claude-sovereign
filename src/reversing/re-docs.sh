@@ -186,7 +186,14 @@ generate_project_documentation() {
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
         local lang=$(detect_language "$file")
-        if [[ ! " ${languages[@]} " =~ " $lang " ]]; then
+        local found=false
+        for existing_lang in "${languages[@]}"; do
+            if [[ "$existing_lang" == "$lang" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == "false" ]]; then
             languages+=("$lang")
         fi
     done <<< "$files"
