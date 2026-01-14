@@ -119,22 +119,6 @@ export class ReflexionAgent {
   }
 
   /**
-   * THINK: Generate explicit reasoning about what to do
-   */
-  private async think(input: string): Promise<string> {
-    // Check if input is already an error - preserve it
-    if (input.startsWith('[ERROR]')) {
-      return input;
-    }
-
-    // Consider context, history, and goal
-    // Generate reasoning about the best approach
-    // Check for similar patterns in memory
-
-    return `Reasoning about: ${input} with goal: ${this.context.goal}`;
-  }
-
-  /**
    * ACT: Execute the action based on reasoning
    */
   private async act(thought: string): Promise<string> {

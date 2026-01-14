@@ -187,18 +187,21 @@ generate_project_documentation() {
         [[ -f "$file" ]] || continue
         local lang=$(detect_language "$file")
         local found=false
-        for existing_lang in "${languages[@]}"; do
-            if [[ "$existing_lang" == "$lang" ]]; then
-                found=true
-                break
-            fi
-        done
+        if [[ ${#languages[@]} -gt 0 ]]; then
+            for existing_lang in "${languages[@]}"; do
+                if [[ "$existing_lang" == "$lang" ]]; then
+                    found=true
+                    break
+                fi
+            done
+        fi
         if [[ "$found" == "false" ]]; then
             languages+=("$lang")
         fi
     done <<< "$files"
 
     if [[ "$output_format" == "markdown" ]]; then
+        local languages_list="${languages[*]:-}"
         cat <<EOF
 # Project Documentation: $project_name
 
@@ -209,7 +212,7 @@ generate_project_documentation() {
 [Auto-generated project documentation]
 
 ## Languages Used
-${languages[@]}
+${languages_list}
 
 ## File Structure
 \`\`\`

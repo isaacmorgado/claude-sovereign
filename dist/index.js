@@ -1663,16 +1663,16 @@ Expecting one of '${allowedValues.join("', '")}'`);
     }
     _getHelpContext(contextOptions) {
       contextOptions = contextOptions || {};
-      const context2 = { error: !!contextOptions.error };
+      const context = { error: !!contextOptions.error };
       let write;
-      if (context2.error) {
+      if (context.error) {
         write = (arg) => this._outputConfiguration.writeErr(arg);
       } else {
         write = (arg) => this._outputConfiguration.writeOut(arg);
       }
-      context2.write = contextOptions.write || write;
-      context2.command = this;
-      return context2;
+      context.write = contextOptions.write || write;
+      context.command = this;
+      return context;
     }
     outputHelp(contextOptions) {
       let deprecatedCallback;
@@ -1680,22 +1680,22 @@ Expecting one of '${allowedValues.join("', '")}'`);
         deprecatedCallback = contextOptions;
         contextOptions = undefined;
       }
-      const context2 = this._getHelpContext(contextOptions);
-      this._getCommandAndAncestors().reverse().forEach((command) => command.emit("beforeAllHelp", context2));
-      this.emit("beforeHelp", context2);
-      let helpInformation = this.helpInformation(context2);
+      const context = this._getHelpContext(contextOptions);
+      this._getCommandAndAncestors().reverse().forEach((command) => command.emit("beforeAllHelp", context));
+      this.emit("beforeHelp", context);
+      let helpInformation = this.helpInformation(context);
       if (deprecatedCallback) {
         helpInformation = deprecatedCallback(helpInformation);
         if (typeof helpInformation !== "string" && !Buffer.isBuffer(helpInformation)) {
           throw new Error("outputHelp callback must return a string or a Buffer");
         }
       }
-      context2.write(helpInformation);
+      context.write(helpInformation);
       if (this._helpLongFlag) {
         this.emit(this._helpLongFlag);
       }
-      this.emit("afterHelp", context2);
-      this._getCommandAndAncestors().forEach((command) => command.emit("afterAllHelp", context2));
+      this.emit("afterHelp", context);
+      this._getCommandAndAncestors().forEach((command) => command.emit("afterAllHelp", context));
     }
     helpOption(flags, description) {
       if (typeof flags === "boolean") {
@@ -1724,15 +1724,15 @@ Expecting one of '${allowedValues.join("', '")}'`);
 Expecting one of '${allowedValues.join("', '")}'`);
       }
       const helpEvent = `${position}Help`;
-      this.on(helpEvent, (context2) => {
+      this.on(helpEvent, (context) => {
         let helpStr;
         if (typeof text === "function") {
-          helpStr = text({ error: context2.error, command: context2.command });
+          helpStr = text({ error: context.error, command: context.command });
         } else {
           helpStr = text;
         }
         if (helpStr) {
-          context2.write(`${helpStr}
+          context.write(`${helpStr}
 `);
         }
       });
@@ -8531,10 +8531,10 @@ class LLMRouter {
       model: modelString
     };
   }
-  async route(request, context2) {
+  async route(request, context) {
     let selection;
-    if (context2.preferredModel) {
-      const parsed = this.parseModel(context2.preferredModel);
+    if (context.preferredModel) {
+      const parsed = this.parseModel(context.preferredModel);
       if (parsed.provider) {
         const provider2 = this.registry.get(parsed.provider);
         if (!provider2) {
@@ -8543,13 +8543,13 @@ class LLMRouter {
         selection = {
           provider: parsed.provider,
           model: parsed.model,
-          reason: `Explicit model selection: ${context2.preferredModel}`
+          reason: `Explicit model selection: ${context.preferredModel}`
         };
       } else {
-        selection = this.selectModelByName(parsed.model, context2);
+        selection = this.selectModelByName(parsed.model, context);
       }
     } else {
-      selection = this.selectModel(context2);
+      selection = this.selectModel(context);
     }
     const provider = this.registry.get(selection.provider);
     if (!provider) {
@@ -8582,8 +8582,8 @@ class LLMRouter {
       }
     });
   }
-  selectModelByName(modelName, context2) {
-    const candidates = this.getCandidates(context2);
+  selectModelByName(modelName, context) {
+    const candidates = this.getCandidates(context);
     const match = candidates.find((c) => c.model === modelName);
     if (match) {
       return {
@@ -8592,10 +8592,10 @@ class LLMRouter {
         reason: `Found model ${modelName} in ${match.provider}`
       };
     }
-    return this.selectModel(context2);
+    return this.selectModel(context);
   }
-  selectModel(context2) {
-    const candidates = this.getCandidates(context2);
+  selectModel(context) {
+    const candidates = this.getCandidates(context);
     if (candidates.length === 0) {
       return {
         provider: "anthropic",
@@ -8603,7 +8603,7 @@ class LLMRouter {
         reason: "Default model (no suitable alternatives found)"
       };
     }
-    const scored = candidates.map((c) => this.scoreCandidate(c, context2));
+    const scored = candidates.map((c) => this.scoreCandidate(c, context));
     scored.sort((a, b) => b.score - a.score);
     const best = scored[0];
     return {
@@ -8612,16 +8612,16 @@ class LLMRouter {
       reason: best.reason.join(", ")
     };
   }
-  getCandidates(context2) {
+  getCandidates(context) {
     const candidates = [];
     const providers = this.registry.list();
     for (const providerName of providers) {
       const provider = this.registry.get(providerName);
       if (!provider)
         continue;
-      if (context2.requiresVision && !provider.capabilities.vision)
+      if (context.requiresVision && !provider.capabilities.vision)
         continue;
-      if (context2.requiresTools && !provider.capabilities.tools)
+      if (context.requiresTools && !provider.capabilities.tools)
         continue;
       if (providerName === "mcp") {
         const mcpProvider = provider;
@@ -8630,9 +8630,9 @@ class LLMRouter {
           const modelInfo = mcpProvider.getModelInfo(model);
           if (!modelInfo)
             continue;
-          if (context2.requiresUnrestricted && !modelInfo.capabilities.includes("unrestricted"))
+          if (context.requiresUnrestricted && !modelInfo.capabilities.includes("unrestricted"))
             continue;
-          if (context2.requiresChinese && !modelInfo.capabilities.includes("chinese") && !modelInfo.capabilities.includes("multilingual"))
+          if (context.requiresChinese && !modelInfo.capabilities.includes("chinese") && !modelInfo.capabilities.includes("multilingual"))
             continue;
           candidates.push({ provider: providerName, model });
         }
@@ -8642,27 +8642,27 @@ class LLMRouter {
     }
     return candidates;
   }
-  scoreCandidate(candidate, context2) {
+  scoreCandidate(candidate, context) {
     let score = 0;
     const reasons = [];
     const modelInfo = this.getModelInfo(candidate);
     if (!modelInfo) {
       return { ...candidate, score: 0, reason: ["Unknown model"] };
     }
-    if (modelInfo.capabilities.includes(context2.taskType)) {
+    if (modelInfo.capabilities.includes(context.taskType)) {
       score += 10;
-      reasons.push(`Specialized for ${context2.taskType}`);
+      reasons.push(`Specialized for ${context.taskType}`);
     }
-    score += this.scorePriority(modelInfo, context2.priority, reasons);
-    if (context2.requiresUnrestricted && modelInfo.capabilities.includes("unrestricted")) {
+    score += this.scorePriority(modelInfo, context.priority, reasons);
+    if (context.requiresUnrestricted && modelInfo.capabilities.includes("unrestricted")) {
       score += 5;
       reasons.push("Unrestricted model");
     }
-    if (context2.requiresChinese && (modelInfo.capabilities.includes("chinese") || modelInfo.capabilities.includes("multilingual"))) {
+    if (context.requiresChinese && (modelInfo.capabilities.includes("chinese") || modelInfo.capabilities.includes("multilingual"))) {
       score += 5;
       reasons.push("Multilingual support");
     }
-    if (context2.taskType === "debugging" || context2.taskType === "reasoning") {
+    if (context.taskType === "debugging" || context.taskType === "reasoning") {
       if (modelInfo.capabilities.includes("agentic")) {
         score += 8;
         reasons.push("Advanced agentic capabilities");
@@ -8777,8 +8777,8 @@ class MemoryManagerBridge {
     const expandedDir = hooksDir.replace(/^~/, process.env.HOME || "");
     this.hookPath = path2.join(expandedDir, "memory-manager.sh");
   }
-  async setTask(task, context2) {
-    const result = await executeBash(`"${this.hookPath}" set-task "${task}" "${context2}"`);
+  async setTask(task, context) {
+    const result = await executeBash(`"${this.hookPath}" set-task "${task}" "${context}"`);
     return result.success;
   }
   async addContext(note, relevance = 8) {
@@ -8827,12 +8827,12 @@ async function createLLMClient() {
         system: options?.system,
         model: options?.model
       };
-      const context2 = {
+      const context = {
         taskType: options?.taskType || "general",
         priority: options?.priority || "balanced",
         requiresUnrestricted: options?.requiresUnrestricted
       };
-      return router.route(request, context2);
+      return router.route(request, context);
     },
     async streamComplete(prompt, onChunk, options) {
       const anthropic = registry.get("anthropic");
@@ -9896,6 +9896,16 @@ class ActionExecutor {
   }
   async execute(action) {
     try {
+      if (action.type === "file_edit") {
+        const exists = await this.fileExists(action.params.path);
+        if (!exists) {
+          return {
+            success: false,
+            output: "",
+            error: `Cannot edit ${action.params.path}: file does not exist. Suggest creating it with file_write instead.`
+          };
+        }
+      }
       switch (action.type) {
         case "file_write":
           return await this.executeFileWrite(action.params.path, action.params.content);
@@ -9925,6 +9935,15 @@ class ActionExecutor {
         output: "",
         error: err.message
       };
+    }
+  }
+  async fileExists(filePath) {
+    const fullPath = path3.resolve(this.workingDir, filePath);
+    try {
+      await fs.access(fullPath);
+      return true;
+    } catch {
+      return false;
     }
   }
   async executeFileWrite(filePath, content) {
@@ -9999,11 +10018,11 @@ class ActionExecutor {
       }
     };
   }
-  async executeLLMGeneration(prompt, context2) {
+  async executeLLMGeneration(prompt, context) {
     const messages = [
       {
         role: "user",
-        content: context2 ? `${context2}
+        content: context ? `${context}
 
 ${prompt}` : prompt
       }
@@ -10079,12 +10098,17 @@ Goal: ${goal}
 Thought: ${thought}
 
 Available action types:
-1. file_write: Create or overwrite a file
+1. file_write: Create or overwrite a file (validates existence first)
 2. file_read: Read a file's contents
-3. file_edit: Edit a file by replacing text
+3. file_edit: Edit a file by replacing text (file must exist)
 4. command: Execute a bash command
 5. llm_generate: Generate code using LLM
 6. git_operation: Perform git operations
+
+IMPORTANT FILE VALIDATION RULES:
+- If goal/thought says "create" → use file_write (creates new file)
+- If goal/thought says "update" or "edit" → validate file exists first
+- If file doesn't exist and action is "update" → suggest creating it instead
 
 Return ONLY a JSON object with this structure:
 {
@@ -10096,6 +10120,8 @@ Return ONLY a JSON object with this structure:
 
 Examples:
 - "Create types.ts file" → {"type": "file_write", "params": {"path": "types.ts", "content": "..."}}
+- "Update types.ts" (file exists) → {"type": "file_edit", "params": {"path": "types.ts", ...}}
+- "Update types.ts" (file missing) → {"type": "file_write", "params": {"path": "types.ts", "content": "..."}}
 - "Run TypeScript compiler" → {"type": "command", "params": {"command": "tsc --noEmit"}}
 - "Generate Logger class" → {"type": "llm_generate", "params": {"prompt": "Generate TypeScript Logger class"}}
 
@@ -10167,16 +10193,34 @@ class ReflexionAgent {
     this.context = {
       goal,
       history: [],
-      metadata: {}
+      metadata: {},
+      metrics: {
+        filesCreated: 0,
+        filesModified: 0,
+        linesChanged: 0,
+        iterations: 0
+      }
     };
     if (llmRouter) {
       this.executor = new ActionExecutor(llmRouter);
     }
   }
   async cycle(input) {
+    this.context.metrics.iterations++;
+    if (this.detectStagnation()) {
+      throw new Error("Agent stuck: No progress for multiple iterations");
+    }
+    if (this.detectRepetition(input)) {
+      throw new Error("Agent stuck: Repeating same actions");
+    }
     const thought = await this.think(input);
     const action = await this.act(thought);
-    const observation = await this.observe(action);
+    let observation = await this.observe(action);
+    const goalAlignment = this.validateGoalAlignment(observation);
+    if (!goalAlignment.aligned) {
+      observation += `
+⚠️ Goal misalignment: ${goalAlignment.reason}`;
+    }
     const reflection = await this.reflect(thought, action, observation);
     const cycle = {
       thought,
@@ -10189,15 +10233,32 @@ class ReflexionAgent {
     return cycle;
   }
   async think(input) {
+    if (input.startsWith("[ERROR]")) {
+      return input;
+    }
     return `Reasoning about: ${input} with goal: ${this.context.goal}`;
   }
   async act(thought) {
+    if (thought.includes("[ERROR]")) {
+      return thought;
+    }
     if (!this.executor) {
       return `[PLACEHOLDER] Action based on: ${thought}`;
     }
     try {
       const action = await this.executor.parseThoughtToAction(thought, this.context.goal);
       const result = await this.executor.execute(action);
+      if (result.success && result.metadata) {
+        if (action.type === "file_write") {
+          if (result.metadata.existed) {
+            this.context.metrics.filesModified++;
+            this.context.metrics.linesChanged += result.metadata.lines || 0;
+          } else {
+            this.context.metrics.filesCreated++;
+            this.context.metrics.linesChanged += result.metadata.lines || 0;
+          }
+        }
+      }
       if (action.type === "file_write" && action.params.path?.endsWith(".ts")) {
         const validationResult = await this.executor.validateTypeScript([action.params.path]);
         if (!validationResult.success) {
@@ -10220,27 +10281,162 @@ class ReflexionAgent {
     }
     const actionTypeMatch = action.match(/^(\w+)\(/);
     const actionType = actionTypeMatch ? actionTypeMatch[1] : "unknown";
+    let observation = "";
     switch (actionType) {
       case "file_write":
-        return `File successfully created/updated`;
+        if (action.includes("File created:")) {
+          observation = "File successfully created";
+        } else if (action.includes("File updated:")) {
+          observation = "File successfully updated";
+        } else {
+          observation = "File successfully created/updated";
+        }
+        break;
       case "file_read":
-        return `File contents retrieved`;
+        observation = "File contents retrieved";
+        break;
       case "command":
-        return `Command executed successfully`;
+        observation = "Command executed successfully";
+        break;
       case "llm_generate":
-        return `Code generated successfully`;
+        observation = "Code generated successfully";
+        break;
       default:
-        return `Action completed: ${action}`;
+        observation = `Action completed: ${action}`;
     }
+    return observation;
   }
   async reflect(thought, action, observation) {
-    return `Reflection on thought: ${thought}, action: ${action}, observation: ${observation}`;
+    const reflections = [];
+    if (observation.includes("[ERROR]") || observation.toLowerCase().includes("failed")) {
+      reflections.push(`❌ Action failed. Need to adjust approach or check preconditions.`);
+      return reflections.join(`
+`);
+    }
+    const expectedOutcome = this.extractExpectedOutcome(thought);
+    const actualOutcome = this.extractActualOutcome(observation);
+    if (expectedOutcome && actualOutcome && expectedOutcome !== actualOutcome) {
+      reflections.push(`⚠️ Expectation mismatch: Expected "${expectedOutcome}" but got "${actualOutcome}"`);
+    }
+    if (!this.isProgressTowardsGoal(action, observation)) {
+      reflections.push(`⚠️ Current action may not be contributing to goal: ${this.context.goal}`);
+    }
+    const { metrics } = this.context;
+    if (metrics.iterations > 5 && metrics.filesCreated === 0 && metrics.filesModified === 0) {
+      reflections.push(`⚠️ ${metrics.iterations} iterations with no file changes. May be stuck in planning loop.`);
+    }
+    if (observation.includes("successfully") || observation.includes("created")) {
+      reflections.push(`✅ Action succeeded. Continue with next step towards goal.`);
+    }
+    if (reflections.length > 0) {
+      return reflections.join(`
+`);
+    }
+    return `Reflection: ${thought} → ${action} → ${observation}`;
+  }
+  extractExpectedOutcome(thought) {
+    const patterns = [
+      /create (\w+\.ts)/i,
+      /update (\w+\.ts)/i,
+      /add (\w+ \w+)/i,
+      /implement (\w+)/i
+    ];
+    for (const pattern of patterns) {
+      const match = thought.match(pattern);
+      if (match) {
+        return match[1];
+      }
+    }
+    return null;
+  }
+  extractActualOutcome(observation) {
+    const fileMatch = observation.match(/(\w+\.ts)/);
+    if (fileMatch) {
+      return fileMatch[1];
+    }
+    if (observation.includes("failed") || observation.includes("[ERROR]")) {
+      return "failure";
+    }
+    if (observation.includes("successfully") || observation.includes("created")) {
+      return "success";
+    }
+    return null;
+  }
+  isProgressTowardsGoal(action, observation) {
+    const { goal } = this.context;
+    const goalLower = goal.toLowerCase();
+    const actionLower = action.toLowerCase();
+    const obsLower = observation.toLowerCase();
+    const goalTerms = goalLower.split(/\s+/).filter((term) => term.length > 3);
+    const hasGoalTerms = goalTerms.some((term) => actionLower.includes(term) || obsLower.includes(term));
+    return hasGoalTerms;
   }
   evaluateSuccess(observation) {
     return true;
   }
   getHistory() {
     return this.context.history;
+  }
+  getMetrics() {
+    return this.context.metrics;
+  }
+  detectStagnation() {
+    const STAGNATION_THRESHOLD = 5;
+    const { metrics, history } = this.context;
+    if (history.length < STAGNATION_THRESHOLD) {
+      return false;
+    }
+    const recentHistory = history.slice(-STAGNATION_THRESHOLD);
+    const startMetrics = {
+      filesCreated: metrics.filesCreated,
+      filesModified: metrics.filesModified,
+      linesChanged: metrics.linesChanged
+    };
+    const noProgress = recentHistory.every((cycle) => {
+      return !cycle.action.includes("file_write") || cycle.action.includes("[ERROR]");
+    });
+    return noProgress;
+  }
+  detectRepetition(input) {
+    const REPETITION_THRESHOLD = 3;
+    const { history } = this.context;
+    if (history.length < REPETITION_THRESHOLD) {
+      return false;
+    }
+    const recentCycles = history.slice(-REPETITION_THRESHOLD);
+    const thoughts = recentCycles.map((c) => c.thought);
+    const allSame = thoughts.every((t) => t === thoughts[0]);
+    return allSame;
+  }
+  validateGoalAlignment(observation) {
+    const { goal } = this.context;
+    const goalLower = goal.toLowerCase();
+    const observationLower = observation.toLowerCase();
+    const goalFileMatch = goal.match(/(\w+\.ts)/);
+    const obsFileMatch = observation.match(/(\w+\.ts)/);
+    if (goalFileMatch && obsFileMatch) {
+      const goalFile = goalFileMatch[1];
+      const obsFile = obsFileMatch[1];
+      if (goalFile !== obsFile) {
+        return {
+          aligned: false,
+          reason: `Goal mentions ${goalFile} but action affected ${obsFile}`
+        };
+      }
+    }
+    if (goalLower.includes("create") && observationLower.includes("updated")) {
+      return {
+        aligned: false,
+        reason: "Goal is to create file but observation shows update"
+      };
+    }
+    if (goalLower.includes("update") && observationLower.includes("created")) {
+      return {
+        aligned: false,
+        reason: "Goal is to update file but observation shows creation"
+      };
+    }
+    return { aligned: true };
   }
 }
 
@@ -10454,9 +10650,9 @@ import { join } from "path";
 import { execSync as execSync2 } from "child_process";
 class CheckpointCommand {
   name = "checkpoint";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const claudeMdPath = join(context2.workDir, "CLAUDE.md");
+      const claudeMdPath = join(context.workDir, "CLAUDE.md");
       let pipelineState = null;
       let currentFeature = "";
       let currentTier = "";
@@ -10485,7 +10681,7 @@ class CheckpointCommand {
             reports = reportsMatch[1];
         }
       }
-      const buildguidePath = join(context2.workDir, "buildguide.md");
+      const buildguidePath = join(context.workDir, "buildguide.md");
       let nextSection = "";
       let newDocsFound = [];
       if (existsSync(buildguidePath)) {
@@ -10540,21 +10736,21 @@ Reports: ${reports || "N/A"}
       }
       writeFileSync(claudeMdPath, claudeContent);
       try {
-        const isGitRepo = execSync2("git rev-parse --git-dir 2>/dev/null", { cwd: context2.workDir, stdio: "pipe" });
+        const isGitRepo = execSync2("git rev-parse --git-dir 2>/dev/null", { cwd: context.workDir, stdio: "pipe" });
         if (isGitRepo) {
-          const hasChanges = execSync2("git diff --quiet || git diff --cached --quiet", { cwd: context2.workDir, stdio: "pipe" });
+          const hasChanges = execSync2("git diff --quiet || git diff --cached --quiet", { cwd: context.workDir, stdio: "pipe" });
           if (hasChanges) {
-            execSync2("git add CLAUDE.md buildguide.md 2>/dev/null || git add CLAUDE.md", { cwd: context2.workDir });
-            execSync2(`git commit -m "checkpoint: ${now} - session progress saved"`, { cwd: context2.workDir });
+            execSync2("git add CLAUDE.md buildguide.md 2>/dev/null || git add CLAUDE.md", { cwd: context.workDir });
+            execSync2(`git commit -m "checkpoint: ${now} - session progress saved"`, { cwd: context.workDir });
             try {
-              execSync2("git push origin HEAD 2>/dev/null", { cwd: context2.workDir });
+              execSync2("git push origin HEAD 2>/dev/null", { cwd: context.workDir });
             } catch (e) {
               console.log(source_default2.yellow("Note: Push failed, may need authentication"));
             }
           }
         }
       } catch (e) {}
-      const continuationPrompt = this.generateContinuationPrompt(context2.workDir, options.summary || "Session checkpointed", currentFeature, currentPhase, currentTier, tierStatus, nextSection, newDocsFound);
+      const continuationPrompt = this.generateContinuationPrompt(context.workDir, options.summary || "Session checkpointed", currentFeature, currentPhase, currentTier, tierStatus, nextSection, newDocsFound);
       console.log(source_default2.bold(`
 ` + continuationPrompt));
       return {
@@ -10693,13 +10889,13 @@ import { execSync as execSync3 } from "child_process";
 class CommitCommand {
   name = "commit";
   description = "Create a permanent version history commit (milestone)";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
       console.log(source_default2.bold(`
 === Git Commit (Milestone) ===`));
       let isGitRepo = false;
       try {
-        execSync3("git rev-parse --git-dir", { cwd: context2.workDir, stdio: "pipe" });
+        execSync3("git rev-parse --git-dir", { cwd: context.workDir, stdio: "pipe" });
         isGitRepo = true;
       } catch (e) {
         return {
@@ -10707,7 +10903,7 @@ class CommitCommand {
           message: "Not in a git repository. Cannot create commit."
         };
       }
-      const hasChanges = execSync3("git diff --quiet || git diff --cached --quiet", { cwd: context2.workDir, stdio: "pipe" });
+      const hasChanges = execSync3("git diff --quiet || git diff --cached --quiet", { cwd: context.workDir, stdio: "pipe" });
       if (!hasChanges) {
         console.log(source_default2.yellow(`
 No changes to commit.`));
@@ -10718,31 +10914,31 @@ No changes to commit.`));
       }
       let commitMessage = options.message;
       if (!commitMessage) {
-        commitMessage = await this.generateCommitMessage(context2);
+        commitMessage = await this.generateCommitMessage(context);
       }
       console.log(source_default2.cyan(`
 Commit message: ${commitMessage}`));
       console.log(source_default2.gray("Staging changes..."));
-      execSync3("git add -A", { cwd: context2.workDir });
+      execSync3("git add -A", { cwd: context.workDir });
       console.log(source_default2.gray("Creating commit..."));
-      execSync3(`git commit -m "${commitMessage}"`, { cwd: context2.workDir });
+      execSync3(`git commit -m "${commitMessage}"`, { cwd: context.workDir });
       console.log(source_default2.green("✓ Commit created successfully"));
-      const commitHash = execSync3("git rev-parse --short HEAD", { cwd: context2.workDir, encoding: "utf-8" }).trim();
+      const commitHash = execSync3("git rev-parse --short HEAD", { cwd: context.workDir, encoding: "utf-8" }).trim();
       console.log(source_default2.gray(`Commit: ${commitHash}`));
       if (options.push) {
         console.log(source_default2.gray("Pushing to remote..."));
         try {
           if (options.branch) {
-            execSync3(`git push origin ${options.branch}`, { cwd: context2.workDir });
+            execSync3(`git push origin ${options.branch}`, { cwd: context.workDir });
           } else {
-            execSync3("git push origin HEAD", { cwd: context2.workDir });
+            execSync3("git push origin HEAD", { cwd: context.workDir });
           }
           console.log(source_default2.green("✓ Pushed to remote"));
         } catch (e) {
           console.log(source_default2.yellow("Note: Push failed, may need authentication"));
         }
       }
-      this.updateClaudeMd(context2, commitMessage, commitHash);
+      this.updateClaudeMd(context, commitMessage, commitHash);
       console.log(source_default2.bold(`
 === Milestone Saved ===`));
       console.log(source_default2.green("This commit represents a stable milestone in your project."));
@@ -10758,10 +10954,10 @@ Commit message: ${commitMessage}`));
       };
     }
   }
-  async generateCommitMessage(context2) {
+  async generateCommitMessage(context) {
     try {
-      const diff = execSync3("git diff --cached --stat", { cwd: context2.workDir, encoding: "utf-8" });
-      const claudeMdPath = join2(context2.workDir, "CLAUDE.md");
+      const diff = execSync3("git diff --cached --stat", { cwd: context.workDir, encoding: "utf-8" });
+      const claudeMdPath = join2(context.workDir, "CLAUDE.md");
       let contextInfo = "";
       if (existsSync2(claudeMdPath)) {
         const claudeContent = readFileSync2(claudeMdPath, "utf-8");
@@ -10781,8 +10977,8 @@ Commit message: ${commitMessage}`));
       return `Milestone: ${now}`;
     }
   }
-  updateClaudeMd(context2, message, hash) {
-    const claudeMdPath = join2(context2.workDir, "CLAUDE.md");
+  updateClaudeMd(context, message, hash) {
+    const claudeMdPath = join2(context.workDir, "CLAUDE.md");
     if (!existsSync2(claudeMdPath))
       return;
     let claudeContent = readFileSync2(claudeMdPath, "utf-8");
@@ -10815,7 +11011,7 @@ import { writeFileSync as writeFileSync3 } from "fs";
 import { join as join3 } from "path";
 class CompactCommand {
   name = "compact";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
       console.log(source_default2.bold(`
 === Memory Compaction ===`));
@@ -10864,7 +11060,7 @@ Working on project features and command implementation.
 3. Test all commands
 4. Update documentation
 `;
-      const memoryDir = join3(context2.workDir, ".claude", "memory");
+      const memoryDir = join3(context.workDir, ".claude", "memory");
       const compactedPath = join3(memoryDir, "compacted-context.md");
       __require("fs").mkdirSync(memoryDir, { recursive: true });
       writeFileSync3(compactedPath, compactedContext);
@@ -10900,7 +11096,7 @@ ${compactedContext}
 import { existsSync as existsSync3, readFileSync as readFileSync4 } from "fs";
 class ReCommand {
   name = "re";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
       const action = options.action || "analyze";
       const target = options.target;
@@ -10917,11 +11113,11 @@ class ReCommand {
 `));
       switch (action) {
         case "extract":
-          return this.extractTarget(context2, target);
+          return this.extractTarget(context, target);
         case "analyze":
-          return this.analyzeTarget(context2, target);
+          return this.analyzeTarget(context, target);
         case "deobfuscate":
-          return this.deobfuscateTarget(context2, target);
+          return this.deobfuscateTarget(context, target);
         default:
           return {
             success: false,
@@ -10935,7 +11131,7 @@ class ReCommand {
       };
     }
   }
-  extractTarget(context2, target) {
+  extractTarget(context, target) {
     console.log(source_default2.yellow("Step 1: Determining target type..."));
     if (target.endsWith(".crx")) {
       console.log(source_default2.green("Detected: Chrome Extension"));
@@ -11009,7 +11205,7 @@ Instructions:`));
       message: "Target type unknown. Analyze manually."
     };
   }
-  analyzeTarget(context2, target) {
+  analyzeTarget(context, target) {
     console.log(source_default2.yellow("Step 1: Reading target file..."));
     if (!existsSync3(target)) {
       return {
@@ -11057,7 +11253,7 @@ Analysis complete.
       message: "Analysis complete"
     };
   }
-  deobfuscateTarget(context2, target) {
+  deobfuscateTarget(context, target) {
     console.log(source_default2.yellow("Step 1: Checking for obfuscation..."));
     if (!existsSync3(target)) {
       return {
@@ -11134,7 +11330,7 @@ class AutoCommand extends BaseCommand {
     this.compactCommand = new CompactCommand;
     this.reCommand = new ReCommand;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       if (!config.goal) {
         return this.createFailure('Goal is required. Usage: komplete auto "your goal"');
@@ -11148,16 +11344,16 @@ class AutoCommand extends BaseCommand {
       await this.memory.addContext(`Model: ${config.model || "auto-routed"}`, 9);
       await this.memory.addContext(`Task Type: ${this.currentTaskType}`, 8);
       if (this.currentTaskType === "reverse-engineering") {
-        await this.executeReverseEngineeringTools(context2, config.goal);
+        await this.executeReverseEngineeringTools(context, config.goal);
       }
       this.contextManager = new ContextManager({
         maxTokens: 128000,
         warningThreshold: 70,
         compactionThreshold: 80,
         strategy: COMPACTION_STRATEGIES.balanced
-      }, context2.llmRouter);
-      const agent = new ReflexionAgent(config.goal, context2.llmRouter);
-      const result = await this.runAutonomousLoop(agent, context2, config);
+      }, context.llmRouter);
+      const agent = new ReflexionAgent(config.goal, context.llmRouter);
+      const result = await this.runAutonomousLoop(agent, context, config);
       if (result.success) {
         this.success(`Goal achieved in ${this.iterations} iterations`);
         await this.memory.recordEpisode("task_complete", `Completed: ${config.goal}`, "success", `Iterations: ${this.iterations}`);
@@ -11180,7 +11376,7 @@ Suggested actions:`));
       return this.createFailure(errorMessage, err);
     }
   }
-  async runAutonomousLoop(agent, context2, config) {
+  async runAutonomousLoop(agent, context, config) {
     const maxIterations = config.maxIterations || 50;
     let goalAchieved = false;
     this.startSpinner("Starting autonomous loop...");
@@ -11189,7 +11385,7 @@ Suggested actions:`));
       this.updateSpinner(`Iteration ${this.iterations}/${maxIterations}`);
       try {
         await this.handleContextCompaction(config);
-        const cycle = await this.executeReflexionCycle(agent, context2, config);
+        const cycle = await this.executeReflexionCycle(agent, context, config);
         this.displayCycle(cycle, config.verbose || false);
         if (cycle.success) {
           this.consecutiveSuccesses++;
@@ -11198,8 +11394,8 @@ Suggested actions:`));
           this.consecutiveFailures++;
           this.consecutiveSuccesses = 0;
         }
-        goalAchieved = await this.checkGoalAchievement(agent, context2, config.goal);
-        await this.invokeSkills(context2, config, cycle, goalAchieved);
+        goalAchieved = await this.checkGoalAchievement(agent, context, config.goal);
+        await this.invokeSkills(context, config, cycle, goalAchieved);
         await this.sleep(500);
       } catch (error2) {
         const err = error2;
@@ -11210,7 +11406,7 @@ Suggested actions:`));
     }
     this.succeedSpinner(`Autonomous loop completed`);
     if (goalAchieved) {
-      await this.performFinalCheckpoint(context2, config.goal);
+      await this.performFinalCheckpoint(context, config.goal);
     }
     if (!goalAchieved && this.iterations >= maxIterations) {
       return this.createFailure(`Max iterations (${maxIterations}) reached without achieving goal`);
@@ -11237,32 +11433,32 @@ Suggested actions:`));
       this.lastCompactIteration = this.iterations;
     }
   }
-  async invokeSkills(context2, config, cycle, isGoalAchieved) {
+  async invokeSkills(context, config, cycle, isGoalAchieved) {
     const checkpointThreshold = config.checkpointThreshold || 10;
     const commitThreshold = 20;
     const shouldCheckpoint = this.iterations % checkpointThreshold === 0 || this.consecutiveFailures >= 3 || this.iterations - this.lastCheckpointIteration >= checkpointThreshold && this.consecutiveSuccesses >= 5;
     if (shouldCheckpoint) {
-      await this.performCheckpoint(context2, config.goal);
+      await this.performCheckpoint(context, config.goal);
       if (this.contextManager && this.conversationHistory.length > 0) {
         const health = this.contextManager.checkContextHealth(this.conversationHistory);
         if (health.status === "warning" || health.status === "critical") {
-          await this.performCompact(context2, "conservative");
+          await this.performCompact(context, "conservative");
         }
       }
     }
     const shouldCommit = this.iterations % commitThreshold === 0 && this.consecutiveSuccesses >= 10 || isGoalAchieved && this.iterations - this.lastCommitIteration >= 5;
     if (shouldCommit) {
-      await this.performCommit(context2, config.goal);
+      await this.performCommit(context, config.goal);
     }
     const shouldInvokeRe = this.currentTaskType === "reverse-engineering" && (this.iterations % 15 === 0 || this.iterations - this.lastReIteration >= 15);
     if (shouldInvokeRe) {
-      await this.performReCommand(context2, config.goal);
+      await this.performReCommand(context, config.goal);
     }
   }
-  async performCheckpoint(context2, goal) {
+  async performCheckpoint(context, goal) {
     this.info("\uD83D\uDCF8 Auto-checkpoint triggered");
     try {
-      const result = await this.checkpointCommand.execute(context2, {
+      const result = await this.checkpointCommand.execute(context, {
         summary: `Auto checkpoint at iteration ${this.iterations}: ${goal}`
       });
       if (result.success) {
@@ -11275,10 +11471,10 @@ Suggested actions:`));
       this.warn("Checkpoint failed (continuing anyway)");
     }
   }
-  async performCommit(context2, goal) {
+  async performCommit(context, goal) {
     this.info("\uD83D\uDCBE Auto-commit triggered (milestone)");
     try {
-      const result = await this.commitCommand.execute(context2, {
+      const result = await this.commitCommand.execute(context, {
         message: `Milestone: ${goal} - iteration ${this.iterations}`,
         push: false
       });
@@ -11292,10 +11488,10 @@ Suggested actions:`));
       this.warn("Commit failed (continuing anyway)");
     }
   }
-  async performCompact(context2, level = "conservative") {
+  async performCompact(context, level = "conservative") {
     this.info("\uD83D\uDD04 Auto-compact triggered");
     try {
-      const result = await this.compactCommand.execute(context2, { level });
+      const result = await this.compactCommand.execute(context, { level });
       if (result.success) {
         this.success("Memory compacted - context optimized");
       } else {
@@ -11306,10 +11502,10 @@ Suggested actions:`));
       this.warn("Compact failed (continuing anyway)");
     }
   }
-  async performFinalCheckpoint(context2, goal) {
+  async performFinalCheckpoint(context, goal) {
     this.info("\uD83D\uDCF8 Final checkpoint before completion");
     try {
-      const result = await this.checkpointCommand.execute(context2, {
+      const result = await this.checkpointCommand.execute(context, {
         summary: `Goal achieved: ${goal} after ${this.iterations} iterations`
       });
       if (result.success) {
@@ -11319,12 +11515,12 @@ Suggested actions:`));
       this.warn("Final checkpoint failed");
     }
   }
-  async performReCommand(context2, goal) {
+  async performReCommand(context, goal) {
     this.info("\uD83D\uDD2C Reverse engineering command triggered");
     try {
       const targetMatch = goal.match(/(?:analyze|extract|deobfuscate|understand)\s+(.+?)(?:\s|$)/i);
       const target = targetMatch ? targetMatch[1] : ".";
-      const result = await this.reCommand.execute(context2, {
+      const result = await this.reCommand.execute(context, {
         action: "analyze",
         target
       });
@@ -11338,13 +11534,13 @@ Suggested actions:`));
       this.warn("Reverse engineering command failed (continuing anyway)");
     }
   }
-  async executeReflexionCycle(agent, context2, config) {
+  async executeReflexionCycle(agent, context, config) {
     const memoryContext = await this.memory.getWorking();
     const recentEpisodes = await this.memory.searchEpisodes(config.goal, 5);
     const prompt = this.buildCyclePrompt(config.goal, memoryContext, recentEpisodes);
     const userMessage = { role: "user", content: prompt };
     this.conversationHistory.push(userMessage);
-    const llmResponse = await context2.llmRouter.route({
+    const llmResponse = await context.llmRouter.route({
       messages: [{ role: "user", content: prompt }],
       system: "You are an autonomous AI agent executing tasks. Think step by step."
     }, {
@@ -11382,7 +11578,7 @@ What is the next step to achieve this goal? Think through:
 Provide your reasoning and proposed action.
 `.trim();
   }
-  async checkGoalAchievement(agent, context2, goal) {
+  async checkGoalAchievement(agent, context, goal) {
     const history = agent.getHistory();
     const recentCycles = history.slice(-3);
     const allSuccessful = recentCycles.every((c) => c.success);
@@ -11401,7 +11597,7 @@ Result: ${c.observation}
 
 Has the goal been achieved? Answer with just "YES" or "NO" and brief explanation.
 `.trim();
-        const response = await context2.llmRouter.route({
+        const response = await context.llmRouter.route({
           messages: [{ role: "user", content: verificationPrompt }],
           system: "You are evaluating if a goal has been achieved. Be objective."
         }, {
@@ -11550,7 +11746,7 @@ Provide your reasoning and proposed action.
 `.trim();
     }
   }
-  async executeReverseEngineeringTools(context2, goal) {
+  async executeReverseEngineeringTools(context, goal) {
     this.info("\uD83D\uDD2C Reverse engineering tools detected");
     try {
       const targetMatch = goal.match(/(?:analyze|extract|deobfuscate|understand)\s+(.+?)(?:\s|$)/i);
@@ -11590,8 +11786,8 @@ class SPARCWorkflow {
   currentPhase = "specification" /* Specification */;
   context;
   router;
-  constructor(context2, router) {
-    this.context = context2;
+  constructor(context, router) {
+    this.context = context;
     this.router = router;
   }
   extractText(content) {
@@ -11869,7 +12065,7 @@ class SPARCCommand extends BaseCommand {
     super();
     this.memory = new MemoryManagerBridge;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       if (!config.task) {
         return this.createFailure('Task is required. Usage: komplete sparc "your task"');
@@ -11883,7 +12079,7 @@ class SPARCCommand extends BaseCommand {
         requirements: config.requirements || [],
         constraints: config.constraints || []
       };
-      const workflow = new SPARCWorkflow(sparcContext, context2.llmRouter);
+      const workflow = new SPARCWorkflow(sparcContext, context.llmRouter);
       this.startSpinner("Executing SPARC workflow...");
       const phases = [
         "specification" /* Specification */,
@@ -12781,11 +12977,11 @@ class SwarmCommand extends BaseCommand {
     this.orchestrator = new SwarmOrchestrator(10);
     this.memory = new MemoryManagerBridge;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       switch (config.action) {
         case "spawn":
-          return await this.spawnSwarm(context2, config);
+          return await this.spawnSwarm(context, config);
         case "status":
           return await this.showStatus(config);
         case "collect":
@@ -12801,7 +12997,7 @@ class SwarmCommand extends BaseCommand {
       return this.createFailure(err.message, err);
     }
   }
-  async spawnSwarm(context2, config) {
+  async spawnSwarm(context, config) {
     if (!config.task) {
       return this.createFailure('Task is required. Usage: komplete swarm spawn N "task description"');
     }
@@ -12903,7 +13099,7 @@ class ReflectCommand extends BaseCommand {
     super();
     this.memory = new MemoryManagerBridge;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       if (!config.goal) {
         return this.createFailure('Goal is required. Usage: komplete reflect "your goal"');
@@ -12919,7 +13115,7 @@ class ReflectCommand extends BaseCommand {
       const cycles = [];
       for (let i = 0;i < iterations; i++) {
         this.updateSpinner(`Cycle ${i + 1}/${iterations}`);
-        const input = await this.generateInput(context2, config.goal, agent.getHistory());
+        const input = await this.generateInput(context, config.goal, agent.getHistory());
         const cycle = await agent.cycle(input);
         cycles.push(cycle);
         if (config.verbose) {
@@ -12945,9 +13141,9 @@ class ReflectCommand extends BaseCommand {
       return this.createFailure(err.message, err);
     }
   }
-  async generateInput(context2, goal, history) {
+  async generateInput(context, goal, history) {
     const prompt = this.buildInputPrompt(goal, history);
-    const response = await context2.llmRouter.route({
+    const response = await context.llmRouter.route({
       messages: [{ role: "user", content: prompt }],
       system: "You are generating input for a reflexion cycle. Be concise and actionable."
     }, {
@@ -13014,7 +13210,7 @@ class ResearchCommand extends BaseCommand {
     super();
     this.memory = new MemoryManagerBridge;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       if (!config.query) {
         return this.createFailure('Query is required. Usage: komplete research "your query"');
@@ -13044,7 +13240,7 @@ class ResearchCommand extends BaseCommand {
         }
       }
       this.startSpinner("Generating research summary...");
-      const summary = await this.generateSummary(context2, config.query, results);
+      const summary = await this.generateSummary(context, config.query, results);
       results.summary = summary;
       this.succeedSpinner("Summary generated");
       await this.memory.recordEpisode("research_complete", `Research: ${config.query}`, "success", JSON.stringify(results));
@@ -13124,10 +13320,10 @@ class ResearchCommand extends BaseCommand {
       return [];
     }
   }
-  async generateSummary(context2, query, results) {
+  async generateSummary(context, query, results) {
     const prompt = this.buildSummaryPrompt(query, results);
     try {
-      const response = await context2.llmRouter.route({
+      const response = await context.llmRouter.route({
         messages: [{ role: "user", content: prompt }],
         system: "You are a research assistant. Provide concise, actionable summaries.",
         max_tokens: 1000
@@ -13628,7 +13824,7 @@ class Recommender {
     }
     return alternatives.slice(0, 5);
   }
-  generateIncrementalSteps(bugDescription, context2) {
+  generateIncrementalSteps(bugDescription, context) {
     const steps = [
       "Create test snapshot before changes",
       "Identify minimal change needed",
@@ -13636,24 +13832,24 @@ class Recommender {
       "Run tests and check for regression",
       "If passing, continue; if failing, revert and try alternative"
     ];
-    if (context2.similarFixesFromMemory.count > 0) {
+    if (context.similarFixesFromMemory.count > 0) {
       steps.unshift("Review similar successful fixes from memory");
     }
-    if (context2.githubSolutions.available) {
+    if (context.githubSolutions.available) {
       steps.unshift("Check GitHub solutions for patterns");
     }
     return steps;
   }
-  assessConfidence(context2) {
+  assessConfidence(context) {
     let confidence = 50;
-    confidence += Math.min(context2.similarFixesCount * 10, 30);
-    if (context2.hasGitHubSolutions) {
+    confidence += Math.min(context.similarFixesCount * 10, 30);
+    if (context.hasGitHubSolutions) {
       confidence += 15;
     }
-    if (context2.testsPassed) {
+    if (context.testsPassed) {
       confidence += 20;
     }
-    confidence -= Math.min(context2.attemptCount * 5, 20);
+    confidence -= Math.min(context.attemptCount * 5, 20);
     return Math.max(0, Math.min(100, confidence));
   }
 }
@@ -13677,7 +13873,7 @@ class DebugOrchestrator {
       bugDescription,
       bugType = "general",
       testCommand = 'echo "No tests configured"',
-      context: context2 = ""
+      context = ""
     } = input;
     const beforeSnapshotId = this.snapshotter.generateBeforeId();
     await this.snapshotter.createSnapshot(beforeSnapshotId, testCommand, `Before fix: ${bugDescription}`);
@@ -13759,13 +13955,13 @@ class RootCauseCommand extends BaseCommand {
     this.orchestrator = createDebugOrchestrator(debugDir, true);
     this.memory = new MemoryManagerBridge;
   }
-  async execute(context2, config) {
+  async execute(context, config) {
     try {
       switch (config.action) {
         case "analyze":
-          return await this.analyzeBug(context2, config);
+          return await this.analyzeBug(context, config);
         case "verify":
-          return await this.verifyFix(context2, config);
+          return await this.verifyFix(context, config);
         default:
           return this.createFailure(`Unknown action: ${config.action}. Use: analyze, verify`);
       }
@@ -13775,7 +13971,7 @@ class RootCauseCommand extends BaseCommand {
       return this.createFailure(err.message, err);
     }
   }
-  async analyzeBug(context2, config) {
+  async analyzeBug(context, config) {
     if (!config.bugDescription) {
       return this.createFailure("Bug description is required");
     }
@@ -13818,7 +14014,7 @@ class RootCauseCommand extends BaseCommand {
     console.log("");
     return this.createSuccess("Analysis complete", debugContext);
   }
-  async verifyFix(context2, config) {
+  async verifyFix(context, config) {
     if (!config.beforeSnapshotId) {
       return this.createFailure("Before snapshot ID is required");
     }
@@ -13870,11 +14066,11 @@ import { join as join6 } from "path";
 import { execSync as execSync4 } from "child_process";
 class BuildCommand {
   name = "build";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const debugLogPath = join6(context2.workDir, ".claude", "docs", "debug-log.md");
-      if (!existsSync4(join6(context2.workDir, ".claude", "docs"))) {
-        execSync4("mkdir -p .claude/docs", { cwd: context2.workDir });
+      const debugLogPath = join6(context.workDir, ".claude", "docs", "debug-log.md");
+      if (!existsSync4(join6(context.workDir, ".claude", "docs"))) {
+        execSync4("mkdir -p .claude/docs", { cwd: context.workDir });
       }
       if (!existsSync4(debugLogPath)) {
         const debugLogTemplate = `# Debug Log
@@ -13905,14 +14101,14 @@ class BuildCommand {
         "CLAUDE.md"
       ];
       for (const path6 of architecturePaths) {
-        if (path6 && existsSync4(join6(context2.workDir, path6))) {
-          architectureContent = readFileSync5(join6(context2.workDir, path6), "utf-8");
+        if (path6 && existsSync4(join6(context.workDir, path6))) {
+          architectureContent = readFileSync5(join6(context.workDir, path6), "utf-8");
           break;
         }
       }
       let targetFeature = options.feature;
-      if (!targetFeature && existsSync4(join6(context2.workDir, "buildguide.md"))) {
-        const buildguideContent = readFileSync5(join6(context2.workDir, "buildguide.md"), "utf-8");
+      if (!targetFeature && existsSync4(join6(context.workDir, "buildguide.md"))) {
+        const buildguideContent = readFileSync5(join6(context.workDir, "buildguide.md"), "utf-8");
         const uncheckedMatch = buildguideContent.match(/-\s*\[\s*\]\s*(.+)/);
         if (uncheckedMatch && uncheckedMatch.length > 0) {
           targetFeature = uncheckedMatch[0].replace(/-\s*\[\s*\]\s*/, "").trim();
@@ -13932,7 +14128,7 @@ class BuildCommand {
       console.log(source_default2.yellow("Step 3: Researching implementation patterns..."));
       console.log(source_default2.gray(`Note: Use MCP grep tool to search GitHub for examples
 `));
-      const buildPlanPath = join6(context2.workDir, ".claude", "current-build.local.md");
+      const buildPlanPath = join6(context.workDir, ".claude", "current-build.local.md");
       const buildPlan = `---
 feature: ${targetFeature}
 phase: implementing
@@ -13992,23 +14188,23 @@ import { join as join7 } from "path";
 import { execSync as execSync5 } from "child_process";
 class CollabCommand {
   name = "collab";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const collabDir = join7(context2.workDir, ".claude", "collab");
+      const collabDir = join7(context.workDir, ".claude", "collab");
       if (!existsSync5(collabDir)) {
-        execSync5("mkdir -p .claude/collab", { cwd: context2.workDir });
+        execSync5("mkdir -p .claude/collab", { cwd: context.workDir });
       }
       switch (options.action) {
         case "start":
-          return this.startSession(context2, options.sessionName);
+          return this.startSession(context, options.sessionName);
         case "join":
-          return this.joinSession(context2, options.sessionId);
+          return this.joinSession(context, options.sessionId);
         case "status":
-          return this.showStatus(context2);
+          return this.showStatus(context);
         case "sync":
-          return this.syncSession(context2);
+          return this.syncSession(context);
         case "leave":
-          return this.leaveSession(context2);
+          return this.leaveSession(context);
         default:
           return {
             success: false,
@@ -14022,9 +14218,9 @@ class CollabCommand {
       };
     }
   }
-  startSession(context2, sessionName) {
+  startSession(context, sessionName) {
     const sessionId = `collab_${Date.now()}`;
-    const sessionPath = join7(context2.workDir, ".claude", "collab", `${sessionId}.json`);
+    const sessionPath = join7(context.workDir, ".claude", "collab", `${sessionId}.json`);
     const sessionData = {
       id: sessionId,
       name: sessionName || "Untitled Session",
@@ -14048,14 +14244,14 @@ Share this ID with collaborators to join:
       message: `Session started: ${sessionId}`
     };
   }
-  joinSession(context2, sessionId) {
+  joinSession(context, sessionId) {
     if (!sessionId) {
       return {
         success: false,
         message: "Session ID required. Use: /collab join <session-id>"
       };
     }
-    const sessionPath = join7(context2.workDir, ".claude", "collab", `${sessionId}.json`);
+    const sessionPath = join7(context.workDir, ".claude", "collab", `${sessionId}.json`);
     if (!existsSync5(sessionPath)) {
       return {
         success: false,
@@ -14087,8 +14283,8 @@ Share this ID with collaborators to join:
       message: `Joined session: ${sessionId}`
     };
   }
-  showStatus(context2) {
-    const collabDir = join7(context2.workDir, ".claude", "collab");
+  showStatus(context) {
+    const collabDir = join7(context.workDir, ".claude", "collab");
     if (!existsSync5(collabDir)) {
       return {
         success: false,
@@ -14124,8 +14320,8 @@ Share this ID with collaborators to join:
       message: `Found ${sessions.length} active session(s)`
     };
   }
-  syncSession(context2) {
-    const collabDir = join7(context2.workDir, ".claude", "collab");
+  syncSession(context) {
+    const collabDir = join7(context.workDir, ".claude", "collab");
     if (!existsSync5(collabDir)) {
       return {
         success: false,
@@ -14144,8 +14340,8 @@ Share this ID with collaborators to join:
       message: "Session synchronized"
     };
   }
-  leaveSession(context2) {
-    const collabDir = join7(context2.workDir, ".claude", "collab");
+  leaveSession(context) {
+    const collabDir = join7(context.workDir, ".claude", "collab");
     const userId = process.env.USER || "unknown";
     if (!existsSync5(collabDir)) {
       return {
@@ -14200,24 +14396,24 @@ import { join as join8 } from "path";
 import { execSync as execSync6 } from "child_process";
 class MultiRepoCommand {
   name = "multi-repo";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const configDir = join8(context2.workDir, ".claude", "multi-repo");
+      const configDir = join8(context.workDir, ".claude", "multi-repo");
       const configPath = join8(configDir, "config.json");
       if (!existsSync6(configDir)) {
-        execSync6("mkdir -p .claude/multi-repo", { cwd: context2.workDir });
+        execSync6("mkdir -p .claude/multi-repo", { cwd: context.workDir });
       }
       switch (options.action) {
         case "status":
-          return this.showStatus(context2, configPath);
+          return this.showStatus(context, configPath);
         case "add":
-          return this.addRepos(context2, configPath, options.repos || []);
+          return this.addRepos(context, configPath, options.repos || []);
         case "sync":
-          return this.syncRepos(context2, configPath);
+          return this.syncRepos(context, configPath);
         case "checkpoint":
-          return this.createCheckpoint(context2, configPath, options.message);
+          return this.createCheckpoint(context, configPath, options.message);
         case "exec":
-          return this.execCommand(context2, configPath, options.command);
+          return this.execCommand(context, configPath, options.command);
         default:
           return {
             success: false,
@@ -14231,7 +14427,7 @@ class MultiRepoCommand {
       };
     }
   }
-  showStatus(context2, configPath) {
+  showStatus(context, configPath) {
     if (!existsSync6(configPath)) {
       console.log(source_default2.yellow(`
 No repositories registered.`));
@@ -14259,7 +14455,7 @@ No repositories registered.`));
       message: `Found ${repos.length} registered repo(s)`
     };
   }
-  addRepos(context2, configPath, repoPaths) {
+  addRepos(context, configPath, repoPaths) {
     if (repoPaths.length === 0) {
       return {
         success: false,
@@ -14271,7 +14467,7 @@ No repositories registered.`));
       config = JSON.parse(readFileSync7(configPath, "utf-8"));
     }
     for (const repoPath of repoPaths) {
-      const absolutePath = join8(context2.workDir, repoPath);
+      const absolutePath = join8(context.workDir, repoPath);
       if (!existsSync6(absolutePath)) {
         console.log(source_default2.yellow(`Warning: ${repoPath} does not exist`));
         continue;
@@ -14298,7 +14494,7 @@ Total repositories: ${config.repos.length}
       message: `Added repositories. Total: ${config.repos.length}`
     };
   }
-  syncRepos(context2, configPath) {
+  syncRepos(context, configPath) {
     if (!existsSync6(configPath)) {
       return {
         success: false,
@@ -14311,7 +14507,7 @@ Total repositories: ${config.repos.length}
 === Synchronizing Repositories ===
 `));
     for (const repo of repos) {
-      const repoPath = join8(context2.workDir, repo.path);
+      const repoPath = join8(context.workDir, repo.path);
       console.log(source_default2.cyan(`Syncing: ${repo.name}...`));
       try {
         execSync6("git pull", { cwd: repoPath, stdio: "pipe" });
@@ -14328,7 +14524,7 @@ Synchronization complete.
       message: `Synchronized ${repos.length} repo(s)`
     };
   }
-  createCheckpoint(context2, configPath, message) {
+  createCheckpoint(context, configPath, message) {
     if (!existsSync6(configPath)) {
       return {
         success: false,
@@ -14341,7 +14537,7 @@ Synchronization complete.
 === Creating Synchronized Checkpoint ===
 `));
     for (const repo of repos) {
-      const repoPath = join8(context2.workDir, repo.path);
+      const repoPath = join8(context.workDir, repo.path);
       console.log(source_default2.cyan(`Checkpointing: ${repo.name}...`));
       try {
         execSync6("git add -A", { cwd: repoPath });
@@ -14360,7 +14556,7 @@ Checkpoint complete.
       message: `Checkpointed ${repos.length} repo(s)`
     };
   }
-  execCommand(context2, configPath, command) {
+  execCommand(context, configPath, command) {
     if (!command) {
       return {
         success: false,
@@ -14381,7 +14577,7 @@ Checkpoint complete.
     console.log(source_default2.cyan(`Command: ${command}
 `));
     for (const repo of repos) {
-      const repoPath = join8(context2.workDir, repo.path);
+      const repoPath = join8(context.workDir, repo.path);
       console.log(source_default2.cyan(`Executing in: ${repo.name}...`));
       try {
         const result = execSync6(command, { cwd: repoPath, stdio: "pipe", encoding: "utf-8" });
@@ -14419,9 +14615,9 @@ import { existsSync as existsSync7, readFileSync as readFileSync8, writeFileSync
 import { join as join9 } from "path";
 class PersonalityCommand {
   name = "personality";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const personalitiesDir = join9(context2.workDir, "personalities");
+      const personalitiesDir = join9(context.workDir, "personalities");
       if (!existsSync7(personalitiesDir)) {
         return {
           success: false,
@@ -14432,13 +14628,13 @@ class PersonalityCommand {
         case "list":
           return this.listPersonalities(personalitiesDir);
         case "load":
-          return this.loadPersonality(personalitiesDir, options.name);
+          return this.loadPersonality(context, personalitiesDir, options.name);
         case "create":
           return this.createPersonality(personalitiesDir, options.name);
         case "edit":
           return this.editPersonality(personalitiesDir, options.name);
         case "current":
-          return this.showCurrent(personalitiesDir);
+          return this.showCurrent(context, personalitiesDir);
         default:
           return {
             success: false,
@@ -14493,7 +14689,7 @@ Use: /personality load <name>`));
       message: `Found ${personalities.length} personality(ies)`
     };
   }
-  loadPersonality(personalitiesDir, name) {
+  loadPersonality(context, personalitiesDir, name) {
     if (!name) {
       return {
         success: false,
@@ -14616,7 +14812,7 @@ Open the file to edit personality settings.
       message: `Edit personality: ${name}`
     };
   }
-  showCurrent(personalitiesDir) {
+  showCurrent(context, personalitiesDir) {
     const activePath = join9(context.workDir, ".claude", "active-personality.txt");
     if (!existsSync7(activePath)) {
       console.log(source_default2.yellow(`
@@ -14663,7 +14859,7 @@ import { writeFileSync as writeFileSync9 } from "fs";
 import { join as join10 } from "path";
 class ResearchApiCommand {
   name = "research-api";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
       const target = options.target;
       const depth = options.depth || "deep";
@@ -14684,7 +14880,7 @@ class ResearchApiCommand {
 === Research Instructions ===
 `));
       console.log(researchPlan);
-      const docsDir = join10(context2.workDir, ".claude", "docs", "api-research");
+      const docsDir = join10(context.workDir, ".claude", "docs", "api-research");
       const targetName = this.sanitizeTargetName(target);
       const researchDocPath = join10(docsDir, `${targetName}.md`);
       __require("fs").mkdirSync(docsDir, { recursive: true });
@@ -14932,9 +15128,9 @@ import { existsSync as existsSync9, readFileSync as readFileSync10, writeFileSyn
 import { join as join11 } from "path";
 class VoiceCommand {
   name = "voice";
-  async execute(context2, options) {
+  async execute(context, options) {
     try {
-      const voiceDir = join11(context2.workDir, ".claude", "voice");
+      const voiceDir = join11(context.workDir, ".claude", "voice");
       const configPath = join11(voiceDir, "config.json");
       const statusPath = join11(voiceDir, "status.json");
       if (!existsSync9(voiceDir)) {
@@ -14942,13 +15138,13 @@ class VoiceCommand {
       }
       switch (options.action) {
         case "start":
-          return this.startVoice(context2, configPath, statusPath);
+          return this.startVoice(context, configPath, statusPath);
         case "stop":
-          return this.stopVoice(context2, configPath, statusPath);
+          return this.stopVoice(context, configPath, statusPath);
         case "status":
-          return this.showStatus(context2, configPath, statusPath);
+          return this.showStatus(context, configPath, statusPath);
         case "settings":
-          return this.showSettings(context2, configPath);
+          return this.showSettings(context, configPath);
         default:
           return {
             success: false,
@@ -14962,7 +15158,7 @@ class VoiceCommand {
       };
     }
   }
-  startVoice(context2, configPath, statusPath) {
+  startVoice(context, configPath, statusPath) {
     const config = this.loadConfig(configPath);
     const status = {
       active: true,
@@ -15001,7 +15197,7 @@ class VoiceCommand {
       message: "Voice control activated"
     };
   }
-  stopVoice(context2, configPath, statusPath) {
+  stopVoice(context, configPath, statusPath) {
     const status = this.loadStatus(statusPath);
     if (!status || !status.active) {
       return {
@@ -15021,7 +15217,7 @@ class VoiceCommand {
       message: "Voice control stopped"
     };
   }
-  showStatus(context2, configPath, statusPath) {
+  showStatus(context, configPath, statusPath) {
     const config = this.loadConfig(configPath);
     const status = this.loadStatus(statusPath);
     console.log(source_default2.bold(`
@@ -15052,7 +15248,7 @@ class VoiceCommand {
       message: "Voice control status displayed"
     };
   }
-  showSettings(context2, configPath) {
+  showSettings(context, configPath) {
     const config = this.loadConfig(configPath);
     console.log(source_default2.bold(`
 === Voice Control Settings ===
@@ -15106,11 +15302,11 @@ async function initializeContext() {
 }
 program2.command("auto").description("Enter autonomous mode with ReAct + Reflexion loop").argument("<goal>", "Goal to achieve autonomously").option("-m, --model <model>", 'Model to use. Supports provider/model syntax (e.g., "glm/glm-4.7", "dolphin-3"). Default: auto-routed').option("-i, --iterations <number>", "Max iterations (default: 50)", "50").option("-c, --checkpoint <number>", "Checkpoint every N iterations (default: 10)", "10").option("-v, --verbose", "Verbose output", false).action(async (goal, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
-    context2.autonomousMode = true;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
+    context.autonomousMode = true;
     const autoCommand = new AutoCommand;
-    const result = await autoCommand.execute(context2, {
+    const result = await autoCommand.execute(context, {
       goal,
       model: options.model,
       maxIterations: parseInt(options.iterations, 10),
@@ -15135,10 +15331,10 @@ program2.command("init").description("Initialize komplete in current project").a
 });
 program2.command("sparc").description("Execute SPARC methodology (Specification \u2192 Pseudocode \u2192 Architecture \u2192 Refinement \u2192 Completion)").argument("<task>", "Task description").option("-r, --requirements <items...>", "Requirements list").option("-c, --constraints <items...>", "Constraints list").option("-v, --verbose", "Verbose output", false).action(async (task, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
     const sparcCommand = new SPARCCommand;
-    const result = await sparcCommand.execute(context2, {
+    const result = await sparcCommand.execute(context, {
       task,
       requirements: options.requirements,
       constraints: options.constraints,
@@ -15158,10 +15354,10 @@ Fatal error:`), err.message);
 });
 program2.command("swarm").description("Spawn and manage distributed agent swarms for parallel execution").argument("<action>", "Action: spawn, status, collect, clear").argument("[task]", "Task description (required for spawn)").option("-n, --count <number>", "Number of agents (for spawn)", "5").option("-id, --swarm-id <id>", "Swarm ID (for status/collect)").option("-d, --dir <directory>", "Working directory").option("-v, --verbose", "Verbose output", false).action(async (action, task, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
     const swarmCommand = new SwarmCommand;
-    const result = await swarmCommand.execute(context2, {
+    const result = await swarmCommand.execute(context, {
       action,
       task,
       agentCount: parseInt(options.count, 10),
@@ -15183,10 +15379,10 @@ Fatal error:`), err.message);
 });
 program2.command("reflect").description("Run ReAct + Reflexion loop (Think \u2192 Act \u2192 Observe \u2192 Reflect)").argument("<goal>", "Goal to achieve").option("-i, --iterations <number>", "Number of reflexion cycles (default: 3)", "3").option("-v, --verbose", "Verbose output", false).action(async (goal, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
     const reflectCommand = new ReflectCommand;
-    const result = await reflectCommand.execute(context2, {
+    const result = await reflectCommand.execute(context, {
       goal,
       iterations: parseInt(options.iterations, 10),
       verbose: options.verbose
@@ -15205,10 +15401,10 @@ Fatal error:`), err.message);
 });
 program2.command("research").description("Research code patterns, solutions, and best practices").argument("<query>", "Research query").option("-s, --sources <sources...>", "Sources: github, memory, web (default: all)", ["github", "memory"]).option("-l, --limit <number>", "Result limit (default: 10)", "10").option("--lang <languages...>", "Filter by programming languages").option("-v, --verbose", "Verbose output", false).action(async (query, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
     const researchCommand = new ResearchCommand;
-    const result = await researchCommand.execute(context2, {
+    const result = await researchCommand.execute(context, {
       query,
       sources: options.sources,
       limit: parseInt(options.limit, 10),
@@ -15229,10 +15425,10 @@ Fatal error:`), err.message);
 });
 program2.command("rootcause").description("Perform root cause analysis with regression detection").argument("<action>", "Action: analyze, verify").option("-b, --bug <description>", "Bug description (for analyze)").option("-t, --type <type>", "Bug type (for analyze)").option("--test <command>", "Test command (for verify)").option("--snapshot <id>", "Before snapshot ID (for verify)").option("-f, --fix <description>", "Fix description (for verify)").option("-v, --verbose", "Verbose output", false).action(async (action, options) => {
   try {
-    const context2 = await initializeContext();
-    context2.verbose = options.verbose;
+    const context = await initializeContext();
+    context.verbose = options.verbose;
     const rootcauseCommand = new RootCauseCommand;
-    const result = await rootcauseCommand.execute(context2, {
+    const result = await rootcauseCommand.execute(context, {
       action,
       bugDescription: options.bug,
       bugType: options.type,
@@ -15262,9 +15458,9 @@ program2.exitOverride((err) => {
 });
 program2.command("checkpoint").description("Save session state to CLAUDE.md and generate continuation prompt").argument("[summary]", "Optional summary of session work").action(async (summary) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const checkpointCommand = new CheckpointCommand;
-    const result = await checkpointCommand.execute(context2, { summary });
+    const result = await checkpointCommand.execute(context, { summary });
     if (!result.success) {
       console.error(source_default.red(`
 Error:`), result.message);
@@ -15279,9 +15475,9 @@ Fatal error:`), err.message);
 });
 program2.command("build").description("Build features autonomously by reading architecture, researching patterns, and implementing").argument("[feature-name]", "Feature name to build").option("--from <file>", "Use specific architecture document").action(async (featureName, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const buildCommand = new BuildCommand;
-    const result = await buildCommand.execute(context2, {
+    const result = await buildCommand.execute(context, {
       feature: featureName,
       from: options.from
     });
@@ -15299,9 +15495,9 @@ Fatal error:`), err.message);
 });
 program2.command("collab").description("Enable multiple users to work simultaneously with Claude on same project").argument("<action>", "Action: start, join, status, sync, leave").option("--session <name>", "Session name (for start)").option("--session-id <id>", "Session ID (for join)").action(async (action, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const collabCommand = new CollabCommand;
-    const result = await collabCommand.execute(context2, {
+    const result = await collabCommand.execute(context, {
       action,
       sessionName: options.session,
       sessionId: options.sessionId
@@ -15320,9 +15516,9 @@ Fatal error:`), err.message);
 });
 program2.command("compact").description("Compact memory to optimize context usage and reduce token consumption").argument("[level]", "Compaction level: aggressive, conservative (default: standard)").action(async (level) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const compactCommand = new CompactCommand;
-    const result = await compactCommand.execute(context2, {
+    const result = await compactCommand.execute(context, {
       level
     });
     if (!result.success) {
@@ -15339,9 +15535,9 @@ Fatal error:`), err.message);
 });
 program2.command("multi-repo").description("Coordinate work across multiple repositories with dependency tracking").argument("<action>", "Action: status, add, sync, checkpoint, exec").option("--repos <paths...>", "Repository paths (for add)").option("--message <text>", "Checkpoint message").option("--command <cmd>", "Command to execute (for exec)").action(async (action, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const multiRepoCommand = new MultiRepoCommand;
-    const result = await multiRepoCommand.execute(context2, {
+    const result = await multiRepoCommand.execute(context, {
       action,
       repos: options.repos,
       message: options.message,
@@ -15361,9 +15557,9 @@ Fatal error:`), err.message);
 });
 program2.command("personality").description("Configure Claude's behavior, knowledge focus, and communication style").argument("<action>", "Action: list, load, create, edit, current").option("--name <name>", "Personality name (for load/create/edit)").action(async (action, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const personalityCommand = new PersonalityCommand;
-    const result = await personalityCommand.execute(context2, {
+    const result = await personalityCommand.execute(context, {
       action,
       name: options.name
     });
@@ -15381,9 +15577,9 @@ Fatal error:`), err.message);
 });
 program2.command("re").description("Extract, analyze, and understand any software").argument("<target>", "Target: path, URL, or app identifier").option("--action <type>", "Action: extract, analyze, deobfuscate").action(async (target, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const reCommand = new ReCommand;
-    const result = await reCommand.execute(context2, {
+    const result = await reCommand.execute(context, {
       target,
       action: options.action
     });
@@ -15401,9 +15597,9 @@ Fatal error:`), err.message);
 });
 program2.command("research-api").description("Reverse engineer APIs, protocols, and binaries when documentation is lacking").argument("<target>", "Target: URL, mobile app, protocol, or binary").option("--depth <level>", "Research depth: quick, deep, forensic").action(async (target, options) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const researchApiCommand = new ResearchApiCommand;
-    const result = await researchApiCommand.execute(context2, {
+    const result = await researchApiCommand.execute(context, {
       target,
       depth: options.depth
     });
@@ -15421,9 +15617,9 @@ Fatal error:`), err.message);
 });
 program2.command("voice").description("Control Claude hands-free using voice commands").argument("<action>", "Action: start, stop, status, settings").action(async (action) => {
   try {
-    const context2 = await initializeContext();
+    const context = await initializeContext();
     const voiceCommand = new VoiceCommand;
-    const result = await voiceCommand.execute(context2, {
+    const result = await voiceCommand.execute(context, {
       action
     });
     if (!result.success) {
