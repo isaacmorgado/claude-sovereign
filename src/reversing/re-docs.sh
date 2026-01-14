@@ -209,7 +209,7 @@ generate_project_documentation() {
 [Auto-generated project documentation]
 
 ## Languages Used
-${languages[*]}
+${languages[@]}
 
 ## File Structure
 \`\`\`
