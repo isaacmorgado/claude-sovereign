@@ -225,7 +225,7 @@ async function testReCommandIntegration() {
     const testCases = [
       { action: 'analyze', target: 'package.json', shouldPass: true },
       { action: 'extract', target: 'test.js', shouldPass: true },
-      { action: 'deobfuscate', target: 'test.js', shouldPass: true },
+      { action: 'deobfuscate', target: 'package.json', shouldPass: true },
       { action: 'invalid', target: 'test.js', shouldPass: false }
     ];
 

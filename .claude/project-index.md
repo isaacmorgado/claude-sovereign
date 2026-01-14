@@ -1,6 +1,6 @@
 # 🗂️ Project Structure: .
 
-**Generated**: 2026-01-13 18:57:12
+**Generated**: 2026-01-13 19:30:46
 **Purpose**: Quick navigation reference for Claude (token-efficient)
 
 ---
@@ -60,8 +60,10 @@
 ├── 📄 AUTO-COMMAND-TEST-REPORT.md
 ├── 📄 AUTO-INTEGRATION-AND-TESTING-SUMMARY.md
 ├── 📄 AUTO-MODE-INTEGRATION-VERIFIED.md
+├── 📄 AUTO-VALIDATION-INTEGRATION.md
 ├── 📄 AUTONOMOUS-SWARM-IMPLEMENTATION.md
 ├── 📄 bun.lock
+├── 📄 calculator.ts
 ├── 📄 CLAUDE.md
 ├── 📄 CLAUDED-INTEGRATION.md
 ├── 📄 CLI-COMPREHENSIVE-TEST-REPORT.md
@@ -84,6 +86,7 @@
 ├── 📄 sparc.md
 ├── 📄 swarm.md
 └── 📄 voice.md
+├── 📄 COMPREHENSIVE-AUTO-COMMAND-TEST-REPORT-2026-01-13.md
 ├── 📄 COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
 ├── 📄 COMPREHENSIVE-TEST-FINDINGS.md
 ├── 📁 config/
@@ -216,20 +219,22 @@
 ├── 📄 test-auto-features.test.ts
 ├── 📄 test-cli-features.ts
 ├── 📄 TEST-EXECUTION-REPORT.md
-├── 📄 test-invalid.ts
 ├── 📄 test-llm-integration.ts
+├── 📄 test-output.ts
 ├── 📁 test-results/
 ├── 📄 TEST-RESULTS.md
-├── 📄 test.ts
 ├── 📄 TESTING-GUIDE.md
 ├── 📁 tests/
 ├── 📄 action-executor-test.ts
+├── 📁 agents/
+│   └── 📄 reflexion-improvements.test.ts
 ├── 📄 comprehensive-auto-test-simple.ts
 ├── 📄 comprehensive-auto-test.ts
 ├── 📁 core/
 │   └── 📁 logging/
 │   │   ├── 📄 FileRotation.test.ts
 │   │   └── 📄 Logger.test.ts
+├── 📁 tmp/
 └── 📄 typescript-validation-test.ts
 ├── 📄 tsconfig.json
 ├── 📄 TYPESCRIPT-CLI-COMPLETE.md
@@ -323,6 +328,7 @@
 • ./SMOKE-TEST-RESULTS.md
 • ./TYPESCRIPT-MIGRATION-STATUS.md
 • ./TYPESCRIPT-CLI-COMPLETE.md
+• ./AUTO-VALIDATION-INTEGRATION.md
 • ./CLAUDED-INTEGRATION.md
 • ./TESTING-GUIDE.md
 • ./CLAUDE.md
@@ -756,10 +762,10 @@
 ## 📊 Project Statistics
 
 **Languages:**
-• JavaScript/TypeScript: 41147 files
+• JavaScript/TypeScript: 41148 files
 • Python: 1 files
 
-**Estimated LOC:** 579824
+**Estimated LOC:** 580528
 
 
 ---

@@ -37,6 +37,18 @@ export class ActionExecutor {
    */
   async execute(action: Action): Promise<ActionResult> {
     try {
+      // Validate file existence for update operations
+      if (action.type === 'file_edit') {
+        const exists = await this.fileExists(action.params.path);
+        if (!exists) {
+          return {
+            success: false,
+            output: '',
+            error: `Cannot edit ${action.params.path}: file does not exist. Suggest creating it with file_write instead.`
+          };
+        }
+      }
+
       switch (action.type) {
         case 'file_write':
           return await this.executeFileWrite(
@@ -86,6 +98,19 @@ export class ActionExecutor {
         output: '',
         error: err.message
       };
+    }
+  }
+
+  /**
+   * Check if a file exists
+   */
+  private async fileExists(filePath: string): Promise<boolean> {
+    const fullPath = path.resolve(this.workingDir, filePath);
+    try {
+      await fs.access(fullPath);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -328,12 +353,17 @@ Goal: ${goal}
 Thought: ${thought}
 
 Available action types:
-1. file_write: Create or overwrite a file
+1. file_write: Create or overwrite a file (validates existence first)
 2. file_read: Read a file's contents
-3. file_edit: Edit a file by replacing text
+3. file_edit: Edit a file by replacing text (file must exist)
 4. command: Execute a bash command
 5. llm_generate: Generate code using LLM
 6. git_operation: Perform git operations
+
+IMPORTANT FILE VALIDATION RULES:
+- If goal/thought says "create" → use file_write (creates new file)
+- If goal/thought says "update" or "edit" → validate file exists first
+- If file doesn't exist and action is "update" → suggest creating it instead
 
 Return ONLY a JSON object with this structure:
 {
@@ -345,6 +375,8 @@ Return ONLY a JSON object with this structure:
 
 Examples:
 - "Create types.ts file" → {"type": "file_write", "params": {"path": "types.ts", "content": "..."}}
+- "Update types.ts" (file exists) → {"type": "file_edit", "params": {"path": "types.ts", ...}}
+- "Update types.ts" (file missing) → {"type": "file_write", "params": {"path": "types.ts", "content": "..."}}
 - "Run TypeScript compiler" → {"type": "command", "params": {"command": "tsc --noEmit"}}
 - "Generate Logger class" → {"type": "llm_generate", "params": {"prompt": "Generate TypeScript Logger class"}}
 

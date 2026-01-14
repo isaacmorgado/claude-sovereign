@@ -20,6 +20,12 @@ export interface Context {
   goal: string;
   history: ReflexionCycle[];
   metadata: Record<string, any>;
+  metrics: {
+    filesCreated: number;
+    filesModified: number;
+    linesChanged: number;
+    iterations: number;
+  };
 }
 
 /**
@@ -34,7 +40,13 @@ export class ReflexionAgent {
     this.context = {
       goal,
       history: [],
-      metadata: {}
+      metadata: {},
+      metrics: {
+        filesCreated: 0,
+        filesModified: 0,
+        linesChanged: 0,
+        iterations: 0
+      }
     };
 
     // Initialize ActionExecutor if LLM router provided
@@ -47,6 +59,18 @@ export class ReflexionAgent {
    * Execute a complete ReAct + Reflexion cycle
    */
   async cycle(input: string): Promise<ReflexionCycle> {
+    this.context.metrics.iterations++;
+
+    // Check for stagnation before continuing
+    if (this.detectStagnation()) {
+      throw new Error('Agent stuck: No progress for multiple iterations');
+    }
+
+    // Check for repetition
+    if (this.detectRepetition(input)) {
+      throw new Error('Agent stuck: Repeating same actions');
+    }
+
     // THINK: Generate reasoning
     const thought = await this.think(input);
 
@@ -54,7 +78,13 @@ export class ReflexionAgent {
     const action = await this.act(thought);
 
     // OBSERVE: Record outcome
-    const observation = await this.observe(action);
+    let observation = await this.observe(action);
+
+    // Validate observable changes match goal
+    const goalAlignment = this.validateGoalAlignment(observation);
+    if (!goalAlignment.aligned) {
+      observation += `\n⚠️ Goal misalignment: ${goalAlignment.reason}`;
+    }
 
     // REFLECT: Learn from outcome
     const reflection = await this.reflect(thought, action, observation);
@@ -76,6 +106,27 @@ export class ReflexionAgent {
    * THINK: Generate explicit reasoning about what to do
    */
   private async think(input: string): Promise<string> {
+    // Special handling for error inputs - pass through directly
+    if (input.startsWith('[ERROR]')) {
+      return input;
+    }
+
+    // Consider context, history, and goal
+    // Generate reasoning about the best approach
+    // Check for similar patterns in memory
+
+    return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+  }
+
+  /**
+   * THINK: Generate explicit reasoning about what to do
+   */
+  private async think(input: string): Promise<string> {
+    // Check if input is already an error - preserve it
+    if (input.startsWith('[ERROR]')) {
+      return input;
+    }
+
     // Consider context, history, and goal
     // Generate reasoning about the best approach
     // Check for similar patterns in memory
@@ -87,6 +138,11 @@ export class ReflexionAgent {
    * ACT: Execute the action based on reasoning
    */
   private async act(thought: string): Promise<string> {
+    // If thought contains an error, propagate it
+    if (thought.includes('[ERROR]')) {
+      return thought;
+    }
+
     if (!this.executor) {
       // Fallback to placeholder if no executor
       return `[PLACEHOLDER] Action based on: ${thought}`;
@@ -101,6 +157,19 @@ export class ReflexionAgent {
 
       // Execute the action
       const result: ActionResult = await this.executor.execute(action);
+
+      // Update metrics based on action result
+      if (result.success && result.metadata) {
+        if (action.type === 'file_write') {
+          if (result.metadata.existed) {
+            this.context.metrics.filesModified++;
+            this.context.metrics.linesChanged += result.metadata.lines || 0;
+          } else {
+            this.context.metrics.filesCreated++;
+            this.context.metrics.linesChanged += result.metadata.lines || 0;
+          }
+        }
+      }
 
       // Auto-validate TypeScript files after file_write
       if (action.type === 'file_write' && action.params.path?.endsWith('.ts')) {
@@ -135,18 +204,32 @@ export class ReflexionAgent {
     const actionTypeMatch = action.match(/^(\w+)\(/);
     const actionType = actionTypeMatch ? actionTypeMatch[1] : 'unknown';
 
+    // Check if this was a file creation vs modification
+    let observation = '';
     switch (actionType) {
       case 'file_write':
-        return `File successfully created/updated`;
+        if (action.includes('File created:')) {
+          observation = 'File successfully created';
+        } else if (action.includes('File updated:')) {
+          observation = 'File successfully updated';
+        } else {
+          observation = 'File successfully created/updated';
+        }
+        break;
       case 'file_read':
-        return `File contents retrieved`;
+        observation = 'File contents retrieved';
+        break;
       case 'command':
-        return `Command executed successfully`;
+        observation = 'Command executed successfully';
+        break;
       case 'llm_generate':
-        return `Code generated successfully`;
+        observation = 'Code generated successfully';
+        break;
       default:
-        return `Action completed: ${action}`;
+        observation = `Action completed: ${action}`;
     }
+
+    return observation;
   }
 
   /**
@@ -157,11 +240,120 @@ export class ReflexionAgent {
     action: string,
     observation: string
   ): Promise<string> {
-    // Self-critique: What went well/poorly?
-    // Extract lessons and patterns
-    // Store in memory for future use
+    const reflections: string[] = [];
 
-    return `Reflection on thought: ${thought}, action: ${action}, observation: ${observation}`;
+    // 1. Check for error patterns FIRST (highest priority)
+    if (observation.includes('[ERROR]') || observation.toLowerCase().includes('failed')) {
+      reflections.push(
+        `❌ Action failed. Need to adjust approach or check preconditions.`
+      );
+      // Early return for errors - don't add success messages
+      return reflections.join('\n');
+    }
+
+    // 2. Check for expectation mismatches
+    const expectedOutcome = this.extractExpectedOutcome(thought);
+    const actualOutcome = this.extractActualOutcome(observation);
+
+    if (expectedOutcome && actualOutcome && expectedOutcome !== actualOutcome) {
+      reflections.push(
+        `⚠️ Expectation mismatch: Expected "${expectedOutcome}" but got "${actualOutcome}"`
+      );
+    }
+
+    // 3. Check if goal is being addressed
+    if (!this.isProgressTowardsGoal(action, observation)) {
+      reflections.push(
+        `⚠️ Current action may not be contributing to goal: ${this.context.goal}`
+      );
+    }
+
+    // 4. Analyze progress metrics
+    const { metrics } = this.context;
+    if (metrics.iterations > 5 && metrics.filesCreated === 0 && metrics.filesModified === 0) {
+      reflections.push(
+        `⚠️ ${metrics.iterations} iterations with no file changes. May be stuck in planning loop.`
+      );
+    }
+
+    // 5. Success patterns (only if no errors)
+    if (observation.includes('successfully') || observation.includes('created')) {
+      reflections.push(
+        `✅ Action succeeded. Continue with next step towards goal.`
+      );
+    }
+
+    // Combine reflections or provide default
+    if (reflections.length > 0) {
+      return reflections.join('\n');
+    }
+
+    return `Reflection: ${thought} → ${action} → ${observation}`;
+  }
+
+  /**
+   * Extract expected outcome from thought
+   */
+  private extractExpectedOutcome(thought: string): string | null {
+    // Simple heuristic: look for action verbs and their objects
+    const patterns = [
+      /create (\w+\.ts)/i,
+      /update (\w+\.ts)/i,
+      /add (\w+ \w+)/i,
+      /implement (\w+)/i
+    ];
+
+    for (const pattern of patterns) {
+      const match = thought.match(pattern);
+      if (match) {
+        return match[1];
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract actual outcome from observation
+   */
+  private extractActualOutcome(observation: string): string | null {
+    // Extract file names or actions from observations
+    const fileMatch = observation.match(/(\w+\.ts)/);
+    if (fileMatch) {
+      return fileMatch[1];
+    }
+
+    if (observation.includes('failed') || observation.includes('[ERROR]')) {
+      return 'failure';
+    }
+
+    if (observation.includes('successfully') || observation.includes('created')) {
+      return 'success';
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if action/observation contributes to goal
+   */
+  private isProgressTowardsGoal(action: string, observation: string): boolean {
+    const { goal } = this.context;
+    const goalLower = goal.toLowerCase();
+    const actionLower = action.toLowerCase();
+    const obsLower = observation.toLowerCase();
+
+    // Extract key terms from goal
+    const goalTerms = goalLower
+      .split(/\s+/)
+      .filter(term => term.length > 3);
+
+    // Check if action or observation contains goal terms
+    const hasGoalTerms = goalTerms.some(term =>
+      actionLower.includes(term) || obsLower.includes(term)
+    );
+
+    return hasGoalTerms;
   }
 
   /**
@@ -177,5 +369,110 @@ export class ReflexionAgent {
    */
   getHistory(): ReflexionCycle[] {
     return this.context.history;
+  }
+
+  /**
+   * Get current progress metrics
+   */
+  getMetrics() {
+    return this.context.metrics;
+  }
+
+  /**
+   * Detect if agent is stuck (no progress for N iterations)
+   */
+  private detectStagnation(): boolean {
+    const STAGNATION_THRESHOLD = 5;
+    const { metrics, history } = this.context;
+
+    // Check if we have enough history
+    if (history.length < STAGNATION_THRESHOLD) {
+      return false;
+    }
+
+    // Get recent history
+    const recentHistory = history.slice(-STAGNATION_THRESHOLD);
+
+    // Check if metrics haven't changed in recent iterations
+    const startMetrics = {
+      filesCreated: metrics.filesCreated,
+      filesModified: metrics.filesModified,
+      linesChanged: metrics.linesChanged
+    };
+
+    // If no file changes in last N iterations, we're stagnant
+    const noProgress = recentHistory.every(cycle => {
+      return !cycle.action.includes('file_write') || cycle.action.includes('[ERROR]');
+    });
+
+    return noProgress;
+  }
+
+  /**
+   * Detect if agent is repeating the same actions
+   */
+  private detectRepetition(input: string): boolean {
+    const REPETITION_THRESHOLD = 3;
+    const { history } = this.context;
+
+    if (history.length < REPETITION_THRESHOLD) {
+      return false;
+    }
+
+    // Get last N cycles
+    const recentCycles = history.slice(-REPETITION_THRESHOLD);
+
+    // Check if all recent cycles have identical thoughts
+    const thoughts = recentCycles.map(c => c.thought);
+    const allSame = thoughts.every(t => t === thoughts[0]);
+
+    return allSame;
+  }
+
+  /**
+   * Validate if observable changes align with stated goal
+   */
+  private validateGoalAlignment(observation: string): { aligned: boolean; reason?: string } {
+    const { goal } = this.context;
+
+    // Extract key terms from goal
+    const goalLower = goal.toLowerCase();
+    const observationLower = observation.toLowerCase();
+
+    // Simple heuristic: check if goal mentions specific files/actions
+    // that should be reflected in observations
+
+    // Example: Goal says "create calculator.ts" but observation says "updated test.ts"
+    const goalFileMatch = goal.match(/(\w+\.ts)/);
+    const obsFileMatch = observation.match(/(\w+\.ts)/);
+
+    if (goalFileMatch && obsFileMatch) {
+      const goalFile = goalFileMatch[1];
+      const obsFile = obsFileMatch[1];
+
+      if (goalFile !== obsFile) {
+        return {
+          aligned: false,
+          reason: `Goal mentions ${goalFile} but action affected ${obsFile}`
+        };
+      }
+    }
+
+    // Check for action type alignment
+    if (goalLower.includes('create') && observationLower.includes('updated')) {
+      return {
+        aligned: false,
+        reason: 'Goal is to create file but observation shows update'
+      };
+    }
+
+    if (goalLower.includes('update') && observationLower.includes('created')) {
+      return {
+        aligned: false,
+        reason: 'Goal is to update file but observation shows creation'
+      };
+    }
+
+    return { aligned: true };
   }
 }

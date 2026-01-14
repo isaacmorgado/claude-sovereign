@@ -351,7 +351,7 @@ case "${1:-help}" in
         ;;
 
     project)
-        generate "project" "$2" "$3"
+        generate "project" "$2"
         ;;
 
     api)
