@@ -18,6 +18,8 @@ import type { ProviderRegistry } from './providers/ProviderFactory';
 import { MCPProvider } from './providers/MCPProvider';
 import { RateLimiter } from './RateLimiter';
 import { ErrorHandler } from './ErrorHandler';
+import { ConcurrencyManager, DEFAULT_PROVIDER_LIMITS } from './ConcurrencyManager';
+import { ModelFallbackChain, DEFAULT_FALLBACK_CHAIN, type FallbackConfig } from './ModelFallbackChain';
 
 /**
  * Model scoring for selection
@@ -43,14 +45,26 @@ interface ParsedModel {
 export class LLMRouter {
   private rateLimiter: RateLimiter;
   private errorHandler: ErrorHandler;
+  private concurrencyManager: ConcurrencyManager;
+  private fallbackChain: ModelFallbackChain;
+  private useFallback: boolean;
 
   constructor(
     private registry: ProviderRegistry,
     rateLimiter?: RateLimiter,
-    errorHandler?: ErrorHandler
+    errorHandler?: ErrorHandler,
+    options?: {
+      useFallback?: boolean;
+      fallbackChain?: FallbackConfig[];
+    }
   ) {
     this.rateLimiter = rateLimiter || new RateLimiter();
     this.errorHandler = errorHandler || new ErrorHandler();
+    this.concurrencyManager = new ConcurrencyManager(DEFAULT_PROVIDER_LIMITS);
+    this.useFallback = options?.useFallback ?? true;
+    this.fallbackChain = new ModelFallbackChain(
+      options?.fallbackChain || DEFAULT_FALLBACK_CHAIN
+    );
   }
 
   /**
@@ -74,8 +88,50 @@ export class LLMRouter {
 
   /**
    * Route a request to the best provider/model
+   * With concurrency control and fallback chain
    */
   async route(request: LLMRequest, context: RoutingContext): Promise<LLMResponse> {
+    // Use fallback chain if enabled
+    if (this.useFallback) {
+      return this.routeWithFallback(request, context);
+    }
+
+    // Original single-provider routing with concurrency control
+    return this.routeSingleProvider(request, context);
+  }
+
+  /**
+   * Route with fallback chain (recommended for production)
+   */
+  private async routeWithFallback(
+    request: LLMRequest,
+    context: RoutingContext
+  ): Promise<LLMResponse> {
+    const result = await this.fallbackChain.execute(
+      request,
+      context,
+      this.registry
+    );
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    console.log(
+      `[Router] Success after ${result.totalAttempts} attempts, ${result.totalDuration}ms ` +
+      `(tried: ${result.attemptedProviders.join(' → ')}, used: ${result.successfulProvider})`
+    );
+
+    return result.response!;
+  }
+
+  /**
+   * Route to single provider with concurrency control
+   */
+  private async routeSingleProvider(
+    request: LLMRequest,
+    context: RoutingContext
+  ): Promise<LLMResponse> {
     // Check if explicit model/provider specified
     let selection: ModelSelection;
 
@@ -109,34 +165,38 @@ export class LLMRouter {
       throw new Error(`Provider not available: ${selection.provider}`);
     }
 
-    // Set model in request
-    const routedRequest: LLMRequest = {
-      ...request,
-      model: selection.model
-    };
+    // Acquire concurrency permit
+    const release = await this.concurrencyManager.acquire(selection.provider);
 
-    // Execute with rate limiting and error handling
-    return this.errorHandler.retryWithBackoff(
-      async (attempt: number) => {
-        // Wait for rate limit token
-        await this.rateLimiter.waitForToken(selection.provider);
+    try {
+      // Set model in request
+      const routedRequest: LLMRequest = {
+        ...request,
+        model: selection.model
+      };
 
-        // Execute request
-        try {
-          return await provider.complete(routedRequest);
-        } catch (error: any) {
-          // Classify error for better retry logic
-          const classified = this.errorHandler.classify(error);
+      // Execute with rate limiting and error handling
+      return await this.errorHandler.retryWithBackoff(
+        async (attempt: number) => {
+          // Wait for rate limit token
+          await this.rateLimiter.waitForToken(selection.provider);
 
-          // Add context to error
-          error.providerName = selection.provider;
-          error.modelName = selection.model;
-          error.attempt = attempt;
-          error.classified = classified;
+          // Execute request
+          try {
+            return await provider.complete(routedRequest, context);
+          } catch (error: any) {
+            // Classify error for better retry logic
+            const classified = this.errorHandler.classify(error);
 
-          throw error;
-        }
-      },
+            // Add context to error
+            error.providerName = selection.provider;
+            error.modelName = selection.model;
+            error.attempt = attempt;
+            error.classified = classified;
+
+            throw error;
+          }
+        },
       {
         maxRetries: 3,
         initialDelay: 1000,
@@ -149,7 +209,11 @@ export class LLMRouter {
           );
         }
       }
-    );
+      );
+    } finally {
+      // Always release concurrency permit
+      release();
+    }
   }
 
   /**

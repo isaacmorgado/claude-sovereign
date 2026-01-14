@@ -14,10 +14,23 @@
 import { spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, readFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 
 const execAsync = promisify(require('child_process').exec);
+
+// Get project root directory (parent of tests/ directory or current directory if in root)
+const TEST_FILE_PATH = fileURLToPath(import.meta.url);
+const PROJECT_ROOT = TEST_FILE_PATH.includes('/tests/') 
+  ? dirname(TEST_FILE_PATH) 
+  : process.cwd();
+
+// Helper function to run commands from project root
+async function execFromProjectRoot(command: string): Promise<{ stdout: string; stderr: string }> {
+  const { stdout, stderr } = await execAsync(`cd ${PROJECT_ROOT} && ${command}`);
+  return { stdout, stderr };
+}
 
 // Test results tracking
 interface TestResult {
@@ -60,7 +73,7 @@ async function runTest(name: string, fn: () => Promise<void>): Promise<void> {
 async function testCLIHelp() {
   console.log(chalk.bold('\n=== Test 1: CLI Help Command ==='));
 
-  const { stdout } = await execAsync('bun run src/index.ts --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts --help');
   if (!stdout.includes('auto')) {
     throw new Error('CLI help does not show auto command');
   }
@@ -73,7 +86,7 @@ async function testCLIAutoCommand() {
   console.log(chalk.bold('\n=== Test 2: CLI Auto Command ==='));
 
   // Test that auto command is recognized
-  const { stdout } = await execAsync('bun run src/index.ts auto --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts auto --help');
   if (!stdout.includes('goal')) {
     throw new Error('auto command does not show goal argument');
   }
@@ -94,19 +107,19 @@ async function testCLIAutoCommand() {
 async function testCLIBuiltVersion() {
   console.log(chalk.bold('\n=== Test 3: Built CLI Version ==='));
 
-  // Build the CLI
+  // Build CLI
   try {
-    await execAsync('bun run build');
+    await execFromProjectRoot('bun run build');
   } catch (error: any) {
     throw new Error(`Build failed: ${error.message}`);
   }
 
   // Test built version recognizes auto command
-  if (!existsSync('dist/index.js')) {
+  if (!existsSync(join(PROJECT_ROOT, 'dist/index.js'))) {
     throw new Error('Built dist/index.js does not exist');
   }
 
-  const { stdout } = await execAsync('node dist/index.js --help');
+  const { stdout } = await execFromProjectRoot('node dist/index.js --help');
   if (!stdout.includes('auto')) {
     throw new Error('Built CLI does not show auto command');
   }
@@ -119,11 +132,11 @@ async function testCLIBuiltVersion() {
 async function testAutoHookExists() {
   console.log(chalk.bold('\n=== Test 4: auto.sh Hook ==='));
 
-  if (!existsSync('hooks/auto.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/auto.sh'))) {
     throw new Error('hooks/auto.sh does not exist');
   }
 
-  const content = readFileSync('hooks/auto.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/auto.sh'), 'utf-8');
   if (!content.includes('activate_autonomous')) {
     throw new Error('auto.sh missing activate_autonomous function');
   }
@@ -139,7 +152,7 @@ async function testAutoHookCommands() {
   console.log(chalk.bold('\n=== Test 5: auto.sh Commands ==='));
 
   // Test help command
-  const { stdout } = await execAsync('bash hooks/auto.sh help');
+  const { stdout } = await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/auto.sh')}" help`);
   if (!stdout.includes('start')) {
     throw new Error('auto.sh help missing start command');
   }
@@ -154,11 +167,11 @@ async function testAutoHookCommands() {
 async function testAutonomousCommandRouterHook() {
   console.log(chalk.bold('\n=== Test 6: autonomous-command-router.sh Hook ==='));
 
-  if (!existsSync('hooks/autonomous-command-router.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/autonomous-command-router.sh'))) {
     throw new Error('hooks/autonomous-command-router.sh does not exist');
   }
 
-  const content = readFileSync('hooks/autonomous-command-router.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/autonomous-command-router.sh'), 'utf-8');
   if (!content.includes('analyze_situation')) {
     throw new Error('autonomous-command-router.sh missing analyze_situation function');
   }
@@ -171,13 +184,13 @@ async function testAutonomousCommandRouterOutput() {
   console.log(chalk.bold('\n=== Test 7: autonomous-command-router.sh Output ==='));
 
   // Test analyze command
-  const { stdout } = await execAsync('bash hooks/autonomous-command-router.sh analyze checkpoint_files');
+  const { stdout } = await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/autonomous-command-router.sh')}" analyze checkpoint_files`);
   if (!stdout.includes('command')) {
     throw new Error('autonomous-command-router.sh analyze did not return command');
   }
 
   // Test status command
-  const { stdout: statusOutput } = await execAsync('bash hooks/autonomous-command-router.sh status');
+  const { stdout: statusOutput } = await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/autonomous-command-router.sh')}" status`);
   if (!statusOutput.includes('autonomous')) {
     throw new Error('autonomous-command-router.sh status did not return autonomous field');
   }
@@ -186,11 +199,11 @@ async function testAutonomousCommandRouterOutput() {
 async function testMemoryManagerHook() {
   console.log(chalk.bold('\n=== Test 8: memory-manager.sh Hook ==='));
 
-  if (!existsSync('hooks/memory-manager.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/memory-manager.sh'))) {
     throw new Error('hooks/memory-manager.sh does not exist');
   }
 
-  const content = readFileSync('hooks/memory-manager.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/memory-manager.sh'), 'utf-8');
   if (!content.includes('get-working')) {
     throw new Error('memory-manager.sh missing get-working function');
   }
@@ -199,11 +212,11 @@ async function testMemoryManagerHook() {
 async function testCoordinatorHook() {
   console.log(chalk.bold('\n=== Test 9: coordinator.sh Hook ==='));
 
-  if (!existsSync('hooks/coordinator.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/coordinator.sh'))) {
     throw new Error('hooks/coordinator.sh does not exist');
   }
 
-  const content = readFileSync('hooks/coordinator.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/coordinator.sh'), 'utf-8');
   if (!content.includes('coordinate_task')) {
     throw new Error('coordinator.sh missing coordinate_task function');
   }
@@ -215,11 +228,11 @@ async function testCoordinatorHook() {
 async function testSwarmOrchestratorHook() {
   console.log(chalk.bold('\n=== Test 10: swarm-orchestrator.sh Hook ==='));
 
-  if (!existsSync('hooks/swarm-orchestrator.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/swarm-orchestrator.sh'))) {
     throw new Error('hooks/swarm-orchestrator.sh does not exist');
   }
 
-  const content = readFileSync('hooks/swarm-orchestrator.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/swarm-orchestrator.sh'), 'utf-8');
   if (!content.includes('spawn_agents')) {
     throw new Error('swarm-orchestrator.sh missing spawn_agents function');
   }
@@ -228,11 +241,11 @@ async function testSwarmOrchestratorHook() {
 async function testPlanThinkActHook() {
   console.log(chalk.bold('\n=== Test 11: plan-think-act.sh Hook ==='));
 
-  if (!existsSync('hooks/plan-think-act.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/plan-think-act.sh'))) {
     throw new Error('hooks/plan-think-act.sh does not exist');
   }
 
-  const content = readFileSync('hooks/plan-think-act.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/plan-think-act.sh'), 'utf-8');
   if (!content.includes('plan')) {
     throw new Error('plan-think-act.sh missing plan function');
   }
@@ -247,11 +260,11 @@ async function testPlanThinkActHook() {
 async function testPersonalityLoaderHook() {
   console.log(chalk.bold('\n=== Test 12: personality-loader.sh Hook ==='));
 
-  if (!existsSync('hooks/personality-loader.sh')) {
+  if (!existsSync(join(PROJECT_ROOT, 'hooks/personality-loader.sh'))) {
     throw new Error('hooks/personality-loader.sh does not exist');
   }
 
-  const content = readFileSync('hooks/personality-loader.sh', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'hooks/personality-loader.sh'), 'utf-8');
   if (!content.includes('load_personality')) {
     throw new Error('personality-loader.sh missing load_personality function');
   }
@@ -268,7 +281,7 @@ async function testHooksDontBlockCLI() {
   const startTime = Date.now();
 
   // Call auto.sh status (should return quickly)
-  await execAsync('bash hooks/auto.sh status');
+  await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/auto.sh')}" status`);
 
   const elapsed = Date.now() - startTime;
   if (elapsed > 5000) {
@@ -280,9 +293,9 @@ async function testMultipleHooksCanRun() {
   console.log(chalk.bold('\n=== Test 14: Multiple Hooks Can Run ==='));
 
   // Run multiple hooks in sequence
-  await execAsync('bash hooks/auto.sh status');
-  await execAsync('bash hooks/autonomous-command-router.sh status');
-  await execAsync('bash hooks/coordinator.sh status');
+  await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/auto.sh')}" status`);
+  await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/autonomous-command-router.sh')}" status`);
+  await execFromProjectRoot(`bash "${join(PROJECT_ROOT, 'hooks/coordinator.sh')}" status`);
 
   // If we get here without timeout, hooks don't block each other
   console.log('  ✓ Multiple hooks executed successfully');
@@ -295,7 +308,7 @@ async function testMultipleHooksCanRun() {
 async function testTypeScriptBridgeDoesNotAutoExecute() {
   console.log(chalk.bold('\n=== Test 15: TypeScriptBridge Entry Point ==='));
 
-  const content = readFileSync('src/core/llm/bridge/TypeScriptBridge.ts', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'src/core/llm/bridge/TypeScriptBridge.ts'), 'utf-8');
 
   // Verify main() is exported but not auto-executed
   if (!content.includes('export async function main()')) {
@@ -320,11 +333,11 @@ async function testTypeScriptBridgeDoesNotAutoExecute() {
 async function testAutoDocumentation() {
   console.log(chalk.bold('\n=== Test 16: auto.md Documentation ==='));
 
-  if (!existsSync('commands/auto.md')) {
+  if (!existsSync(join(PROJECT_ROOT, 'commands/auto.md'))) {
     throw new Error('commands/auto.md does not exist');
   }
 
-  const content = readFileSync('commands/auto.md', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'commands/auto.md'), 'utf-8');
 
   // Verify documentation clarifies hooks vs CLI commands
   if (!content.includes('Shell Hooks vs CLI Commands')) {
@@ -348,7 +361,7 @@ async function testNativeSlashCommandsDocumented() {
   console.log(chalk.bold('\n=== Test 17: Native Slash Commands ==='));
 
   // Check that documentation mentions native slash commands
-  const content = readFileSync('commands/auto.md', 'utf-8');
+  const content = readFileSync(join(PROJECT_ROOT, 'commands/auto.md'), 'utf-8');
 
   // Verify documentation mentions that native slash commands remain accessible
   if (!content.includes('native') && !content.includes('slash command')) {
@@ -363,7 +376,7 @@ async function testNativeSlashCommandsDocumented() {
 async function testPackageJsonScripts() {
   console.log(chalk.bold('\n=== Test 18: package.json Scripts ==='));
 
-  const pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
+  const pkg = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf-8'));
 
   // Verify test script exists
   if (!pkg.scripts || !pkg.scripts.test) {
@@ -393,7 +406,7 @@ async function testPackageJsonScripts() {
 async function testAutoCommandModelOption() {
   console.log(chalk.bold('\n=== Test 19: Auto Command -m Option ==='));
 
-  const { stdout } = await execAsync('bun run src/index.ts auto --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts auto --help');
   if (!stdout.includes('-m, --model')) {
     throw new Error('auto command missing -m/--model option');
   }
@@ -405,7 +418,7 @@ async function testAutoCommandModelOption() {
 async function testAutoCommandIterationsOption() {
   console.log(chalk.bold('\n=== Test 20: Auto Command -i Option ==='));
 
-  const { stdout } = await execAsync('bun run src/index.ts auto --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts auto --help');
   if (!stdout.includes('-i, --iterations')) {
     throw new Error('auto command missing -i/--iterations option');
   }
@@ -417,7 +430,7 @@ async function testAutoCommandIterationsOption() {
 async function testAutoCommandCheckpointOption() {
   console.log(chalk.bold('\n=== Test 21: Auto Command -c Option ==='));
 
-  const { stdout } = await execAsync('bun run src/index.ts auto --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts auto --help');
   if (!stdout.includes('-c, --checkpoint')) {
     throw new Error('auto command missing -c/--checkpoint option');
   }
@@ -429,7 +442,7 @@ async function testAutoCommandCheckpointOption() {
 async function testAutoCommandVerboseOption() {
   console.log(chalk.bold('\n=== Test 22: Auto Command -v Option ==='));
 
-  const { stdout } = await execAsync('bun run src/index.ts auto --help');
+  const { stdout } = await execFromProjectRoot('bun run src/index.ts auto --help');
   if (!stdout.includes('-v, --verbose')) {
     throw new Error('auto command missing -v/--verbose option');
   }
@@ -445,7 +458,7 @@ async function testAutoCommandVerboseOption() {
 async function testAutoCommandClass() {
   console.log(chalk.bold('\n=== Test 23: AutoCommand Class ==='));
 
-  const { AutoCommand } = await import('./src/cli/commands/AutoCommand.ts');
+  const { AutoCommand } = await import(join(PROJECT_ROOT, 'src/cli/commands/AutoCommand.ts'));
   const autoCmd = new AutoCommand();
 
   if (autoCmd.name !== 'auto') {
@@ -464,7 +477,7 @@ async function testAutoCommandClass() {
 async function testBaseCommandClass() {
   console.log(chalk.bold('\n=== Test 24: BaseCommand Class ==='));
 
-  const { BaseCommand } = await import('./src/cli/BaseCommand.ts');
+  const { BaseCommand } = await import(join(PROJECT_ROOT, 'src/cli/BaseCommand.ts'));
 
   if (typeof BaseCommand !== 'function') {
     throw new Error('BaseCommand is not a class/function');
@@ -476,9 +489,9 @@ async function testBaseCommandClass() {
 // ============================================================================
 
 async function main() {
-  console.log(chalk.bold.blue('\n╔════════════════════════════════════════════════════════════╗'));
+  console.log(chalk.bold.blue('\n╔══════════════════════════════════════════════╗'));
   console.log(chalk.bold.blue('║       Komplete Kontrol Auto Features Test Suite              ║'));
-  console.log(chalk.bold.blue('╚════════════════════════════════════════════════════════════╝\n'));
+  console.log(chalk.bold.blue('╚══════════════════════════════════════════════════╝\n'));
 
   const tests = [
     // CLI Features

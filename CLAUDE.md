@@ -3,33 +3,53 @@
 Autonomous AI operation system being migrated from bash hooks to TypeScript/Bun. Goal: Integrate Roo Code SPARC methodology, /auto autonomy features, and multi-provider support into a unified modern CLI.
 
 ## Current Focus
-Phase 1 Complete: ReflexionCommand CLI implemented and tested. Ready for Phase 2 orchestrator integration.
+Documentation cleanup complete. Project now has professional-grade organization with 97% reduction in root clutter.
 
-## Last Session (2026-01-13)
+## Last Session (2026-01-14)
 
-**ReflexionCommand CLI Integration - Phase 1 Complete**:
-- Implemented ReflexionCommand.ts (257 lines) with execute/status/metrics subcommands
-- Integrated into CLI router (src/index.ts) with full Commander.js support
-- Created integration test suite (335 lines, all passing)
-- JSON output mode for bash orchestrator (`--output-json` flag)
-- All 4 acceptance criteria verified (CLI works, JSON parseable, exit codes correct, metrics included)
-- Comprehensive documentation (REFLEXION-COMMAND-INTEGRATION-COMPLETE.md, 470+ lines)
-- Stopped at: Phase 1 complete, ready for orchestrator integration
+**Documentation Cleanup - Complete**:
+- Reorganized 65 markdown files from root into structured /docs directory
+- Created categories: features/, integration/, guides/, archive/sessions/, archive/test-reports/
+- Root reduced from 65 to 2 files (CLAUDE.md, README.md only)
+- Created master DOCUMENTATION-INDEX.md with task-based navigation
+- Updated README.md and CLAUDE.md references to new paths
+- 108 files moved/modified, zero files lost
 
 ## Next Steps
-1. Wait for API quota reset (24h from 2026-01-13 21:34), run `./run-edge-case-tests.sh` to validate 30-50 iteration performance
-2. Phase 2: Integrate ReflexionCommand into autonomous-orchestrator-v2.sh decision tree
-3. Phase 3: Create orchestrator integration test suite
-4. Phase 4: Production deployment with feature flag
+1. Run `./run-edge-case-tests.sh` to validate ReflexionAgent 30-50 iteration performance (after API quota reset)
+2. Phase 2B: E2E orchestrator tests with actual ReflexionAgent execution
+3. Phase 3: Validation and performance benchmarks
+4. Phase 4: Production rollout (enable ENABLE_REFLEXION_AGENT feature flag by default)
 
 ## Key Files
-- `src/cli/commands/ReflexionCommand.ts` - CLI interface for ReflexionAgent
+
+**Phase 1 Files**:
+- `src/cli/commands/ReflexionCommand.ts` - CLI interface for ReflexionAgent (257 lines)
 - `src/index.ts` - CLI router with /reflexion command
-- `tests/integration/reflexion-command.test.ts` - Integration test suite
-- `REFLEXION-COMMAND-INTEGRATION-COMPLETE.md` - Phase 1 documentation
-- `REFLEXION-ORCHESTRATOR-INTEGRATION-PLAN.md` - 4-phase integration plan
+- `tests/integration/reflexion-command.test.ts` - Integration test suite (335 lines)
+- `docs/features/REFLEXION-COMMAND-INTEGRATION-COMPLETE.md` - Phase 1 documentation (470+ lines)
+
+**Phase 2A Files**:
+- `~/.claude/hooks/autonomous-orchestrator-v2.sh` - Modified (+120 lines)
+- `docs/integration/ORCHESTRATOR-REFLEXION-INTEGRATION-DESIGN.md` - Integration design (271 lines)
+- `tests/orchestrator/UNIT-TEST-RESULTS.md` - Decision logic test results
+- `docs/archive/sessions/SESSION-SUMMARY-ORCHESTRATOR-INTEGRATION-2026-01-13.md` - Session summary
+
+**Planning Documents**:
+- `docs/integration/REFLEXION-ORCHESTRATOR-INTEGRATION-PLAN.md` - 4-phase integration plan (updated)
+
+**Documentation**:
+- `DOCUMENTATION-INDEX.md` - Master documentation index (90+ organized files)
 
 ## Key Context
-- CLI invocation: `bun run kk reflexion execute --goal "..." --output-json`
-- Test pattern: Always use `--preferred-model glm-4.7` to avoid rate limits
+
+**CLI Usage**:
+- Invocation: `bun run src/index.ts reflexion execute --goal "..." --output-json`
+- Model: Always use `--preferred-model glm-4.7` to avoid rate limits
 - Fallback chain: Kimi-K2 → GLM-4.7 → Llama-70B → Dolphin-3
+
+**Orchestrator Integration**:
+- Feature flag: `export ENABLE_REFLEXION_AGENT=1` (default: 0)
+- Decision logic: 4 rules route complex tasks to ReflexionAgent
+- Automatic fallback: Rate limits or errors trigger bash agent-loop
+- Logging: All decisions logged to `~/.claude/orchestrator.log`

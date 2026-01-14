@@ -339,10 +339,23 @@ export CHECKPOINT_FILE_THRESHOLD=15  # After 15 files
 
 ## Documentation
 
-- **[40% Flow Verified](docs/40-PERCENT-FLOW-VERIFIED.md)** - Complete 40% context flow
-- **[100% Hands-Off Operation](docs/100-PERCENT-HANDS-OFF-OPERATION.md)** - Full autonomous guide
-- **[Project Navigator Guide](docs/PROJECT-NAVIGATOR-GUIDE.md)** - Token optimization
-- **[GitHub Push & Navigation](docs/GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md)** - Git integration
+📚 **[Complete Documentation Index](DOCUMENTATION-INDEX.md)** - Navigate all 90+ organized docs
+
+### Quick Links
+- **[Quickstart Guide](docs/guides/QUICKSTART.md)** - Get started in 5 minutes
+- **[Quickstart Auto Mode](docs/guides/QUICKSTART-AUTO-MODE.md)** - Autonomous operation
+- **[Setup Guide](docs/guides/SETUP-GUIDE.md)** - Detailed installation
+- **[Command Usage Guide](docs/guides/COMMAND-USAGE-GUIDE.md)** - All commands
+
+### Feature Documentation
+- **[Features V2 Overview](docs/features/FEATURES-V2.md)** - Latest capabilities
+- **[Reflexion Agent](docs/features/REFLEXION-COMMAND-INTEGRATION-COMPLETE.md)** - AI reasoning system
+- **[Autonomous Swarm](docs/features/AUTONOMOUS-SWARM-IMPLEMENTATION.md)** - Multi-agent orchestration
+- **[TypeScript Migration](docs/features/TYPESCRIPT-CLI-COMPLETE.md)** - Modern architecture
+
+### Archives
+- **[Session Summaries](docs/archive/sessions/)** - Development logs
+- **[Test Reports](docs/archive/test-reports/)** - Validation results
 
 ## Benefits
 

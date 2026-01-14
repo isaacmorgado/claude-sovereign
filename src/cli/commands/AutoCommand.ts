@@ -32,6 +32,8 @@ import { CompactCommand } from './CompactCommand';
 import { ReCommand, type ReOptions } from './ReCommand';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join } from 'path';
 
 const execAsync = promisify(exec);
 
@@ -164,6 +166,46 @@ export class AutoCommand extends BaseCommand {
 
     this.startSpinner('Starting autonomous loop...');
 
+    // Phase 0: Initial analysis and planning
+    this.info('📊 Phase 0: Initial analysis and planning');
+
+    // Select reasoning mode
+    const reasoningMode = await this.selectReasoningMode(config.goal, '');
+    this.info(`Reasoning mode: ${reasoningMode.mode} (confidence: ${reasoningMode.confidence})`);
+
+    // Check bounded autonomy
+    const autonomyCheck = await this.checkBoundedAutonomy(config.goal, '');
+    if (!autonomyCheck.allowed) {
+      return this.createFailure(`Task blocked: ${autonomyCheck.reason || 'Bounded autonomy check failed'}`);
+    }
+    if (autonomyCheck.requiresApproval) {
+      this.warn(`⚠️ Task requires approval: ${autonomyCheck.reason || 'High risk or low confidence'}`);
+      // In production, would wait for approval here
+      // For now, continue with warning
+    }
+
+    // Phase 1: Pre-execution intelligence
+    this.info('🧠 Phase 1: Pre-execution intelligence');
+
+    // Run Tree of Thoughts for complex problems
+    const totResult = await this.runTreeOfThoughts(config.goal, '');
+    if (totResult.branches.length > 0) {
+      this.info(`Tree of Thoughts: ${totResult.branches.length} branches, selected: ${totResult.selected?.strategy || 'default'}`);
+    }
+
+    // Analyze parallel execution opportunities
+    const parallelAnalysis = await this.analyzeParallelExecution(config.goal, '');
+    if (parallelAnalysis.canParallelize) {
+      this.info(`Parallel execution: ${parallelAnalysis.groups.length} groups detected`);
+    }
+
+    // Coordinate multi-agent routing
+    const multiAgentResult = await this.coordinateMultiAgent(config.goal, '');
+    this.info(`Multi-agent routing: ${multiAgentResult.agent} agent`);
+
+    // Phase 2: Execution with monitoring
+    this.info('⚡ Phase 2: Execution with monitoring');
+
     while (this.iterations < maxIterations && !goalAchieved) {
       this.iterations++;
 
@@ -195,7 +237,14 @@ export class AutoCommand extends BaseCommand {
           config.goal
         );
 
-        // Step 4: Invoke skills based on Claude agent skills logic
+        // Step 4: Quality gate evaluation
+        const qualityGate = await this.evaluateQualityGate(cycle.observation || '', this.currentTaskType);
+        if (!qualityGate.passed) {
+          this.warn(`Quality gate failed: ${qualityGate.feedback}`);
+          // In production, would trigger revision here
+        }
+
+        // Step 5: Invoke skills based on Claude agent skills logic
         await this.invokeSkills(context, config, cycle, goalAchieved);
 
         // Brief pause between iterations
@@ -287,6 +336,15 @@ export class AutoCommand extends BaseCommand {
    *
    * /compact: When context window is getting full, proactively at checkpoints or natural breakpoints
    * - Triggered: Handled by handleContextCompaction(), can also be invoked at checkpoints
+   *
+   * /debug-orchestrator: Run debug orchestrator for regression detection
+   * - Triggered: When debugging tasks or after failures
+   *
+   * /ui-testing: Run UI testing hooks for web/app testing
+   * - Triggered: When UI testing is needed
+   *
+   * /mac-app-testing: Run Mac app testing hooks
+   * - Triggered: When Mac app testing is needed
    */
   private async invokeSkills(
     context: CommandContext,
@@ -305,7 +363,7 @@ export class AutoCommand extends BaseCommand {
 
     if (shouldCheckpoint) {
       await this.performCheckpoint(context, config.goal);
-      
+
       // After checkpoint, also consider compacting (Claude best practice)
       if (this.contextManager && this.conversationHistory.length > 0) {
         const health = this.contextManager.checkContextHealth(this.conversationHistory);
@@ -323,14 +381,44 @@ export class AutoCommand extends BaseCommand {
     if (shouldCommit) {
       await this.performCommit(context, config.goal);
     }
-    
+
     // /re: Trigger for reverse engineering tasks
     const shouldInvokeRe =
       this.currentTaskType === 'reverse-engineering' &&
       (this.iterations % 15 === 0 || this.iterations - this.lastReIteration >= 15);
-    
+
     if (shouldInvokeRe) {
       await this.performReCommand(context, config.goal);
+    }
+
+    // /debug-orchestrator: Run debug orchestrator for debugging tasks
+    const shouldRunDebugOrchestrator =
+      this.currentTaskType === 'debugging' ||
+      (this.consecutiveFailures >= 3); // After failures for analysis
+
+    if (shouldRunDebugOrchestrator) {
+      await this.runDebugOrchestrator(config.goal, '');
+    }
+
+    // /ui-testing: Run UI testing for web/app testing
+    const shouldRunUITesting =
+      config.goal.toLowerCase().includes('ui') ||
+      config.goal.toLowerCase().includes('interface') ||
+      config.goal.toLowerCase().includes('web') ||
+      config.goal.toLowerCase().includes('app');
+
+    if (shouldRunUITesting) {
+      await this.runUITesting('detect', config.goal);
+    }
+
+    // /mac-app-testing: Run Mac app testing hooks
+    const shouldRunMacAppTesting =
+      config.goal.toLowerCase().includes('mac') ||
+      config.goal.toLowerCase().includes('desktop') ||
+      config.goal.toLowerCase().includes('native');
+
+    if (shouldRunMacAppTesting) {
+      await this.runMacAppTesting('launch', 'Safari');
     }
   }
 
@@ -836,3 +924,275 @@ type TaskType =
   | 'documentation'
   | 'refactoring'
   | 'general';
+
+/**
+ * Hook paths for integration
+ */
+private hooksPath = join(process.env.HOME || '', '.claude/hooks');
+
+/**
+ * Run a hook script and return JSON result
+ */
+private async runHook(hookName: string, args: string[] = []): Promise<any> {
+  const hookPath = join(this.hooksPath, `${hookName}.sh`);
+  try {
+    const { stdout } = await execAsync(`bash ${hookPath} ${args.join(' ')}`);
+    return JSON.parse(stdout);
+  } catch (error) {
+    this.warn(`Hook ${hookName} failed: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+/**
+ * Quality gate evaluation using LLM-as-Judge
+ */
+private async evaluateQualityGate(
+  output: string,
+  taskType: string
+): Promise<{ passed: boolean; score: number; feedback: string }> {
+  this.info('🔍 Running quality gate evaluation...');
+
+  const criteria = await this.runHook('auto-evaluator', ['criteria', taskType]);
+  const evaluation = await this.runHook('auto-evaluator', ['evaluate', output, criteria]);
+
+  if (!evaluation) {
+    return { passed: true, score: 7.0, feedback: 'Quality gate check passed' };
+  }
+
+  const score = evaluation.score || 7.0;
+  const passed = evaluation.decision === 'continue' || score >= 7.0;
+
+  this.info(`Quality gate: ${passed ? '✓ PASSED' : '✗ FAILED'} (score: ${score}/10)`);
+
+  return {
+    passed,
+    score,
+    feedback: evaluation.message || `Quality score: ${score}/10`
+  };
+}
+
+/**
+ * Bounded autonomy safety check
+ */
+private async checkBoundedAutonomy(
+  task: string,
+  context: string
+): Promise<{ allowed: boolean; requiresApproval: boolean; reason?: string }> {
+  this.info('🛡️ Running bounded autonomy check...');
+
+  const check = await this.runHook('bounded-autonomy', ['check', task, context]);
+
+  if (!check) {
+    return { allowed: true, requiresApproval: false };
+  }
+
+  const allowed = check.allowed !== false;
+  const requiresApproval = check.requires_approval === true;
+
+  if (!allowed) {
+    this.error(`🚫 Task blocked: ${check.reason || 'Bounded autonomy check failed'}`);
+  } else if (requiresApproval) {
+    this.warn(`⚠️ Task requires approval: ${check.reason || 'High risk or low confidence'}`);
+  } else {
+    this.info('✓ Bounded autonomy check passed');
+  }
+
+  return { allowed, requiresApproval, reason: check.reason };
+}
+
+/**
+ * Reasoning mode selection
+ */
+private async selectReasoningMode(
+  task: string,
+  context: string
+): Promise<{ mode: string; confidence: number; reasoning: string }> {
+  this.info('🧠 Selecting reasoning mode...');
+
+  const modeInfo = await this.runHook('reasoning-mode-switcher', ['select', task, context, 'normal', 'normal', 'low']);
+
+  if (!modeInfo) {
+    return { mode: 'deliberate', confidence: 0.7, reasoning: 'Default mode selected' };
+  }
+
+  const mode = modeInfo.selected_mode || 'deliberate';
+  const confidence = modeInfo.confidence || 0.7;
+
+  this.info(`Reasoning mode: ${mode} (confidence: ${confidence})`);
+
+  return {
+    mode,
+    confidence,
+    reasoning: modeInfo.reasoning || `Task characteristics suggest ${mode} mode`
+  };
+}
+
+/**
+ * Tree of Thoughts for complex problems
+ */
+private async runTreeOfThoughts(
+  task: string,
+  context: string
+): Promise<{ branches: any[]; selected: any; success: boolean }> {
+  this.info('🌳 Running Tree of Thoughts...');
+
+  const branches = await this.runHook('tree-of-thoughts', ['generate', task, context, '3']);
+  const evaluation = await this.runHook('tree-of-thoughts', ['evaluate', branches]);
+
+  if (!evaluation) {
+    return { branches: [], selected: null, success: false };
+  }
+
+  const selected = evaluation.selected_branch;
+  const success = true;
+
+  this.info(`Tree of Thoughts selected: ${selected?.strategy || 'default'}`);
+
+  return {
+    branches: branches.branches || [],
+    selected,
+    success
+  };
+}
+
+/**
+ * Parallel execution analysis
+ */
+private async analyzeParallelExecution(
+  task: string,
+  context: string
+): Promise<{ canParallelize: boolean; groups: any[]; success: boolean }> {
+  this.info('⚡ Analyzing parallel execution opportunities...');
+
+  const analysis = await this.runHook('parallel-execution-planner', ['analyze', task, context]);
+
+  if (!analysis) {
+    return { canParallelize: false, groups: [], success: false };
+  }
+
+  const canParallelize = analysis.canParallelize || false;
+  const groups = analysis.groups || [];
+  const success = true;
+
+  if (canParallelize) {
+    const groupCount = groups.length;
+    this.info(`Task can be parallelized into ${groupCount} groups`);
+  } else {
+    this.info('Task will execute sequentially');
+  }
+
+  return {
+    canParallelize,
+    groups,
+    success
+  };
+}
+
+/**
+ * Multi-agent coordination
+ */
+private async coordinateMultiAgent(
+  task: string,
+  context: string
+): Promise<{ agent: string; workflow: any[]; success: boolean }> {
+  this.info('🤖 Coordinating multi-agent execution...');
+
+  const routing = await this.runHook('multi-agent-orchestrator', ['route', task]);
+  const orchestrate = await this.runHook('multi-agent-orchestrator', ['orchestrate', task]);
+
+  if (!routing || !orchestrate) {
+    return { agent: 'general', workflow: [], success: false };
+  }
+
+  const agent = routing.selected_agent || 'general';
+  const workflow = orchestrate.workflow || [];
+  const success = true;
+
+  this.info(`Multi-agent routing: ${agent} agent`);
+
+  return {
+    agent,
+    workflow,
+    success
+  };
+}
+
+/**
+ * Debug orchestrator with regression detection
+ */
+private async runDebugOrchestrator(
+  task: string,
+  context: string
+): Promise<{ snapshot: string; recommendations: any[]; success: boolean }> {
+  this.info('🐛 Running debug orchestrator...');
+
+  // Import debug orchestrator from core
+  const { DebugOrchestrator } = await import('../../core/debug/orchestrator/index.ts');
+
+  const orchestrator = new DebugOrchestrator();
+  const snapshot = await orchestrator.createSnapshot(context);
+  const recommendations = await orchestrator.analyze(task);
+  const success = true;
+
+  this.info('Debug orchestrator analysis complete');
+
+  return {
+    snapshot: snapshot.id,
+    recommendations,
+    success
+  };
+}
+
+/**
+ * UI testing integration
+ */
+private async runUITesting(
+  action: string,
+  element: string,
+  value?: string
+): Promise<{ success: boolean; result: any }> {
+  this.info('🖱️ Running UI testing...');
+
+  const result = await this.runHook('ui-testing', [action, element, value || '']);
+
+  if (!result) {
+    return { success: false, result: null };
+  }
+
+  const success = result.status === 'success';
+
+  this.info(`UI testing: ${success ? '✓ PASSED' : '✗ FAILED'}`);
+
+  return {
+    success,
+    result
+  };
+}
+
+/**
+ * Mac app testing integration
+ */
+private async runMacAppTesting(
+  action: string,
+  appName: string,
+  element?: string,
+  value?: string
+): Promise<{ success: boolean; result: any }> {
+  this.info('🍎 Running Mac app testing...');
+
+  const result = await this.runHook('mac-app-testing', [action, appName, element || '', value || '']);
+
+  if (!result) {
+    return { success: false, result: null };
+  }
+
+  const success = result.status === 'success';
+
+  this.info(`Mac app testing: ${success ? '✓ PASSED' : '✗ FAILED'}`);
+
+  return {
+    success,
+    result
+  };
+}

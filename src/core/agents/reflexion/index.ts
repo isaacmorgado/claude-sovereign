@@ -36,8 +36,9 @@ export class ReflexionAgent {
   private context: Context;
   private executor?: ActionExecutor;
   private llmRouter?: LLMRouter;
+  private preferredModel?: string;
 
-  constructor(goal: string, llmRouter?: LLMRouter) {
+  constructor(goal: string, llmRouter?: LLMRouter, preferredModel?: string) {
     this.context = {
       goal,
       history: [],
@@ -51,6 +52,7 @@ export class ReflexionAgent {
     };
 
     this.llmRouter = llmRouter;
+    this.preferredModel = preferredModel;
 
     // Initialize ActionExecutor if LLM router provided
     if (llmRouter) {
@@ -161,7 +163,8 @@ What should I do next? Provide specific, actionable reasoning.`;
           taskType: 'reasoning',
           priority: 'balanced',
           requiresTools: false,
-          requiresVision: false
+          requiresVision: false,
+          preferredModel: this.preferredModel  // Use agent's preferred model if set
         }
       );
 

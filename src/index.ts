@@ -14,6 +14,7 @@ import {
   SPARCCommand,
   SwarmCommand,
   ReflectCommand,
+  ReflexionCommand,
   ResearchCommand,
   RootCauseCommand,
   CheckpointCommand,
@@ -189,6 +190,55 @@ program
         iterations: parseInt(options.iterations, 10),
         verbose: options.verbose
       });
+
+      if (!result.success) {
+        console.error(chalk.red('\nError:'), result.message);
+        process.exit(1);
+      }
+    } catch (error) {
+      const err = error as Error;
+      console.error(chalk.red('\nFatal error:'), err.message);
+      process.exit(1);
+    }
+  });
+
+/**
+ * /reflexion - ReflexionAgent execution
+ */
+program
+  .command('reflexion')
+  .description('Execute autonomous tasks with ReflexionAgent (Think → Act → Observe → Reflect loop)')
+  .argument('<action>', 'Action: execute, status, metrics')
+  .option('-g, --goal <text>', 'Goal to achieve (for execute)')
+  .option('-i, --max-iterations <number>', 'Max iterations (default: 30)', '30')
+  .option('-m, --preferred-model <model>', 'Preferred LLM model (e.g., glm-4.7, llama-70b)')
+  .option('--output-json', 'Output JSON for orchestrator consumption', false)
+  .option('-v, --verbose', 'Verbose output', false)
+  .action(async (action: string, options: any) => {
+    try {
+      const context = await initializeContext();
+      context.verbose = options.verbose;
+
+      const reflexionCommand = new ReflexionCommand();
+
+      let result;
+      if (action === 'execute') {
+        result = await reflexionCommand.execute(context, {
+          goal: options.goal,
+          maxIterations: parseInt(options.maxIterations, 10),
+          preferredModel: options.preferredModel,
+          outputJson: options.outputJson,
+          verbose: options.verbose
+        });
+      } else if (action === 'status') {
+        result = await reflexionCommand.status(context, {});
+      } else if (action === 'metrics') {
+        result = await reflexionCommand.metrics(context, {});
+      } else {
+        console.error(chalk.red('\nError:'), `Unknown action: ${action}`);
+        console.log(chalk.gray('Available actions: execute, status, metrics'));
+        process.exit(1);
+      }
 
       if (!result.success) {
         console.error(chalk.red('\nError:'), result.message);

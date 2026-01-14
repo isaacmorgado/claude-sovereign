@@ -8508,15 +8508,282 @@ class ErrorHandler {
   }
 }
 
+// src/core/llm/ConcurrencyManager.ts
+class ConcurrencyManager {
+  limits;
+  semaphores;
+  tokenBuckets;
+  constructor(limits) {
+    this.limits = limits;
+    this.semaphores = new Map;
+    this.tokenBuckets = new Map;
+    for (const [provider, config] of Object.entries(limits)) {
+      this.semaphores.set(provider, new Semaphore(config.maxConcurrent));
+      if (config.reservoir && config.reservoirRefresh) {
+        this.tokenBuckets.set(provider, new TokenBucket(config.reservoir, config.reservoirRefresh));
+      }
+    }
+  }
+  async acquire(provider) {
+    const semaphore = this.semaphores.get(provider);
+    if (!semaphore) {
+      throw new Error(`No concurrency limits configured for provider: ${provider}`);
+    }
+    const tokenBucket = this.tokenBuckets.get(provider);
+    if (tokenBucket) {
+      await tokenBucket.consume();
+    }
+    const release = await semaphore.acquire();
+    const config = this.limits[provider];
+    if (config.minTimeBetween) {
+      await this.delay(config.minTimeBetween);
+    }
+    return release;
+  }
+  getStatus(provider) {
+    const semaphore = this.semaphores.get(provider);
+    if (!semaphore) {
+      throw new Error(`No concurrency limits configured for provider: ${provider}`);
+    }
+    return semaphore.getStatus();
+  }
+  updateLimits(provider, config) {
+    this.limits[provider] = config;
+    this.semaphores.set(provider, new Semaphore(config.maxConcurrent));
+    if (config.reservoir && config.reservoirRefresh) {
+      this.tokenBuckets.set(provider, new TokenBucket(config.reservoir, config.reservoirRefresh));
+    }
+  }
+  delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+class Semaphore {
+  maxPermits;
+  permits;
+  queue = [];
+  constructor(maxPermits) {
+    this.maxPermits = maxPermits;
+    this.permits = maxPermits;
+  }
+  async acquire() {
+    if (this.permits > 0) {
+      this.permits--;
+      return () => this.release();
+    }
+    return new Promise((resolve) => {
+      this.queue.push(() => {
+        this.permits--;
+        resolve(() => this.release());
+      });
+    });
+  }
+  release() {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift();
+      next();
+    } else {
+      this.permits++;
+    }
+  }
+  getStatus() {
+    return {
+      available: this.permits,
+      max: this.maxPermits,
+      waiting: this.queue.length
+    };
+  }
+}
+
+class TokenBucket {
+  capacity;
+  refreshInterval;
+  tokens;
+  lastRefresh;
+  constructor(capacity, refreshInterval) {
+    this.capacity = capacity;
+    this.refreshInterval = refreshInterval;
+    this.tokens = capacity;
+    this.lastRefresh = Date.now();
+  }
+  async consume() {
+    this.refill();
+    if (this.tokens > 0) {
+      this.tokens--;
+      return;
+    }
+    const waitTime = this.refreshInterval - (Date.now() - this.lastRefresh);
+    if (waitTime > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      await this.consume();
+    }
+  }
+  refill() {
+    const now = Date.now();
+    const elapsed = now - this.lastRefresh;
+    if (elapsed >= this.refreshInterval) {
+      this.tokens = this.capacity;
+      this.lastRefresh = now;
+    }
+  }
+}
+var DEFAULT_PROVIDER_LIMITS = {
+  mcp: {
+    maxConcurrent: 1,
+    minTimeBetween: 1000,
+    reservoir: 4,
+    reservoirRefresh: 60000
+  },
+  glm: {
+    maxConcurrent: 10,
+    minTimeBetween: 100
+  },
+  featherless: {
+    maxConcurrent: 5,
+    minTimeBetween: 200,
+    reservoir: 20,
+    reservoirRefresh: 60000
+  },
+  anthropic: {
+    maxConcurrent: 50,
+    minTimeBetween: 50,
+    reservoir: 100,
+    reservoirRefresh: 60000
+  }
+};
+
+// src/core/llm/ModelFallbackChain.ts
+class ModelFallbackChain {
+  chain;
+  constructor(configs) {
+    this.chain = configs.sort((a, b) => a.priority - b.priority);
+  }
+  async execute(request, context, providerRegistry) {
+    const startTime = Date.now();
+    const attemptedProviders = [];
+    let totalAttempts = 0;
+    for (const config of this.chain) {
+      const provider = providerRegistry.get(config.provider);
+      if (!provider) {
+        console.warn(`[FallbackChain] Provider not available: ${config.provider}`);
+        continue;
+      }
+      attemptedProviders.push(config.provider);
+      const result = await this.tryProviderWithRetries(provider, config, request, context);
+      totalAttempts += result.attempts;
+      if (result.success && result.response) {
+        return {
+          response: result.response,
+          attemptedProviders,
+          successfulProvider: config.provider,
+          totalAttempts,
+          totalDuration: Date.now() - startTime
+        };
+      }
+      console.log(`[FallbackChain] ${config.provider}/${config.model} failed after ${result.attempts} attempts: ${result.error?.message}`);
+    }
+    return {
+      error: new Error(`All fallback providers exhausted (tried: ${attemptedProviders.join(", ")})`),
+      attemptedProviders,
+      totalAttempts,
+      totalDuration: Date.now() - startTime
+    };
+  }
+  async tryProviderWithRetries(provider, config, request, context) {
+    const maxRetries = config.maxRetries ?? 3;
+    const baseDelay = config.retryDelay ?? 1000;
+    const useExponentialBackoff = config.useExponentialBackoff ?? true;
+    let attempts = 0;
+    let lastError;
+    while (attempts < maxRetries) {
+      attempts++;
+      try {
+        const fallbackContext = {
+          ...context,
+          preferredModel: config.model
+        };
+        const response = await provider.complete(request, fallbackContext);
+        return { success: true, response, attempts };
+      } catch (error2) {
+        lastError = error2;
+        const isRateLimit = this.isRateLimitError(error2);
+        if (!isRateLimit || attempts >= maxRetries) {
+          break;
+        }
+        const delay = useExponentialBackoff ? baseDelay * Math.pow(2, attempts - 1) : baseDelay;
+        const jitter = Math.random() * delay * 0.25;
+        const totalDelay = delay + jitter;
+        console.log(`[FallbackChain] Rate limit hit, retry ${attempts}/${maxRetries} after ${totalDelay}ms`);
+        await this.delay(totalDelay);
+      }
+    }
+    return { success: false, error: lastError, attempts };
+  }
+  isRateLimitError(error2) {
+    const errorString = error2.message?.toLowerCase() || "";
+    return errorString.includes("rate limit") || errorString.includes("429") || errorString.includes("concurrency limit") || errorString.includes("quota exceeded");
+  }
+  delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  getChain() {
+    return [...this.chain];
+  }
+  updateChain(configs) {
+    this.chain = configs.sort((a, b) => a.priority - b.priority);
+  }
+}
+var DEFAULT_FALLBACK_CHAIN = [
+  {
+    provider: "mcp",
+    model: "kimi-k2",
+    priority: 1,
+    maxRetries: 2,
+    retryDelay: 5000,
+    useExponentialBackoff: true
+  },
+  {
+    provider: "mcp",
+    model: "glm-4.7",
+    priority: 2,
+    maxRetries: 3,
+    retryDelay: 2000,
+    useExponentialBackoff: true
+  },
+  {
+    provider: "featherless",
+    model: "llama-70b",
+    priority: 3,
+    maxRetries: 3,
+    retryDelay: 1000,
+    useExponentialBackoff: true
+  },
+  {
+    provider: "featherless",
+    model: "dolphin-3",
+    priority: 4,
+    maxRetries: 3,
+    retryDelay: 1000,
+    useExponentialBackoff: true
+  }
+];
+
 // src/core/llm/Router.ts
 class LLMRouter {
   registry;
   rateLimiter;
   errorHandler;
-  constructor(registry, rateLimiter, errorHandler) {
+  concurrencyManager;
+  fallbackChain;
+  useFallback;
+  constructor(registry, rateLimiter, errorHandler, options) {
     this.registry = registry;
     this.rateLimiter = rateLimiter || new RateLimiter;
     this.errorHandler = errorHandler || new ErrorHandler;
+    this.concurrencyManager = new ConcurrencyManager(DEFAULT_PROVIDER_LIMITS);
+    this.useFallback = options?.useFallback ?? true;
+    this.fallbackChain = new ModelFallbackChain(options?.fallbackChain || DEFAULT_FALLBACK_CHAIN);
   }
   parseModel(modelString) {
     const match = modelString.match(/^([a-z]+)\/(.+)$/);
@@ -8532,6 +8799,20 @@ class LLMRouter {
     };
   }
   async route(request, context) {
+    if (this.useFallback) {
+      return this.routeWithFallback(request, context);
+    }
+    return this.routeSingleProvider(request, context);
+  }
+  async routeWithFallback(request, context) {
+    const result = await this.fallbackChain.execute(request, context, this.registry);
+    if (result.error) {
+      throw result.error;
+    }
+    console.log(`[Router] Success after ${result.totalAttempts} attempts, ${result.totalDuration}ms ` + `(tried: ${result.attemptedProviders.join(" → ")}, used: ${result.successfulProvider})`);
+    return result.response;
+  }
+  async routeSingleProvider(request, context) {
     let selection;
     if (context.preferredModel) {
       const parsed = this.parseModel(context.preferredModel);
@@ -8555,32 +8836,37 @@ class LLMRouter {
     if (!provider) {
       throw new Error(`Provider not available: ${selection.provider}`);
     }
-    const routedRequest = {
-      ...request,
-      model: selection.model
-    };
-    return this.errorHandler.retryWithBackoff(async (attempt) => {
-      await this.rateLimiter.waitForToken(selection.provider);
-      try {
-        return await provider.complete(routedRequest);
-      } catch (error2) {
-        const classified = this.errorHandler.classify(error2);
-        error2.providerName = selection.provider;
-        error2.modelName = selection.model;
-        error2.attempt = attempt;
-        error2.classified = classified;
-        throw error2;
-      }
-    }, {
-      maxRetries: 3,
-      initialDelay: 1000,
-      maxDelay: 60000,
-      factor: 2,
-      onRetry: (attempt, delay, error2) => {
-        const classified = this.errorHandler.classify(error2);
-        console.warn(`[Router] Retry ${attempt}/${3} after ${delay}ms - ${this.errorHandler.formatError(classified)}`);
-      }
-    });
+    const release = await this.concurrencyManager.acquire(selection.provider);
+    try {
+      const routedRequest = {
+        ...request,
+        model: selection.model
+      };
+      return await this.errorHandler.retryWithBackoff(async (attempt) => {
+        await this.rateLimiter.waitForToken(selection.provider);
+        try {
+          return await provider.complete(routedRequest, context);
+        } catch (error2) {
+          const classified = this.errorHandler.classify(error2);
+          error2.providerName = selection.provider;
+          error2.modelName = selection.model;
+          error2.attempt = attempt;
+          error2.classified = classified;
+          throw error2;
+        }
+      }, {
+        maxRetries: 3,
+        initialDelay: 1000,
+        maxDelay: 60000,
+        factor: 2,
+        onRetry: (attempt, delay, error2) => {
+          const classified = this.errorHandler.classify(error2);
+          console.warn(`[Router] Retry ${attempt}/${3} after ${delay}ms - ${this.errorHandler.formatError(classified)}`);
+        }
+      });
+    } finally {
+      release();
+    }
   }
   selectModelByName(modelName, context) {
     const candidates = this.getCandidates(context);
@@ -10190,7 +10476,8 @@ class ReflexionAgent {
   context;
   executor;
   llmRouter;
-  constructor(goal, llmRouter) {
+  preferredModel;
+  constructor(goal, llmRouter, preferredModel) {
     this.context = {
       goal,
       history: [],
@@ -10203,6 +10490,7 @@ class ReflexionAgent {
       }
     };
     this.llmRouter = llmRouter;
+    this.preferredModel = preferredModel;
     if (llmRouter) {
       this.executor = new ActionExecutor(llmRouter);
     }
@@ -10275,7 +10563,8 @@ What should I do next? Provide specific, actionable reasoning.`;
         taskType: "reasoning",
         priority: "balanced",
         requiresTools: false,
-        requiresVision: false
+        requiresVision: false,
+        preferredModel: this.preferredModel
       });
       const textContent = response.content.find((block) => block.type === "text");
       if (textContent && "text" in textContent) {
@@ -13265,6 +13554,159 @@ What should be the next step?
     return new Promise((resolve2) => setTimeout(resolve2, ms));
   }
 }
+// src/cli/commands/ReflexionCommand.ts
+class ReflexionCommand {
+  name = "reflexion";
+  router;
+  async execute(context, options) {
+    const startTime = Date.now();
+    if (!options.goal) {
+      return {
+        success: false,
+        message: `Error: --goal parameter is required
+Example: bun run kk reflexion execute --goal "Create calculator app"`
+      };
+    }
+    const maxIterations = options.maxIterations || 30;
+    const preferredModel = options.preferredModel;
+    const outputJson = options.outputJson ?? false;
+    const verbose = options.verbose ?? false;
+    try {
+      if (!this.router) {
+        const registry = await createDefaultRegistry();
+        this.router = new LLMRouter(registry);
+      }
+      if (!outputJson) {
+        console.log(source_default2.bold(`
+\uD83E\uDD16 ReflexionAgent Execution
+`));
+        console.log(source_default2.cyan(`Goal: ${options.goal}`));
+        console.log(source_default2.gray(`Max Iterations: ${maxIterations}`));
+        if (preferredModel) {
+          console.log(source_default2.gray(`Preferred Model: ${preferredModel}`));
+        }
+        console.log("");
+      }
+      const agent = new ReflexionAgent(options.goal, this.router, preferredModel);
+      let cycles = 0;
+      let lastInput = "Start task";
+      let stagnationDetected = false;
+      let goalAchieved = false;
+      let finalObservation = "";
+      while (cycles < maxIterations) {
+        cycles++;
+        if (!outputJson && verbose) {
+          console.log(source_default2.yellow(`
+--- Cycle ${cycles}/${maxIterations} ---`));
+        }
+        const result = await agent.cycle(lastInput);
+        finalObservation = result.observation;
+        if (outputJson) {
+          console.log(JSON.stringify({
+            cycle: cycles,
+            thought: result.thought.substring(0, 200) + (result.thought.length > 200 ? "..." : ""),
+            action: result.action,
+            observation: result.observation.substring(0, 200) + (result.observation.length > 200 ? "..." : ""),
+            reflection: result.reflection?.substring(0, 200) + (result.reflection && result.reflection.length > 200 ? "..." : "")
+          }));
+        } else if (verbose) {
+          console.log(source_default2.white(`Thought: ${result.thought.substring(0, 150)}...`));
+          console.log(source_default2.green(`Action: ${result.action}`));
+          console.log(source_default2.blue(`Observation: ${result.observation.substring(0, 150)}...`));
+          if (result.reflection) {
+            console.log(source_default2.magenta(`Reflection: ${result.reflection.substring(0, 150)}...`));
+          }
+        } else {
+          process.stdout.write(".");
+        }
+        const metrics2 = agent.getMetrics();
+        if (result.observation.includes("No progress detected") || result.observation.includes("stagnation")) {
+          stagnationDetected = true;
+          if (!outputJson) {
+            console.log(source_default2.yellow(`
+⚠️  Stagnation detected - stopping early`));
+          }
+          break;
+        }
+        if (metrics2.filesCreated > 0 || metrics2.filesModified > 0) {
+          const hasErrors = result.observation.toLowerCase().includes("error") || result.observation.toLowerCase().includes("failed");
+          if (!hasErrors && cycles > 2) {
+            goalAchieved = true;
+            if (!outputJson) {
+              console.log(source_default2.green(`
+✅ Goal appears achieved`));
+            }
+            break;
+          }
+        }
+        lastInput = result.observation;
+      }
+      const metrics = agent.getMetrics();
+      const elapsedTime = Date.now() - startTime;
+      const resultData = {
+        success: goalAchieved || metrics.filesCreated + metrics.filesModified > 0,
+        iterations: cycles,
+        filesCreated: metrics.filesCreated,
+        filesModified: metrics.filesModified,
+        linesChanged: metrics.linesChanged,
+        stagnationDetected,
+        goalAchieved,
+        elapsedTime,
+        finalObservation: finalObservation.substring(0, 500)
+      };
+      if (outputJson) {
+        console.log(JSON.stringify({ status: "complete", ...resultData }));
+      } else {
+        console.log(`
+`);
+        console.log(source_default2.bold("\uD83D\uDCCA Execution Summary:"));
+        console.log(source_default2.gray("─".repeat(50)));
+        console.log(source_default2.white(`Status: ${resultData.success ? source_default2.green("Success") : source_default2.yellow("Incomplete")}`));
+        console.log(source_default2.white(`Iterations: ${resultData.iterations}`));
+        console.log(source_default2.white(`Files Created: ${resultData.filesCreated}`));
+        console.log(source_default2.white(`Files Modified: ${resultData.filesModified}`));
+        console.log(source_default2.white(`Lines Changed: ${resultData.linesChanged}`));
+        console.log(source_default2.white(`Elapsed Time: ${(elapsedTime / 1000).toFixed(2)}s`));
+        if (stagnationDetected) {
+          console.log(source_default2.yellow("Stagnation: Detected"));
+        }
+        console.log("");
+      }
+      return {
+        success: resultData.success,
+        message: resultData.success ? `Goal achieved in ${resultData.iterations} iterations` : `Task incomplete after ${resultData.iterations} iterations`,
+        data: resultData
+      };
+    } catch (error2) {
+      const errorMessage = error2 instanceof Error ? error2.message : String(error2);
+      if (outputJson) {
+        console.log(JSON.stringify({
+          status: "error",
+          error: errorMessage,
+          iterations: 0
+        }));
+      }
+      return {
+        success: false,
+        message: `ReflexionAgent error: ${errorMessage}`
+      };
+    }
+  }
+  async status(context, options) {
+    return {
+      success: true,
+      message: `Status tracking not yet implemented.
+Future: Will show ongoing executions and their progress.`
+    };
+  }
+  async metrics(context, options) {
+    return {
+      success: true,
+      message: `Metrics tracking not yet implemented.
+Future: Will show aggregated performance stats from past runs.`
+    };
+  }
+}
 // src/cli/commands/ResearchCommand.ts
 class ResearchCommand extends BaseCommand {
   name = "research";
@@ -15451,6 +15893,42 @@ program2.command("reflect").description("Run ReAct + Reflexion loop (Think \u219
       iterations: parseInt(options.iterations, 10),
       verbose: options.verbose
     });
+    if (!result.success) {
+      console.error(source_default.red(`
+Error:`), result.message);
+      process.exit(1);
+    }
+  } catch (error2) {
+    const err = error2;
+    console.error(source_default.red(`
+Fatal error:`), err.message);
+    process.exit(1);
+  }
+});
+program2.command("reflexion").description("Execute autonomous tasks with ReflexionAgent (Think \u2192 Act \u2192 Observe \u2192 Reflect loop)").argument("<action>", "Action: execute, status, metrics").option("-g, --goal <text>", "Goal to achieve (for execute)").option("-i, --max-iterations <number>", "Max iterations (default: 30)", "30").option("-m, --preferred-model <model>", "Preferred LLM model (e.g., glm-4.7, llama-70b)").option("--output-json", "Output JSON for orchestrator consumption", false).option("-v, --verbose", "Verbose output", false).action(async (action, options) => {
+  try {
+    const context = await initializeContext();
+    context.verbose = options.verbose;
+    const reflexionCommand = new ReflexionCommand;
+    let result;
+    if (action === "execute") {
+      result = await reflexionCommand.execute(context, {
+        goal: options.goal,
+        maxIterations: parseInt(options.maxIterations, 10),
+        preferredModel: options.preferredModel,
+        outputJson: options.outputJson,
+        verbose: options.verbose
+      });
+    } else if (action === "status") {
+      result = await reflexionCommand.status(context, {});
+    } else if (action === "metrics") {
+      result = await reflexionCommand.metrics(context, {});
+    } else {
+      console.error(source_default.red(`
+Error:`), `Unknown action: ${action}`);
+      console.log(source_default.gray("Available actions: execute, status, metrics"));
+      process.exit(1);
+    }
     if (!result.success) {
       console.error(source_default.red(`
 Error:`), result.message);

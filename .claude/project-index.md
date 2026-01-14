@@ -1,6 +1,6 @@
 # 🗂️ Project Structure: .
 
-**Generated**: 2026-01-13 20:26:57
+**Generated**: 2026-01-13 22:30:52
 **Purpose**: Quick navigation reference for Claude (token-efficient)
 
 ---
@@ -51,24 +51,9 @@
 ├── 📁 0.14.10/
 │   └── 📄 7731983317421308213
 └── 📄 CACHEDIR.TAG
-├── 📄 ACCURATE-INTEGRATION-STATUS.md
-├── 📄 AUTO-COMMAND-BLOCKING-ANALYSIS.md
-├── 📄 AUTO-COMMAND-COMPREHENSIVE-TEST-REPORT.md
-├── 📄 AUTO-COMMAND-ENHANCEMENT-COMPLETE.md
-├── 📄 AUTO-COMMAND-FIX-VERIFIED.md
-├── 📄 AUTO-COMMAND-TEST-LOG.md
-├── 📄 AUTO-COMMAND-TEST-REPORT.md
-├── 📄 AUTO-INTEGRATION-AND-TESTING-SUMMARY.md
-├── 📄 AUTO-MODE-INTEGRATION-VERIFIED.md
-├── 📄 AUTO-VALIDATION-INTEGRATION.md
-├── 📄 AUTONOMOUS-SWARM-IMPLEMENTATION.md
 ├── 📄 bun.lock
 ├── 📄 calculator.ts
 ├── 📄 CLAUDE.md
-├── 📄 CLAUDED-INTEGRATION.md
-├── 📄 CLI-COMPREHENSIVE-TEST-REPORT.md
-├── 📄 CLI-IMPLEMENTATION-SUMMARY.md
-├── 📄 COMMAND-USAGE-GUIDE.md
 ├── 📁 commands/
 ├── 📄 auto.md
 ├── 📄 build.md
@@ -86,55 +71,136 @@
 ├── 📄 sparc.md
 ├── 📄 swarm.md
 └── 📄 voice.md
-├── 📄 COMPREHENSIVE-AUTO-COMMAND-TEST-REPORT-2026-01-13.md
-├── 📄 COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
-├── 📄 COMPREHENSIVE-TEST-FINDINGS.md
 ├── 📁 config/
 └── 📄 CLAUDE.md
-├── 📄 CORRECTED-INTEGRATION-STATUS.md
 ├── 📁 docs/
 ├── 📄 100-PERCENT-HANDS-OFF-OPERATION.md
 ├── 📄 40-PERCENT-FLOW-VERIFIED.md
+├── 📁 archive/
+│   ├── 📁 sessions/
+│   │   ├── 📄 SESSION-SUMMARY-2026-01-14.md
+│   │   ├── 📄 SESSION-SUMMARY-ORCHESTRATOR-INTEGRATION-2026-01-13.md
+│   │   ├── 📄 SESSION-SUMMARY-RATE-LIMIT-MITIGATION.md
+│   │   └── 📄 SESSION-SUMMARY-REFLEXION-CLI.md
+│   └── 📁 test-reports/
+│   │   ├── 📄 AUTO-COMMAND-COMPREHENSIVE-TEST-REPORT.md
+│   │   ├── 📄 AUTO-COMMAND-TEST-LOG.md
+│   │   ├── 📄 AUTO-COMMAND-TEST-REPORT.md
+│   │   ├── 📄 AUTO-INTEGRATION-AND-TESTING-SUMMARY.md
+│   │   ├── 📄 AUTO-REVERSE-ENGINEERING-TEST-REPORT.md
+│   │   ├── 📄 CLI-COMPREHENSIVE-TEST-REPORT.md
+│   │   ├── 📄 COMPREHENSIVE-AUTO-COMMAND-TEST-REPORT-2026-01-13.md
+│   │   ├── 📄 COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
+│   │   ├── 📄 COMPREHENSIVE-TEST-FINDINGS.md
+│   │   ├── 📄 END-TO-END-TESTING-STATUS.md
+│   │   ├── 📄 FINAL-TEST-REPORT-100-PERCENT-PASS.md
+│   │   ├── 📄 HONEST-TEST-REPORT.md
+│   │   ├── 📄 QUICK-TEST-GUIDE.md
+│   │   ├── 📄 RE-TOOLS-AUTO-INTEGRATION-TEST.md
+│   │   ├── 📄 RE-TOOLS-TEST-REPORT.md
+│   │   ├── 📄 REFLEXION-EDGE-CASE-TEST-RESULTS.md
+│   │   ├── 📄 REFLEXION-PRODUCTION-TEST-RESULTS.md
+│   │   ├── 📄 SMOKE-TEST-RESULTS.md
+│   │   ├── 📄 TEST-6-FIX-REPORT.md
+│   │   ├── 📄 TEST-EXECUTION-NOTE.md
+│   │   ├── 📄 TEST-EXECUTION-REPORT.md
+│   │   ├── 📄 TEST-RESULTS-REFLEXION-AGENT.md
+│   │   ├── 📄 TEST-RESULTS.md
+│   │   └── 📄 TESTING-GUIDE.md
 ├── 📄 AUTO-COMMAND-SKILL-INTEGRATION.md
+├── 📁 features/
+│   ├── 📄 AUTO-COMMAND-BLOCKING-ANALYSIS.md
+│   ├── 📄 AUTO-COMMAND-ENHANCEMENT-COMPLETE.md
+│   ├── 📄 AUTO-COMMAND-FIX-VERIFIED.md
+│   ├── 📄 FEATURES-V2.md
+│   ├── 📄 MEMORY-BUG-FIXES-APPLIED.md
+│   ├── 📄 MEMORY-FIX-SUMMARY.md
+│   ├── 📄 MEMORY-SYSTEM-BUG-REPORT.md
+│   ├── 📄 RATE-LIMIT-MITIGATION-COMPLETE.md
+│   ├── 📄 TYPESCRIPT-CLI-COMPLETE.md
+│   └── 📄 TYPESCRIPT-MIGRATION-STATUS.md
 ├── 📄 GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md
+├── 📁 guides/
+│   ├── 📄 COMMAND-USAGE-GUIDE.md
+│   ├── 📄 QUICKSTART-AUTO-MODE.md
+│   ├── 📄 QUICKSTART.md
+│   └── 📄 SETUP-GUIDE.md
+├── 📁 integration/
+│   ├── 📄 ACCURATE-INTEGRATION-STATUS.md
+│   ├── 📄 AUTO-COMMAND-INTEGRATION-ANALYSIS.md
+│   ├── 📄 AUTO-MODE-INTEGRATION-VERIFIED.md
+│   ├── 📄 AUTO-VALIDATION-INTEGRATION.md
+│   ├── 📄 AUTONOMOUS-SWARM-IMPLEMENTATION.md
+│   ├── 📄 CLAUDED-INTEGRATION.md
+│   ├── 📄 CLI-IMPLEMENTATION-SUMMARY.md
+│   ├── 📄 CORRECTED-INTEGRATION-STATUS.md
+│   ├── 📄 FINAL-VERIFICATION-REPORT.md
+│   ├── 📄 GLM-INTEGRATION-COMPLETE.md
+│   ├── 📄 IMPLEMENTATION-SUMMARY.md
+│   ├── 📄 INTEGRATION-FIXES.md
+│   ├── 📄 INTEGRATION-GUIDE.md
+│   ├── 📄 INTEGRATION-PROGRESS-2026-01-13.md
+│   ├── 📄 ORCHESTRATOR-REFLEXION-INTEGRATION-DESIGN.md
+│   ├── 📄 RE-TOOLS-INTEGRATION-FINAL-REPORT.md
+│   ├── 📄 RE-TOOLS-INTEGRATION-REPORT.md
+│   ├── 📄 REFLEXION-COMMAND-INTEGRATION-COMPLETE.md
+│   ├── 📄 REFLEXION-ORCHESTRATOR-INTEGRATION-PLAN.md
+│   ├── 📄 V2-IMPLEMENTATION-SUMMARY.md
+│   └── 📄 VERIFICATION-COMPLETE.md
 ├── 📄 PROJECT-NAVIGATOR-GUIDE.md
 └── 📄 REFLEXION-AGENT-IMPROVEMENTS.md
-├── 📄 END-TO-END-TESTING-STATUS.md
-├── 📄 FEATURES-V2.md
-├── 📄 FINAL-VERIFICATION-REPORT.md
-├── 📄 GLM-INTEGRATION-COMPLETE.md
+├── 📄 DOCUMENTATION-INDEX.md
 ├── 📄 hello.ts
-├── 📄 HONEST-TEST-REPORT.md
 ├── 📁 hooks/
 ├── 📁 .claude/
 │   ├── 📄 checkpoint-state.json
 │   └── 📄 file-changes.json
+├── 📄 agent-loop.sh
 ├── 📄 auto-continue.sh
+├── 📄 auto-evaluator.sh
 ├── 📄 auto.sh
 ├── 📄 autonomous-command-router.sh
+├── 📄 autonomous-orchestrator-v2.sh
+├── 📄 bounded-autonomy.sh
 ├── 📄 comprehensive-validation.sh
+├── 📄 constitutional-ai.sh
 ├── 📄 context-event-tracker.sh
+├── 📄 context-optimizer.sh
 ├── 📄 coordinator.sh
+├── 📄 enhanced-audit-trail.sh
+├── 📄 error-handler.sh
 ├── 📄 feedback-learning.sh
+├── 📄 feedback-loop.sh
 ├── 📄 file-change-tracker.sh
+├── 📄 hypothesis-tester.sh
+├── 📄 learning-engine.sh
+├── 📄 mac-app-testing.sh
 ├── 📄 memory-manager.sh
 ├── 📄 message-tracker.sh
+├── 📄 meta-reflection.sh
+├── 📄 multi-agent-orchestrator.sh
+├── 📄 parallel-execution-planner.sh
+├── 📄 pattern-miner.sh
 ├── 📄 personality-loader.sh
+├── 📄 plan-execute.sh
 ├── 📄 plan-think-act.sh
 ├── 📄 post-edit-quality.sh
 ├── 📄 project-navigator.sh
+├── 📄 react-reflexion.sh
+├── 📄 reasoning-mode-switcher.sh
+├── 📄 reinforcement-learning.sh
+├── 📄 risk-predictor.sh
 ├── 📄 sandbox-executor.sh
+├── 📄 self-healing.sh
 ├── 📄 sliding-window.sh
-└── 📄 swarm-orchestrator.sh
-├── 📄 IMPLEMENTATION-SUMMARY.md
+├── 📄 strategy-selector.sh
+├── 📄 swarm-orchestrator.sh
+├── 📄 task-queue.sh
+├── 📄 thinking-framework.sh
+├── 📄 tree-of-thoughts.sh
+└── 📄 ui-testing.sh
 ├── 📄 install.sh
-├── 📄 INTEGRATION-FIXES.md
-├── 📄 INTEGRATION-GUIDE.md
-├── 📄 INTEGRATION-PROGRESS-2026-01-13.md
 ├── 📄 LICENSE
-├── 📄 MEMORY-BUG-FIXES-APPLIED.md
-├── 📄 MEMORY-FIX-SUMMARY.md
-├── 📄 MEMORY-SYSTEM-BUG-REPORT.md
 ├── 📄 package.json
 ├── 📁 personalities/
 ├── 📄 default.yaml
@@ -142,17 +208,9 @@
 └── 📄 security-expert.yaml
 ├── 📁 plans 2/
 └── 📄 ULTIMATE-TOOL-INTEGRATION-PLAN.md
-├── 📄 QUICK-TEST-GUIDE.md
-├── 📄 QUICKSTART-AUTO-MODE.md
-├── 📄 QUICKSTART.md
-├── 📄 RE-TOOLS-AUTO-INTEGRATION-TEST.md
-├── 📄 RE-TOOLS-INTEGRATION-FINAL-REPORT.md
-├── 📄 RE-TOOLS-INTEGRATION-REPORT.md
-├── 📄 RE-TOOLS-TEST-REPORT.md
 ├── 📄 README.md
+├── 📄 run-edge-case-tests.sh
 ├── 📄 run-tests-with-logs.sh
-├── 📄 SETUP-GUIDE.md
-├── 📄 SMOKE-TEST-RESULTS.md
 ├── 📄 smoke-test.sh
 ├── 📁 src/
 ├── 📁 cli/
@@ -165,10 +223,12 @@
 │   │   ├── 📄 CommitCommand.ts
 │   │   ├── 📄 CompactCommand.ts
 │   │   ├── 📄 index.ts
+│   │   ├── 📄 InitCommand.ts
 │   │   ├── 📄 MultiRepoCommand.ts
 │   │   ├── 📄 PersonalityCommand.ts
 │   │   ├── 📄 ReCommand.ts
 │   │   ├── 📄 ReflectCommand.ts
+│   │   ├── 📄 ReflexionCommand.ts
 │   │   ├── 📄 ResearchApiCommand.ts
 │   │   ├── 📄 ResearchCommand.ts
 │   │   ├── 📄 RootCauseCommand.ts
@@ -186,10 +246,12 @@
 │   │   └── 📁 orchestrator/
 │   ├── 📁 llm/
 │   │   ├── 📁 bridge/
+│   │   ├── 📄 ConcurrencyManager.ts
 │   │   ├── 📄 ContextManager.ts
 │   │   ├── 📄 EndpointManager.ts
 │   │   ├── 📄 ErrorHandler.ts
 │   │   ├── 📄 index.ts
+│   │   ├── 📄 ModelFallbackChain.ts
 │   │   ├── 📁 providers/
 │   │   ├── 📄 RateLimiter.ts
 │   │   ├── 📄 Router.ts
@@ -216,35 +278,47 @@
 │   ├── 📄 re-analyze.sh
 │   ├── 📄 re-docs.sh
 │   └── 📄 re-prompt.sh
-├── 📄 TEST-6-FIX-REPORT.md
 ├── 📄 test-auto-command.sh
 ├── 📄 test-auto-features.test.ts
 ├── 📄 test-cli-features.ts
-├── 📄 TEST-EXECUTION-REPORT.md
 ├── 📄 test-llm-integration.ts
 ├── 📄 test-output.ts
 ├── 📁 test-results/
-├── 📄 TEST-RESULTS-REFLEXION-AGENT.md
-├── 📄 TEST-RESULTS.md
-├── 📄 TESTING-GUIDE.md
+├── 📁 test-workspace-acceptance/
+├── 📁 test-workspace-reflexion-cli/
+├── 📁 test-workspace-reflexion-edge-cases/
+├── 📁 test-workspace-reflexion-edge-cases 2/
+├── 📁 test-workspace-reflexion-production/
+├── 📁 test-workspace-reflexion-stress/
+└── 📁 src/
+│   ├── 📄 types.ts
+│   └── 📄 utils.ts
+├── 📁 test-workspace-reflexion-stress 2/
+└── 📁 src/
+│   └── 📄 types.ts
+├── 📄 test.txt
 ├── 📁 tests/
 ├── 📄 action-executor-test.ts
 ├── 📁 agents/
 │   ├── 📄 reflexion-autonomous-stress.test.ts
-│   └── 📄 reflexion-improvements.test.ts
+│   ├── 📄 reflexion-edge-cases.test.ts
+│   ├── 📄 reflexion-improvements.test.ts
+│   └── 📄 reflexion-production-test.test.ts
 ├── 📄 comprehensive-auto-test-simple.ts
 ├── 📄 comprehensive-auto-test.ts
 ├── 📁 core/
 │   └── 📁 logging/
 │   │   ├── 📄 FileRotation.test.ts
 │   │   └── 📄 Logger.test.ts
+├── 📁 integration/
+│   └── 📄 reflexion-command.test.ts
+├── 📁 orchestrator/
+│   ├── 📄 reflexion-integration.test.sh
+│   ├── 📄 test-decision-logic.sh
+│   └── 📄 UNIT-TEST-RESULTS.md
 ├── 📁 tmp/
 └── 📄 typescript-validation-test.ts
-├── 📄 tsconfig.json
-├── 📄 TYPESCRIPT-CLI-COMPLETE.md
-├── 📄 TYPESCRIPT-MIGRATION-STATUS.md
-├── 📄 V2-IMPLEMENTATION-SUMMARY.md
-└── 📄 VERIFICATION-COMPLETE.md
+└── 📄 tsconfig.json
 ```
 
 ---
@@ -266,54 +340,18 @@
 • ./README.md
 • ./config/CLAUDE.md
 • ./CLAUDE.md
-• ./FINAL-VERIFICATION-REPORT.md
-• ./AUTO-COMMAND-FIX-VERIFIED.md
-• ./AUTO-COMMAND-BLOCKING-ANALYSIS.md
-• ./CLI-IMPLEMENTATION-SUMMARY.md
-• ./V2-IMPLEMENTATION-SUMMARY.md
-• ./END-TO-END-TESTING-STATUS.md
-• ./RE-TOOLS-INTEGRATION-REPORT.md
-• ./ACCURATE-INTEGRATION-STATUS.md
-• ./QUICK-TEST-GUIDE.md
-• ./TEST-6-FIX-REPORT.md
-• ./AUTONOMOUS-SWARM-IMPLEMENTATION.md
+• ./DOCUMENTATION-INDEX.md
 • ./config/CLAUDE.md
-• ./IMPLEMENTATION-SUMMARY.md
-• ./AUTO-MODE-INTEGRATION-VERIFIED.md
-• ./QUICKSTART-AUTO-MODE.md
-• ./INTEGRATION-FIXES.md
-• ./QUICKSTART.md
-• ./COMMAND-USAGE-GUIDE.md
-• ./COMPREHENSIVE-AUTO-COMMAND-TEST-REPORT-2026-01-13.md
 • ./.claude/auto-continue.local.md
 • ./.claude/project-index.md
-• ./COMPREHENSIVE-TEST-FINDINGS.md
-• ./SETUP-GUIDE.md
-• ./INTEGRATION-GUIDE.md
 • ./docs/GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md
 • ./docs/REFLEXION-AGENT-IMPROVEMENTS.md
 • ./docs/40-PERCENT-FLOW-VERIFIED.md
 • ./docs/PROJECT-NAVIGATOR-GUIDE.md
 • ./docs/AUTO-COMMAND-SKILL-INTEGRATION.md
 • ./docs/100-PERCENT-HANDS-OFF-OPERATION.md
-• ./RE-TOOLS-AUTO-INTEGRATION-TEST.md
-• ./AUTO-COMMAND-ENHANCEMENT-COMPLETE.md
-• ./FEATURES-V2.md
 • ./README.md
-• ./INTEGRATION-PROGRESS-2026-01-13.md
-• ./COMPREHENSIVE-COMMAND-TEST-REPORT-2026-01-13.md
-• ./CORRECTED-INTEGRATION-STATUS.md
-• ./GLM-INTEGRATION-COMPLETE.md
-• ./CLI-COMPREHENSIVE-TEST-REPORT.md
-• ./AUTO-COMMAND-TEST-LOG.md
 • ./plans 2/ULTIMATE-TOOL-INTEGRATION-PLAN.md
-• ./AUTO-INTEGRATION-AND-TESTING-SUMMARY.md
-• ./MEMORY-FIX-SUMMARY.md
-• ./TEST-RESULTS.md
-• ./AUTO-COMMAND-COMPREHENSIVE-TEST-REPORT.md
-• ./RE-TOOLS-INTEGRATION-FINAL-REPORT.md
-• ./AUTO-COMMAND-TEST-REPORT.md
-• ./TEST-EXECUTION-REPORT.md
 • ./commands/voice.md
 • ./commands/collab.md
 • ./commands/rootcause.md
@@ -330,19 +368,7 @@
 • ./commands/build.md
 • ./commands/personality.md
 • ./commands/compact.md
-• ./MEMORY-SYSTEM-BUG-REPORT.md
-• ./SMOKE-TEST-RESULTS.md
-• ./TYPESCRIPT-MIGRATION-STATUS.md
-• ./TYPESCRIPT-CLI-COMPLETE.md
-• ./TEST-RESULTS-REFLEXION-AGENT.md
-• ./AUTO-VALIDATION-INTEGRATION.md
-• ./CLAUDED-INTEGRATION.md
-• ./TESTING-GUIDE.md
 • ./CLAUDE.md
-• ./VERIFICATION-COMPLETE.md
-• ./HONEST-TEST-REPORT.md
-• ./MEMORY-BUG-FIXES-APPLIED.md
-• ./RE-TOOLS-TEST-REPORT.md
 
 ### Entry Points
 • ./dist/index.js
@@ -769,10 +795,10 @@
 ## 📊 Project Statistics
 
 **Languages:**
-• JavaScript/TypeScript: 41149 files
+• JavaScript/TypeScript: 41159 files
 • Python: 1 files
 
-**Estimated LOC:** 581130
+**Estimated LOC:** 583255
 
 
 ---
@@ -795,6 +821,13 @@
 • **plans 2/**
 • **src/**: Source code
 • **test-results/**
+• **test-workspace-acceptance/**
+• **test-workspace-reflexion-cli/**
+• **test-workspace-reflexion-edge-cases/**
+• **test-workspace-reflexion-edge-cases 2/**
+• **test-workspace-reflexion-production/**
+• **test-workspace-reflexion-stress/**
+• **test-workspace-reflexion-stress 2/**
 • **tests/**: Test files
 
 ---
