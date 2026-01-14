@@ -12,9 +12,36 @@ import * as path from 'path';
 
 // Mock LLM Router for testing
 class MockLLMRouter implements Partial<LLMRouter> {
+  private callCount = 0;
+  public stagnationMode = false; // When true, returns planning actions instead of file_write
+  public repetitionMode = false; // When true, always returns identical thoughts
+
   async route(request: any, options?: any) {
+    this.callCount++;
+
     // Mock response for parseThoughtToAction
     if (request.messages[0].content.includes('action parser')) {
+      // In stagnation mode, return non-file actions (just thinking/planning)
+      if (this.stagnationMode) {
+        return {
+          id: 'mock',
+          model: 'mock',
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                type: 'think', // Non-file action
+                params: { analysis: 'Still planning...' }
+              })
+            }
+          ],
+          stopReason: 'end_turn',
+          usage: { inputTokens: 0, outputTokens: 0 }
+        };
+      }
+
+      // Normal mode: return file_write action
       return {
         id: 'mock',
         model: 'mock',
@@ -36,12 +63,43 @@ class MockLLMRouter implements Partial<LLMRouter> {
       };
     }
 
+    // Mock response for think() - vary based on input to avoid repetition detection
+    const userPrompt = request.messages[0].content;
+    let thoughtText = 'Mock response';
+
+    // In repetition mode, always return the same thought
+    if (this.repetitionMode) {
+      thoughtText = 'I should read the test file and analyze it';
+    } else {
+      // Generate varied thoughts based on input content (case insensitive)
+      const promptLower = userPrompt.toLowerCase();
+
+      if (promptLower.includes('step 1')) {
+        thoughtText = 'I should start by analyzing the requirements for Step 1';
+      } else if (promptLower.includes('step 2')) {
+        thoughtText = 'Now I need to proceed with implementing Step 2';
+      } else if (promptLower.includes('step 3')) {
+        thoughtText = 'Let me work on completing Step 3';
+      } else if (promptLower.includes('planning')) {
+        thoughtText = `Planning iteration ${this.callCount}: Analyzing the approach`;
+      } else if (promptLower.includes('add tests')) {
+        thoughtText = 'I should add comprehensive test coverage';
+      } else if (promptLower.includes('complete')) {
+        thoughtText = 'Time to complete the implementation';
+      } else if (promptLower.includes('create calculator')) {
+        thoughtText = `Working on creating calculator.ts (attempt ${this.callCount})`;
+      } else {
+        // Vary response based on call count to avoid repetition
+        thoughtText = `Reasoning about the task (iteration ${this.callCount})`;
+      }
+    }
+
     // Default mock response
     return {
       id: 'mock',
       model: 'mock',
       role: 'assistant',
-      content: [{ type: 'text', text: 'Mock response' }],
+      content: [{ type: 'text', text: thoughtText }],
       stopReason: 'end_turn',
       usage: { inputTokens: 0, outputTokens: 0 }
     };
@@ -64,6 +122,10 @@ describe('ReflexionAgent Improvements', () => {
 
     // Initialize mock router and agent
     mockRouter = new MockLLMRouter();
+    // Reset modes to default
+    mockRouter.stagnationMode = false;
+    mockRouter.repetitionMode = false;
+
     agent = new ReflexionAgent(
       'Create a Calculator class in calculator.ts with add and subtract methods',
       mockRouter as any
@@ -135,7 +197,10 @@ describe('ReflexionAgent Improvements', () => {
     });
 
     test('should detect stagnation after multiple planning iterations', async () => {
-      // Simulate 5+ planning iterations with no file changes
+      // Enable stagnation mode: mock will return non-file actions
+      mockRouter.stagnationMode = true;
+
+      // Simulate 6 planning iterations with no file changes
       const planningCycles = Array(6).fill('Reasoning about the task');
 
       let threwError = false;
@@ -155,6 +220,9 @@ describe('ReflexionAgent Improvements', () => {
 
   describe('Repetition Detection', () => {
     test('should detect when agent repeats identical thoughts', async () => {
+      // Enable repetition mode: mock will return identical thoughts
+      mockRouter.repetitionMode = true;
+
       const repeatedInput = 'Read the contents of test.ts';
 
       let threwError = false;
@@ -273,8 +341,9 @@ describe('ReflexionAgent Improvements', () => {
     test('should detect expectation mismatches', async () => {
       const cycle = await agent.cycle('Create calculator.ts but observe test.ts was created');
 
-      // Reflection should mention mismatch
-      expect(cycle.reflection).toContain('mismatch' || 'Expected' || '⚠️');
+      // Reflection should contain warning indicators (⚠️ or "not contributing")
+      const hasWarning = cycle.reflection.includes('⚠️') || cycle.reflection.includes('not contributing');
+      expect(hasWarning).toBe(true);
     });
 
     test('should detect error patterns in reflection', async () => {
@@ -314,8 +383,9 @@ describe('ReflexionAgent Improvements', () => {
     test('should acknowledge success patterns', async () => {
       const cycle = await agent.cycle('Create calculator.ts successfully');
 
-      // Reflection should acknowledge success
-      expect(cycle.reflection).toContain('success' || '✅' || 'succeeded');
+      // Reflection should contain success indicators (✅ or "succeeded")
+      const hasSuccess = cycle.reflection.includes('✅') || cycle.reflection.includes('succeeded');
+      expect(hasSuccess).toBe(true);
     });
 
     test('should warn about planning loops', async () => {

@@ -1,6 +1,6 @@
 # 🗂️ Project Structure: .
 
-**Generated**: 2026-01-13 20:05:32
+**Generated**: 2026-01-13 20:26:57
 **Purpose**: Quick navigation reference for Claude (token-efficient)
 
 ---
@@ -224,10 +224,8 @@
 ├── 📄 test-llm-integration.ts
 ├── 📄 test-output.ts
 ├── 📁 test-results/
+├── 📄 TEST-RESULTS-REFLEXION-AGENT.md
 ├── 📄 TEST-RESULTS.md
-├── 📁 test-workspace-reflexion-stress/
-└── 📁 src/
-│   └── 📄 types.ts
 ├── 📄 TESTING-GUIDE.md
 ├── 📁 tests/
 ├── 📄 action-executor-test.ts
@@ -336,6 +334,7 @@
 • ./SMOKE-TEST-RESULTS.md
 • ./TYPESCRIPT-MIGRATION-STATUS.md
 • ./TYPESCRIPT-CLI-COMPLETE.md
+• ./TEST-RESULTS-REFLEXION-AGENT.md
 • ./AUTO-VALIDATION-INTEGRATION.md
 • ./CLAUDED-INTEGRATION.md
 • ./TESTING-GUIDE.md
@@ -770,10 +769,10 @@
 ## 📊 Project Statistics
 
 **Languages:**
-• JavaScript/TypeScript: 41150 files
+• JavaScript/TypeScript: 41149 files
 • Python: 1 files
 
-**Estimated LOC:** 580970
+**Estimated LOC:** 581130
 
 
 ---
@@ -796,7 +795,6 @@
 • **plans 2/**
 • **src/**: Source code
 • **test-results/**
-• **test-workspace-reflexion-stress/**
 • **tests/**: Test files
 
 ---

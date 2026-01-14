@@ -35,6 +35,7 @@ export interface Context {
 export class ReflexionAgent {
   private context: Context;
   private executor?: ActionExecutor;
+  private llmRouter?: LLMRouter;
 
   constructor(goal: string, llmRouter?: LLMRouter) {
     this.context = {
@@ -48,6 +49,8 @@ export class ReflexionAgent {
         iterations: 0
       }
     };
+
+    this.llmRouter = llmRouter;
 
     // Initialize ActionExecutor if LLM router provided
     if (llmRouter) {
@@ -111,11 +114,69 @@ export class ReflexionAgent {
       return input;
     }
 
-    // Consider context, history, and goal
-    // Generate reasoning about the best approach
-    // Check for similar patterns in memory
+    // If no LLM router, fallback to template
+    if (!this.llmRouter) {
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    }
 
-    return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    // Build context from history
+    const recentHistory = this.context.history.slice(-3).map(cycle =>
+      `Previous: ${cycle.thought} → ${cycle.action} → ${cycle.observation} → ${cycle.reflection}`
+    ).join('\n');
+
+    const progressSummary = `Progress: ${this.context.metrics.filesCreated} created, ${this.context.metrics.filesModified} modified, ${this.context.metrics.linesChanged} lines changed`;
+
+    // Construct prompt for LLM
+    const systemPrompt = `You are a reasoning agent using the ReAct pattern. Given a goal and current input, generate explicit reasoning about what action to take next.
+
+Your response should:
+1. Analyze the current situation and input
+2. Consider past actions and their outcomes
+3. Propose the next logical step towards the goal
+4. Be specific and actionable (mention exact filenames, actions, etc.)
+
+Keep your reasoning concise (2-3 sentences max).`;
+
+    const userPrompt = `Goal: ${this.context.goal}
+
+Current Input: ${input}
+
+${recentHistory ? `Recent History:\n${recentHistory}\n` : ''}
+${progressSummary}
+
+What should I do next? Provide specific, actionable reasoning.`;
+
+    try {
+      // Route request through LLM
+      const response = await this.llmRouter.route(
+        {
+          messages: [
+            { role: 'user', content: userPrompt }
+          ],
+          system: systemPrompt,
+          max_tokens: 200,
+          temperature: 0.7
+        },
+        {
+          taskType: 'reasoning',
+          priority: 'balanced',
+          requiresTools: false,
+          requiresVision: false
+        }
+      );
+
+      // Extract text from response
+      const textContent = response.content.find(block => block.type === 'text');
+      if (textContent && 'text' in textContent) {
+        return textContent.text.trim();
+      }
+
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    } catch (error) {
+      // Fallback on LLM error
+      console.error('[ReflexionAgent] LLM think() failed:', error);
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    }
   }
 
   /**
@@ -188,20 +249,35 @@ export class ReflexionAgent {
     const actionTypeMatch = action.match(/^(\w+)\(/);
     const actionType = actionTypeMatch ? actionTypeMatch[1] : 'unknown';
 
+    // Extract filename context from action
+    let filename: string | null = null;
+    const filenameMatch = action.match(/"path":"([^"]+)"/);
+    if (filenameMatch) {
+      filename = filenameMatch[1];
+    }
+
     // Check if this was a file creation vs modification
     let observation = '';
     switch (actionType) {
       case 'file_write':
         if (action.includes('File created:')) {
-          observation = 'File successfully created';
+          observation = filename
+            ? `File successfully created: ${filename}`
+            : 'File successfully created';
         } else if (action.includes('File updated:')) {
-          observation = 'File successfully updated';
+          observation = filename
+            ? `File successfully updated: ${filename}`
+            : 'File successfully updated';
         } else {
-          observation = 'File successfully created/updated';
+          observation = filename
+            ? `File successfully created/updated: ${filename}`
+            : 'File successfully created/updated';
         }
         break;
       case 'file_read':
-        observation = 'File contents retrieved';
+        observation = filename
+          ? `File contents retrieved: ${filename}`
+          : 'File contents retrieved';
         break;
       case 'command':
         observation = 'Command executed successfully';
@@ -426,13 +502,29 @@ export class ReflexionAgent {
     // Simple heuristic: check if goal mentions specific files/actions
     // that should be reflected in observations
 
-    // Example: Goal says "create calculator.ts" but observation says "updated test.ts"
-    const goalFileMatch = goal.match(/(\w+\.ts)/);
-    const obsFileMatch = observation.match(/(\w+\.ts)/);
+    // Extract filename from observation (now includes filenames!)
+    const obsFileMatch = observation.match(/(\w+)\.ts/);
 
+    if (obsFileMatch) {
+      const obsFile = obsFileMatch[1]; // e.g., "unrelated-file" from "unrelated-file.ts"
+
+      // Check if goal mentions this filename (with or without extension)
+      const goalMentionsFile = goalLower.includes(obsFile.toLowerCase());
+
+      if (!goalMentionsFile) {
+        // Goal doesn't mention the file being created/modified
+        return {
+          aligned: false,
+          reason: `Goal does not mention ${obsFileMatch[0]} but action affected it`
+        };
+      }
+    }
+
+    // Check exact filename match if goal has explicit .ts file
+    const goalFileMatch = goal.match(/(\w+\.ts)/);
     if (goalFileMatch && obsFileMatch) {
       const goalFile = goalFileMatch[1];
-      const obsFile = obsFileMatch[1];
+      const obsFile = obsFileMatch[0];
 
       if (goalFile !== obsFile) {
         return {

@@ -10189,6 +10189,7 @@ Return JSON now:
 class ReflexionAgent {
   context;
   executor;
+  llmRouter;
   constructor(goal, llmRouter) {
     this.context = {
       goal,
@@ -10201,6 +10202,7 @@ class ReflexionAgent {
         iterations: 0
       }
     };
+    this.llmRouter = llmRouter;
     if (llmRouter) {
       this.executor = new ActionExecutor(llmRouter);
     }
@@ -10236,7 +10238,54 @@ class ReflexionAgent {
     if (input.startsWith("[ERROR]")) {
       return input;
     }
-    return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    if (!this.llmRouter) {
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    }
+    const recentHistory = this.context.history.slice(-3).map((cycle) => `Previous: ${cycle.thought} → ${cycle.action} → ${cycle.observation} → ${cycle.reflection}`).join(`
+`);
+    const progressSummary = `Progress: ${this.context.metrics.filesCreated} created, ${this.context.metrics.filesModified} modified, ${this.context.metrics.linesChanged} lines changed`;
+    const systemPrompt = `You are a reasoning agent using the ReAct pattern. Given a goal and current input, generate explicit reasoning about what action to take next.
+
+Your response should:
+1. Analyze the current situation and input
+2. Consider past actions and their outcomes
+3. Propose the next logical step towards the goal
+4. Be specific and actionable (mention exact filenames, actions, etc.)
+
+Keep your reasoning concise (2-3 sentences max).`;
+    const userPrompt = `Goal: ${this.context.goal}
+
+Current Input: ${input}
+
+${recentHistory ? `Recent History:
+${recentHistory}
+` : ""}
+${progressSummary}
+
+What should I do next? Provide specific, actionable reasoning.`;
+    try {
+      const response = await this.llmRouter.route({
+        messages: [
+          { role: "user", content: userPrompt }
+        ],
+        system: systemPrompt,
+        max_tokens: 200,
+        temperature: 0.7
+      }, {
+        taskType: "reasoning",
+        priority: "balanced",
+        requiresTools: false,
+        requiresVision: false
+      });
+      const textContent = response.content.find((block) => block.type === "text");
+      if (textContent && "text" in textContent) {
+        return textContent.text.trim();
+      }
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    } catch (error2) {
+      console.error("[ReflexionAgent] LLM think() failed:", error2);
+      return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+    }
   }
   async act(thought) {
     if (thought.includes("[ERROR]")) {
@@ -10281,19 +10330,24 @@ class ReflexionAgent {
     }
     const actionTypeMatch = action.match(/^(\w+)\(/);
     const actionType = actionTypeMatch ? actionTypeMatch[1] : "unknown";
+    let filename = null;
+    const filenameMatch = action.match(/"path":"([^"]+)"/);
+    if (filenameMatch) {
+      filename = filenameMatch[1];
+    }
     let observation = "";
     switch (actionType) {
       case "file_write":
         if (action.includes("File created:")) {
-          observation = "File successfully created";
+          observation = filename ? `File successfully created: ${filename}` : "File successfully created";
         } else if (action.includes("File updated:")) {
-          observation = "File successfully updated";
+          observation = filename ? `File successfully updated: ${filename}` : "File successfully updated";
         } else {
-          observation = "File successfully created/updated";
+          observation = filename ? `File successfully created/updated: ${filename}` : "File successfully created/updated";
         }
         break;
       case "file_read":
-        observation = "File contents retrieved";
+        observation = filename ? `File contents retrieved: ${filename}` : "File contents retrieved";
         break;
       case "command":
         observation = "Command executed successfully";
@@ -10412,11 +10466,21 @@ class ReflexionAgent {
     const { goal } = this.context;
     const goalLower = goal.toLowerCase();
     const observationLower = observation.toLowerCase();
+    const obsFileMatch = observation.match(/(\w+)\.ts/);
+    if (obsFileMatch) {
+      const obsFile = obsFileMatch[1];
+      const goalMentionsFile = goalLower.includes(obsFile.toLowerCase());
+      if (!goalMentionsFile) {
+        return {
+          aligned: false,
+          reason: `Goal does not mention ${obsFileMatch[0]} but action affected it`
+        };
+      }
+    }
     const goalFileMatch = goal.match(/(\w+\.ts)/);
-    const obsFileMatch = observation.match(/(\w+\.ts)/);
     if (goalFileMatch && obsFileMatch) {
       const goalFile = goalFileMatch[1];
-      const obsFile = obsFileMatch[1];
+      const obsFile = obsFileMatch[0];
       if (goalFile !== obsFile) {
         return {
           aligned: false,
