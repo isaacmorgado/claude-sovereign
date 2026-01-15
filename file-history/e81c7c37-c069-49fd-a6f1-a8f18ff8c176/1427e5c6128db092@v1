@@ -1,0 +1,310 @@
+// AI Tools Panel - AI-powered analysis and editing suggestions
+import { LitElement, html, css } from 'lit'
+import { customElement, property, state } from 'lit/decorators.js'
+import type { ClipSelection } from '@/types/plugin'
+import type { AnalysisType, AIAnalysisResponse } from '@/types/api'
+import { analyzeClip, isAIServiceConfigured } from '@/utils/api/ai-service'
+import { canPerformOperation, incrementOperationsUsed } from '@/utils/api/plugin'
+import { backendClient, type AudioJob, type User } from '@/utils/api/backend-client'
+import { logger } from '@/utils/logger'
+
+type UploadState = 'idle' | 'uploading' | 'processing' | 'complete' | 'error'
+type CloudTool = 'transcription' | 'vocal_isolation'
+
+@customElement('ai-tools-panel')
+export class AIToolsPanel extends LitElement {
+  static styles = css`
+    :host {
+      display: block;
+    }
+
+    .section {
+      margin-bottom: var(--space-lg);
+    }
+
+    .section-title {
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+      color: var(--text-secondary);
+      margin-bottom: var(--space-sm);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .ai-tools-grid {
+      display: grid;
+      gap: var(--space-sm);
+    }
+
+    .ai-tool-card {
+      background: var(--bg-layer-1);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+      cursor: pointer;
+      transition: all var(--transition-fast);
+      border: 1px solid transparent;
+    }
+
+    .ai-tool-card:hover {
+      background: var(--bg-layer-2);
+      border-color: var(--border-hover);
+    }
+
+    .ai-tool-card.disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .ai-tool-card.disabled:hover {
+      background: var(--bg-layer-1);
+      border-color: transparent;
+    }
+
+    .tool-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: var(--space-xs);
+    }
+
+    .tool-name {
+      font-weight: var(--font-weight-medium);
+    }
+
+    .tool-badge {
+      font-size: var(--font-size-xs);
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      background: var(--color-accent);
+      color: white;
+    }
+
+    .tool-badge.premium {
+      background: linear-gradient(135deg, #ffd700, #ffaa00);
+      color: #1a1a1a;
+    }
+
+    .tool-description {
+      font-size: var(--font-size-sm);
+      color: var(--text-secondary);
+    }
+
+    .warning-banner {
+      background: var(--bg-layer-1);
+      border-left: 3px solid var(--color-warning);
+      padding: var(--space-md);
+      border-radius: var(--radius-sm);
+      margin-bottom: var(--space-md);
+    }
+
+    .warning-banner h4 {
+      margin: 0 0 var(--space-xs) 0;
+      color: var(--color-warning);
+      font-size: var(--font-size-sm);
+    }
+
+    .warning-banner p {
+      margin: 0;
+      font-size: var(--font-size-sm);
+      color: var(--text-secondary);
+    }
+
+    .results-section {
+      background: var(--bg-layer-1);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+    }
+
+    .result-item {
+      padding: var(--space-sm) 0;
+      border-bottom: 1px solid var(--border-default);
+    }
+
+    .result-item:last-child {
+      border-bottom: none;
+    }
+
+    .loading-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: var(--space-xl);
+      gap: var(--space-md);
+    }
+  `
+
+  @property({ type: Array }) selectedClips: ClipSelection[] = []
+  @property({ type: Number }) remainingOperations = 0
+  @property({ type: Boolean }) isPremium = false
+
+  @state() private isAnalyzing = false
+  @state() private analysisResult: AIAnalysisResponse | null = null
+
+  private aiTools = [
+    {
+      id: 'scene-detection' as AnalysisType,
+      name: 'Scene Detection',
+      description: 'Automatically detect scene changes and suggest cut points',
+      premium: false,
+    },
+    {
+      id: 'smart-cut' as AnalysisType,
+      name: 'Smart Cut Suggestions',
+      description: 'AI-powered suggestions for optimal edit points',
+      premium: false,
+    },
+    {
+      id: 'audio-analysis' as AnalysisType,
+      name: 'Audio Analysis',
+      description: 'Analyze audio for beats, silence, and speech patterns',
+      premium: true,
+    },
+    {
+      id: 'content' as AnalysisType,
+      name: 'Content Analysis',
+      description: 'Deep analysis of clip content and themes',
+      premium: true,
+    },
+  ]
+
+  private async handleToolClick(toolId: AnalysisType, isPremiumTool: boolean): Promise<void> {
+    // Check if service is configured
+    if (!isAIServiceConfigured()) {
+      logger.warn('AI service not configured')
+      return
+    }
+
+    // Check if clips are selected
+    if (this.selectedClips.length === 0) {
+      logger.warn('No clips selected for analysis')
+      return
+    }
+
+    // Check premium requirement
+    if (isPremiumTool && !this.isPremium) {
+      this.dispatchEvent(new CustomEvent('upgrade-needed', { bubbles: true, composed: true }))
+      return
+    }
+
+    // Check operation limit for free tier
+    if (!this.isPremium && !canPerformOperation()) {
+      this.dispatchEvent(new CustomEvent('upgrade-needed', { bubbles: true, composed: true }))
+      return
+    }
+
+    this.isAnalyzing = true
+    this.analysisResult = null
+
+    try {
+      // Use first selected clip for analysis
+      const clip = this.selectedClips[0]
+
+      const result = await analyzeClip({
+        clipData: {
+          duration: clip.endTime - clip.startTime,
+          frameRate: 24, // Would come from actual project settings
+          audioChannels: 2,
+          metadata: { name: clip.name },
+        },
+        analysisType: toolId,
+      })
+
+      this.analysisResult = result
+
+      // Decrement operations for free tier
+      if (!this.isPremium && result.success) {
+        incrementOperationsUsed()
+        this.dispatchEvent(new CustomEvent('operation-used', { bubbles: true, composed: true }))
+      }
+    } catch (error) {
+      logger.error('Analysis failed', error)
+    } finally {
+      this.isAnalyzing = false
+    }
+  }
+
+  private canUseTool(isPremiumTool: boolean): boolean {
+    if (!isAIServiceConfigured()) return false
+    if (this.selectedClips.length === 0) return false
+    if (isPremiumTool && !this.isPremium) return false
+    if (!this.isPremium && !canPerformOperation()) return false
+    return true
+  }
+
+  render() {
+    if (!isAIServiceConfigured()) {
+      return html`
+        <div class="warning-banner">
+          <h4>⚠️ AI Service Not Configured</h4>
+          <p>Please add your API key in Settings to use AI-powered features.</p>
+        </div>
+      `
+    }
+
+    if (this.isAnalyzing) {
+      return html`
+        <div class="loading-state">
+          <sp-progress-circle indeterminate size="l" label="Analyzing clip"></sp-progress-circle>
+          <p>Analyzing clip...</p>
+        </div>
+      `
+    }
+
+    return html`
+      ${this.selectedClips.length === 0
+        ? html`
+            <div class="warning-banner">
+              <h4>📹 No Clips Selected</h4>
+              <p>Select clips in the Selection tab or Premiere Pro timeline to use AI tools.</p>
+            </div>
+          `
+        : ''}
+
+      <div class="section">
+        <div class="section-title">AI-Powered Tools</div>
+        <div class="ai-tools-grid">
+          ${this.aiTools.map(
+            (tool) => html`
+              <div
+                class="ai-tool-card ${this.canUseTool(tool.premium) ? '' : 'disabled'}"
+                @click=${() =>
+                  this.canUseTool(tool.premium) && this.handleToolClick(tool.id, tool.premium)}
+              >
+                <div class="tool-header">
+                  <span class="tool-name">${tool.name}</span>
+                  ${tool.premium
+                    ? html`<span class="tool-badge premium">PRO</span>`
+                    : html`<span class="tool-badge">AI</span>`}
+                </div>
+                <div class="tool-description">${tool.description}</div>
+              </div>
+            `
+          )}
+        </div>
+      </div>
+
+      ${this.analysisResult
+        ? html`
+            <div class="section">
+              <div class="section-title">Analysis Results</div>
+              <div class="results-section">
+                ${this.analysisResult.success
+                  ? html` <pre>${JSON.stringify(this.analysisResult.result, null, 2)}</pre> `
+                  : html`
+                      <p style="color: var(--color-negative)">
+                        Error: ${this.analysisResult.error?.message}
+                      </p>
+                    `}
+              </div>
+            </div>
+          `
+        : ''}
+    `
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'ai-tools-panel': AIToolsPanel
+  }
+}

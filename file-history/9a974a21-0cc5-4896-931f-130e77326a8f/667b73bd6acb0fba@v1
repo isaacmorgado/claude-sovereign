@@ -1,0 +1,625 @@
+/**
+ * Repetition/Stutter Detection Service
+ *
+ * Detects repeated words, phrases, and stutters in transcripts.
+ * Based on Fireside's proven approach with enhancements.
+ *
+ * Features:
+ * - Frequency-based pattern detection
+ * - Phrase similarity matching
+ * - OpenAI refinement for boundary detection
+ * - Configurable tolerance and phrase size
+ * - Word-level result with grouping
+ *
+ * Two Modes:
+ * - Basic: Fast local detection (no API calls)
+ * - Advanced: Uses OpenAI for precise boundary detection
+ */
+
+const OpenAI = require('openai');
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const DEFAULT_OPTIONS = {
+  mode: 'basic',            // 'basic' or 'advanced'
+  phraseSize: 5,            // Words per comparison window
+  tolerance: 0.7,           // Similarity threshold (0-1)
+  searchRadius: 100,        // Words to search ahead
+  minOccurrences: 2,        // Minimum occurrences to count as repetition
+  extendMode: 'next-punctuation', // 'next-punctuation' or 'longest-occurrence'
+  useOpenAI: false,         // Use OpenAI for boundary refinement
+  maxGapWords: 20           // Max words between occurrences to group
+};
+
+// Punctuation for boundary detection
+const PUNCTUATION = /[.!?,;:]/;
+
+// =============================================================================
+// Core Detection - Basic Mode
+// =============================================================================
+
+/**
+ * Detect repetitions in transcript using basic frequency analysis
+ *
+ * @param {Object} transcript - Transcript with words array
+ * @param {Object} options - Detection options
+ * @returns {Object} Detection results with repetitions
+ */
+function detectRepetitionsBasic(transcript, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const words = transcript.words || [];
+
+  if (words.length < opts.phraseSize * 2) {
+    return { repetitions: [], metadata: { reason: 'Not enough words for analysis' } };
+  }
+
+  console.log(`[SPLICE Repetition] Basic mode: ${words.length} words, phraseSize=${opts.phraseSize}, tolerance=${opts.tolerance}`);
+
+  // Normalize words for comparison
+  const normalizedWords = words.map(w => normalizeWord(w.word || w.text || ''));
+
+  // Find all phrase occurrences
+  const phraseGroups = findPhraseOccurrences(normalizedWords, {
+    phraseSize: opts.phraseSize,
+    searchRadius: opts.searchRadius,
+    tolerance: opts.tolerance,
+    minOccurrences: opts.minOccurrences
+  });
+
+  // Convert to time-based repetitions
+  const repetitions = phraseGroups.map((group, index) => ({
+    id: index,
+    occurrences: group.occurrences.map(occ => ({
+      startWord: occ.startIndex,
+      endWord: occ.endIndex,
+      start: words[occ.startIndex].start,
+      end: words[occ.endIndex].end,
+      text: words.slice(occ.startIndex, occ.endIndex + 1).map(w => w.word || w.text).join(' ')
+    })),
+    bestOccurrence: 0, // First occurrence is usually the "keeper"
+    similarity: group.similarity,
+    wordCount: opts.phraseSize
+  }));
+
+  // Filter overlapping repetitions
+  const filtered = filterOverlappingRepetitions(repetitions);
+
+  console.log(`[SPLICE Repetition] Found ${filtered.length} repetition group(s)`);
+
+  return {
+    repetitions: filtered,
+    metadata: {
+      mode: 'basic',
+      totalWords: words.length,
+      phraseSize: opts.phraseSize,
+      tolerance: opts.tolerance,
+      groupsFound: filtered.length,
+      totalOccurrences: filtered.reduce((sum, r) => sum + r.occurrences.length, 0)
+    }
+  };
+}
+
+/**
+ * Find phrase occurrences using sliding window comparison
+ *
+ * @param {Array<string>} normalizedWords - Normalized word strings
+ * @param {Object} options - Search options
+ * @returns {Array} Groups of similar phrases
+ */
+function findPhraseOccurrences(normalizedWords, options) {
+  const { phraseSize, searchRadius, tolerance, minOccurrences } = options;
+  const groups = [];
+  const usedIndices = new Set();
+
+  for (let i = 0; i <= normalizedWords.length - phraseSize; i++) {
+    if (usedIndices.has(i)) continue;
+
+    const phrase = normalizedWords.slice(i, i + phraseSize);
+    const occurrences = [{
+      startIndex: i,
+      endIndex: i + phraseSize - 1
+    }];
+
+    // Search ahead for similar phrases
+    const searchEnd = Math.min(i + searchRadius, normalizedWords.length - phraseSize);
+
+    for (let j = i + phraseSize; j <= searchEnd; j++) {
+      if (usedIndices.has(j)) continue;
+
+      const comparePhrase = normalizedWords.slice(j, j + phraseSize);
+      const similarity = calculateSimilarity(phrase, comparePhrase);
+
+      if (similarity >= tolerance) {
+        occurrences.push({
+          startIndex: j,
+          endIndex: j + phraseSize - 1
+        });
+        // Mark these indices as used
+        for (let k = j; k < j + phraseSize; k++) {
+          usedIndices.add(k);
+        }
+      }
+    }
+
+    if (occurrences.length >= minOccurrences) {
+      // Mark original phrase indices as used
+      for (let k = i; k < i + phraseSize; k++) {
+        usedIndices.add(k);
+      }
+
+      groups.push({
+        occurrences,
+        similarity: 1.0, // First match is reference
+        phraseText: phrase.join(' ')
+      });
+    }
+  }
+
+  return groups;
+}
+
+// =============================================================================
+// Core Detection - Advanced Mode (with OpenAI)
+// =============================================================================
+
+/**
+ * Detect repetitions with OpenAI boundary refinement
+ *
+ * @param {Object} transcript - Transcript with words array
+ * @param {Object} options - Detection options
+ * @returns {Promise<Object>} Detection results with refined boundaries
+ */
+async function detectRepetitionsAdvanced(transcript, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options, mode: 'advanced' };
+
+  // First, do basic detection
+  const basicResult = detectRepetitionsBasic(transcript, opts);
+
+  if (basicResult.repetitions.length === 0) {
+    return basicResult;
+  }
+
+  // If OpenAI refinement is disabled, return basic results
+  if (!opts.useOpenAI) {
+    return {
+      ...basicResult,
+      metadata: { ...basicResult.metadata, mode: 'advanced-local' }
+    };
+  }
+
+  // Refine boundaries using OpenAI
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const refinedRepetitions = [];
+
+  for (const rep of basicResult.repetitions) {
+    try {
+      const refined = await refineRepetitionBoundaries(openai, transcript.words, rep);
+      refinedRepetitions.push(refined);
+    } catch (err) {
+      console.warn('[SPLICE Repetition] OpenAI refinement failed, using basic:', err.message);
+      refinedRepetitions.push(rep);
+    }
+  }
+
+  return {
+    repetitions: refinedRepetitions,
+    metadata: {
+      ...basicResult.metadata,
+      mode: 'advanced-openai',
+      openaiRefined: true
+    }
+  };
+}
+
+/**
+ * Refine repetition boundaries using OpenAI
+ *
+ * @param {OpenAI} openai - OpenAI client
+ * @param {Array} words - All transcript words
+ * @param {Object} repetition - Basic repetition detection
+ * @returns {Promise<Object>} Refined repetition with better boundaries
+ */
+async function refineRepetitionBoundaries(openai, words, repetition) {
+  // Get context around the repetition
+  const allOccurrences = repetition.occurrences;
+  const minStart = Math.max(0, allOccurrences[0].startWord - 5);
+  const maxEnd = Math.min(words.length - 1, allOccurrences[allOccurrences.length - 1].endWord + 5);
+
+  // Build context string with markers
+  let contextText = '';
+  for (let i = minStart; i <= maxEnd; i++) {
+    const word = words[i].word || words[i].text;
+    // Mark occurrence boundaries
+    const isStart = allOccurrences.some(o => o.startWord === i);
+    const isEnd = allOccurrences.some(o => o.endWord === i);
+
+    if (isStart) contextText += '[';
+    contextText += word + ' ';
+    if (isEnd) contextText += '] ';
+  }
+
+  const prompt = `Analyze this text for repeated content. The brackets mark detected repetitions:
+
+"${contextText.trim()}"
+
+For each bracketed section, determine:
+1. Is this truly a repetition/restart/stutter?
+2. What are the exact word boundaries that should be removed (keeping only the best take)?
+
+Respond in JSON format:
+{
+  "isRepetition": true/false,
+  "keepOccurrence": 0-based index of the occurrence to keep (usually the last/most complete),
+  "removeRanges": [{"start": wordIndex, "end": wordIndex}]
+}`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'You are an expert video editor identifying repeated content in speech transcripts. Be precise about boundaries.' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0,
+    max_tokens: 500
+  });
+
+  try {
+    const result = JSON.parse(response.choices[0].message.content);
+
+    if (!result.isRepetition) {
+      // False positive - return empty
+      return { ...repetition, occurrences: [], metadata: { refined: true, isRepetition: false } };
+    }
+
+    // Update best occurrence
+    return {
+      ...repetition,
+      bestOccurrence: result.keepOccurrence || 0,
+      metadata: { refined: true, openaiResult: result }
+    };
+  } catch (parseErr) {
+    // Return original if parsing fails
+    return repetition;
+  }
+}
+
+// =============================================================================
+// Stutter Detection (Single-Word Repetitions)
+// =============================================================================
+
+/**
+ * Detect single-word stutters (e.g., "I I I think")
+ *
+ * @param {Object} transcript - Transcript with words array
+ * @param {Object} options - Detection options
+ * @returns {Object} Stutter detection results
+ */
+function detectStutters(transcript, options = {}) {
+  const {
+    minRepeats = 2,      // Minimum times word must repeat
+    maxGapMs = 500,      // Max gap between words (milliseconds)
+    ignoreFillers = true, // Ignore common filler words
+    minWordLength = 1    // Minimum word length (1 allows "I", "a", etc.)
+  } = options;
+
+  const words = transcript.words || [];
+  const stutters = [];
+
+  // Common filler words to optionally ignore
+  const fillerWords = new Set(['um', 'uh', 'ah', 'er', 'like', 'so', 'well', 'you know']);
+
+  let i = 0;
+  while (i < words.length) {
+    const word = words[i];
+    const normalized = normalizeWord(word.word || word.text || '');
+
+    // Skip fillers if configured
+    if (ignoreFillers && fillerWords.has(normalized)) {
+      i++;
+      continue;
+    }
+
+    // Skip very short words (likely noise)
+    if (normalized.length < 2) {
+      i++;
+      continue;
+    }
+
+    // Look for consecutive repeats
+    let repeatCount = 1;
+    let j = i + 1;
+
+    while (j < words.length) {
+      const nextWord = words[j];
+      const nextNormalized = normalizeWord(nextWord.word || nextWord.text || '');
+
+      // Check if same word
+      if (nextNormalized !== normalized) break;
+
+      // Check gap (convert to ms)
+      const gap = (nextWord.start - words[j - 1].end) * 1000;
+      if (gap > maxGapMs) break;
+
+      repeatCount++;
+      j++;
+    }
+
+    if (repeatCount >= minRepeats) {
+      stutters.push({
+        word: normalized,
+        occurrences: repeatCount,
+        startWord: i,
+        endWord: j - 1,
+        start: words[i].start,
+        end: words[j - 1].end,
+        duration: words[j - 1].end - words[i].start,
+        // Keep first occurrence, remove rest
+        keepStart: words[i].start,
+        keepEnd: words[i].end,
+        removeStart: words[i + 1].start,
+        removeEnd: words[j - 1].end
+      });
+    }
+
+    i = j; // Skip past all repeats
+  }
+
+  console.log(`[SPLICE Repetition] Found ${stutters.length} stutter(s)`);
+
+  return {
+    stutters,
+    metadata: {
+      type: 'stutters',
+      totalWords: words.length,
+      stutterCount: stutters.length,
+      totalRepeatedWords: stutters.reduce((sum, s) => sum + s.occurrences, 0)
+    }
+  };
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/**
+ * Normalize a word for comparison
+ */
+function normalizeWord(word) {
+  return word
+    .toLowerCase()
+    .replace(/[^\w\s'-]/g, '') // Remove punctuation except apostrophe/hyphen
+    .trim();
+}
+
+/**
+ * Calculate similarity between two word arrays
+ * Uses Jaccard-like similarity with position weighting
+ *
+ * @param {Array<string>} arr1 - First word array
+ * @param {Array<string>} arr2 - Second word array
+ * @returns {number} Similarity score (0-1)
+ */
+function calculateSimilarity(arr1, arr2) {
+  if (arr1.length !== arr2.length) return 0;
+  if (arr1.length === 0) return 0;
+
+  let matches = 0;
+  for (let i = 0; i < arr1.length; i++) {
+    if (arr1[i] === arr2[i]) {
+      matches++;
+    } else {
+      // Partial credit for similar words (edit distance)
+      const editDist = levenshteinDistance(arr1[i], arr2[i]);
+      const maxLen = Math.max(arr1[i].length, arr2[i].length);
+      if (maxLen > 0) {
+        const wordSim = 1 - (editDist / maxLen);
+        if (wordSim > 0.7) matches += wordSim;
+      }
+    }
+  }
+
+  return matches / arr1.length;
+}
+
+/**
+ * Levenshtein edit distance between two strings
+ */
+function levenshteinDistance(s1, s2) {
+  const m = s1.length;
+  const n = s2.length;
+
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (s1[i - 1] === s2[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = 1 + Math.min(
+          dp[i - 1][j],     // deletion
+          dp[i][j - 1],     // insertion
+          dp[i - 1][j - 1]  // substitution
+        );
+      }
+    }
+  }
+
+  return dp[m][n];
+}
+
+/**
+ * Filter overlapping repetition groups
+ */
+function filterOverlappingRepetitions(repetitions) {
+  if (repetitions.length <= 1) return repetitions;
+
+  // Sort by first occurrence start
+  const sorted = [...repetitions].sort((a, b) =>
+    a.occurrences[0].start - b.occurrences[0].start
+  );
+
+  const result = [];
+  let lastEnd = -1;
+
+  for (const rep of sorted) {
+    const firstOcc = rep.occurrences[0];
+    // Check if overlaps with previous
+    if (firstOcc.start >= lastEnd) {
+      result.push(rep);
+      // Update lastEnd to include all occurrences
+      lastEnd = Math.max(...rep.occurrences.map(o => o.end));
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Convert repetitions to removal segments
+ * Keeps the "best" occurrence, returns segments to remove
+ *
+ * @param {Array} repetitions - Detected repetitions
+ * @returns {Array} Segments to remove from timeline
+ */
+function repetitionsToRemovalSegments(repetitions) {
+  const segments = [];
+
+  for (const rep of repetitions) {
+    const keepIndex = rep.bestOccurrence || 0;
+
+    rep.occurrences.forEach((occ, i) => {
+      if (i !== keepIndex) {
+        segments.push({
+          start: occ.start,
+          end: occ.end,
+          type: 'repetition',
+          text: occ.text,
+          reason: `Duplicate of occurrence ${keepIndex + 1}`
+        });
+      }
+    });
+  }
+
+  // Sort by start time and merge adjacent
+  return mergeAdjacentSegments(segments);
+}
+
+/**
+ * Convert stutters to removal segments
+ *
+ * @param {Array} stutters - Detected stutters
+ * @returns {Array} Segments to remove
+ */
+function stuttersToRemovalSegments(stutters) {
+  return stutters.map(s => ({
+    start: s.removeStart,
+    end: s.removeEnd,
+    type: 'stutter',
+    text: `${s.word} (x${s.occurrences})`,
+    keepRange: { start: s.keepStart, end: s.keepEnd }
+  }));
+}
+
+/**
+ * Merge adjacent removal segments
+ */
+function mergeAdjacentSegments(segments, maxGap = 0.1) {
+  if (segments.length <= 1) return segments;
+
+  const sorted = [...segments].sort((a, b) => a.start - b.start);
+  const merged = [];
+  let current = { ...sorted[0] };
+
+  for (let i = 1; i < sorted.length; i++) {
+    const next = sorted[i];
+
+    if (next.start - current.end <= maxGap) {
+      // Merge
+      current.end = next.end;
+      current.text = `${current.text}, ${next.text}`;
+    } else {
+      merged.push(current);
+      current = { ...next };
+    }
+  }
+
+  merged.push(current);
+  return merged;
+}
+
+// =============================================================================
+// Combined Detection
+// =============================================================================
+
+/**
+ * Run all repetition detection (phrases + stutters)
+ *
+ * @param {Object} transcript - Transcript with words array
+ * @param {Object} options - Detection options
+ * @returns {Promise<Object>} Combined detection results
+ */
+async function detectAllRepetitions(transcript, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  // Detect phrase repetitions
+  const phraseResult = opts.useOpenAI
+    ? await detectRepetitionsAdvanced(transcript, opts)
+    : detectRepetitionsBasic(transcript, opts);
+
+  // Detect stutters
+  const stutterResult = detectStutters(transcript, opts);
+
+  // Combine removal segments
+  const phraseSegments = repetitionsToRemovalSegments(phraseResult.repetitions);
+  const stutterSegments = stuttersToRemovalSegments(stutterResult.stutters);
+  const allSegments = mergeAdjacentSegments([...phraseSegments, ...stutterSegments]);
+
+  // Calculate total removable time
+  const totalRemovableTime = allSegments.reduce((sum, s) => sum + (s.end - s.start), 0);
+
+  return {
+    repetitions: phraseResult.repetitions,
+    stutters: stutterResult.stutters,
+    removalSegments: allSegments,
+    metadata: {
+      ...phraseResult.metadata,
+      stutterCount: stutterResult.stutters.length,
+      totalRemovalSegments: allSegments.length,
+      totalRemovableTime: parseFloat(totalRemovableTime.toFixed(3))
+    }
+  };
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
+module.exports = {
+  // Core detection
+  detectRepetitionsBasic,
+  detectRepetitionsAdvanced,
+  detectStutters,
+  detectAllRepetitions,
+
+  // Conversion utilities
+  repetitionsToRemovalSegments,
+  stuttersToRemovalSegments,
+
+  // Helper utilities
+  normalizeWord,
+  calculateSimilarity,
+  levenshteinDistance,
+  filterOverlappingRepetitions,
+  mergeAdjacentSegments,
+
+  // Config
+  DEFAULT_OPTIONS
+};

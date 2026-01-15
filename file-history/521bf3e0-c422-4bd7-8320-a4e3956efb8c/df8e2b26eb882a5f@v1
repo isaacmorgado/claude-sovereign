@@ -1,0 +1,260 @@
+/**
+ * Slice 9: XML-Based Razor (Custom Razor API)
+ *
+ * Implements actual clip splitting via FCP XML export/modify/import workflow.
+ * This is the proven approach used by commercial tools like TimeBolt and Recut.
+ *
+ * Workflow:
+ * 1. Export sequence to FCP XML (via Premiere's built-in export)
+ * 2. Detect silences using FFprobe (actual audio analysis)
+ * 3. Send XML + silences to backend for processing
+ * 4. Import processed XML as new sequence
+ */
+
+// XML export path for razor workflow
+let xmlExportPath = '/tmp/splice_export.xml';
+
+/**
+ * Initialize Slice 9 - Razor functionality
+ * Uses silences detected from the unified detection flow (Slice 8)
+ */
+function initSlice9() {
+  initRazorButton();
+  initExportXMLButton();
+  checkFFprobeAvailability();
+}
+
+/**
+ * Check if FFprobe is available on the system
+ */
+async function checkFFprobeAvailability() {
+  try {
+    const response = await fetchWithTimeout(`${getBackendUrl()}/ffprobe-check`, {}, FETCH_TIMEOUT_HEALTH);
+    const data = await response.json();
+
+    if (!data.installed) {
+      console.warn('[SPLICE] FFprobe not installed:', data.message);
+      // Show warning in UI
+      const advancedSection = document.getElementById('advancedSection');
+      if (advancedSection) {
+        const warning = document.createElement('p');
+        warning.style.cssText = 'color: #ff6b6b; font-size: 10px; margin: 5px 0;';
+        warning.textContent = 'FFprobe not found. Install: brew install ffmpeg';
+        advancedSection.prepend(warning);
+      }
+    } else {
+      console.log('[SPLICE] FFprobe available');
+    }
+  } catch (err) {
+    console.warn('[SPLICE] Could not check FFprobe status:', err.message);
+  }
+}
+
+/**
+ * Initialize Export XML button
+ */
+function initExportXMLButton() {
+  const btn = document.getElementById('exportXMLBtn');
+  if (!btn) return;
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    setStatus('Exporting sequence to XML...');
+
+    try {
+      await exportSequenceToXML();
+      setStatus('XML exported successfully');
+      document.getElementById('razorSilencesBtn').disabled = false;
+    } catch (err) {
+      setStatus(`Export failed: ${err.message}`);
+      console.error('[SPLICE] XML export error:', err);
+    }
+
+    btn.disabled = false;
+  });
+}
+
+/**
+ * Export active sequence to FCP XML
+ *
+ * Note: UXP doesn't have direct XML export API yet.
+ * This uses a workaround via sequence markers or requires manual export.
+ */
+async function exportSequenceToXML() {
+  const context = await getActiveSequence();
+  if (!context) {
+    throw new Error('No project or sequence open');
+  }
+
+  const { project, sequence } = context;
+
+  // Get sequence info for manual export instructions
+  const sequenceName = await sequence.getName();
+
+  // UXP doesn't have exportFinalCutProXML yet
+  // Show instructions for manual export
+  const exportInstructions = `
+To export the sequence as XML:
+1. File > Export > Final Cut Pro XML
+2. Save to: ${xmlExportPath}
+3. Click "Process XML" when done
+  `;
+
+  // Create/show export modal or instructions
+  const existingModal = document.getElementById('exportModal');
+  if (existingModal) {
+    existingModal.remove();
+  }
+
+  const modal = document.createElement('div');
+  modal.id = 'exportModal';
+  modal.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #424242;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    z-index: 1000;
+    max-width: 350px;
+  `;
+  modal.innerHTML = `
+    <h3 style="margin: 0 0 15px 0; color: #e1e1e1;">Export Sequence: ${sequenceName}</h3>
+    <p style="font-size: 12px; color: #b0b0b0; white-space: pre-line;">${exportInstructions}</p>
+    <div style="margin-top: 15px; text-align: right;">
+      <button id="closeExportModal" style="background: #666; padding: 8px 16px; border: none; border-radius: 4px; color: white; cursor: pointer;">
+        Got it
+      </button>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  document.getElementById('closeExportModal').addEventListener('click', () => {
+    modal.remove();
+  });
+
+  console.log(`[SPLICE] Sequence "${sequenceName}" ready for XML export`);
+}
+
+/**
+ * Initialize Razor button
+ */
+function initRazorButton() {
+  const btn = document.getElementById('razorSilencesBtn');
+  if (!btn) return;
+
+  btn.addEventListener('click', async () => {
+    // Check for preview-selected silences first, fall back to global
+    let silences;
+    if (window.splicePreviewState && window.splicePreviewState.hasPreview()) {
+      silences = window.splicePreviewState.getSelectedSilences();
+    } else {
+      silences = getCurrentSilences();
+    }
+
+    if (!silences || silences.length === 0) {
+      setStatus('No silences detected. Run "Detect & Remove Silences" first.');
+      return;
+    }
+
+    btn.disabled = true;
+    setStatus(`Processing ${silences.length} silence(s) with razor cuts...`);
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/process-xml`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          xmlPath: xmlExportPath,
+          silences: silences,
+          removeGaps: true
+        })
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'XML processing failed');
+      }
+
+      const data = await response.json();
+
+      // Show results and import instructions
+      showImportInstructions(data);
+
+      setStatus(`Processed: ${data.stats.clipsProcessed} clips, ${data.stats.clipsSplit} splits`);
+
+    } catch (err) {
+      setStatus(`Razor failed: ${err.message}`);
+      console.error('[SPLICE] Razor error:', err);
+    }
+
+    btn.disabled = false;
+  });
+}
+
+/**
+ * Show import instructions after XML processing
+ */
+function showImportInstructions(data) {
+  const existingModal = document.getElementById('importModal');
+  if (existingModal) {
+    existingModal.remove();
+  }
+
+  const modal = document.createElement('div');
+  modal.id = 'importModal';
+  modal.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #424242;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    z-index: 1000;
+    max-width: 400px;
+  `;
+  modal.innerHTML = `
+    <h3 style="margin: 0 0 15px 0; color: #28a745;">XML Processed Successfully!</h3>
+    <div style="font-size: 12px; color: #b0b0b0;">
+      <p><strong>Stats:</strong></p>
+      <ul style="margin: 5px 0; padding-left: 20px;">
+        <li>Clips processed: ${data.stats.clipsProcessed}</li>
+        <li>Clips split: ${data.stats.clipsSplit}</li>
+        <li>Silences removed: ${data.stats.silencesRemoved}</li>
+        <li>Time removed: ${data.stats.totalTimeRemoved.toFixed(2)}s</li>
+      </ul>
+      <p style="margin-top: 15px;"><strong>To import:</strong></p>
+      <ol style="margin: 5px 0; padding-left: 20px;">
+        <li>File > Import</li>
+        <li>Select: ${data.outputPath}</li>
+        <li>New sequence will be created</li>
+      </ol>
+    </div>
+    <div style="margin-top: 15px; text-align: right;">
+      <button id="closeImportModal" style="background: #28a745; padding: 8px 16px; border: none; border-radius: 4px; color: white; cursor: pointer;">
+        Done
+      </button>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  document.getElementById('closeImportModal').addEventListener('click', () => {
+    modal.remove();
+  });
+}
+
+/**
+ * Show the advanced section (called after silences are detected)
+ */
+function showRazorSection() {
+  const section = document.getElementById('advancedSection');
+  if (section) {
+    section.classList.remove('hidden');
+  }
+}

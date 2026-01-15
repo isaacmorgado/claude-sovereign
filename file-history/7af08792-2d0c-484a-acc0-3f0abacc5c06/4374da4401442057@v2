@@ -1,0 +1,308 @@
+/**
+ * License Routes
+ *
+ * License key management endpoints
+ */
+
+const express = require('express');
+
+/**
+ * Create license routes
+ * @param {Object} options - Route configuration options
+ * @param {Object} options.services - Shared services (licenseService, usageTracking, stripe, emailService)
+ * @param {Object} options.authHelpers - Auth helper functions (maskSensitiveData)
+ * @returns {express.Router}
+ */
+function createLicenseRoutes(options = {}) {
+  const router = express.Router();
+  const { licenseService, usageTracking, stripe, emailService } = options.services || {};
+  const { maskSensitiveData } = options.authHelpers || {};
+
+  /**
+   * POST /activate - Activate a license key
+   *
+   * Body: { key: "SPLICE-XXXX-XXXX-XXXX" }
+   * Returns: { success, customerId, tier, hoursRemaining }
+   */
+  router.post('/activate', async (req, res) => {
+    const { key } = req.body;
+
+    if (!key) {
+      return res.status(400).json({
+        error: 'Missing license key',
+        message: 'License key is required'
+      });
+    }
+
+    // Validate format
+    if (!licenseService.isValidKeyFormat(key)) {
+      return res.status(400).json({
+        error: 'Invalid license key format',
+        message: 'License key should be in format: SPLICE-XXXX-XXXX-XXXX'
+      });
+    }
+
+    try {
+      // Activate the key
+      const result = await licenseService.activateLicenseKey(key);
+
+      if (!result.success) {
+        return res.status(400).json({
+          success: false,
+          error: result.error
+        });
+      }
+
+      // Get the customer's balance and tier info
+      const balance = await usageTracking.getBalance(result.customerId);
+
+      res.json({
+        success: true,
+        customerId: result.customerId,
+        tier: balance.tier,
+        tierName: balance.tierName,
+        hoursRemaining: balance.hoursRemaining,
+        hoursTotal: balance.hoursTotal
+      });
+    } catch (err) {
+      console.error('[SPLICE] License activation error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * GET /key - Get license key for a customer (for display/resend)
+   *
+   * Requires x-stripe-customer-id header
+   */
+  router.get('/key', async (req, res) => {
+    const stripeCustomerId = req.headers['x-stripe-customer-id'];
+
+    if (!stripeCustomerId) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Missing x-stripe-customer-id header'
+      });
+    }
+
+    try {
+      const result = await licenseService.getLicenseByCustomerId(stripeCustomerId);
+
+      if (!result.success) {
+        return res.status(404).json({
+          success: false,
+          error: result.error
+        });
+      }
+
+      res.json({
+        success: true,
+        key: result.key,
+        activated: result.activated,
+        createdAt: result.createdAt
+      });
+    } catch (err) {
+      console.error('[SPLICE] License lookup error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /resend - Resend license key to customer email
+   *
+   * For support cases where customer didn't receive their license key.
+   * Requires x-stripe-customer-id header or customerId in body (for support).
+   */
+  router.post('/resend', async (req, res) => {
+    // Allow customerId from header or body (for support staff)
+    const stripeCustomerId = req.headers['x-stripe-customer-id'] || req.body.customerId;
+
+    if (!stripeCustomerId) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Missing customer ID'
+      });
+    }
+
+    try {
+      // Get existing license key
+      let licenseResult = await licenseService.getLicenseByCustomerId(stripeCustomerId);
+
+      if (!licenseResult.success) {
+        // No license exists - try to generate one
+        console.log(`[SPLICE] No license found for ${stripeCustomerId}, generating new one`);
+        const newLicense = await licenseService.generateLicenseKey(stripeCustomerId);
+
+        if (!newLicense.success) {
+          return res.status(500).json({
+            success: false,
+            error: 'Failed to generate license key',
+            details: newLicense.error
+          });
+        }
+
+        licenseResult = { key: newLicense.key, success: true };
+      }
+
+      // Get customer email from Stripe
+      let customerEmail = null;
+      try {
+        const customer = await stripe.customers.retrieve(stripeCustomerId);
+        customerEmail = customer.email;
+      } catch (stripeErr) {
+        console.error(`[SPLICE] Failed to get customer email:`, stripeErr.message);
+      }
+
+      if (!customerEmail) {
+        return res.status(400).json({
+          success: false,
+          error: 'No email address found for customer',
+          key: licenseResult.key, // Still return key for manual delivery
+          manualDeliveryRequired: true
+        });
+      }
+
+      // SECURITY: Mask sensitive data in logs
+      console.log(`[SPLICE] License key resend requested for ${maskSensitiveData(customerEmail)}: ${maskSensitiveData(licenseResult.key)}`);
+
+      // Send license key via email
+      let emailSent = false;
+      if (emailService && emailService.sendLicenseLookupEmail) {
+        try {
+          await emailService.sendLicenseLookupEmail(customerEmail, licenseResult.key);
+          emailSent = true;
+          console.log(`[SPLICE] License key resent to ${maskSensitiveData(customerEmail)}`);
+        } catch (sendErr) {
+          console.error(`[SPLICE] Failed to send license resend email:`, sendErr.message);
+        }
+      }
+
+      res.json({
+        success: true,
+        message: emailSent ? `License key sent to ${customerEmail}` : `License key will be sent to ${customerEmail}`,
+        email: customerEmail,
+        key: licenseResult.key, // Include key for immediate display
+        activated: licenseResult.activated,
+        emailSent
+      });
+    } catch (err) {
+      console.error('[SPLICE] License resend error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /lookup - Look up license key by email address
+   *
+   * SECURITY: Does NOT return the license key in the response.
+   * Instead, sends the key via email to the verified email address.
+   * This prevents attackers from obtaining keys by guessing email addresses.
+   */
+  router.post('/lookup', async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email address required'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        error: 'Invalid email format'
+      });
+    }
+
+    try {
+      // Look up customer by email in Stripe
+      const customers = await stripe.customers.list({
+        email: email.toLowerCase(),
+        limit: 1
+      });
+
+      if (customers.data.length === 0) {
+        // SECURITY: Don't reveal if email exists in our system
+        // Always return same success message to prevent enumeration
+        console.log(`[SPLICE] License lookup attempt for unknown email: ${maskSensitiveData(email)}`);
+        return res.json({
+          success: true,
+          message: 'If an account exists with this email, the license key will be sent shortly.',
+          emailSent: true
+        });
+      }
+
+      const customer = customers.data[0];
+
+      // Get license key for this customer
+      let licenseResult = await licenseService.getLicenseByCustomerId(customer.id);
+
+      if (!licenseResult.success) {
+        // Check if they have an active subscription before generating key
+        const subscriptions = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: 'active',
+          limit: 1
+        });
+
+        if (subscriptions.data.length === 0) {
+          // SECURITY: Same message to prevent enumeration
+          console.log(`[SPLICE] License lookup - no active subscription for: ${maskSensitiveData(email)}`);
+          return res.json({
+            success: true,
+            message: 'If an account exists with this email, the license key will be sent shortly.',
+            emailSent: true
+          });
+        }
+
+        // Generate a new license key for active subscriber without one
+        const newLicense = await licenseService.generateLicenseKey(customer.id);
+        if (!newLicense.success) {
+          console.error(`[SPLICE] Failed to generate license key for ${maskSensitiveData(customer.id)}`);
+          return res.status(500).json({
+            success: false,
+            error: 'Failed to process request. Please try again later.'
+          });
+        }
+        licenseResult = newLicense;
+      }
+
+      // SECURITY: Log the lookup (masked) and send via email
+      console.log(`[SPLICE] License key lookup for ${maskSensitiveData(email)} - sending via email`);
+
+      // Send license key via email
+      let emailSentSuccess = false;
+      if (emailService && emailService.sendLicenseLookupEmail) {
+        try {
+          await emailService.sendLicenseLookupEmail(email, licenseResult.key);
+          emailSentSuccess = true;
+          console.log(`[SPLICE] License key sent to ${maskSensitiveData(email)}`);
+        } catch (sendErr) {
+          console.error(`[SPLICE] Failed to send license lookup email:`, sendErr.message);
+        }
+      }
+
+      // SECURITY: Never return the key in the response
+      // Always send via email to the verified address
+      res.json({
+        success: true,
+        message: emailSentSuccess
+          ? 'Your license key has been sent to your email address. Please check your inbox (and spam folder).'
+          : 'Your license key will be sent to your email address shortly.',
+        emailSent: emailSentSuccess,
+        // Hint at activation status without revealing the key
+        hint: licenseResult.activated
+          ? 'Note: Your license is already activated on a device.'
+          : null
+      });
+    } catch (err) {
+      console.error('[SPLICE] License lookup error:', err.message);
+      res.status(500).json({ error: 'Failed to process request. Please try again later.' });
+    }
+  });
+
+  return router;
+}
+
+module.exports = createLicenseRoutes;

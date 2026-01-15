@@ -1,0 +1,407 @@
+     1→/**
+     2→ * Batch Routes
+     3→ *
+     4→ * Batch processing endpoints
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const { detectSilencesRMS, sensitivityToParams } = require('../services/rmsSilenceDetection');
+     9→const { validateAudioPath } = require('../services/securityUtils');
+    10→
+    11→// In-memory job queue for batch processing
+    12→const batchJobs = new Map();
+    13→
+    14→// Batch job limits to prevent memory leak
+    15→const MAX_BATCH_JOBS = 10000;
+    16→const BATCH_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+    17→
+    18→/**
+    19→ * Generate a unique job ID
+    20→ */
+    21→function generateJobId() {
+    22→  return `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    23→}
+    24→
+    25→/**
+    26→ * Clean up old batch jobs to prevent memory leak
+    27→ * Removes jobs older than 24 hours
+    28→ */
+    29→function cleanupOldBatchJobs() {
+    30→  const now = Date.now();
+    31→  let removedCount = 0;
+    32→
+    33→  for (const [jobId, job] of batchJobs.entries()) {
+    34→    const createdAt = new Date(job.createdAt).getTime();
+    35→    if (now - createdAt > BATCH_JOB_MAX_AGE_MS) {
+    36→      batchJobs.delete(jobId);
+    37→      removedCount++;
+    38→    }
+    39→  }
+    40→
+    41→  if (removedCount > 0) {
+    42→    console.log(`[SPLICE] Cleaned up ${removedCount} old batch job(s)`);
+    43→  }
+    44→}
+    45→
+    46→/**
+    47→ * Enforce max job limit by removing oldest completed jobs
+    48→ */
+    49→function enforceJobLimit() {
+    50→  if (batchJobs.size < MAX_BATCH_JOBS) return;
+    51→
+    52→  // Get completed jobs sorted by creation date (oldest first)
+    53→  const completedJobs = Array.from(batchJobs.entries())
+    54→    .filter(([_, job]) => job.status !== 'processing')
+    55→    .sort((a, b) => new Date(a[1].createdAt) - new Date(b[1].createdAt));
+    56→
+    57→  // Remove oldest completed jobs until under limit
+    58→  const toRemove = batchJobs.size - MAX_BATCH_JOBS + 1;
+    59→  for (let i = 0; i < Math.min(toRemove, completedJobs.length); i++) {
+    60→    batchJobs.delete(completedJobs[i][0]);
+    61→  }
+    62→
+    63→  console.log(`[SPLICE] Enforced job limit, removed ${Math.min(toRemove, completedJobs.length)} job(s)`);
+    64→}
+    65→
+    66→// Run cleanup every hour
+    67→setInterval(cleanupOldBatchJobs, 60 * 60 * 1000);
+    68→
+    69→/**
+    70→ * Process a batch job (runs in background)
+    71→ */
+    72→async function processBatchJob(jobId, usageTracking) {
+    73→  const job = batchJobs.get(jobId);
+    74→  if (!job) return;
+    75→
+    76→  const { sensitivity, ...manualOptions } = job.options;
+    77→
+    78→  // Build detection options
+    79→  let detectionOptions = {};
+    80→  if (typeof sensitivity === 'number') {
+    81→    detectionOptions = sensitivityToParams(sensitivity);
+    82→  } else {
+    83→    detectionOptions = {
+    84→      threshold: manualOptions.threshold ?? -30,
+    85→      minSilenceLength: manualOptions.minSilenceLength ?? 0.5,
+    86→      paddingStart: manualOptions.paddingStart ?? 0.1,
+    87→      paddingEnd: manualOptions.paddingEnd ?? 0.05,
+    88→      autoThreshold: manualOptions.autoThreshold ?? false
+    89→    };
+    90→  }
+    91→
+    92→  // Process files with controlled parallelism (3 concurrent for disk I/O efficiency)
+    93→  const CONCURRENCY_LIMIT = 3;
+    94→  const chunks = [];
+    95→  for (let i = 0; i < job.files.length; i += CONCURRENCY_LIMIT) {
+    96→    chunks.push(job.files.slice(i, i + CONCURRENCY_LIMIT));
+    97→  }
+    98→
+    99→  for (const chunk of chunks) {
+   100→    // Mark chunk files as processing
+   101→    chunk.forEach(f => f.status = 'processing');
+   102→
+   103→    // Process chunk in parallel
+   104→    await Promise.all(
+   105→      chunk.map(async (fileEntry) => {
+   106→        try {
+   107→          const result = await detectSilencesRMS(fileEntry.path, detectionOptions);
+   108→
+   109→          fileEntry.status = 'completed';
+   110→          fileEntry.result = {
+   111→            silences: result.silences,
+   112→            count: result.silences.length,
+   113→            totalSilenceDuration: result.metadata.totalSilenceDuration,
+   114→            audioDuration: result.metadata.audioDuration
+   115→          };
+   116→
+   117→          job.results.push({
+   118→            file: fileEntry.path,
+   119→            ...fileEntry.result
+   120→          });
+   121→
+   122→          // Deduct usage for this file
+   123→          const audioDuration = result.metadata?.audioDuration || 0;
+   124→          if (audioDuration > 0 && job.stripeCustomerId && usageTracking) {
+   125→            try {
+   126→              await usageTracking.deductUsage(job.stripeCustomerId, audioDuration, 'batch-silences');
+   127→              job.totalUsageDeducted += audioDuration;
+   128→            } catch (usageErr) {
+   129→              console.warn(`[SPLICE] Batch ${jobId}: Usage deduction failed:`, usageErr.message);
+   130→            }
+   131→          }
+   132→
+   133→          job.progress.completed++;
+   134→          return { success: true, fileEntry };
+   135→        } catch (err) {
+   136→          fileEntry.status = 'failed';
+   137→          fileEntry.error = err.message;
+   138→
+   139→          job.errors.push({
+   140→            file: fileEntry.path,
+   141→            error: err.message
+   142→          });
+   143→
+   144→          job.progress.failed++;
+   145→          console.error(`[SPLICE] Batch ${jobId}: ${fileEntry.path} failed:`, err.message);
+   146→          return { success: false, fileEntry, error: err };
+   147→        }
+   148→      })
+   149→    );
+   150→
+   151→    // Update progress after each chunk
+   152→    job.progress.percentage = Math.round(
+   153→      ((job.progress.completed + job.progress.failed) / job.progress.total) * 100
+   154→    );
+   155→    console.log(`[SPLICE] Batch ${jobId}: ${job.progress.completed + job.progress.failed}/${job.files.length} processed`);
+   156→  }
+   157→
+   158→  // Mark job as complete
+   159→  job.status = job.progress.failed === job.progress.total ? 'failed' :
+   160→               job.progress.failed > 0 ? 'completed_with_errors' : 'completed';
+   161→  job.completedAt = new Date().toISOString();
+   162→
+   163→  console.log(`[SPLICE] Batch job ${jobId} ${job.status}`);
+   164→}
+   165→
+   166→/**
+   167→ * Create batch routes
+   168→ * @param {Object} options - Route configuration options
+   169→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+   170→ * @param {Object} options.services - Shared services (usageTracking)
+   171→ * @returns {express.Router}
+   172→ */
+   173→function createBatchRoutes(options = {}) {
+   174→  const router = express.Router();
+   175→  const { requireCredits } = options.middleware || {};
+   176→  const { usageTracking } = options.services || {};
+   177→
+   178→  /**
+   179→   * POST /silences - Process multiple files for silence detection
+   180→   *
+   181→   * Creates a batch job that processes multiple audio files.
+   182→   * Returns a job ID for tracking progress.
+   183→   *
+   184→   * Body:
+   185→   * - files: Array of file paths to process
+   186→   * - options: Detection options (sensitivity, threshold, etc.)
+   187→   */
+   188→  router.post('/silences', requireCredits({ endpoint: 'batch-silences' }), async (req, res) => {
+   189→    const { files, options: batchOptions = {} } = req.body;
+   190→
+   191→    if (!files || !Array.isArray(files) || files.length === 0) {
+   192→      return res.status(400).json({ error: 'files array is required' });
+   193→    }
+   194→
+   195→    // SECURITY: Validate all file paths to prevent path traversal attacks
+   196→    const validationResults = await Promise.all(
+   197→      files.map(async (f) => {
+   198→        const result = await validateAudioPath(f);
+   199→        return { original: f, ...result };
+   200→      })
+   201→    );
+   202→
+   203→    const invalidFiles = validationResults.filter(r => !r.valid);
+   204→    if (invalidFiles.length > 0) {
+   205→      return res.status(400).json({
+   206→        error: 'Some files failed validation',
+   207→        invalidFiles: invalidFiles.map(f => ({ file: f.original, error: f.error }))
+   208→      });
+   209→    }
+   210→
+   211→    // Use validated paths
+   212→    const validatedFiles = validationResults.map(r => r.path);
+   213→
+   214→    // Enforce job limit before creating new job
+   215→    enforceJobLimit();
+   216→
+   217→    const jobId = generateJobId();
+   218→
+   219→    // Initialize job with customer ID for usage tracking
+   220→    const job = {
+   221→      id: jobId,
+   222→      type: 'silences',
+   223→      status: 'processing',
+   224→      createdAt: new Date().toISOString(),
+   225→      stripeCustomerId: req.stripeCustomerId,  // Store for usage deduction
+   226→      files: validatedFiles.map(f => ({
+   227→        path: f,
+   228→        status: 'pending',
+   229→        result: null,
+   230→        error: null
+   231→      })),
+   232→      options: batchOptions,
+   233→      progress: {
+   234→        total: validatedFiles.length,
+   235→        completed: 0,
+   236→        failed: 0,
+   237→        percentage: 0
+   238→      },
+   239→      results: [],
+   240→      errors: [],
+   241→      totalUsageDeducted: 0  // Track total seconds deducted
+   242→    };
+   243→
+   244→    batchJobs.set(jobId, job);
+   245→    console.log(`[SPLICE] Batch job ${jobId} created with ${validatedFiles.length} files`);
+   246→
+   247→    // Start processing in background
+   248→    processBatchJob(jobId, usageTracking);
+   249→
+   250→    res.json({
+   251→      success: true,
+   252→      jobId,
+   253→      message: `Batch job created with ${validatedFiles.length} files`,
+   254→      statusUrl: `/batch/status/${jobId}`
+   255→    });
+   256→  });
+   257→
+   258→  /**
+   259→   * GET /status/:jobId - Get batch job status and results
+   260→   * Requires authentication matching job owner
+   261→   */
+   262→  router.get('/status/:jobId', requireCredits({ endpoint: 'batch-status' }), (req, res) => {
+   263→    const { jobId } = req.params;
+   264→    const stripeCustomerId = req.stripeCustomerId;
+   265→    const job = batchJobs.get(jobId);
+   266→
+   267→    if (!job) {
+   268→      return res.status(404).json({ error: 'Job not found' });
+   269→    }
+   270→
+   271→    // Verify customer ownership
+   272→    if (job.stripeCustomerId && job.stripeCustomerId !== stripeCustomerId) {
+   273→      return res.status(403).json({ error: 'Access denied: Job belongs to another user' });
+   274→    }
+   275→
+   276→    res.json({
+   277→      success: true,
+   278→      job: {
+   279→        id: job.id,
+   280→        type: job.type,
+   281→        status: job.status,
+   282→        createdAt: job.createdAt,
+   283→        completedAt: job.completedAt,
+   284→        progress: job.progress,
+   285→        files: job.files.map(f => ({
+   286→          path: f.path,
+   287→          status: f.status,
+   288→          silenceCount: f.result?.count,
+   289→          error: f.error
+   290→        }))
+   291→      }
+   292→    });
+   293→  });
+   294→
+   295→  /**
+   296→   * GET /results/:jobId - Get full results for a completed batch job
+   297→   * Requires authentication matching job owner
+   298→   */
+   299→  router.get('/results/:jobId', requireCredits({ endpoint: 'batch-results' }), (req, res) => {
+   300→    const { jobId } = req.params;
+   301→    const stripeCustomerId = req.stripeCustomerId;
+   302→    const job = batchJobs.get(jobId);
+   303→
+   304→    if (!job) {
+   305→      return res.status(404).json({ error: 'Job not found' });
+   306→    }
+   307→
+   308→    // Verify customer ownership
+   309→    if (job.stripeCustomerId && job.stripeCustomerId !== stripeCustomerId) {
+   310→      return res.status(403).json({ error: 'Access denied: Job belongs to another user' });
+   311→    }
+   312→
+   313→    if (job.status === 'processing') {
+   314→      return res.status(202).json({
+   315→        success: false,
+   316→        message: 'Job still processing',
+   317→        progress: job.progress
+   318→      });
+   319→    }
+   320→
+   321→    res.json({
+   322→      success: true,
+   323→      jobId: job.id,
+   324→      status: job.status,
+   325→      progress: job.progress,
+   326→      results: job.results,
+   327→      errors: job.errors,
+   328→      summary: {
+   329→        totalFiles: job.progress.total,
+   330→        successful: job.progress.completed,
+   331→        failed: job.progress.failed,
+   332→        totalSilences: job.results.reduce((sum, r) => sum + (r.count || 0), 0),
+   333→        totalSilenceDuration: job.results.reduce((sum, r) => sum + (r.totalSilenceDuration || 0), 0)
+   334→      }
+   335→    });
+   336→  });
+   337→
+   338→  /**
+   339→   * DELETE /:jobId - Cancel or delete a batch job
+   340→   * Requires authentication matching job owner
+   341→   */
+   342→  router.delete('/:jobId', requireCredits({ endpoint: 'batch-delete' }), (req, res) => {
+   343→    const { jobId } = req.params;
+   344→    const stripeCustomerId = req.stripeCustomerId;
+   345→    const job = batchJobs.get(jobId);
+   346→
+   347→    if (!job) {
+   348→      return res.status(404).json({ error: 'Job not found' });
+   349→    }
+   350→
+   351→    // Verify customer ownership
+   352→    if (job.stripeCustomerId && job.stripeCustomerId !== stripeCustomerId) {
+   353→      return res.status(403).json({ error: 'Access denied: Job belongs to another user' });
+   354→    }
+   355→
+   356→    // Note: This doesn't actually cancel in-progress processing
+   357→    // but prevents the job from being queried
+   358→    batchJobs.delete(jobId);
+   359→
+   360→    res.json({
+   361→      success: true,
+   362→      message: `Job ${jobId} deleted`
+   363→    });
+   364→  });
+   365→
+   366→  /**
+   367→   * GET /jobs - List batch jobs for authenticated user
+   368→   * Requires x-stripe-customer-id header to filter jobs by owner
+   369→   */
+   370→  router.get('/jobs', requireCredits({ endpoint: 'batch-jobs' }), (req, res) => {
+   371→    const stripeCustomerId = req.stripeCustomerId;
+   372→
+   373→    // Filter jobs by customer ownership (only show user's own jobs)
+   374→    const jobs = Array.from(batchJobs.values())
+   375→      .filter(job => job.stripeCustomerId === stripeCustomerId)
+   376→      .map(job => ({
+   377→        id: job.id,
+   378→        type: job.type,
+   379→        status: job.status,
+   380→        createdAt: job.createdAt,
+   381→        completedAt: job.completedAt,
+   382→        progress: job.progress
+   383→      }));
+   384→
+   385→    // Sort by creation date (newest first)
+   386→    jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+   387→
+   388→    res.json({
+   389→      success: true,
+   390→      count: jobs.length,
+   391→      jobs
+   392→    });
+   393→  });
+   394→
+   395→  return router;
+   396→}
+   397→
+   398→// Export job queue for cleanup access
+   399→createBatchRoutes.batchJobs = batchJobs;
+   400→createBatchRoutes.cleanupOldBatchJobs = cleanupOldBatchJobs;
+   401→
+   402→module.exports = createBatchRoutes;
+   403→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,404 @@
+     1→/**
+     2→ * Insights Engine
+     3→ *
+     4→ * Processes insight definitions from insights.json and classifies them
+     5→ * as strengths or areas of improvement based on user's metric scores.
+     6→ *
+     7→ * Logic:
+     8→ * - For each insight definition, calculate average score of affected metrics
+     9→ * - Weakness: if avg score < threshold → classify with severity label
+    10→ * - Strength: if avg score > threshold → classify with grade label
+    11→ *
+    12→ * Z-Score Based 5-Tier Severity Logic:
+    13→ * - Ideal (Green): User is inside the ideal range
+    14→ * - Good (Blue): Within 0.5 Standard Deviation of the mean (|z| < 0.5)
+    15→ * - Fair (Cyan): Between 0.5 and 1 Standard Deviation (0.5 ≤ |z| < 1)
+    16→ * - Moderate (Yellow): Between 1 and 2 Standard Deviations (1 ≤ |z| < 2)
+    17→ * - Severe (Red): More than 2 Standard Deviations away (|z| ≥ 2)
+    18→ *
+    19→ * Severity Labels (Weaknesses):
+    20→ *   0-3 = "Severe"
+    21→ *   3-5 = "Moderate"
+    22→ *   5-7 = "Minor"
+    23→ *
+    24→ * Grade Labels (Strengths):
+    25→ *   8-9   = "Good"
+    26→ *   9-9.5 = "Excellent"
+    27→ *   9.5-10 = "Ideal"
+    28→ */
+    29→
+    30→import { Strength, Flaw } from '@/types/results';
+    31→import { MetricScoreResult, METRIC_CONFIGS, isValueAcceptable, ConfidenceLevel } from '@/lib/harmony-scoring';
+    32→
+    33→// ============================================
+    34→// MASTER SCORING DATABASE (Z-Score Based)
+    35→// ============================================
+    36→
+    37→export type SeverityLevel = 'ideal' | 'good' | 'fair' | 'moderate' | 'severe';
+    38→export type Gender = 'male' | 'female';
+    39→export type Ethnicity = 'white' | 'black' | 'east_asian' | 'south_asian' | 'hispanic' | 'middle_eastern' | 'native_american' | 'pacific_islander';
+    40→
+    41→export interface MasterMetricConfig {
+    42→  ideal: [number, number];  // [min, max] ideal range
+    43→  mean: number;             // Population mean
+    44→  std_dev: number;          // Standard deviation
+    45→  flaws?: {
+    46→    low?: string[];         // Flaws when value is too low
+    47→    high?: string[];        // Flaws when value is too high
+    48→  };
+    49→}
+    50→
+    51→// Base/Default standards (White Male baseline)
+    52→export const MASTER_SCORING_DB: Record<string, MasterMetricConfig> = {
+    53→  // MIDFACE & PROPORTIONS
+    54→  "midface_ratio": {
+    55→    ideal: [0.97, 1.00],
+    56→    mean: 1.0,
+    57→    std_dev: 0.115,
+    58→    flaws: { low: ["Long midface", "Long upper jaw"] }
+    59→  },
+    60→  "faceWidthToHeight": {
+    61→    ideal: [1.30, 1.45],
+    62→    mean: 1.38,
+    63→    std_dev: 0.08,
+    64→    flaws: {
+    65→      low: ["Overly long face", "Narrow face"],
+    66→      high: ["Wide face", "Short face"]
+    67→    }
+    68→  },
+    69→  "totalFacialWidthToHeight": {
+    70→    ideal: [1.25, 1.40],
+    71→    mean: 1.33,
+    72→    std_dev: 0.075,
+    73→    flaws: {
+    74→      low: ["Long face shape"],
+    75→      high: ["Wide face shape"]
+    76→    }
+    77→  },
+    78→  "upperThirdProportion": {
+    79→    ideal: [0.30, 0.36],
+    80→    mean: 0.33,
+    81→    std_dev: 0.03,
+    82→    flaws: {
+    83→      low: ["Short forehead"],
+    84→      high: ["Long forehead"]
+    85→    }
+    86→  },
+    87→  "middleThirdProportion": {
+    88→    ideal: [0.30, 0.36],
+    89→    mean: 0.33,
+    90→    std_dev: 0.03,
+    91→    flaws: {
+    92→      low: ["Short midface"],
+    93→      high: ["Long midface"]
+    94→    }
+    95→  },
+    96→  "lowerThirdProportion": {
+    97→    ideal: [0.30, 0.36],
+    98→    mean: 0.33,
+    99→    std_dev: 0.03,
+   100→    flaws: {
+   101→      low: ["Short lower face"],
+   102→      high: ["Long lower face"]
+   103→    }
+   104→  },
+   105→
+   106→  // EYE SPACING & IPD
+   107→  "eye_separation_ratio": {
+   108→    ideal: [0.45, 0.47],
+   109→    mean: 0.46,
+   110→    std_dev: 0.03,
+   111→    flaws: {
+   112→      low: ["Close-set eyes"],
+   113→      high: ["Wide-set eyes"]
+   114→    }
+   115→  },
+   116→  "interpupillaryRatio": {
+   117→    ideal: [0.44, 0.48],
+   118→    mean: 0.46,
+   119→    std_dev: 0.025,
+   120→    flaws: {
+   121→      low: ["Close-set eyes"],
+   122→      high: ["Wide-set eyes"]
+   123→    }
+   124→  },
+   125→  "oneEyeApartTest": {
+   126→    ideal: [0.95, 1.05],
+   127→    mean: 1.0,
+   128→    std_dev: 0.08,
+   129→    flaws: {
+   130→      low: ["Close-set eyes"],
+   131→      high: ["Wide-set eyes"]
+   132→    }
+   133→  },
+   134→  "intercanthalWidth": {
+   135→    ideal: [30, 35],
+   136→    mean: 32.5,
+   137→    std_dev: 2.5,
+   138→    flaws: {
+   139→      low: ["Narrow eye spacing"],
+   140→      high: ["Wide eye spacing"]
+   141→    }
+   142→  },
+   143→
+   144→  // EYE SHAPE & FEATURES
+   145→  "lateralCanthalTilt": {
+   146→    ideal: [6, 8],
+   147→    mean: 5.0,
+   148→    std_dev: 3.5,
+   149→    flaws: {
+   150→      low: ["Negative canthal tilt", "Downturned eyes"],
+   151→      high: ["Excessively upturned eyes"]
+   152→    }
+   153→  },
+   154→  "eyeAspectRatio": {
+   155→    ideal: [0.30, 0.35],
+   156→    mean: 0.32,
+   157→    std_dev: 0.04,
+   158→    flaws: {
+   159→      low: ["Narrow eyes"],
+   160→      high: ["Round eyes"]
+   161→    }
+   162→  },
+   163→  "palpebralFissureLength": {
+   164→    ideal: [28, 32],
+   165→    mean: 30.0,
+   166→    std_dev: 2.5,
+   167→    flaws: {
+   168→      low: ["Small eyes"],
+   169→      high: ["Large eyes"]
+   170→    }
+   171→  },
+   172→  "eyeWidth": {
+   173→    ideal: [28, 32],
+   174→    mean: 30.0,
+   175→    std_dev: 2.0,
+   176→    flaws: {
+   177→      low: ["Narrow eyes"],
+   178→      high: ["Wide eyes"]
+   179→    }
+   180→  },
+   181→  "upperEyelidExposure": {
+   182→    ideal: [0.5, 1.2],
+   183→    mean: 0.85,
+   184→    std_dev: 0.35,
+   185→    flaws: {
+   186→      low: ["Hooded eyes"],
+   187→      high: ["Excessive upper lid exposure"]
+   188→    }
+   189→  },
+   190→  "tearTroughDepth": {
+   191→    ideal: [0.0, 0.3],
+   192→    mean: 0.15,
+   193→    std_dev: 0.15,
+   194→    flaws: {
+   195→      high: ["Dark circles / Tear troughs", "Under-eye hollowness"]
+   196→    }
+   197→  },
+   198→
+   199→  // JAW ANGLES & STRUCTURE
+   200→  "gonial_angle": {
+   201→    ideal: [115, 125],
+   202→    mean: 118.0,
+   203→    std_dev: 6.5,
+   204→    flaws: {
+   205→      high: ["Weak/soft jaw structure", "Rounded jaw"]
+   206→    }
+   207→  },
+   208→  "mandibularPlaneAngle": {
+   209→    ideal: [20, 28],
+   210→    mean: 24.0,
+   211→    std_dev: 4.0,
+   212→    flaws: {
+   213→      low: ["Flat mandibular plane"],
+   214→      high: ["Steep mandibular plane", "Hyper-divergent jaw"]
+   215→    }
+   216→  },
+   217→  "jawFrontalAngle": {
+   218→    ideal: [125, 135],
+   219→    mean: 130.0,
+   220→    std_dev: 5.0,
+   221→    flaws: {
+   222→      low: ["Steep jaw"],
+   223→      high: ["Flat jaw angle"]
+   224→    }
+   225→  },
+   226→  "jawSlope": {
+   227→    ideal: [25, 35],
+   228→    mean: 30.0,
+   229→    std_dev: 5.0,
+   230→    flaws: {
+   231→      low: ["Flat jawline"],
+   232→      high: ["Steep jawline"]
+   233→    }
+   234→  },
+   235→
+   236→  // JAW WIDTH
+   237→  "jawWidthRatio": {
+   238→    ideal: [0.85, 0.95],
+   239→    mean: 0.90,
+   240→    std_dev: 0.05,
+   241→    flaws: {
+   242→      low: ["Narrow jaw"],
+   243→      high: ["Wide jaw"]
+   244→    }
+   245→  },
+   246→  "bigonialWidth": {
+   247→    ideal: [110, 125],
+   248→    mean: 117.5,
+   249→    std_dev: 7.5,
+   250→    flaws: {
+   251→      low: ["Narrow jaw width"],
+   252→      high: ["Excessively wide jaw"]
+   253→    }
+   254→  },
+   255→
+   256→  // CHEEKBONES
+   257→  "cheekbone_height": {
+   258→    ideal: [83.0, 100.0],
+   259→    mean: 85.0,
+   260→    std_dev: 5.0,
+   261→    flaws: {
+   262→      low: ["Low-set cheekbones", "Flat midface"]
+   263→    }
+   264→  },
+   265→  "cheekboneWidth": {
+   266→    ideal: [130, 145],
+   267→    mean: 137.5,
+   268→    std_dev: 7.5,
+   269→    flaws: {
+   270→      low: ["Narrow cheekbones"],
+   271→      high: ["Wide cheekbones"]
+   272→    }
+   273→  },
+   274→
+   275→  // CHIN
+   276→  "chinPhiltrumRatio": {
+   277→    ideal: [1.8, 2.2],
+   278→    mean: 2.0,
+   279→    std_dev: 0.2,
+   280→    flaws: {
+   281→      low: ["Recessed chin", "Short chin"],
+   282→      high: ["Long chin", "Projected chin"]
+   283→    }
+   284→  },
+   285→  "chinHeight": {
+   286→    ideal: [35, 45],
+   287→    mean: 40.0,
+   288→    std_dev: 5.0,
+   289→    flaws: {
+   290→      low: ["Short chin"],
+   291→      high: ["Long chin"]
+   292→    }
+   293→  },
+   294→  "chinWidth": {
+   295→    ideal: [35, 45],
+   296→    mean: 40.0,
+   297→    std_dev: 5.0,
+   298→    flaws: {
+   299→      low: ["Pointed/Narrow chin"],
+   300→      high: ["Wide chin"]
+   301→    }
+   302→  },
+   303→
+   304→  // NOSE ANGLES
+   305→  "nasalTipAngle": {
+   306→    ideal: [95, 115],
+   307→    mean: 105.0,
+   308→    std_dev: 10.0,
+   309→    flaws: {
+   310→      low: ["Droopy nasal tip"],
+   311→      high: ["Upturned nasal tip"]
+   312→    }
+   313→  },
+   314→  "nasolabialAngle": {
+   315→    ideal: [95, 110],
+   316→    mean: 102.5,
+   317→    std_dev: 7.5,
+   318→    flaws: {
+   319→      low: ["Droopy nasal tip"],
+   320→      high: ["Upturned nose"]
+   321→    }
+   322→  },
+   323→  "nasofrontalAngle": {
+   324→    ideal: [115, 135],
+   325→    mean: 125.0,
+   326→    std_dev: 10.0,
+   327→    flaws: {
+   328→      low: ["Deep nasal root"],
+   329→      high: ["Flat nasal root"]
+   330→    }
+   331→  },
+   332→  "nasofacialAngle": {
+   333→    ideal: [30, 40],
+   334→    mean: 35.0,
+   335→    std_dev: 5.0,
+   336→    flaws: {
+   337→      low: ["Flat nose profile"],
+   338→      high: ["Overprojected nose"]
+   339→    }
+   340→  },
+   341→  "nasomentaAngle": {
+   342→    ideal: [120, 135],
+   343→    mean: 127.5,
+   344→    std_dev: 7.5,
+   345→    flaws: {
+   346→      low: ["Convex profile"],
+   347→      high: ["Concave profile"]
+   348→    }
+   349→  },
+   350→
+   351→  // NOSE WIDTH & PROPORTIONS
+   352→  "nasalIndex": {
+   353→    ideal: [65, 75],
+   354→    mean: 70.0,
+   355→    std_dev: 5.0,
+   356→    flaws: {
+   357→      low: ["Narrow nose"],
+   358→      high: ["Wide nose", "Bulbous nose"]
+   359→    }
+   360→  },
+   361→  "noseWidth": {
+   362→    ideal: [35, 42],
+   363→    mean: 38.5,
+   364→    std_dev: 3.5,
+   365→    flaws: {
+   366→      low: ["Narrow nose"],
+   367→      high: ["Wide nasal base"]
+   368→    }
+   369→  },
+   370→  "noseBridgeWidth": {
+   371→    ideal: [12, 18],
+   372→    mean: 15.0,
+   373→    std_dev: 3.0,
+   374→    flaws: {
+   375→      low: ["Narrow nose bridge"],
+   376→      high: ["Wide nose bridge"]
+   377→    }
+   378→  },
+   379→  "nasalProjection": {
+   380→    ideal: [16, 22],
+   381→    mean: 19.0,
+   382→    std_dev: 3.0,
+   383→    flaws: {
+   384→      low: ["Underprojected nose"],
+   385→      high: ["Overprojected nose"]
+   386→    }
+   387→  },
+   388→  "noseLengthRatio": {
+   389→    ideal: [0.45, 0.55],
+   390→    mean: 0.50,
+   391→    std_dev: 0.05,
+   392→    flaws: {
+   393→      low: ["Short nose"],
+   394→      high: ["Long nose"]
+   395→    }
+   396→  },
+   397→
+   398→  // LIPS & PHILTRUM
+   399→  "lipRatio": {
+   400→    ideal: [1.4, 1.6],
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

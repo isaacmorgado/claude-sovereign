@@ -1,0 +1,263 @@
+# 🚨 CRITICAL: JSX Bridge Timeout Bug
+
+**File**: `splice-cep/panel/js/config.js`
+**Severity**: ⚠️ **CRITICAL - PRODUCTION BLOCKER**
+**Impact**: Complete UI freeze if ExtendScript hangs
+
+---
+
+## The Bug
+
+**Location**: Lines 212-247
+
+```javascript
+evalScript: async function(script) {
+    await this.ensureInitialized();
+
+    return new Promise((resolve, reject) => {
+        this.cs.evalScript(script, (result) => {
+            // ... error handling ...
+            resolve(result);
+        });
+    });
+    // ❌ NO TIMEOUT - Promise never rejects if ExtendScript hangs!
+}
+```
+
+---
+
+## Root Cause
+
+The `evalScript()` function wraps `CSInterface.evalScript()` in a Promise but **never sets a timeout**. If ExtendScript:
+- Hangs indefinitely
+- Gets stuck in an infinite loop
+- Waits for user input (alert/prompt)
+- Has a race condition
+
+**The Promise never resolves or rejects** → UI freezes forever!
+
+---
+
+## Trace Path (Reproduction Steps)
+
+1. User clicks GO button → `runDetection()` (main.js:730)
+2. → `checkSequenceOpen()` called (main.js:743)
+3. → `jsx.call('checkSequenceOpen')` (main.js:385)
+4. → `jsx.evalScript("checkSequenceOpen()")` (config.js:278)
+5. → Promise created at line 215 → **waits for ExtendScript callback**
+6. **IF** hostScript.jsx hangs (e.g., Premiere Pro freezes):
+   - Callback never fires
+   - Promise never resolves
+   - `await jsx.call()` waits forever
+   - UI thread blocked
+   - Panel completely frozen
+
+---
+
+## Impact
+
+### User Experience
+- ❌ Panel becomes completely unresponsive
+- ❌ No error message displayed
+- ❌ Only fix is to close and reopen panel (loses state)
+- ❌ User thinks SPLICE is broken
+
+### Scenarios That Trigger This
+1. **Premiere Pro busy** (rendering, exporting)
+2. **ExtendScript infinite loop** (bug in hostScript.jsx)
+3. **Slow operations** (large file I/O, network calls in JSX)
+4. **Modal dialogs in Premiere** (blocks ExtendScript)
+5. **System under load** (ExtendScript thread starved)
+
+---
+
+## The Fix
+
+```javascript
+evalScript: async function(script) {
+    await this.ensureInitialized();
+
+    // ✅ Add timeout wrapper
+    const EVALSCRIPT_TIMEOUT = 30000; // 30 seconds
+
+    return new Promise((resolve, reject) => {
+        let completed = false;
+
+        // Timeout handler
+        const timeoutId = setTimeout(() => {
+            if (!completed) {
+                completed = true;
+                reject(new Error(`ExtendScript timeout after ${EVALSCRIPT_TIMEOUT}ms: ${script.substring(0, 100)}...`));
+            }
+        }, EVALSCRIPT_TIMEOUT);
+
+        this.cs.evalScript(script, (result) => {
+            if (completed) {
+                // Timeout already fired, ignore this callback
+                console.warn('[JSX] Late evalScript result received after timeout');
+                return;
+            }
+
+            completed = true;
+            clearTimeout(timeoutId);
+
+            if (result === 'undefined' || result === undefined) {
+                resolve(null);
+                return;
+            }
+
+            // Check for EvalScript error or ExtendScript runtime errors
+            if (typeof result === 'string' && (
+                result.indexOf('EvalScript error') !== -1 ||
+                result.indexOf('Error:') !== -1 ||
+                result.indexOf('TypeError:') !== -1 ||
+                result.indexOf('ReferenceError:') !== -1
+            )) {
+                reject(new Error(result));
+                return;
+            }
+
+            // Try to parse JSON
+            try {
+                const parsed = JSON.parse(result);
+                if (parsed.error) {
+                    reject(new Error(parsed.error));
+                } else {
+                    resolve(parsed);
+                }
+            } catch (e) {
+                // Return as-is if not JSON
+                resolve(result);
+            }
+        });
+    });
+},
+```
+
+---
+
+## Configuration Options
+
+Different operations need different timeouts:
+
+```javascript
+const EVALSCRIPT_TIMEOUTS = {
+    DEFAULT: 30000,        // 30s - most operations
+    QUICK: 5000,           // 5s  - checkSequenceOpen, getVersion
+    NORMAL: 30000,         // 30s - getClips, createMarker
+    LONG: 120000,          // 2m  - export operations, large file I/O
+    CRITICAL: 300000       // 5m  - complex timeline operations
+};
+
+evalScript: async function(script, timeout = EVALSCRIPT_TIMEOUTS.DEFAULT) {
+    // ... use configurable timeout ...
+}
+```
+
+---
+
+## All Affected Call Sites
+
+**24 occurrences in main.js alone!**
+
+Every `jsx.call()` and `jsx.evalScript()` is affected:
+
+### High-Frequency Calls (CRITICAL)
+- `checkSequenceOpen()` - called on every GO button press
+- `getActiveSequence()` - called frequently
+- `getClipsInTrack()` - called on analysis
+
+### Medium-Frequency Calls (HIGH)
+- `createMarker()` - called in loops (100+ times for captions)
+- `razorSequenceAtSeconds()` - called for each cut
+- `deleteClipsAtSilencePointsInTrack()` - batch operations
+
+### Low-Frequency but Long-Running (HIGH)
+- `exportSequenceAudioForAnalysis()` - can take 60+ seconds
+- `buildSequenceFromCutList()` - complex timeline rebuild
+
+---
+
+## Regression Tests
+
+```javascript
+// Test 1: Timeout triggers correctly
+test('evalScript should timeout after 30 seconds', async () => {
+    // Mock ExtendScript that never responds
+    jest.spyOn(CSInterface.prototype, 'evalScript').mockImplementation((script, callback) => {
+        // Never call callback
+    });
+
+    await expect(jsx.evalScript('test')).rejects.toThrow('ExtendScript timeout');
+});
+
+// Test 2: Late callbacks ignored
+test('evalScript should ignore late callbacks after timeout', async () => {
+    let callback;
+    jest.spyOn(CSInterface.prototype, 'evalScript').mockImplementation((script, cb) => {
+        callback = cb; // Save callback
+    });
+
+    const promise = jsx.evalScript('test');
+
+    // Wait for timeout
+    await jest.advanceTimersByTime(31000);
+
+    // Now fire late callback
+    callback('{"success": true}');
+
+    // Should already be rejected
+    await expect(promise).rejects.toThrow('timeout');
+});
+
+// Test 3: Normal operations still work
+test('evalScript should resolve normally when ExtendScript responds', async () => {
+    jest.spyOn(CSInterface.prototype, 'evalScript').mockImplementation((script, callback) => {
+        setTimeout(() => callback('{"success": true}'), 100);
+    });
+
+    const result = await jsx.evalScript('test');
+    expect(result).toEqual({ success: true });
+});
+```
+
+---
+
+## Related Issues
+
+This same pattern appears in:
+1. **config.js: `call()` method** (line 255) - wraps `evalScript()`, inherits timeout
+2. **main.js: `checkSequenceOpen()`** (line 376) - already has retry logic but no timeout protection
+3. **All AI feature modules** - music.js, animatedCaptions.js, etc.
+
+---
+
+## Priority & Risk Assessment
+
+| Factor | Rating | Notes |
+|--------|--------|-------|
+| **Severity** | 🔴 CRITICAL | Completely breaks UI |
+| **Likelihood** | 🟠 HIGH | Happens under load, slow systems |
+| **User Impact** | 🔴 CRITICAL | No recovery without panel restart |
+| **Fix Complexity** | 🟢 LOW | 15-20 lines of code |
+| **Testing Required** | 🟡 MEDIUM | Need to test timeout edge cases |
+| **Deployment Risk** | 🟢 LOW | Backward compatible, pure addition |
+
+**Recommendation**: ⚠️ **MUST FIX BEFORE LAUNCH**
+
+---
+
+## Prevention Checklist
+
+- [ ] Add timeout to `evalScript()`
+- [ ] Add configurable timeout constants
+- [ ] Update all `jsx.call()` sites with appropriate timeouts
+- [ ] Add error handling in calling code for timeout errors
+- [ ] Add user feedback for timeout scenarios
+- [ ] Test with slow Premiere Pro operations
+- [ ] Test with system under load
+- [ ] Document timeout behavior in developer docs
+
+---
+
+Generated by Claude Code Production Audit - January 12, 2026

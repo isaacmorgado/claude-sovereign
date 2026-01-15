@@ -1,0 +1,527 @@
+     1→/**
+     2→ * Rate Limiter Middleware
+     3→ *
+     4→ * Checks if user has sufficient credits before processing.
+     5→ * Uses atomic credit reservation to prevent race conditions.
+     6→ * Returns 402 Payment Required if insufficient credits.
+     7→ *
+     8→ * SECURITY FEATURES:
+     9→ * - JWT authentication via authenticateToken middleware
+    10→ * - Redis-backed rate limiting with in-memory fallback
+    11→ * - Tiered limits: authenticated users get higher limits than anonymous
+    12→ * - Endpoint-specific limits for sensitive operations
+    13→ * - Proper 429 responses with Retry-After header
+    14→ * - Legacy x-stripe-customer-id header is DISABLED in production for security
+    15→ */
+    16→
+    17→const {
+    18→  deductUsage,
+    19→  getBalance,
+    20→  reserveCredits,
+    21→  confirmReservation,
+    22→  releaseReservation,
+    23→  customerExists,
+    24→  hasFeatureAccess
+    25→} = require('../services/usageTracking');
+    26→const { verifyToken, extractBearerToken } = require('./auth');
+    27→const redisClient = require('../services/redisClient');
+    28→
+    29→// SECURITY: Disable legacy auth in production unless explicitly enabled
+    30→const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+    31→const ALLOW_LEGACY_AUTH = process.env.ALLOW_LEGACY_AUTH === 'true';
+    32→
+    33→// =============================================================================
+    34→// SECURITY: Enhanced IP-based Rate Limiting with Redis Backend
+    35→// =============================================================================
+    36→
+    37→/**
+    38→ * Rate limit configuration
+    39→ * Tiered limits: authenticated users get higher limits than anonymous
+    40→ */
+    41→const RATE_LIMITS = {
+    42→  // Global IP limits
+    43→  global: {
+    44→    anonymous: { max: 100, window: 60 },      // 100 req/min for unauthenticated
+    45→    authenticated: { max: 300, window: 60 }   // 300 req/min for authenticated users
+    46→  },
+    47→  // Endpoint-specific limits (stricter)
+    48→  endpoints: {
+    49→    '/auth/send-code': { max: 5, window: 300 },        // 5 requests per 5 minutes
+    50→    '/auth/verify-code': { max: 10, window: 300 },     // 10 requests per 5 minutes
+    51→    '/music/generate': { max: 10, window: 60 },        // 10 requests per minute
+    52→    '/analyze': { max: 30, window: 60 },               // 30 requests per minute
+    53→    'upload': { max: 20, window: 60 }                  // 20 uploads per minute
+    54→  }
+    55→};
+    56→
+    57→// In-memory fallback for when Redis is unavailable
+    58→const ipRequestCounts = new Map(); // IP -> { count, windowStart }
+    59→
+    60→// Cleanup old entries every 5 minutes to prevent memory leaks
+    61→setInterval(() => {
+    62→  const now = Date.now();
+    63→  for (const [ip, data] of ipRequestCounts.entries()) {
+    64→    if (now - data.windowStart > 120000) { // Clean up entries older than 2 minutes
+    65→      ipRequestCounts.delete(ip);
+    66→    }
+    67→  }
+    68→}, 300000);
+    69→
+    70→/**
+    71→ * SECURITY: Check rate limit using Redis with in-memory fallback
+    72→ * @param {string} key - Redis key for rate limit counter
+    73→ * @param {number} max - Maximum requests allowed
+    74→ * @param {number} windowSeconds - Time window in seconds
+    75→ * @returns {Promise<{allowed: boolean, remaining: number, resetAt: number}>}
+    76→ */
+    77→async function checkRateLimit(key, max, windowSeconds) {
+    78→  try {
+    79→    // Try Redis first (preferred for multi-instance deployments)
+    80→    if (redisClient && redisClient.isConnected) {
+    81→      const current = await redisClient.incr(key);
+    82→      
+    83→      if (current === 1) {
+    84→        // First request in window, set expiry
+    85→        await redisClient.expire(key, windowSeconds);
+    86→      }
+    87→      
+    88→      const ttl = await redisClient.ttl(key);
+    89→      const resetAt = Date.now() + (ttl * 1000);
+    90→      
+    91→      return {
+    92→        allowed: current <= max,
+    93→        remaining: Math.max(0, max - current),
+    94→        resetAt,
+    95→        retryAfter: ttl
+    96→      };
+    97→    }
+    98→  } catch (redisError) {
+    99→    console.warn('[RateLimiter] Redis error, falling back to in-memory:', redisError.message);
+   100→  }
+   101→  
+   102→  // Fallback to in-memory (single-instance only)
+   103→  const now = Date.now();
+   104→  const windowMs = windowSeconds * 1000;
+   105→  const data = ipRequestCounts.get(key);
+   106→  
+   107→  if (!data || now - data.windowStart > windowMs) {
+   108→    // Start new window
+   109→    ipRequestCounts.set(key, { count: 1, windowStart: now });
+   110→    return {
+   111→      allowed: true,
+   112→      remaining: max - 1,
+   113→      resetAt: now + windowMs,
+   114→      retryAfter: windowSeconds
+   115→    };
+   116→  }
+   117→  
+   118→  data.count++;
+   119→  const allowed = data.count <= max;
+   120→  const remaining = Math.max(0, max - data.count);
+   121→  const resetAt = data.windowStart + windowMs;
+   122→  const retryAfter = Math.ceil((resetAt - now) / 1000);
+   123→  
+   124→  return {
+   125→    allowed,
+   126→    remaining,
+   127→    resetAt,
+   128→    retryAfter
+   129→  };
+   130→}
+   131→
+   132→/**
+   133→ * SECURITY: IP-based rate limiting middleware with tiered limits
+   134→ * Authenticated users get higher limits than anonymous users
+   135→ * Returns 429 with Retry-After header when limit exceeded
+   136→ */
+   137→function ipRateLimit(req, res, next) {
+   138→  const clientIp = req.ip || req.headers['x-forwarded-for']?.split(',')[0] || req.connection?.remoteAddress || 'unknown';
+   139→  
+   140→  // Determine if user is authenticated (check for valid JWT token)
+   141→  const authHeader = req.headers['authorization'];
+   142→  const token = extractBearerToken(authHeader);
+   143→  const isAuthenticated = !!token; // Simple check, validation happens in requireCredits
+   144→  
+   145→  // Select appropriate rate limit
+   146→  const limit = isAuthenticated
+   147→    ? RATE_LIMITS.global.authenticated
+   148→    : RATE_LIMITS.global.anonymous;
+   149→  
+   150→  const rateLimitKey = `ratelimit:global:${clientIp}`;
+   151→  
+   152→  checkRateLimit(rateLimitKey, limit.max, limit.window)
+   153→    .then(result => {
+   154→      // Add rate limit headers (industry standard)
+   155→      res.set('X-RateLimit-Limit', limit.max.toString());
+   156→      res.set('X-RateLimit-Remaining', result.remaining.toString());
+   157→      res.set('X-RateLimit-Reset', Math.floor(result.resetAt / 1000).toString());
+   158→      
+   159→      if (!result.allowed) {
+   160→        // SECURITY: Return 429 with Retry-After header
+   161→        res.set('Retry-After', result.retryAfter.toString());
+   162→        console.warn(`[SECURITY] Global rate limit exceeded for IP: ${clientIp} (${isAuthenticated ? 'authenticated' : 'anonymous'})`);
+   163→        return res.status(429).json({
+   164→          error: 'Too many requests',
+   165→          message: 'Please slow down and try again later',
+   166→          retryAfter: result.retryAfter,
+   167→          limit: limit.max,
+   168→          window: limit.window
+   169→        });
+   170→      }
+   171→      
+   172→      next();
+   173→    })
+   174→    .catch(err => {
+   175→      console.error('[RateLimiter] Error checking rate limit:', err);
+   176→      // On error, allow request but log warning
+   177→      console.warn('[RateLimiter] Rate limit check failed, allowing request');
+   178→      next();
+   179→    });
+   180→}
+   181→
+   182→/**
+   183→ * SECURITY: Endpoint-specific rate limiting
+   184→ * Stricter limits for sensitive operations like authentication and file uploads
+   185→ * @param {string} endpointKey - Key from RATE_LIMITS.endpoints
+   186→ */
+   187→function endpointRateLimit(endpointKey) {
+   188→  return async (req, res, next) => {
+   189→    const clientIp = req.ip || req.headers['x-forwarded-for']?.split(',')[0] || req.connection?.remoteAddress || 'unknown';
+   190→    const limit = RATE_LIMITS.endpoints[endpointKey];
+   191→    
+   192→    if (!limit) {
+   193→      console.warn(`[RateLimiter] No rate limit configured for endpoint: ${endpointKey}`);
+   194→      return next();
+   195→    }
+   196→    
+   197→    const rateLimitKey = `ratelimit:endpoint:${endpointKey}:${clientIp}`;
+   198→    
+   199→    try {
+   200→      const result = await checkRateLimit(rateLimitKey, limit.max, limit.window);
+   201→      
+   202→      // Add rate limit headers
+   203→      res.set('X-RateLimit-Limit', limit.max.toString());
+   204→      res.set('X-RateLimit-Remaining', result.remaining.toString());
+   205→      res.set('X-RateLimit-Reset', Math.floor(result.resetAt / 1000).toString());
+   206→      
+   207→      if (!result.allowed) {
+   208→        // SECURITY: Return 429 with Retry-After header
+   209→        res.set('Retry-After', result.retryAfter.toString());
+   210→        console.warn(`[SECURITY] Endpoint rate limit exceeded for ${endpointKey} from IP: ${clientIp}`);
+   211→        return res.status(429).json({
+   212→          error: 'Too many requests',
+   213→          message: `Rate limit exceeded for this operation. Please try again in ${result.retryAfter} seconds.`,
+   214→          retryAfter: result.retryAfter,
+   215→          limit: limit.max,
+   216→          window: limit.window
+   217→        });
+   218→      }
+   219→      
+   220→      next();
+   221→    } catch (err) {
+   222→      console.error(`[RateLimiter] Error checking endpoint rate limit for ${endpointKey}:`, err);
+   223→      // On error, allow request but log warning
+   224→      console.warn('[RateLimiter] Endpoint rate limit check failed, allowing request');
+   225→      next();
+   226→    }
+   227→  };
+   228→}
+   229→
+   230→// Rate limiting for legacy auth attempts (prevent brute force)
+   231→const legacyAuthAttempts = new Map(); // IP -> { count, timestamp }
+   232→const LEGACY_AUTH_WINDOW_MS = 60000; // 1 minute
+   233→const LEGACY_AUTH_MAX_ATTEMPTS = 5; // 5 attempts per minute
+   234→
+   235→/**
+   236→ * Check if IP is rate limited for legacy auth
+   237→ */
+   238→function isLegacyAuthRateLimited(ip) {
+   239→  const now = Date.now();
+   240→  const attempt = legacyAuthAttempts.get(ip);
+   241→
+   242→  if (!attempt || (now - attempt.timestamp) > LEGACY_AUTH_WINDOW_MS) {
+   243→    legacyAuthAttempts.set(ip, { count: 1, timestamp: now });
+   244→    return false;
+   245→  }
+   246→
+   247→  attempt.count++;
+   248→  if (attempt.count > LEGACY_AUTH_MAX_ATTEMPTS) {
+   249→    console.warn(`[SECURITY] Legacy auth rate limit exceeded for IP: ${ip}`);
+   250→    return true;
+   251→  }
+   252→
+   253→  return false;
+   254→}
+   255→
+   256→// Default estimated duration for reservation (1 minute = 60 seconds)
+   257→const DEFAULT_RESERVATION_SECONDS = 60;
+   258→
+   259→/**
+   260→ * Middleware to check and atomically reserve credits before processing
+   261→ *
+   262→ * SECURITY: Authenticates via JWT token (Authorization: Bearer <token>)
+   263→ * Falls back to legacy x-stripe-customer-id header (deprecated)
+   264→ *
+   265→ * Uses req.estimatedDuration (in seconds) for pre-check, defaults to 60s
+   266→ *
+   267→ * This middleware uses SELECT...FOR UPDATE to prevent race conditions
+   268→ * where multiple concurrent requests could all pass credit check.
+   269→ */
+   270→function requireCredits(options = {}) {
+   271→  const { endpoint = 'unknown', estimatedSeconds = DEFAULT_RESERVATION_SECONDS } = options;
+   272→
+   273→  return async (req, res, next) => {
+   274→    // SECURITY: Primary auth via JWT token
+   275→    const authHeader = req.headers['authorization'];
+   276→    const token = extractBearerToken(authHeader);
+   277→
+   278→    let stripeCustomerId = null;
+   279→
+   280→    if (token) {
+   281→      const decoded = await verifyToken(token);
+   282→      if (decoded && decoded.sub) {
+   283→        stripeCustomerId = decoded.sub;
+   284→        req.tokenData = decoded;
+   285→      } else {
+   286→        // Token present but invalid
+   287→        return res.status(401).json({
+   288→          error: 'Invalid or expired token',
+   289→          message: 'Please log in again to continue'
+   290→        });
+   291→      }
+   292→    } else {
+   293→      // DEPRECATED: Fallback to legacy header
+   294→      const legacyId = req.headers['x-stripe-customer-id'];
+   295→      if (legacyId) {
+   296→        // SECURITY: Block legacy auth in production unless explicitly enabled
+   297→        if (isProduction && !ALLOW_LEGACY_AUTH) {
+   298→          console.warn(`[SECURITY] Legacy auth blocked in production for ${endpoint}`);
+   299→          return res.status(401).json({
+   300→            error: 'Authentication method not supported',
+   301→            message: 'Please use JWT authentication. Legacy header auth is disabled in production.'
+   302→          });
+   303→        }
+   304→
+   305→        // SECURITY: Rate limit legacy auth attempts to prevent brute force
+   306→        const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+   307→        if (isLegacyAuthRateLimited(clientIp)) {
+   308→          return res.status(429).json({
+   309→            error: 'Too many authentication attempts',
+   310→            message: 'Please wait before trying again'
+   311→          });
+   312→        }
+   313→
+   314→        // Validate format to prevent injection
+   315→        if (!legacyId.match(/^cus_[a-zA-Z0-9]{14,}$/)) {
+   316→          return res.status(401).json({
+   317→            error: 'Invalid customer ID format',
+   318→            message: 'Customer ID must be a valid Stripe customer ID'
+   319→          });
+   320→        }
+   321→
+   322→        // SECURITY: Verify customer exists in database before accepting
+   323→        const exists = await customerExists(legacyId);
+   324→        if (!exists) {
+   325→          console.warn(`[SECURITY] Legacy auth attempt with non-existent customer: ${legacyId}`);
+   326→          return res.status(401).json({
+   327→            error: 'Invalid customer ID',
+   328→            message: 'Customer not found'
+   329→          });
+   330→        }
+   331→
+   332→        stripeCustomerId = legacyId;
+   333→        req.isLegacyAuth = true;
+   334→        console.warn(`[RateLimiter] DEPRECATED: Legacy auth header used for ${endpoint} - migrate to JWT`);
+   335→      }
+   336→    }
+   337→
+   338→    if (!stripeCustomerId) {
+   339→      return res.status(401).json({
+   340→        error: 'Authentication required',
+   341→        message: 'Missing Stripe customer ID'
+   342→      });
+   343→    }
+   344→
+   345→    // Store for later use
+   346→    req.stripeCustomerId = stripeCustomerId;
+   347→
+   348→    // Determine estimated duration - use request value, option value, or default
+   349→    const estSeconds = req.estimatedDuration || estimatedSeconds;
+   350→
+   351→    try {
+   352→      // Atomically reserve credits using SELECT...FOR UPDATE
+   353→      const reservation = await reserveCredits(stripeCustomerId, estSeconds, endpoint);
+   354→
+   355→      if (!reservation.success) {
+   356→        // Reservation failed - not enough credits
+   357→        const balance = await getBalance(stripeCustomerId);
+   358→        return res.status(402).json({
+   359→          error: 'Insufficient credits',
+   360→          message: 'Please upgrade your plan or wait for your next billing cycle',
+   361→          balance: {
+   362→            hoursRemaining: balance.hoursRemaining,
+   363→            tier: balance.tier
+   364→          }
+   365→        });
+   366→      }
+   367→
+   368→      // Store reservation info for confirmation/release
+   369→      req.reservation = {
+   370→        id: reservation.reservationId,
+   371→        seconds: estSeconds,
+   372→        hoursReserved: reservation.hoursReserved
+   373→      };
+   374→
+   375→      // Attach helper function to confirm usage with actual duration
+   376→      // This adjusts the reservation if actual duration differs
+   377→      req.deductUsage = async (actualDurationSeconds) => {
+   378→        return await confirmReservation(
+   379→          stripeCustomerId,
+   380→          actualDurationSeconds,
+   381→          estSeconds,
+   382→          endpoint
+   383→        );
+   384→      };
+   385→
+   386→      // Attach helper function to release reservation on failure
+   387→      req.releaseReservation = async (reason = 'processing_failed') => {
+   388→        return await releaseReservation(stripeCustomerId, estSeconds, endpoint, reason);
+   389→      };
+   390→
+   391→      // Hook into response to auto-release on error responses
+   392→      const originalSend = res.send.bind(res);
+   393→      res.send = function(body) {
+   394→        // If response is an error (4xx/5xx) and no usage was confirmed, release reservation
+   395→        if (res.statusCode >= 400 && req.reservation && !req.usageConfirmed) {
+   396→          releaseReservation(stripeCustomerId, estSeconds, endpoint, `error_${res.statusCode}`)
+   397→            .catch(err => console.error('[RateLimiter] Failed to release reservation:', err));
+   398→        }
+   399→        return originalSend(body);
+   400→      };
+   401→
+   402→      next();
+   403→    } catch (err) {
+   404→      console.error('[RateLimiter] Error reserving credits:', err);
+   405→      return res.status(500).json({
+   406→        error: 'Credit check failed',
+   407→        message: err.message
+   408→      });
+   409→    }
+   410→  };
+   411→}
+   412→
+   413→/**
+   414→ * Middleware to enforce tier-based feature access
+   415→ *
+   416→ * SECURITY: Must be called AFTER requireCredits which sets req.stripeCustomerId
+   417→ * Returns 403 Forbidden if user's tier doesn't have access to the feature.
+   418→ *
+   419→ * @param {string} featureName - Feature to check access for (e.g., 'social_reframe', 'text_editing', 'multitrack')
+   420→ */
+   421→function requireFeature(featureName) {
+   422→  return async (req, res, next) => {
+   423→    // Must have stripeCustomerId from requireCredits middleware
+   424→    if (!req.stripeCustomerId) {
+   425→      return res.status(401).json({
+   426→        error: 'Authentication required',
+   427→        message: 'Please log in to access this feature'
+   428→      });
+   429→    }
+   430→
+   431→    try {
+   432→      // Get user's current balance (includes tier info)
+   433→      const balance = await getBalance(req.stripeCustomerId);
+   434→
+   435→      // Check if user's tier has access to this feature
+   436→      if (!hasFeatureAccess(balance.tier, featureName)) {
+   437→        // Release any reserved credits since we're blocking the request
+   438→        if (req.releaseReservation) {
+   439→          await req.releaseReservation('feature_not_available');
+   440→        }
+   441→
+   442→        // Determine required tier for helpful error message
+   443→        const requiredTier = getRequiredTierForFeature(featureName);
+   444→
+   445→        console.warn(`[SECURITY] Feature access denied: ${featureName} requires ${requiredTier}, user has ${balance.tier}`);
+   446→
+   447→        return res.status(403).json({
+   448→          error: 'Feature not available',
+   449→          message: `This feature requires a ${requiredTier} plan or higher`,
+   450→          requiredFeature: featureName,
+   451→          requiredTier: requiredTier,
+   452→          currentTier: balance.tier
+   453→        });
+   454→      }
+   455→
+   456→      // Feature access granted
+   457→      next();
+   458→    } catch (err) {
+   459→      console.error('[requireFeature] Error checking feature access:', err);
+   460→      return res.status(500).json({
+   461→        error: 'Feature access check failed',
+   462→        message: err.message
+   463→      });
+   464→    }
+   465→  };
+   466→}
+   467→
+   468→/**
+   469→ * Helper to determine required tier for a feature
+   470→ * Used for helpful error messages
+   471→ */
+   472→function getRequiredTierForFeature(featureName) {
+   473→  const teamOnlyFeatures = ['multitrack', 'music_to_cut', 'mood_timeline', 'youtube_metadata', 'profanity_bleeping'];
+   474→  const proFeatures = ['vocal_isolation', 'social_reframe', 'text_editing', 'all_captions', 'profanity_detection', 'chapter_detection'];
+   475→
+   476→  if (teamOnlyFeatures.includes(featureName)) {
+   477→    return 'Team';
+   478→  } else if (proFeatures.includes(featureName)) {
+   479→    return 'Pro';
+   480→  }
+   481→  return 'Starter';
+   482→}
+   483→
+   484→/**
+   485→ * Middleware to track usage after successful response
+   486→ *
+   487→ * Call this after processing to deduct actual usage
+   488→ */
+   489→function trackUsage(endpoint = 'unknown') {
+   490→  return async (req, res, next) => {
+   491→    // Store original json method
+   492→    const originalJson = res.json.bind(res);
+   493→
+   494→    // Override json to track usage on success
+   495→    res.json = async (data) => {
+   496→      // Only deduct on successful responses
+   497→      if (res.statusCode >= 200 && res.statusCode < 300 && req.audioDuration) {
+   498→        try {
+   499→          const balance = await deductUsage(
+   500→            req.stripeCustomerId,
+   501→            req.audioDuration,
+   502→            endpoint
+   503→          );
+   504→          // Attach updated balance to response
+   505→          data.balance = balance;
+   506→        } catch (err) {
+   507→          console.error('[RateLimiter] Error deducting usage:', err);
+   508→        }
+   509→      }
+   510→      return originalJson(data);
+   511→    };
+   512→
+   513→    next();
+   514→  };
+   515→}
+   516→
+   517→module.exports = {
+   518→  requireCredits,
+   519→  requireFeature,
+   520→  trackUsage,
+   521→  ipRateLimit
+   522→};
+   523→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

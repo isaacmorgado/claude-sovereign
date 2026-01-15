@@ -1,0 +1,664 @@
+#!/bin/bash
+# Comprehensive Test Suite for /checkpoint Integration
+# Tests both auto-continue.sh (context threshold) and file-change-tracker.sh (file count threshold)
+
+set -euo pipefail
+
+PASSED=0
+FAILED=0
+TEST_DIR="/tmp/checkpoint-integration-tests-$$"
+
+# Colors for output
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+log_pass() {
+    echo -e "${GREEN}✅ PASS${NC}: $1"
+    ((PASSED++))
+}
+
+log_fail() {
+    echo -e "${RED}❌ FAIL${NC}: $1"
+    ((FAILED++))
+}
+
+log_info() {
+    echo -e "${YELLOW}ℹ️  INFO${NC}: $1"
+}
+
+setup() {
+    echo "========================================="
+    echo "  Checkpoint Integration Test Suite"
+    echo "========================================="
+    echo ""
+
+    mkdir -p "$TEST_DIR"
+    cd "$TEST_DIR"
+
+    # Create .claude directory structure
+    mkdir -p .claude
+
+    log_info "Test directory: $TEST_DIR"
+    echo ""
+}
+
+cleanup() {
+    cd /
+    rm -rf "$TEST_DIR"
+}
+
+# ============================================================================
+# TEST SUITE 1: auto-continue.sh (Context Threshold Testing)
+# ============================================================================
+
+test_auto_continue_default_threshold() {
+    echo "TEST 1.1: auto-continue.sh - Default 40% threshold"
+    echo "---------------------------------------------------"
+
+    # Create mock input at exactly 40% (80000/200000 tokens)
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 80000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    # Run auto-continue.sh with mock input
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    # Check if it triggers (should block and provide continuation)
+    if echo "$result" | jq -e '.decision == "block"' &>/dev/null; then
+        log_pass "Triggers at exactly 40% threshold"
+    else
+        log_fail "Did not trigger at 40% threshold"
+        echo "Result: $result"
+    fi
+
+    # Check if it instructs to run /checkpoint
+    if echo "$result" | jq -r '.reason' | grep -q "Run /checkpoint"; then
+        log_pass "Includes /checkpoint instruction in continuation"
+    else
+        log_fail "Missing /checkpoint instruction"
+        echo "Reason: $(echo "$result" | jq -r '.reason')"
+    fi
+
+    echo ""
+}
+
+test_auto_continue_below_threshold() {
+    echo "TEST 1.2: auto-continue.sh - Below threshold (39%)"
+    echo "---------------------------------------------------"
+
+    # Create mock input at 39% (78000/200000 tokens)
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 78000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    # Should NOT trigger (exit 0, no output)
+    if [[ -z "$result" ]]; then
+        log_pass "Correctly does not trigger below threshold (39%)"
+    else
+        log_fail "Incorrectly triggered below threshold"
+        echo "Result: $result"
+    fi
+
+    echo ""
+}
+
+test_auto_continue_custom_threshold() {
+    echo "TEST 1.3: auto-continue.sh - Custom threshold (60%)"
+    echo "---------------------------------------------------"
+
+    # Test with 60% threshold (120000/200000 tokens)
+    export CLAUDE_CONTEXT_THRESHOLD=60
+
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 120000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    if echo "$result" | jq -e '.decision == "block"' &>/dev/null; then
+        log_pass "Respects custom threshold CLAUDE_CONTEXT_THRESHOLD=60"
+    else
+        log_fail "Did not respect custom threshold"
+    fi
+
+    unset CLAUDE_CONTEXT_THRESHOLD
+    echo ""
+}
+
+test_auto_continue_edge_case_0_percent() {
+    echo "TEST 1.4: auto-continue.sh - Edge case 0% usage"
+    echo "------------------------------------------------"
+
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    if [[ -z "$result" ]]; then
+        log_pass "Handles 0% usage correctly (no trigger)"
+    else
+        log_fail "Incorrectly triggered at 0%"
+    fi
+
+    echo ""
+}
+
+test_auto_continue_edge_case_100_percent() {
+    echo "TEST 1.5: auto-continue.sh - Edge case 100% usage"
+    echo "--------------------------------------------------"
+
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 200000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    if echo "$result" | jq -e '.decision == "block"' &>/dev/null; then
+        log_pass "Triggers at 100% usage"
+
+        # Verify percentage shown in message
+        local percent
+        percent=$(echo "$result" | jq -r '.systemMessage' | grep -oE '[0-9]+%' | head -1 | tr -d '%')
+        if [[ "$percent" == "100" ]]; then
+            log_pass "Shows correct percentage (100%) in message"
+        else
+            log_fail "Incorrect percentage shown: ${percent}%"
+        fi
+    else
+        log_fail "Did not trigger at 100%"
+    fi
+
+    echo ""
+}
+
+test_auto_continue_with_cache_tokens() {
+    echo "TEST 1.6: auto-continue.sh - With cache tokens"
+    echo "-----------------------------------------------"
+
+    # Test that cache tokens are included in calculation
+    # 30000 input + 20000 cache_create + 30000 cache_read = 80000 total = 40%
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 30000,
+      "cache_creation_input_tokens": 20000,
+      "cache_read_input_tokens": 30000
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    local result
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    if echo "$result" | jq -e '.decision == "block"' &>/dev/null; then
+        log_pass "Correctly includes cache tokens in calculation"
+    else
+        log_fail "Did not include cache tokens"
+    fi
+
+    echo ""
+}
+
+# ============================================================================
+# TEST SUITE 2: file-change-tracker.sh (File Count Testing)
+# ============================================================================
+
+test_file_tracker_init() {
+    echo "TEST 2.1: file-change-tracker - Initialization"
+    echo "----------------------------------------------"
+
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    if [[ -f ".claude/file-changes.json" ]]; then
+        log_pass "Creates tracker file on init"
+
+        # Verify JSON structure
+        local count
+        count=$(jq -r '.change_count' .claude/file-changes.json)
+        if [[ "$count" == "0" ]]; then
+            log_pass "Initializes with count=0"
+        else
+            log_fail "Initial count not 0: $count"
+        fi
+    else
+        log_fail "Did not create tracker file"
+    fi
+
+    echo ""
+}
+
+test_file_tracker_count_to_threshold() {
+    echo "TEST 2.2: file-change-tracker - Count to 10 threshold"
+    echo "------------------------------------------------------"
+
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # Add 9 files (should not trigger)
+    for i in {1..9}; do
+        result=$(~/.claude/hooks/file-change-tracker.sh record "test$i.txt" modified 2>&1)
+        if echo "$result" | grep -q "CHECKPOINT_NEEDED"; then
+            log_fail "Incorrectly triggered at $i files"
+            echo "Result: $result"
+            echo ""
+            return
+        fi
+    done
+    log_pass "Does not trigger before 10 files (at 9 files)"
+
+    # Add 10th file (should trigger)
+    result=$(~/.claude/hooks/file-change-tracker.sh record "test10.txt" modified 2>&1)
+    if echo "$result" | grep -q "CHECKPOINT_NEEDED"; then
+        log_pass "Triggers at exactly 10 files"
+
+        # Check count value
+        if echo "$result" | grep -q "CHECKPOINT_NEEDED:10"; then
+            log_pass "Returns correct count (10)"
+        else
+            log_fail "Incorrect count in response: $result"
+        fi
+    else
+        log_fail "Did not trigger at 10 files"
+        echo "Result: $result"
+    fi
+
+    echo ""
+}
+
+test_file_tracker_reset() {
+    echo "TEST 2.3: file-change-tracker - Reset after checkpoint"
+    echo "-------------------------------------------------------"
+
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # Add 10 files
+    for i in {1..10}; do
+        ~/.claude/hooks/file-change-tracker.sh record "test$i.txt" modified &>/dev/null
+    done
+
+    # Reset counter
+    ~/.claude/hooks/file-change-tracker.sh reset &>/dev/null
+
+    # Check count is back to 0
+    local count
+    count=$(jq -r '.change_count' .claude/file-changes.json)
+    if [[ "$count" == "0" ]]; then
+        log_pass "Reset sets count back to 0"
+    else
+        log_fail "Reset failed, count is: $count"
+    fi
+
+    # Check checkpoint count incremented
+    local checkpoint_count
+    checkpoint_count=$(jq -r '.checkpoint_count' .claude/file-changes.json)
+    if [[ "$checkpoint_count" == "1" ]]; then
+        log_pass "Increments checkpoint counter"
+    else
+        log_fail "Checkpoint count incorrect: $checkpoint_count"
+    fi
+
+    echo ""
+}
+
+test_file_tracker_custom_threshold() {
+    echo "TEST 2.4: file-change-tracker - Custom threshold (5 files)"
+    echo "-----------------------------------------------------------"
+
+    export CHECKPOINT_FILE_THRESHOLD=5
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # Add 4 files (should not trigger)
+    for i in {1..4}; do
+        result=$(~/.claude/hooks/file-change-tracker.sh record "test$i.txt" modified 2>&1)
+        if echo "$result" | grep -q "CHECKPOINT_NEEDED"; then
+            log_fail "Incorrectly triggered at $i files with threshold=5"
+            unset CHECKPOINT_FILE_THRESHOLD
+            echo ""
+            return
+        fi
+    done
+    log_pass "Does not trigger before threshold (at 4 files, threshold=5)"
+
+    # Add 5th file (should trigger)
+    result=$(~/.claude/hooks/file-change-tracker.sh record "test5.txt" modified 2>&1)
+    if echo "$result" | grep -q "CHECKPOINT_NEEDED:5"; then
+        log_pass "Triggers at custom threshold (5 files)"
+    else
+        log_fail "Did not trigger at custom threshold"
+        echo "Result: $result"
+    fi
+
+    unset CHECKPOINT_FILE_THRESHOLD
+    echo ""
+}
+
+test_file_tracker_edge_case_threshold_1() {
+    echo "TEST 2.5: file-change-tracker - Edge case threshold=1"
+    echo "------------------------------------------------------"
+
+    export CHECKPOINT_FILE_THRESHOLD=1
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # First file should trigger immediately
+    result=$(~/.claude/hooks/file-change-tracker.sh record "test1.txt" modified 2>&1)
+    if echo "$result" | grep -q "CHECKPOINT_NEEDED:1"; then
+        log_pass "Triggers on first file with threshold=1"
+    else
+        log_fail "Did not trigger with threshold=1"
+        echo "Result: $result"
+    fi
+
+    unset CHECKPOINT_FILE_THRESHOLD
+    echo ""
+}
+
+test_file_tracker_edge_case_threshold_100() {
+    echo "TEST 2.6: file-change-tracker - Edge case threshold=100"
+    echo "--------------------------------------------------------"
+
+    export CHECKPOINT_FILE_THRESHOLD=100
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # Add 99 files (should not trigger)
+    for i in {1..99}; do
+        ~/.claude/hooks/file-change-tracker.sh record "test$i.txt" modified &>/dev/null
+    done
+
+    result=$(~/.claude/hooks/file-change-tracker.sh check 2>&1)
+    if echo "$result" | grep -q "false:99"; then
+        log_pass "Does not trigger at 99 files with threshold=100"
+    else
+        log_fail "Incorrect behavior at 99 files"
+        echo "Result: $result"
+    fi
+
+    # Add 100th file (should trigger)
+    result=$(~/.claude/hooks/file-change-tracker.sh record "test100.txt" modified 2>&1)
+    if echo "$result" | grep -q "CHECKPOINT_NEEDED:100"; then
+        log_pass "Triggers at exactly 100 files"
+    else
+        log_fail "Did not trigger at 100 files"
+        echo "Result: $result"
+    fi
+
+    unset CHECKPOINT_FILE_THRESHOLD
+    echo ""
+}
+
+test_file_tracker_status_command() {
+    echo "TEST 2.7: file-change-tracker - Status command"
+    echo "-----------------------------------------------"
+
+    ~/.claude/hooks/file-change-tracker.sh init &>/dev/null
+
+    # Add 5 files
+    for i in {1..5}; do
+        ~/.claude/hooks/file-change-tracker.sh record "test$i.txt" modified &>/dev/null
+    done
+
+    # Check status output
+    local status
+    status=$(~/.claude/hooks/file-change-tracker.sh status 2>&1)
+
+    if echo "$status" | grep -q "Changes since last checkpoint: 5 / 10"; then
+        log_pass "Status shows correct count (5/10)"
+    else
+        log_fail "Status shows incorrect count"
+        echo "Status: $status"
+    fi
+
+    if echo "$status" | grep -q "Checkpoint needed: no"; then
+        log_pass "Status correctly shows checkpoint not needed"
+    else
+        log_fail "Status incorrectly shows checkpoint needed"
+    fi
+
+    echo ""
+}
+
+# ============================================================================
+# TEST SUITE 3: Integration Tests
+# ============================================================================
+
+test_integration_memory_checkpoint_creation() {
+    echo "TEST 3.1: Integration - Memory checkpoint creation"
+    echo "---------------------------------------------------"
+
+    # Test that auto-continue actually calls memory-manager checkpoint
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 80000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    # Check log for checkpoint creation
+    local log_file="${HOME}/.claude/auto-continue.log"
+    local before_line_count=0
+    if [[ -f "$log_file" ]]; then
+        before_line_count=$(wc -l < "$log_file")
+    fi
+
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    # Check if memory checkpoint was attempted
+    if [[ -f "$log_file" ]]; then
+        local new_lines
+        new_lines=$(tail -n +$((before_line_count + 1)) "$log_file")
+
+        if echo "$new_lines" | grep -q "Creating memory checkpoint"; then
+            log_pass "Attempts to create memory checkpoint"
+        else
+            log_fail "Did not attempt memory checkpoint creation"
+        fi
+    else
+        log_info "Log file not found (normal if memory-manager unavailable)"
+    fi
+
+    echo ""
+}
+
+test_integration_checkpoint_instruction_format() {
+    echo "TEST 3.2: Integration - /checkpoint instruction format"
+    echo "-------------------------------------------------------"
+
+    local mock_input=$(cat <<'EOF'
+{
+  "context_window": {
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 80000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "transcript_path": ""
+}
+EOF
+)
+
+    result=$(echo "$mock_input" | ~/.claude/hooks/auto-continue.sh 2>&1 || true)
+
+    # Check instruction format
+    local reason
+    reason=$(echo "$result" | jq -r '.reason')
+
+    if echo "$reason" | grep -q "First: Run /checkpoint to save session state"; then
+        log_pass "Uses correct /checkpoint instruction format"
+    else
+        log_fail "Incorrect instruction format"
+        echo "Instruction: $reason"
+    fi
+
+    if echo "$reason" | grep -q "Then:"; then
+        log_pass "Includes continuation action after checkpoint"
+    else
+        log_fail "Missing continuation action"
+    fi
+
+    echo ""
+}
+
+test_configuration_variables() {
+    echo "TEST 3.3: Configuration - Environment variables"
+    echo "------------------------------------------------"
+
+    # Test CLAUDE_CONTEXT_THRESHOLD
+    if export CLAUDE_CONTEXT_THRESHOLD=50 && [[ "$CLAUDE_CONTEXT_THRESHOLD" == "50" ]]; then
+        log_pass "CLAUDE_CONTEXT_THRESHOLD can be set"
+        unset CLAUDE_CONTEXT_THRESHOLD
+    else
+        log_fail "Cannot set CLAUDE_CONTEXT_THRESHOLD"
+    fi
+
+    # Test CHECKPOINT_FILE_THRESHOLD
+    if export CHECKPOINT_FILE_THRESHOLD=15 && [[ "$CHECKPOINT_FILE_THRESHOLD" == "15" ]]; then
+        log_pass "CHECKPOINT_FILE_THRESHOLD can be set"
+        unset CHECKPOINT_FILE_THRESHOLD
+    else
+        log_fail "Cannot set CHECKPOINT_FILE_THRESHOLD"
+    fi
+
+    echo ""
+}
+
+# ============================================================================
+# Main Test Execution
+# ============================================================================
+
+main() {
+    setup
+
+    echo "========================================="
+    echo "  SUITE 1: auto-continue.sh Tests"
+    echo "========================================="
+    echo ""
+
+    test_auto_continue_default_threshold
+    test_auto_continue_below_threshold
+    test_auto_continue_custom_threshold
+    test_auto_continue_edge_case_0_percent
+    test_auto_continue_edge_case_100_percent
+    test_auto_continue_with_cache_tokens
+
+    echo "========================================="
+    echo "  SUITE 2: file-change-tracker.sh Tests"
+    echo "========================================="
+    echo ""
+
+    test_file_tracker_init
+    test_file_tracker_count_to_threshold
+    test_file_tracker_reset
+    test_file_tracker_custom_threshold
+    test_file_tracker_edge_case_threshold_1
+    test_file_tracker_edge_case_threshold_100
+    test_file_tracker_status_command
+
+    echo "========================================="
+    echo "  SUITE 3: Integration Tests"
+    echo "========================================="
+    echo ""
+
+    test_integration_memory_checkpoint_creation
+    test_integration_checkpoint_instruction_format
+    test_configuration_variables
+
+    echo ""
+    echo "========================================="
+    echo "  TEST SUMMARY"
+    echo "========================================="
+    echo ""
+    echo -e "${GREEN}Passed: $PASSED${NC}"
+    echo -e "${RED}Failed: $FAILED${NC}"
+    echo ""
+
+    if [[ $FAILED -eq 0 ]]; then
+        echo -e "${GREEN}🎉 ALL TESTS PASSED!${NC}"
+        cleanup
+        exit 0
+    else
+        echo -e "${RED}❌ SOME TESTS FAILED${NC}"
+        echo ""
+        echo "Test directory preserved at: $TEST_DIR"
+        exit 1
+    fi
+}
+
+main

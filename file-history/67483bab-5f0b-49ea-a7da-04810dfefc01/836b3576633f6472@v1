@@ -1,0 +1,316 @@
+import * as vscode from "vscode"
+import type {
+	AutomationDefinition,
+	AutomationConfig,
+	AutomationState,
+	AutomationExecutionResult,
+} from "@multi-agent/types"
+import type { TaskProviderLike } from "@multi-agent/types"
+import { AutomationConfigLoader } from "./AutomationConfigLoader"
+import { TriggerRegistry } from "./TriggerRegistry"
+import { AutomationExecutor } from "./AutomationExecutor"
+import { TriggerEventPayload } from "./triggers/BaseTrigger"
+
+export interface AutomationManagerOptions {
+	workspacePath: string
+	taskProvider: TaskProviderLike
+	enabled?: boolean
+}
+
+/**
+ * Main automation manager.
+ * Coordinates config loading, trigger management, and task execution.
+ */
+export class AutomationManager {
+	private workspacePath: string
+	private taskProvider: TaskProviderLike
+	private configLoader: AutomationConfigLoader
+	private triggerRegistry: TriggerRegistry
+	private executor: AutomationExecutor
+	private isEnabled: boolean
+	private isInitialized: boolean = false
+	private automationStates: Map<string, AutomationState> = new Map()
+
+	private _onAutomationTriggered = new vscode.EventEmitter<{
+		automation: AutomationDefinition
+		payload: TriggerEventPayload
+	}>()
+	private _onAutomationExecuted = new vscode.EventEmitter<AutomationExecutionResult>()
+	private _onAutomationsChanged = new vscode.EventEmitter<AutomationDefinition[]>()
+
+	public readonly onAutomationTriggered = this._onAutomationTriggered.event
+	public readonly onAutomationExecuted = this._onAutomationExecuted.event
+	public readonly onAutomationsChanged = this._onAutomationsChanged.event
+
+	constructor(options: AutomationManagerOptions) {
+		this.workspacePath = options.workspacePath
+		this.taskProvider = options.taskProvider
+		this.isEnabled = options.enabled ?? true
+
+		this.configLoader = new AutomationConfigLoader({
+			workspacePath: this.workspacePath,
+		})
+
+		this.triggerRegistry = new TriggerRegistry(this.workspacePath)
+		this.executor = new AutomationExecutor(this.taskProvider)
+	}
+
+	/**
+	 * Initialize the automation manager
+	 */
+	async initialize(): Promise<void> {
+		if (this.isInitialized) {
+			return
+		}
+
+		// Set up config change listener
+		this.configLoader.onAutomationsChanged((config) => {
+			this.handleConfigChange(config)
+		})
+
+		// Initialize config loader (starts watching files)
+		await this.configLoader.initialize()
+
+		// Set up trigger event listener
+		this.triggerRegistry.onAnyTrigger((payload) => {
+			this.handleTriggerEvent(payload)
+		})
+
+		// Load and register initial automations
+		const config = await this.configLoader.loadAutomations()
+		if (config) {
+			await this.registerAutomations(config.automations)
+		}
+
+		// Start all triggers if enabled
+		if (this.isEnabled) {
+			await this.startAll()
+		}
+
+		this.isInitialized = true
+	}
+
+	/**
+	 * Enable or disable the automation system
+	 */
+	async setEnabled(enabled: boolean): Promise<void> {
+		if (this.isEnabled === enabled) {
+			return
+		}
+
+		this.isEnabled = enabled
+
+		if (enabled) {
+			await this.startAll()
+		} else {
+			await this.stopAll()
+		}
+	}
+
+	/**
+	 * Get whether automations are enabled
+	 */
+	get enabled(): boolean {
+		return this.isEnabled
+	}
+
+	/**
+	 * Register automations from config
+	 */
+	private async registerAutomations(automations: AutomationDefinition[]): Promise<void> {
+		for (const automation of automations) {
+			await this.registerAutomation(automation)
+		}
+		this._onAutomationsChanged.fire(automations)
+	}
+
+	/**
+	 * Register a single automation
+	 */
+	private async registerAutomation(automation: AutomationDefinition): Promise<void> {
+		// Create trigger if applicable
+		const trigger = await this.triggerRegistry.registerTrigger(automation)
+
+		// Track state
+		this.automationStates.set(automation.id, {
+			id: automation.id,
+			definition: automation,
+			isActive: false,
+		})
+
+		// Start trigger if enabled and automation is enabled
+		if (this.isEnabled && automation.enabled && trigger) {
+			await trigger.start()
+			const state = this.automationStates.get(automation.id)
+			if (state) {
+				state.isActive = true
+			}
+		}
+	}
+
+	/**
+	 * Handle config file changes
+	 */
+	private async handleConfigChange(config: AutomationConfig | null): Promise<void> {
+		// Stop and unregister all existing triggers
+		await this.triggerRegistry.dispose()
+
+		// Clear states
+		this.automationStates.clear()
+
+		// Recreate registry
+		this.triggerRegistry = new TriggerRegistry(this.workspacePath)
+		this.triggerRegistry.onAnyTrigger((payload) => {
+			this.handleTriggerEvent(payload)
+		})
+
+		// Register new automations
+		if (config) {
+			await this.registerAutomations(config.automations)
+		} else {
+			this._onAutomationsChanged.fire([])
+		}
+	}
+
+	/**
+	 * Handle a trigger event
+	 */
+	private async handleTriggerEvent(payload: TriggerEventPayload): Promise<void> {
+		const automation = this.configLoader.getAutomation(payload.automationId)
+		if (!automation) {
+			console.warn(`Automation not found: ${payload.automationId}`)
+			return
+		}
+
+		// Check if automation is enabled
+		if (!automation.enabled) {
+			return
+		}
+
+		// Emit triggered event
+		this._onAutomationTriggered.fire({ automation, payload })
+
+		// Execute the automation
+		const result = await this.executor.execute(automation, payload)
+
+		// Update state
+		const state = this.automationStates.get(automation.id)
+		if (state) {
+			state.lastExecution = result
+		}
+
+		// Emit executed event
+		this._onAutomationExecuted.fire(result)
+	}
+
+	/**
+	 * Start all registered triggers
+	 */
+	async startAll(): Promise<void> {
+		await this.triggerRegistry.startAll()
+		for (const state of this.automationStates.values()) {
+			if (state.definition.enabled) {
+				state.isActive = true
+			}
+		}
+	}
+
+	/**
+	 * Stop all registered triggers
+	 */
+	async stopAll(): Promise<void> {
+		await this.triggerRegistry.stopAll()
+		for (const state of this.automationStates.values()) {
+			state.isActive = false
+		}
+	}
+
+	/**
+	 * Get all automation states
+	 */
+	getAutomationStates(): AutomationState[] {
+		return Array.from(this.automationStates.values())
+	}
+
+	/**
+	 * Get a specific automation state
+	 */
+	getAutomationState(automationId: string): AutomationState | undefined {
+		return this.automationStates.get(automationId)
+	}
+
+	/**
+	 * Get all automation definitions
+	 */
+	getAutomations(): AutomationDefinition[] {
+		return this.configLoader.getEnabledAutomations()
+	}
+
+	/**
+	 * Manually trigger an automation
+	 */
+	async triggerManually(automationId: string): Promise<AutomationExecutionResult | null> {
+		const automation = this.configLoader.getAutomation(automationId)
+		if (!automation) {
+			console.warn(`Automation not found: ${automationId}`)
+			return null
+		}
+
+		const payload: TriggerEventPayload = {
+			triggerId: `manual-${Date.now()}`,
+			automationId,
+			context: {
+				triggerId: `manual-${Date.now()}`,
+				automationId,
+				triggerType: "manual" as any,
+				timestamp: Date.now(),
+				workspacePath: this.workspacePath,
+			},
+		}
+
+		this._onAutomationTriggered.fire({ automation, payload })
+		const result = await this.executor.execute(automation, payload)
+		this._onAutomationExecuted.fire(result)
+		return result
+	}
+
+	/**
+	 * Get execution history for an automation
+	 */
+	getExecutionHistory(automationId: string): AutomationExecutionResult[] {
+		return this.executor.getExecutionHistory(automationId)
+	}
+
+	/**
+	 * Check if automations config exists
+	 */
+	async hasConfig(): Promise<boolean> {
+		return this.configLoader.hasAutomationsConfig()
+	}
+
+	/**
+	 * Create default config file
+	 */
+	async createDefaultConfig(): Promise<void> {
+		await this.configLoader.createDefaultAutomationsConfig()
+	}
+
+	/**
+	 * Update the task provider reference
+	 */
+	setTaskProvider(taskProvider: TaskProviderLike): void {
+		this.taskProvider = taskProvider
+		this.executor.setTaskProvider(taskProvider)
+	}
+
+	/**
+	 * Dispose of all resources
+	 */
+	async dispose(): Promise<void> {
+		await this.triggerRegistry.dispose()
+		this.configLoader.dispose()
+		this._onAutomationTriggered.dispose()
+		this._onAutomationExecuted.dispose()
+		this._onAutomationsChanged.dispose()
+	}
+}

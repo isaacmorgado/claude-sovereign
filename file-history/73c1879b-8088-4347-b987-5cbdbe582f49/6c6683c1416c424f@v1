@@ -1,0 +1,165 @@
+-- SPLICE AI Music Generation Schema
+-- Migration 001: Create generated_music table and update users table
+
+-- Create generated_music table
+CREATE TABLE IF NOT EXISTS generated_music (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  stripe_customer_id VARCHAR(255) NOT NULL,
+
+  -- Job metadata
+  job_id VARCHAR(255) UNIQUE NOT NULL,
+  status VARCHAR(50) DEFAULT 'pending',
+
+  -- Reference song info (from ACRCloud)
+  reference_song_title VARCHAR(255),
+  reference_artist VARCHAR(255),
+  reference_youtube_url TEXT,
+  reference_bpm INTEGER,
+  reference_key VARCHAR(10),
+  reference_mood VARCHAR(100),
+  reference_genres TEXT[],
+  reference_confidence INTEGER,
+
+  -- Generation parameters
+  prompt TEXT,
+  duration_seconds INTEGER DEFAULT 60,
+  instruments TEXT[],
+  mood VARCHAR(100),
+  style VARCHAR(100),
+
+  -- Mureka output
+  mureka_task_id VARCHAR(255),
+
+  -- Storage
+  r2_key VARCHAR(255),
+  r2_preview_key VARCHAR(255),
+  file_size_bytes BIGINT,
+  audio_duration_seconds DECIMAL(10,2),
+
+  -- Metadata
+  title VARCHAR(255),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  completed_at TIMESTAMP WITH TIME ZONE,
+  error_message TEXT,
+
+  -- Constraints
+  CONSTRAINT valid_status CHECK (
+    status IN ('pending', 'extracting', 'identifying', 'generating', 'uploading', 'completed', 'failed')
+  ),
+  CONSTRAINT valid_duration CHECK (
+    duration_seconds >= 30 AND duration_seconds <= 180
+  )
+);
+
+-- Indexes for efficient queries
+CREATE INDEX IF NOT EXISTS idx_generated_music_customer ON generated_music(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS idx_generated_music_job_id ON generated_music(job_id);
+CREATE INDEX IF NOT EXISTS idx_generated_music_status ON generated_music(status);
+CREATE INDEX IF NOT EXISTS idx_generated_music_created_at ON generated_music(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generated_music_user_id ON generated_music(user_id);
+
+-- Add music credits to users table
+ALTER TABLE users
+ADD COLUMN IF NOT EXISTS music_credits_remaining INTEGER DEFAULT 5,
+ADD COLUMN IF NOT EXISTS music_credits_total INTEGER DEFAULT 5,
+ADD COLUMN IF NOT EXISTS music_credits_reset_at TIMESTAMP WITH TIME ZONE;
+
+-- Function to get music credit balance
+CREATE OR REPLACE FUNCTION get_music_credits(p_stripe_customer_id VARCHAR(255))
+RETURNS TABLE(remaining INTEGER, total INTEGER, reset_at TIMESTAMP WITH TIME ZONE) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    u.music_credits_remaining,
+    u.music_credits_total,
+    u.music_credits_reset_at
+  FROM users u
+  WHERE u.stripe_customer_id = p_stripe_customer_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to deduct music credit
+CREATE OR REPLACE FUNCTION deduct_music_credit(p_stripe_customer_id VARCHAR(255))
+RETURNS BOOLEAN AS $$
+DECLARE
+  v_remaining INTEGER;
+BEGIN
+  -- Lock the row and check credits
+  SELECT music_credits_remaining INTO v_remaining
+  FROM users
+  WHERE stripe_customer_id = p_stripe_customer_id
+  FOR UPDATE;
+
+  IF v_remaining IS NULL THEN
+    RAISE EXCEPTION 'User not found';
+  END IF;
+
+  IF v_remaining <= 0 THEN
+    RETURN FALSE;
+  END IF;
+
+  -- Deduct credit
+  UPDATE users
+  SET music_credits_remaining = music_credits_remaining - 1
+  WHERE stripe_customer_id = p_stripe_customer_id;
+
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to reset music credits based on tier
+CREATE OR REPLACE FUNCTION reset_music_credits(
+  p_stripe_customer_id VARCHAR(255),
+  p_tier VARCHAR(50)
+)
+RETURNS VOID AS $$
+DECLARE
+  v_credits INTEGER;
+BEGIN
+  -- Determine credits by tier
+  v_credits := CASE p_tier
+    WHEN 'starter' THEN 5
+    WHEN 'pro' THEN 20
+    WHEN 'team' THEN 100
+    ELSE 5
+  END;
+
+  UPDATE users
+  SET
+    music_credits_remaining = v_credits,
+    music_credits_total = v_credits,
+    music_credits_reset_at = CURRENT_TIMESTAMP
+  WHERE stripe_customer_id = p_stripe_customer_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to add music credits (for overage purchases)
+CREATE OR REPLACE FUNCTION add_music_credits(
+  p_stripe_customer_id VARCHAR(255),
+  p_credits INTEGER
+)
+RETURNS INTEGER AS $$
+DECLARE
+  v_new_remaining INTEGER;
+BEGIN
+  UPDATE users
+  SET music_credits_remaining = music_credits_remaining + p_credits
+  WHERE stripe_customer_id = p_stripe_customer_id
+  RETURNING music_credits_remaining INTO v_new_remaining;
+
+  RETURN v_new_remaining;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create index for music library queries
+CREATE INDEX IF NOT EXISTS idx_generated_music_library
+ON generated_music(stripe_customer_id, status, created_at DESC)
+WHERE status = 'completed';
+
+-- Comments for documentation
+COMMENT ON TABLE generated_music IS 'Stores AI-generated music files and their metadata';
+COMMENT ON COLUMN generated_music.job_id IS 'Unique job ID format: music_{timestamp}_{random}';
+COMMENT ON COLUMN generated_music.r2_key IS 'Cloudflare R2 storage key for master WAV file';
+COMMENT ON COLUMN generated_music.r2_preview_key IS 'Cloudflare R2 storage key for preview MP3 file';
+COMMENT ON COLUMN generated_music.reference_confidence IS 'ACRCloud identification confidence score (0-100)';

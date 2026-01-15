@@ -1,0 +1,591 @@
+/**
+ * MultiAgent Browser Bridge - Content Script
+ *
+ * Runs in the context of web pages and handles DOM inspection,
+ * console monitoring, and communication with the background script.
+ */
+
+;(function () {
+	"use strict"
+
+	// Prevent multiple injections
+	if (window.__multiagentContentScript) {
+		return
+	}
+	window.__multiagentContentScript = true
+
+	// Configuration
+	const CONFIG = {
+		highlightColor: "rgba(66, 133, 244, 0.3)",
+		highlightBorderColor: "#4285f4",
+		inspectorEnabled: false,
+	}
+
+	// State
+	let inspectorOverlay = null
+	let tooltipElement = null
+	let lastHoveredElement = null
+
+	/**
+	 * Initialize the content script
+	 */
+	function init() {
+		// Listen for messages from background script
+		chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+			handleMessage(message)
+				.then(sendResponse)
+				.catch((error) => {
+					sendResponse({ error: error.message })
+				})
+			return true // Keep channel open for async response
+		})
+
+		// Set up error listener to capture uncaught errors
+		window.addEventListener("error", handleWindowError)
+		window.addEventListener("unhandledrejection", handleUnhandledRejection)
+	}
+
+	/**
+	 * Handle messages from background script
+	 */
+	async function handleMessage(message) {
+		const { type, payload } = message
+
+		switch (type) {
+			case "enable_inspector":
+				enableInspector()
+				return { success: true }
+
+			case "disable_inspector":
+				disableInspector()
+				return { success: true }
+
+			case "highlight_element":
+				highlightElement(payload.selector, payload.color)
+				return { success: true }
+
+			case "clear_highlights":
+				clearHighlights()
+				return { success: true }
+
+			case "scroll_to_element":
+				scrollToElement(payload.selector)
+				return { success: true }
+
+			case "get_element_info":
+				return getElementInfo(document.querySelector(payload.selector))
+
+			case "capture_dom_snapshot":
+				return captureDOMSnapshot(payload.depth || 5)
+
+			default:
+				return { error: `Unknown message type: ${type}` }
+		}
+	}
+
+	/**
+	 * Enable visual element inspector
+	 */
+	function enableInspector() {
+		if (CONFIG.inspectorEnabled) return
+
+		CONFIG.inspectorEnabled = true
+
+		// Create overlay element
+		inspectorOverlay = document.createElement("div")
+		inspectorOverlay.id = "multiagent-inspector-overlay"
+		inspectorOverlay.style.cssText = `
+			position: fixed;
+			pointer-events: none;
+			z-index: 2147483647;
+			border: 2px solid ${CONFIG.highlightBorderColor};
+			background-color: ${CONFIG.highlightColor};
+			transition: all 0.1s ease-out;
+			display: none;
+		`
+		document.body.appendChild(inspectorOverlay)
+
+		// Create tooltip element
+		tooltipElement = document.createElement("div")
+		tooltipElement.id = "multiagent-inspector-tooltip"
+		tooltipElement.style.cssText = `
+			position: fixed;
+			z-index: 2147483647;
+			background: #1a1a1a;
+			color: #fff;
+			font-family: monospace;
+			font-size: 12px;
+			padding: 6px 10px;
+			border-radius: 4px;
+			pointer-events: none;
+			display: none;
+			max-width: 400px;
+			word-break: break-all;
+			box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+		`
+		document.body.appendChild(tooltipElement)
+
+		// Add event listeners
+		document.addEventListener("mousemove", onInspectorMouseMove, true)
+		document.addEventListener("click", onInspectorClick, true)
+		document.addEventListener("keydown", onInspectorKeyDown, true)
+	}
+
+	/**
+	 * Disable visual element inspector
+	 */
+	function disableInspector() {
+		if (!CONFIG.inspectorEnabled) return
+
+		CONFIG.inspectorEnabled = false
+
+		if (inspectorOverlay) {
+			inspectorOverlay.remove()
+			inspectorOverlay = null
+		}
+
+		if (tooltipElement) {
+			tooltipElement.remove()
+			tooltipElement = null
+		}
+
+		document.removeEventListener("mousemove", onInspectorMouseMove, true)
+		document.removeEventListener("click", onInspectorClick, true)
+		document.removeEventListener("keydown", onInspectorKeyDown, true)
+
+		lastHoveredElement = null
+	}
+
+	/**
+	 * Handle mouse move during inspection
+	 */
+	function onInspectorMouseMove(event) {
+		const element = document.elementFromPoint(event.clientX, event.clientY)
+
+		// Ignore our own elements
+		if (
+			!element ||
+			element === inspectorOverlay ||
+			element === tooltipElement ||
+			element.id?.startsWith("multiagent-")
+		) {
+			return
+		}
+
+		if (element === lastHoveredElement) return
+		lastHoveredElement = element
+
+		const rect = element.getBoundingClientRect()
+
+		// Update overlay position
+		inspectorOverlay.style.display = "block"
+		inspectorOverlay.style.top = rect.top + "px"
+		inspectorOverlay.style.left = rect.left + "px"
+		inspectorOverlay.style.width = rect.width + "px"
+		inspectorOverlay.style.height = rect.height + "px"
+
+		// Update tooltip
+		const tagName = element.tagName.toLowerCase()
+		const id = element.id ? `#${element.id}` : ""
+		const classes = element.className
+			? "." +
+				element.className
+					.toString()
+					.trim()
+					.split(/\s+/)
+					.slice(0, 3)
+					.join(".")
+			: ""
+
+		let tooltipText = `<strong>${tagName}</strong>${id}${classes}`
+
+		// Add dimensions
+		tooltipText += `<br><span style="color:#888">${Math.round(rect.width)}×${Math.round(rect.height)}</span>`
+
+		tooltipElement.innerHTML = tooltipText
+		tooltipElement.style.display = "block"
+
+		// Position tooltip
+		let tooltipX = event.clientX + 10
+		let tooltipY = event.clientY + 10
+
+		const tooltipRect = tooltipElement.getBoundingClientRect()
+
+		if (tooltipX + tooltipRect.width > window.innerWidth) {
+			tooltipX = event.clientX - tooltipRect.width - 10
+		}
+		if (tooltipY + tooltipRect.height > window.innerHeight) {
+			tooltipY = event.clientY - tooltipRect.height - 10
+		}
+
+		tooltipElement.style.left = tooltipX + "px"
+		tooltipElement.style.top = tooltipY + "px"
+	}
+
+	/**
+	 * Handle click during inspection
+	 */
+	function onInspectorClick(event) {
+		event.preventDefault()
+		event.stopPropagation()
+
+		const element = document.elementFromPoint(event.clientX, event.clientY)
+
+		if (
+			!element ||
+			element === inspectorOverlay ||
+			element === tooltipElement ||
+			element.id?.startsWith("multiagent-")
+		) {
+			return
+		}
+
+		// Send selected element info to background
+		const elementInfo = getElementInfo(element)
+
+		chrome.runtime.sendMessage({
+			type: "element_selected",
+			payload: elementInfo,
+		})
+
+		// Keep inspector enabled for multiple selections
+		// User can press Escape to disable
+	}
+
+	/**
+	 * Handle keyboard events during inspection
+	 */
+	function onInspectorKeyDown(event) {
+		if (event.key === "Escape") {
+			disableInspector()
+			chrome.runtime.sendMessage({
+				type: "inspector_disabled",
+			})
+		}
+	}
+
+	/**
+	 * Get detailed element information
+	 */
+	function getElementInfo(element, maxDepth = 3, currentDepth = 0) {
+		if (!element || currentDepth > maxDepth) return null
+
+		const rect = element.getBoundingClientRect()
+		const computedStyle = window.getComputedStyle(element)
+
+		const info = {
+			tagName: element.tagName.toLowerCase(),
+			id: element.id || undefined,
+			className: element.className?.toString() || undefined,
+			attributes: {},
+			textContent: element.textContent?.trim().slice(0, 200) || undefined,
+			innerHTML: currentDepth === 0 ? element.innerHTML?.slice(0, 1000) : undefined,
+			outerHTML: currentDepth === 0 ? element.outerHTML?.slice(0, 2000) : undefined,
+			rect: {
+				x: rect.x,
+				y: rect.y,
+				width: rect.width,
+				height: rect.height,
+				top: rect.top,
+				left: rect.left,
+				bottom: rect.bottom,
+				right: rect.right,
+			},
+			computedStyles: currentDepth === 0 ? getRelevantStyles(computedStyle) : undefined,
+			xpath: getXPath(element),
+			cssSelector: getCssSelector(element),
+		}
+
+		// Get attributes
+		for (const attr of element.attributes) {
+			info.attributes[attr.name] = attr.value
+		}
+
+		// Get children info (limited)
+		if (currentDepth < maxDepth && element.children.length > 0 && element.children.length <= 20) {
+			info.children = Array.from(element.children)
+				.slice(0, 10)
+				.map((child) => getElementInfo(child, maxDepth, currentDepth + 1))
+		}
+
+		return info
+	}
+
+	/**
+	 * Get relevant computed styles (not all of them)
+	 */
+	function getRelevantStyles(computedStyle) {
+		const relevantProps = [
+			"display",
+			"position",
+			"width",
+			"height",
+			"margin",
+			"padding",
+			"color",
+			"backgroundColor",
+			"fontSize",
+			"fontFamily",
+			"fontWeight",
+			"lineHeight",
+			"textAlign",
+			"border",
+			"borderRadius",
+			"boxShadow",
+			"opacity",
+			"visibility",
+			"zIndex",
+			"overflow",
+			"flexDirection",
+			"justifyContent",
+			"alignItems",
+			"gridTemplateColumns",
+			"gridTemplateRows",
+		]
+
+		const styles = {}
+		for (const prop of relevantProps) {
+			const value = computedStyle.getPropertyValue(prop.replace(/([A-Z])/g, "-$1").toLowerCase())
+			if (value && value !== "none" && value !== "normal" && value !== "auto") {
+				styles[prop] = value
+			}
+		}
+		return styles
+	}
+
+	/**
+	 * Get XPath for an element
+	 */
+	function getXPath(element) {
+		if (!element) return ""
+		if (element.id) return `//*[@id="${element.id}"]`
+
+		const parts = []
+		let current = element
+
+		while (current && current.nodeType === Node.ELEMENT_NODE) {
+			let index = 1
+			let sibling = current.previousSibling
+
+			while (sibling) {
+				if (sibling.nodeType === Node.ELEMENT_NODE && sibling.tagName === current.tagName) {
+					index++
+				}
+				sibling = sibling.previousSibling
+			}
+
+			const tagName = current.tagName.toLowerCase()
+			parts.unshift(`${tagName}[${index}]`)
+			current = current.parentNode
+		}
+
+		return "/" + parts.join("/")
+	}
+
+	/**
+	 * Get CSS selector for an element
+	 */
+	function getCssSelector(element) {
+		if (!element) return ""
+		if (element.id) return `#${element.id}`
+
+		const parts = []
+		let current = element
+
+		while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
+			let selector = current.tagName.toLowerCase()
+
+			if (current.id) {
+				selector = `#${current.id}`
+				parts.unshift(selector)
+				break
+			}
+
+			if (current.className) {
+				const classes = current.className
+					.toString()
+					.trim()
+					.split(/\s+/)
+					.filter((c) => c && !c.includes(":"))
+					.slice(0, 2)
+				if (classes.length) {
+					selector += "." + classes.join(".")
+				}
+			}
+
+			const siblings = current.parentNode?.children
+			if (siblings && siblings.length > 1) {
+				const sameTagSiblings = Array.from(siblings).filter((s) => s.tagName === current.tagName)
+				if (sameTagSiblings.length > 1) {
+					const index = sameTagSiblings.indexOf(current) + 1
+					selector += `:nth-of-type(${index})`
+				}
+			}
+
+			parts.unshift(selector)
+			current = current.parentNode
+		}
+
+		return parts.join(" > ")
+	}
+
+	/**
+	 * Highlight an element
+	 */
+	function highlightElement(selector, color = CONFIG.highlightColor) {
+		const element = document.querySelector(selector)
+		if (!element) return
+
+		const overlay = document.createElement("div")
+		overlay.className = "multiagent-highlight"
+		const rect = element.getBoundingClientRect()
+
+		overlay.style.cssText = `
+			position: fixed;
+			top: ${rect.top}px;
+			left: ${rect.left}px;
+			width: ${rect.width}px;
+			height: ${rect.height}px;
+			background-color: ${color};
+			border: 2px solid ${CONFIG.highlightBorderColor};
+			pointer-events: none;
+			z-index: 2147483646;
+			transition: opacity 0.3s;
+		`
+
+		document.body.appendChild(overlay)
+
+		// Auto-remove after 3 seconds
+		setTimeout(() => {
+			overlay.style.opacity = "0"
+			setTimeout(() => overlay.remove(), 300)
+		}, 3000)
+	}
+
+	/**
+	 * Clear all highlights
+	 */
+	function clearHighlights() {
+		document.querySelectorAll(".multiagent-highlight").forEach((el) => el.remove())
+	}
+
+	/**
+	 * Scroll element into view
+	 */
+	function scrollToElement(selector) {
+		const element = document.querySelector(selector)
+		if (!element) return false
+
+		element.scrollIntoView({
+			behavior: "smooth",
+			block: "center",
+			inline: "center",
+		})
+
+		// Highlight briefly
+		highlightElement(selector)
+		return true
+	}
+
+	/**
+	 * Capture DOM snapshot
+	 */
+	function captureDOMSnapshot(maxDepth = 5) {
+		function captureNode(node, depth) {
+			if (depth > maxDepth) return null
+			if (node.nodeType !== Node.ELEMENT_NODE) return null
+
+			const rect = node.getBoundingClientRect()
+
+			const snapshot = {
+				tagName: node.tagName.toLowerCase(),
+				id: node.id || undefined,
+				className: node.className?.toString() || undefined,
+				attributes: {},
+				rect:
+					rect.width > 0 || rect.height > 0
+						? {
+								x: Math.round(rect.x),
+								y: Math.round(rect.y),
+								width: Math.round(rect.width),
+								height: Math.round(rect.height),
+							}
+						: undefined,
+				children: [],
+			}
+
+			for (const attr of node.attributes) {
+				if (attr.name !== "class" && attr.name !== "id") {
+					snapshot.attributes[attr.name] = attr.value
+				}
+			}
+
+			if (Object.keys(snapshot.attributes).length === 0) {
+				delete snapshot.attributes
+			}
+
+			for (const child of node.children) {
+				const childSnapshot = captureNode(child, depth + 1)
+				if (childSnapshot) {
+					snapshot.children.push(childSnapshot)
+				}
+			}
+
+			if (snapshot.children.length === 0) {
+				delete snapshot.children
+
+				// Include text content for leaf nodes
+				const text = node.textContent?.trim()
+				if (text && text.length > 0 && text.length < 100) {
+					snapshot.text = text
+				}
+			}
+
+			return snapshot
+		}
+
+		return {
+			url: window.location.href,
+			title: document.title,
+			viewport: {
+				width: window.innerWidth,
+				height: window.innerHeight,
+			},
+			document: captureNode(document.documentElement, 0),
+		}
+	}
+
+	/**
+	 * Handle window errors
+	 */
+	function handleWindowError(event) {
+		chrome.runtime.sendMessage({
+			type: "console_message",
+			payload: {
+				level: "error",
+				message: event.message,
+				source: event.filename,
+				lineNumber: event.lineno,
+				columnNumber: event.colno,
+				stackTrace: event.error?.stack,
+			},
+		})
+	}
+
+	/**
+	 * Handle unhandled promise rejections
+	 */
+	function handleUnhandledRejection(event) {
+		chrome.runtime.sendMessage({
+			type: "console_message",
+			payload: {
+				level: "error",
+				message: `Unhandled Promise Rejection: ${event.reason}`,
+				stackTrace: event.reason?.stack,
+			},
+		})
+	}
+
+	// Initialize
+	init()
+})()

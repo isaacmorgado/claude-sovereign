@@ -1,0 +1,565 @@
+/**
+ * Music Alignment Service
+ * Handles beat detection and audio trimming for aligning music to video duration
+ */
+
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs').promises;
+const path = require('path');
+
+const execAsync = promisify(exec);
+
+// Default settings
+const DEFAULT_FADE_DURATION = 2.0; // seconds
+const MIN_FADE_DURATION = 0.5;
+const MAX_FADE_DURATION = 5.0;
+const BEAT_SEARCH_WINDOW = 3.0; // Search within +/- 3 seconds of target
+const MIN_AUDIO_DURATION = 5.0; // Minimum output duration
+
+/**
+ * Detect beats in an audio file using FFmpeg's aubio filter
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<number[]>} Array of beat timestamps in seconds
+ */
+async function detectBeats(audioPath) {
+  // Verify file exists
+  try {
+    await fs.access(audioPath);
+  } catch (_err) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
+
+  // Use FFmpeg with aubio beat detection
+  // Output format: time,beat_strength
+  const tempOutput = path.join(
+    process.env.TEMP_DIR || '/tmp/splice-music',
+    `beats_${Date.now()}.txt`
+  );
+
+  try {
+    // Ensure temp dir exists
+    await fs.mkdir(path.dirname(tempOutput), { recursive: true });
+
+    // Run FFmpeg with aubio filter to detect beats
+    // The aubio filter detects onset/beat positions
+    const ffmpegCmd = `ffmpeg -i "${audioPath}" -af "aubio=method=default:threshold=0.3,ametadata=print:file=${tempOutput}" -f null -`;
+
+    await execAsync(ffmpegCmd, { timeout: 120000 }); // 2 minute timeout
+
+    // Read and parse beat timestamps
+    const beatData = await fs.readFile(tempOutput, 'utf8');
+    const beats = parseBeatOutput(beatData);
+
+    return beats;
+  } catch (error) {
+    // If aubio fails, fall back to silence-based detection
+    console.warn('Aubio beat detection failed, using fallback method:', error.message);
+    return await detectBeatsWithFallback(audioPath);
+  } finally {
+    // Cleanup temp file
+    try {
+      await fs.unlink(tempOutput);
+    } catch (_e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Parse FFmpeg aubio metadata output
+ * @param {string} data - Raw output from ametadata filter
+ * @returns {number[]} Array of beat timestamps
+ */
+function parseBeatOutput(data) {
+  const beats = [];
+  const lines = data.split('\n');
+
+  for (const line of lines) {
+    // Look for timestamp lines from ametadata
+    // Format: frame:N    pts:N    pts_time:N.NNNNNN
+    // or lavfi.aubio.time=N.NNNNNN
+    const timeMatch = line.match(/lavfi\.aubio\.time=(\d+\.?\d*)/);
+    if (timeMatch) {
+      beats.push(parseFloat(timeMatch[1]));
+    }
+
+    // Alternative format: pts_time:N.NNNNNN
+    const ptsMatch = line.match(/pts_time:(\d+\.?\d*)/);
+    if (ptsMatch && !timeMatch) {
+      beats.push(parseFloat(ptsMatch[1]));
+    }
+  }
+
+  // Remove duplicates and sort
+  const uniqueBeats = [...new Set(beats)].sort((a, b) => a - b);
+
+  return uniqueBeats;
+}
+
+/**
+ * Fallback beat detection using onset detection via energy changes
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<number[]>} Array of beat timestamps
+ */
+async function detectBeatsWithFallback(audioPath) {
+  // Use energy-based onset detection as fallback
+  const tempOutput = path.join(
+    process.env.TEMP_DIR || '/tmp/splice-music',
+    `energy_${Date.now()}.txt`
+  );
+
+  try {
+    await fs.mkdir(path.dirname(tempOutput), { recursive: true });
+
+    // Detect silence gaps which often indicate beat boundaries
+    const ffmpegCmd = `ffmpeg -i "${audioPath}" -af "silencedetect=noise=-35dB:d=0.1,ametadata=print:file=${tempOutput}" -f null -`;
+
+    await execAsync(ffmpegCmd, { timeout: 120000 });
+
+    const data = await fs.readFile(tempOutput, 'utf8');
+    const beats = parseSilenceAsBeats(data);
+
+    // If no beats detected, generate synthetic beats at regular intervals
+    if (beats.length === 0) {
+      return await generateSyntheticBeats(audioPath);
+    }
+
+    return beats;
+  } catch (error) {
+    console.warn('Fallback detection failed, using synthetic beats:', error.message);
+    return await generateSyntheticBeats(audioPath);
+  } finally {
+    try {
+      await fs.unlink(tempOutput);
+    } catch (_e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Parse silence detection output as potential beat points
+ * @param {string} data - Raw output from silencedetect
+ * @returns {number[]} Array of beat timestamps
+ */
+function parseSilenceAsBeats(data) {
+  const beats = [];
+  const lines = data.split('\n');
+
+  for (const line of lines) {
+    // Look for silence_start markers (end of audio phrase = potential cut point)
+    const startMatch = line.match(/silence_start:\s*(\d+\.?\d*)/);
+    if (startMatch) {
+      beats.push(parseFloat(startMatch[1]));
+    }
+  }
+
+  return beats.sort((a, b) => a - b);
+}
+
+/**
+ * Generate synthetic beats at regular intervals based on tempo estimation
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<number[]>} Array of beat timestamps
+ */
+async function generateSyntheticBeats(audioPath) {
+  // Get audio duration
+  const duration = await getAudioDuration(audioPath);
+
+  // Assume 120 BPM as default (0.5 seconds per beat)
+  const beatsPerSecond = 2;
+  const beatInterval = 1 / beatsPerSecond;
+
+  const beats = [];
+  for (let t = 0; t < duration; t += beatInterval) {
+    beats.push(t);
+  }
+
+  return beats;
+}
+
+/**
+ * Get audio file duration using FFprobe
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<number>} Duration in seconds
+ */
+async function getAudioDuration(audioPath) {
+  const { stdout } = await execAsync(
+    `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+    { timeout: 30000 }
+  );
+
+  const duration = parseFloat(stdout.trim());
+  if (isNaN(duration)) {
+    throw new Error('Could not determine audio duration');
+  }
+
+  return duration;
+}
+
+/**
+ * Find the nearest beat to a target time
+ * @param {number[]} beats - Array of beat timestamps
+ * @param {number} targetTime - Target time in seconds
+ * @param {number} searchWindow - Search window in seconds (+/-)
+ * @returns {{beat: number, offset: number}|null} Nearest beat and offset from target
+ */
+function findNearestBeat(beats, targetTime, searchWindow = BEAT_SEARCH_WINDOW) {
+  if (!beats || beats.length === 0) {
+    return null;
+  }
+
+  let nearestBeat = null;
+  let minOffset = Infinity;
+
+  for (const beat of beats) {
+    const offset = Math.abs(beat - targetTime);
+
+    // Only consider beats within search window
+    if (offset <= searchWindow && offset < minOffset) {
+      minOffset = offset;
+      nearestBeat = beat;
+    }
+  }
+
+  if (nearestBeat === null) {
+    // No beat found in window, find overall nearest
+    for (const beat of beats) {
+      const offset = Math.abs(beat - targetTime);
+      if (offset < minOffset) {
+        minOffset = offset;
+        nearestBeat = beat;
+      }
+    }
+  }
+
+  return nearestBeat !== null ? { beat: nearestBeat, offset: minOffset } : null;
+}
+
+/**
+ * Find the best beat to cut at, preferring beats before target (avoid cutting mid-phrase)
+ * @param {number[]} beats - Array of beat timestamps
+ * @param {number} targetTime - Target duration in seconds
+ * @param {number} searchWindow - Search window in seconds
+ * @returns {{beat: number, offset: number, direction: string}}
+ */
+function findBestCutBeat(beats, targetTime, searchWindow = BEAT_SEARCH_WINDOW) {
+  // Return exact target if no beats available
+  if (!beats || beats.length === 0) {
+    return { beat: targetTime, offset: 0, direction: 'exact' };
+  }
+
+  // Filter beats within search window
+  const candidatesBefore = beats.filter(b => b <= targetTime && b >= targetTime - searchWindow);
+  const candidatesAfter = beats.filter(b => b > targetTime && b <= targetTime + searchWindow);
+
+  // Prefer beats before target (earlier is safer to avoid cutting content)
+  // But not too early - find the closest one before
+  let bestBeat = null;
+  let bestOffset = Infinity;
+  let direction = 'exact';
+
+  // Check beats before target (preferred)
+  for (const beat of candidatesBefore) {
+    const offset = targetTime - beat;
+    if (offset < bestOffset) {
+      bestOffset = offset;
+      bestBeat = beat;
+      direction = 'before';
+    }
+  }
+
+  // If no good beat before, check after
+  if (bestBeat === null || bestOffset > searchWindow * 0.5) {
+    for (const beat of candidatesAfter) {
+      const offset = beat - targetTime;
+      if (offset < bestOffset) {
+        bestOffset = offset;
+        bestBeat = beat;
+        direction = 'after';
+      }
+    }
+  }
+
+  // Fallback: just use target time if no beats found
+  if (bestBeat === null) {
+    return { beat: targetTime, offset: 0, direction: 'exact' };
+  }
+
+  return { beat: bestBeat, offset: bestOffset, direction };
+}
+
+/**
+ * Trim audio to target duration at nearest beat with fade out
+ * @param {string|Buffer} audioInput - Path to audio file or audio buffer
+ * @param {number} targetDuration - Target duration in seconds
+ * @param {Object} options - Trim options
+ * @param {number} options.fadeDuration - Fade out duration in seconds
+ * @param {boolean} options.beatAlign - Whether to align to beats (default: true)
+ * @param {number} options.searchWindow - Beat search window in seconds
+ * @returns {Promise<{buffer: Buffer, cutTime: number, wasAligned: boolean, beats: number[]}>}
+ */
+async function trimToLength(audioInput, targetDuration, options = {}) {
+  const {
+    fadeDuration = DEFAULT_FADE_DURATION,
+    beatAlign = true,
+    searchWindow = BEAT_SEARCH_WINDOW
+  } = options;
+
+  // Clamp fade duration
+  const clampedFade = Math.max(MIN_FADE_DURATION, Math.min(MAX_FADE_DURATION, fadeDuration));
+
+  // Handle buffer input - write to temp file
+  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+  await fs.mkdir(tempDir, { recursive: true });
+
+  let inputPath;
+  let inputIsTemp = false;
+
+  if (Buffer.isBuffer(audioInput)) {
+    inputPath = path.join(tempDir, `input_${Date.now()}.wav`);
+    await fs.writeFile(inputPath, audioInput);
+    inputIsTemp = true;
+  } else {
+    inputPath = audioInput;
+  }
+
+  const outputPath = path.join(tempDir, `trimmed_${Date.now()}.wav`);
+
+  try {
+    // Get original duration
+    const originalDuration = await getAudioDuration(inputPath);
+
+    // If target is longer than original, just return original with fade
+    if (targetDuration >= originalDuration) {
+      const buffer = await applyFadeOut(inputPath, originalDuration, clampedFade, outputPath);
+      return {
+        buffer,
+        cutTime: originalDuration,
+        wasAligned: false,
+        beats: []
+      };
+    }
+
+    // Detect beats if alignment requested
+    let beats = [];
+    let cutTime = targetDuration;
+    let wasAligned = false;
+
+    if (beatAlign) {
+      beats = await detectBeats(inputPath);
+
+      if (beats.length > 0) {
+        const cutResult = findBestCutBeat(beats, targetDuration, searchWindow);
+        if (cutResult) {
+          cutTime = cutResult.beat;
+          wasAligned = cutResult.direction !== 'exact';
+        }
+      }
+    }
+
+    // Ensure minimum duration
+    cutTime = Math.max(MIN_AUDIO_DURATION, cutTime);
+
+    // Calculate fade start time (fade ends at cut time)
+    const fadeStart = Math.max(0, cutTime - clampedFade);
+
+    // Trim and fade using FFmpeg
+    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -af "afade=t=out:st=${fadeStart}:d=${clampedFade}" -t ${cutTime} -c:a pcm_s16le "${outputPath}"`;
+
+    await execAsync(ffmpegCmd, { timeout: 60000 });
+
+    // Read output buffer
+    const buffer = await fs.readFile(outputPath);
+
+    return {
+      buffer,
+      cutTime,
+      wasAligned,
+      beats: beats.filter(b => b <= cutTime) // Only beats before cut
+    };
+  } finally {
+    // Cleanup temp files
+    try {
+      if (inputIsTemp) {
+        await fs.unlink(inputPath);
+      }
+      await fs.unlink(outputPath);
+    } catch (_e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Apply fade out to audio file
+ * @param {string} inputPath - Input audio path
+ * @param {number} duration - Total duration
+ * @param {number} fadeDuration - Fade duration
+ * @param {string} outputPath - Output path
+ * @returns {Promise<Buffer>} Output buffer
+ */
+async function applyFadeOut(inputPath, duration, fadeDuration, outputPath) {
+  const fadeStart = Math.max(0, duration - fadeDuration);
+
+  const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -af "afade=t=out:st=${fadeStart}:d=${fadeDuration}" -c:a pcm_s16le "${outputPath}"`;
+
+  await execAsync(ffmpegCmd, { timeout: 60000 });
+
+  return await fs.readFile(outputPath);
+}
+
+/**
+ * Analyze audio for beat information without trimming
+ * @param {string|Buffer} audioInput - Path to audio file or buffer
+ * @returns {Promise<{duration: number, beats: number[], bpm: number|null}>}
+ */
+async function analyzeBeats(audioInput) {
+  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+  await fs.mkdir(tempDir, { recursive: true });
+
+  let inputPath;
+  let inputIsTemp = false;
+
+  if (Buffer.isBuffer(audioInput)) {
+    inputPath = path.join(tempDir, `analyze_${Date.now()}.wav`);
+    await fs.writeFile(inputPath, audioInput);
+    inputIsTemp = true;
+  } else {
+    inputPath = audioInput;
+  }
+
+  try {
+    const duration = await getAudioDuration(inputPath);
+    const beats = await detectBeats(inputPath);
+
+    // Estimate BPM from beat intervals
+    let bpm = null;
+    if (beats.length >= 2) {
+      const intervals = [];
+      for (let i = 1; i < beats.length; i++) {
+        intervals.push(beats[i] - beats[i - 1]);
+      }
+      const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      bpm = Math.round(60 / avgInterval);
+
+      // Clamp to reasonable BPM range
+      if (bpm < 40 || bpm > 220) {
+        bpm = null; // Outside normal range, likely inaccurate
+      }
+    }
+
+    return {
+      duration,
+      beats,
+      beatCount: beats.length,
+      bpm
+    };
+  } finally {
+    if (inputIsTemp) {
+      try {
+        await fs.unlink(inputPath);
+      } catch (_e) {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
+
+/**
+ * Generate a smooth crossfade between two audio segments
+ * @param {Buffer} audioA - First audio buffer
+ * @param {Buffer} audioB - Second audio buffer
+ * @param {number} crossfadeDuration - Crossfade duration in seconds
+ * @returns {Promise<Buffer>} Combined audio with crossfade
+ */
+async function crossfade(audioA, audioB, crossfadeDuration = 2.0) {
+  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+  await fs.mkdir(tempDir, { recursive: true });
+
+  const tempA = path.join(tempDir, `xfade_a_${Date.now()}.wav`);
+  const tempB = path.join(tempDir, `xfade_b_${Date.now()}.wav`);
+  const outputPath = path.join(tempDir, `xfade_out_${Date.now()}.wav`);
+
+  try {
+    await fs.writeFile(tempA, audioA);
+    await fs.writeFile(tempB, audioB);
+
+    // durationA could be used for proportional crossfade calculation
+
+    // Use acrossfade filter for smooth transition
+    const ffmpegCmd = `ffmpeg -y -i "${tempA}" -i "${tempB}" -filter_complex "acrossfade=d=${crossfadeDuration}:c1=tri:c2=tri" -c:a pcm_s16le "${outputPath}"`;
+
+    await execAsync(ffmpegCmd, { timeout: 120000 });
+
+    return await fs.readFile(outputPath);
+  } finally {
+    try {
+      await fs.unlink(tempA);
+      await fs.unlink(tempB);
+      await fs.unlink(outputPath);
+    } catch (_e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Validate alignment options
+ * @param {Object} options - Alignment options
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+function validateAlignmentOptions(options) {
+  const errors = [];
+
+  if (options.targetDuration !== undefined) {
+    if (typeof options.targetDuration !== 'number') {
+      errors.push('targetDuration must be a number');
+    } else if (options.targetDuration < MIN_AUDIO_DURATION) {
+      errors.push(`targetDuration must be at least ${MIN_AUDIO_DURATION} seconds`);
+    }
+  }
+
+  if (options.fadeDuration !== undefined) {
+    if (typeof options.fadeDuration !== 'number') {
+      errors.push('fadeDuration must be a number');
+    } else if (options.fadeDuration < MIN_FADE_DURATION || options.fadeDuration > MAX_FADE_DURATION) {
+      errors.push(`fadeDuration must be between ${MIN_FADE_DURATION} and ${MAX_FADE_DURATION} seconds`);
+    }
+  }
+
+  if (options.searchWindow !== undefined) {
+    if (typeof options.searchWindow !== 'number') {
+      errors.push('searchWindow must be a number');
+    } else if (options.searchWindow < 0.5 || options.searchWindow > 10) {
+      errors.push('searchWindow must be between 0.5 and 10 seconds');
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+module.exports = {
+  detectBeats,
+  parseBeatOutput,
+  detectBeatsWithFallback,
+  parseSilenceAsBeats,
+  generateSyntheticBeats,
+  getAudioDuration,
+  findNearestBeat,
+  findBestCutBeat,
+  trimToLength,
+  applyFadeOut,
+  analyzeBeats,
+  crossfade,
+  validateAlignmentOptions,
+  DEFAULT_FADE_DURATION,
+  MIN_FADE_DURATION,
+  MAX_FADE_DURATION,
+  BEAT_SEARCH_WINDOW,
+  MIN_AUDIO_DURATION
+};

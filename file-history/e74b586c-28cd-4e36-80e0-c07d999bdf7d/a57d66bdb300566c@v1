@@ -1,0 +1,363 @@
+// Web Snatcher - Background Service Worker
+// Handles downloads, file creation, and asset fetching
+
+console.log('Web Snatcher background script loaded');
+
+// ============================================
+// MESSAGE HANDLERS
+// ============================================
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'downloadCapture') {
+    handleCapture(message.data)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true; // Keep channel open for async response
+  }
+});
+
+// ============================================
+// CAPTURE HANDLERS
+// ============================================
+
+async function handleCapture(data) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const hostname = extractHostname(data.metadata.url);
+  const folderName = `${hostname}_${timestamp}`;
+
+  let fileCount = 0;
+
+  if (data.type === 'element') {
+    fileCount = await handleElementCapture(data, folderName);
+  } else {
+    fileCount = await handleFullPageCapture(data, folderName);
+  }
+
+  return { success: true, fileCount };
+}
+
+async function handleElementCapture(data, folderName) {
+  let fileCount = 0;
+
+  // Create main HTML file with metadata
+  const htmlContent = buildElementHtml(data);
+  await downloadFile(
+    createDataUrl(htmlContent, 'text/html'),
+    `${folderName}/element.html`
+  );
+  fileCount++;
+
+  // Create metadata JSON
+  const metaContent = JSON.stringify({
+    ...data.metadata,
+    jsInfo: data.jsInfo,
+    assets: data.assets
+  }, null, 2);
+  await downloadFile(
+    createDataUrl(metaContent, 'application/json'),
+    `${folderName}/metadata.json`
+  );
+  fileCount++;
+
+  // Create JavaScript info file if present
+  if (data.jsInfo) {
+    const jsContent = buildJsInfoFile(data.jsInfo);
+    await downloadFile(
+      createDataUrl(jsContent, 'text/plain'),
+      `${folderName}/javascript-info.txt`
+    );
+    fileCount++;
+  }
+
+  // Download assets if requested
+  if (data.assets) {
+    const assetCount = await downloadAssets(data.assets, folderName);
+    fileCount += assetCount;
+  }
+
+  return fileCount;
+}
+
+async function handleFullPageCapture(data, folderName) {
+  let fileCount = 0;
+
+  // Create main HTML file
+  await downloadFile(
+    createDataUrl(data.html, 'text/html'),
+    `${folderName}/index.html`
+  );
+  fileCount++;
+
+  // Create metadata JSON
+  const metaContent = JSON.stringify(data.metadata, null, 2);
+  await downloadFile(
+    createDataUrl(metaContent, 'application/json'),
+    `${folderName}/metadata.json`
+  );
+  fileCount++;
+
+  // Save stylesheets
+  if (data.stylesheets && data.stylesheets.length > 0) {
+    for (let i = 0; i < data.stylesheets.length; i++) {
+      const sheet = data.stylesheets[i];
+      if (sheet.content) {
+        await downloadFile(
+          createDataUrl(sheet.content, 'text/css'),
+          `${folderName}/styles/style-${i + 1}.css`
+        );
+        fileCount++;
+      }
+    }
+  }
+
+  // Save scripts
+  if (data.scripts && data.scripts.length > 0) {
+    let scriptIndex = 1;
+    for (const script of data.scripts) {
+      if (script.content && script.content.trim()) {
+        await downloadFile(
+          createDataUrl(script.content, 'application/javascript'),
+          `${folderName}/scripts/script-${scriptIndex}.js`
+        );
+        fileCount++;
+        scriptIndex++;
+      }
+    }
+
+    // Create script manifest
+    const scriptManifest = data.scripts.map((s, i) => ({
+      index: i + 1,
+      type: s.type,
+      src: s.src,
+      hasContent: !!(s.content && s.content.trim())
+    }));
+    await downloadFile(
+      createDataUrl(JSON.stringify(scriptManifest, null, 2), 'application/json'),
+      `${folderName}/scripts/manifest.json`
+    );
+    fileCount++;
+  }
+
+  // Download assets if requested
+  if (data.assets) {
+    const assetCount = await downloadAssets(data.assets, folderName);
+    fileCount += assetCount;
+  }
+
+  return fileCount;
+}
+
+// ============================================
+// HTML BUILDERS
+// ============================================
+
+function buildElementHtml(data) {
+  const { html, metadata, jsInfo, assets } = data;
+
+  let comment = `<!--
+  Web Snatcher Element Capture
+  ============================
+  Source URL: ${metadata.url}
+  Page Title: ${metadata.title}
+  Selector: ${metadata.selector}
+  Captured: ${metadata.capturedAt}
+  Dimensions: ${metadata.dimensions.width}x${metadata.dimensions.height}px
+`;
+
+  if (assets) {
+    if (assets.fonts && assets.fonts.length > 0) {
+      comment += `\n  Fonts Used: ${assets.fonts.join(', ')}`;
+    }
+    if (assets.images && assets.images.length > 0) {
+      comment += `\n  Images: ${assets.images.length} found`;
+    }
+  }
+
+  if (jsInfo && jsInfo.events) {
+    const events = jsInfo.events.listeners || [];
+    if (events.length > 0) {
+      comment += `\n  Event Handlers: ${events.map(e => e.type).join(', ')}`;
+    }
+  }
+
+  comment += '\n-->\n\n';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Captured Element - ${metadata.title}</title>
+  <style>
+    /* Reset and container styles */
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
+    }
+    .capture-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+${comment}
+<div class="capture-container">
+${html}
+</div>
+</body>
+</html>`;
+}
+
+function buildJsInfoFile(jsInfo) {
+  let content = 'JavaScript Information\n';
+  content += '======================\n\n';
+
+  // Event listeners
+  if (jsInfo.events && jsInfo.events.listeners && jsInfo.events.listeners.length > 0) {
+    content += 'Inline Event Handlers:\n';
+    content += '----------------------\n';
+    for (const listener of jsInfo.events.listeners) {
+      content += `\n${listener.type}:\n`;
+      content += `  ${listener.handler}\n`;
+    }
+    content += '\n';
+  }
+
+  // Data attributes
+  if (jsInfo.events && jsInfo.events.dataAttrs && jsInfo.events.dataAttrs.length > 0) {
+    content += 'Data Attributes:\n';
+    content += '----------------\n';
+    for (const attr of jsInfo.events.dataAttrs) {
+      content += `${attr.name}: ${attr.value}\n`;
+    }
+    content += '\n';
+  }
+
+  // Related scripts
+  if (jsInfo.scripts && jsInfo.scripts.length > 0) {
+    content += 'Related Scripts:\n';
+    content += '----------------\n';
+    for (const script of jsInfo.scripts) {
+      if (script.type === 'external') {
+        content += `\n[External] ${script.src}\n`;
+      } else {
+        content += `\n[Inline - ${script.reason}]\n`;
+        content += `${script.content}\n`;
+      }
+    }
+  }
+
+  return content;
+}
+
+// ============================================
+// ASSET DOWNLOADING
+// ============================================
+
+async function downloadAssets(assets, folderName) {
+  let count = 0;
+
+  // Download images
+  if (assets.images && assets.images.length > 0) {
+    const uniqueImages = [...new Set(assets.images)];
+    for (let i = 0; i < Math.min(uniqueImages.length, 50); i++) { // Limit to 50 images
+      const url = uniqueImages[i];
+      try {
+        const filename = getFilenameFromUrl(url) || `image-${i + 1}.png`;
+        await chrome.downloads.download({
+          url: url,
+          filename: `${folderName}/assets/images/${filename}`,
+          saveAs: false,
+          conflictAction: 'uniquify'
+        });
+        count++;
+      } catch (e) {
+        console.warn('Failed to download image:', url, e);
+      }
+    }
+  }
+
+  // Note: Stylesheets are already captured in the HTML
+  // External stylesheets could be downloaded here if needed
+
+  return count;
+}
+
+// ============================================
+// UTILITIES
+// ============================================
+
+function createDataUrl(content, mimeType) {
+  const encoded = btoa(unescape(encodeURIComponent(content)));
+  return `data:${mimeType};base64,${encoded}`;
+}
+
+function downloadFile(dataUrl, filename) {
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download({
+      url: dataUrl,
+      filename: filename,
+      saveAs: false,
+      conflictAction: 'uniquify'
+    }, (downloadId) => {
+      if (chrome.runtime.lastError) {
+        console.error('Download error:', chrome.runtime.lastError);
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(downloadId);
+      }
+    });
+  });
+}
+
+function extractHostname(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname.replace(/\./g, '_');
+  } catch {
+    return 'unknown';
+  }
+}
+
+function getFilenameFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname;
+    const parts = pathname.split('/');
+    const last = parts[parts.length - 1];
+    if (last && last.includes('.')) {
+      // Clean the filename
+      return last.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================
+// EXTENSION LIFECYCLE
+// ============================================
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    console.log('Web Snatcher installed');
+    // Set default settings
+    chrome.storage.local.set({
+      mode: 'element',
+      includeJs: true,
+      inlineStyles: true,
+      downloadAssets: true
+    });
+  }
+});

@@ -1,0 +1,166 @@
+     1→/**
+     2→ * Export Routes
+     3→ *
+     4→ * Caption export endpoints (SRT, VTT, TXT, JSON)
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const fsPromises = require('fs').promises;
+     9→const fs = require('fs');
+    10→const { transcribeWithWords } = require('../services/transcription');
+    11→const {
+    12→  toSRT,
+    13→  toVTT,
+    14→  toPlainText,
+    15→  toJSON,
+    16→  exportToFile,
+    17→  getSupportedFormats
+    18→} = require('../services/captionExporter');
+    19→
+    20→// Async file existence check (non-blocking)
+    21→async function fileExists(filePath) {
+    22→  try {
+    23→    await fsPromises.access(filePath, fs.constants.R_OK);
+    24→    return true;
+    25→  } catch {
+    26→    return false;
+    27→  }
+    28→}
+    29→
+    30→/**
+    31→ * Create export routes
+    32→ * @param {Object} options - Route configuration options
+    33→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    34→ * @param {Object} options.staticCache - Static response cache
+    35→ * @returns {express.Router}
+    36→ */
+    37→function createExportRoutes(options = {}) {
+    38→  const router = express.Router();
+    39→  const { requireCredits } = options.middleware || {};
+    40→  const { staticCache, sendCachedResponse } = options;
+    41→
+    42→  /**
+    43→   * POST /captions - Export transcript to caption format (SRT, VTT, etc.)
+    44→   *
+    45→   * Converts a transcript to the specified caption format.
+    46→   * Can optionally save to file.
+    47→   *
+    48→   * Options:
+    49→   * - wavPath: Path to audio file (to transcribe first)
+    50→   * - transcript: Pre-existing transcript with word-level timing
+    51→   * - format: Export format (srt, vtt, txt, json) - default: srt
+    52→   * - outputPath: Optional file path to save to
+    53→   * - maxWordsPerCaption: Max words per caption (default: 8)
+    54→   * - maxDuration: Max duration per caption in seconds (default: 5)
+    55→   */
+    56→  router.post('/captions', requireCredits({ endpoint: 'export-captions' }), async (req, res) => {
+    57→    const {
+    58→      wavPath,
+    59→      transcript: providedTranscript,
+    60→      format = 'srt',
+    61→      outputPath = null,
+    62→      maxWordsPerCaption = 8,
+    63→      maxDuration = 5
+    64→    } = req.body;
+    65→
+    66→    if (!wavPath && !providedTranscript) {
+    67→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+    68→    }
+    69→
+    70→    if (wavPath && !(await fileExists(wavPath))) {
+    71→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+    72→    }
+    73→
+    74→    console.log(`[SPLICE] Caption export: ${wavPath || 'provided transcript'} -> ${format}`);
+    75→
+    76→    try {
+    77→      // Get or create transcript with word-level timestamps
+    78→      let transcript = providedTranscript;
+    79→      if (!transcript && wavPath) {
+    80→        transcript = await transcribeWithWords(wavPath);
+    81→      }
+    82→
+    83→      const exportOptions = { maxWordsPerCaption, maxDuration };
+    84→
+    85→      // Generate caption content based on format
+    86→      let content;
+    87→      let mimeType;
+    88→
+    89→      switch (format.toLowerCase()) {
+    90→        case 'srt':
+    91→          content = toSRT(transcript, exportOptions);
+    92→          mimeType = 'application/x-subrip';
+    93→          break;
+    94→        case 'vtt':
+    95→        case 'webvtt':
+    96→          content = toVTT(transcript, exportOptions);
+    97→          mimeType = 'text/vtt';
+    98→          break;
+    99→        case 'txt':
+   100→        case 'text':
+   101→          content = toPlainText(transcript, { ...exportOptions, includeTimestamps: true });
+   102→          mimeType = 'text/plain';
+   103→          break;
+   104→        case 'json':
+   105→          content = toJSON(transcript);
+   106→          mimeType = 'application/json';
+   107→          break;
+   108→        default:
+   109→          return res.status(400).json({
+   110→            error: `Unsupported format: ${format}`,
+   111→            supportedFormats: getSupportedFormats()
+   112→          });
+   113→      }
+   114→
+   115→      // Save to file if outputPath provided
+   116→      let savedPath = null;
+   117→      if (outputPath) {
+   118→        const result = await exportToFile(transcript, outputPath, format, exportOptions);
+   119→        savedPath = result.path;
+   120→        console.log(`[SPLICE] Saved captions to: ${savedPath}`);
+   121→      }
+   122→
+   123→      // Deduct usage based on audio duration
+   124→      const audioDuration = transcript.duration || 0;
+   125→      let balance = null;
+   126→      if (audioDuration > 0 && req.deductUsage) {
+   127→        balance = await req.deductUsage(audioDuration);
+   128→      }
+   129→
+   130→      res.json({
+   131→        success: true,
+   132→        format,
+   133→        content,
+   134→        mimeType,
+   135→        savedPath,
+   136→        wordCount: transcript.words?.length || 0,
+   137→        duration: transcript.duration || 0,
+   138→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   139→      });
+   140→    } catch (err) {
+   141→      console.error('[SPLICE] Caption export error:', err);
+   142→      res.status(500).json({ error: err.message });
+   143→    }
+   144→  });
+   145→
+   146→  /**
+   147→   * GET /formats - Get supported export formats
+   148→   * PERF-FIX: Uses cached response with ETag for conditional GET
+   149→   */
+   150→  router.get('/formats', (req, res) => {
+   151→    if (sendCachedResponse && staticCache?.exportFormats) {
+   152→      return sendCachedResponse(req, res, 'exportFormats');
+   153→    }
+   154→    const formats = getSupportedFormats();
+   155→    res.json({ success: true, formats });
+   156→  });
+   157→
+   158→  return router;
+   159→}
+   160→
+   161→module.exports = createExportRoutes;
+   162→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

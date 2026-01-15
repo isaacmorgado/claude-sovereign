@@ -1,0 +1,300 @@
+"""
+Privacy Overlay Module
+
+Prevents screen capture of sensitive windows using Windows Display Affinity API.
+Protects PII/passwords from accidental recording or unauthorized capture.
+"""
+
+import ctypes
+from ctypes import wintypes
+from enum import IntEnum
+from typing import Optional, Union
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class WindowDisplayAffinity(IntEnum):
+    """Windows Display Affinity flags."""
+    WDA_NONE = 0x00000000
+    WDA_MONITOR = 0x00000001  # Legacy - content only on monitor
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011  # Win10 2004+ - exclude from capture
+
+
+class PrivacyOverlayError(Exception):
+    """Raised when privacy overlay operations fail."""
+    pass
+
+
+def _get_last_error_message() -> str:
+    """Get formatted Windows error message."""
+    error_code = ctypes.get_last_error()
+    if error_code == 0:
+        return "No error"
+
+    FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
+    FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
+
+    buffer = ctypes.create_unicode_buffer(256)
+    ctypes.windll.kernel32.FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        None,
+        error_code,
+        0,
+        buffer,
+        len(buffer),
+        None
+    )
+    return f"Error {error_code}: {buffer.value.strip()}"
+
+
+def set_window_uncapturable(window_handle: Union[int, wintypes.HWND]) -> bool:
+    """
+    Set a window to be excluded from screen capture.
+
+    Uses SetWindowDisplayAffinity with WDA_EXCLUDEFROMCAPTURE flag.
+    Requires Windows 10 version 2004 (build 19041) or later.
+
+    Args:
+        window_handle: Native window handle (HWND)
+
+    Returns:
+        True if successful, False otherwise
+
+    Raises:
+        PrivacyOverlayError: If the operation fails critically
+    """
+    try:
+        user32 = ctypes.windll.user32
+
+        hwnd = wintypes.HWND(window_handle)
+
+        # Validate window handle
+        if not user32.IsWindow(hwnd):
+            logger.error(f"Invalid window handle: {window_handle}")
+            return False
+
+        # Set display affinity to exclude from capture
+        result = user32.SetWindowDisplayAffinity(
+            hwnd,
+            WindowDisplayAffinity.WDA_EXCLUDEFROMCAPTURE
+        )
+
+        if result:
+            logger.info(f"Window {window_handle} set to uncapturable")
+            return True
+        else:
+            error_msg = _get_last_error_message()
+            logger.warning(f"Failed to set display affinity: {error_msg}")
+            return False
+
+    except OSError as e:
+        raise PrivacyOverlayError(f"OS error setting display affinity: {e}")
+    except Exception as e:
+        raise PrivacyOverlayError(f"Unexpected error: {e}")
+
+
+def set_window_capturable(window_handle: Union[int, wintypes.HWND]) -> bool:
+    """
+    Remove capture protection from a window.
+
+    Args:
+        window_handle: Native window handle (HWND)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = wintypes.HWND(window_handle)
+
+        if not user32.IsWindow(hwnd):
+            return False
+
+        result = user32.SetWindowDisplayAffinity(
+            hwnd,
+            WindowDisplayAffinity.WDA_NONE
+        )
+
+        if result:
+            logger.info(f"Window {window_handle} capture protection removed")
+
+        return bool(result)
+
+    except Exception as e:
+        logger.error(f"Error removing capture protection: {e}")
+        return False
+
+
+def get_window_display_affinity(window_handle: Union[int, wintypes.HWND]) -> Optional[int]:
+    """
+    Get current display affinity setting for a window.
+
+    Args:
+        window_handle: Native window handle (HWND)
+
+    Returns:
+        Current affinity value, or None if query failed
+    """
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = wintypes.HWND(window_handle)
+        affinity = wintypes.DWORD()
+
+        result = user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity))
+
+        if result:
+            return affinity.value
+        return None
+
+    except Exception as e:
+        logger.error(f"Error getting display affinity: {e}")
+        return None
+
+
+def is_window_uncapturable(window_handle: Union[int, wintypes.HWND]) -> bool:
+    """Check if window is currently protected from capture."""
+    affinity = get_window_display_affinity(window_handle)
+    if affinity is None:
+        return False
+    return affinity == WindowDisplayAffinity.WDA_EXCLUDEFROMCAPTURE
+
+
+# Tkinter integration
+class SecureWindow:
+    """
+    Tkinter window wrapper with automatic capture protection.
+
+    Usage:
+        root = tk.Tk()
+        secure = SecureWindow(root)
+        secure.enable_protection()
+    """
+
+    def __init__(self, tk_window):
+        """
+        Initialize secure window wrapper.
+
+        Args:
+            tk_window: Tkinter Tk or Toplevel instance
+        """
+        self.tk_window = tk_window
+        self._hwnd: Optional[int] = None
+        self._protected = False
+
+    def _get_hwnd(self) -> int:
+        """Get Windows handle from Tkinter window."""
+        if self._hwnd is None:
+            # Ensure window is created
+            self.tk_window.update_idletasks()
+            self._hwnd = self.tk_window.winfo_id()
+        return self._hwnd
+
+    def enable_protection(self) -> bool:
+        """Enable screen capture protection."""
+        hwnd = self._get_hwnd()
+        success = set_window_uncapturable(hwnd)
+        self._protected = success
+        return success
+
+    def disable_protection(self) -> bool:
+        """Disable screen capture protection."""
+        hwnd = self._get_hwnd()
+        success = set_window_capturable(hwnd)
+        if success:
+            self._protected = False
+        return success
+
+    @property
+    def is_protected(self) -> bool:
+        """Check current protection status."""
+        return is_window_uncapturable(self._get_hwnd())
+
+
+def create_secure_entry_dialog(
+    title: str = "Secure Input",
+    prompt: str = "Enter sensitive data:",
+    show: str = "*"
+) -> Optional[str]:
+    """
+    Create a capture-protected input dialog.
+
+    Args:
+        title: Dialog window title
+        prompt: Label text for the input
+        show: Character to display instead of input (use "*" for passwords)
+
+    Returns:
+        User input string, or None if cancelled
+    """
+    import tkinter as tk
+
+    result = None
+
+    dialog = tk.Tk()
+    dialog.title(title)
+    dialog.geometry("300x120")
+    dialog.resizable(False, False)
+
+    # Center the window
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() - 300) // 2
+    y = (dialog.winfo_screenheight() - 120) // 2
+    dialog.geometry(f"+{x}+{y}")
+
+    # Apply capture protection
+    secure = SecureWindow(dialog)
+    dialog.after(100, secure.enable_protection)
+
+    # UI elements
+    tk.Label(dialog, text=prompt).pack(pady=(15, 5))
+
+    entry = tk.Entry(dialog, show=show, width=35)
+    entry.pack(pady=5)
+    entry.focus_set()
+
+    def on_submit():
+        nonlocal result
+        result = entry.get()
+        dialog.destroy()
+
+    def on_cancel():
+        dialog.destroy()
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=10)
+
+    tk.Button(btn_frame, text="OK", width=10, command=on_submit).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Cancel", width=10, command=on_cancel).pack(side=tk.LEFT, padx=5)
+
+    dialog.bind("<Return>", lambda e: on_submit())
+    dialog.bind("<Escape>", lambda e: on_cancel())
+
+    dialog.mainloop()
+
+    return result
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(level=logging.INFO)
+
+    if sys.platform != "win32":
+        print("This module requires Windows 10 version 2004 or later")
+        sys.exit(1)
+
+    # Demo: Secure password entry
+    print("Opening secure input dialog...")
+    print("(Window content will appear black in screen recordings)")
+
+    password = create_secure_entry_dialog(
+        title="Secure Login",
+        prompt="Enter your password:",
+        show="*"
+    )
+
+    if password:
+        print(f"Received input: {'*' * len(password)} ({len(password)} chars)")
+    else:
+        print("Input cancelled")

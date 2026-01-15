@@ -1,0 +1,302 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { api } from "@/lib/api";
+
+function CheckIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function XIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function LoaderIcon({ className }: { className?: string }) {
+  return (
+    <svg className={`${className} animate-spin`} viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path
+        className="opacity-75"
+        fill="currentColor"
+        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+      />
+    </svg>
+  );
+}
+
+export default function SignupPage() {
+  const router = useRouter();
+  const [formData, setFormData] = useState({
+    email: "",
+    password: "",
+    confirmPassword: "",
+    username: "",
+    termsAccepted: false,
+  });
+  const [usernameStatus, setUsernameStatus] = useState<{
+    checking: boolean;
+    available: boolean | null;
+    reason: string | null;
+  }>({ checking: false, available: null, reason: null });
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Debounced username check
+  const checkUsernameAvailability = useCallback(async (username: string) => {
+    if (username.length < 3) {
+      setUsernameStatus({ checking: false, available: false, reason: "Too short" });
+      return;
+    }
+
+    setUsernameStatus({ checking: true, available: null, reason: null });
+
+    try {
+      const result = await api.checkUsername(username);
+      setUsernameStatus({
+        checking: false,
+        available: result.available,
+        reason: result.reason,
+      });
+    } catch {
+      setUsernameStatus({ checking: false, available: null, reason: "Check failed" });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (formData.username.length >= 3) {
+      const timer = setTimeout(() => {
+        checkUsernameAvailability(formData.username);
+      }, 500);
+      return () => clearTimeout(timer);
+    } else if (formData.username.length > 0) {
+      setUsernameStatus({ checking: false, available: false, reason: "Too short" });
+    } else {
+      setUsernameStatus({ checking: false, available: null, reason: null });
+    }
+  }, [formData.username, checkUsernameAvailability]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+
+    // Validation
+    if (!formData.username || usernameStatus.available !== true) {
+      setError("Please choose a valid, available username");
+      return;
+    }
+
+    if (formData.password.length < 8) {
+      setError("Password must be at least 8 characters");
+      return;
+    }
+
+    if (formData.password !== formData.confirmPassword) {
+      setError("Passwords do not match");
+      return;
+    }
+
+    if (!formData.termsAccepted) {
+      setError("You must accept the Terms & Conditions");
+      return;
+    }
+
+    setIsLoading(true);
+
+    try {
+      const response = await api.register({
+        email: formData.email,
+        password: formData.password,
+        username: formData.username,
+        termsAccepted: formData.termsAccepted,
+      });
+
+      // Store token and redirect
+      localStorage.setItem("auth_token", response.access_token);
+      api.setToken(response.access_token);
+      router.push("/gender");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Registration failed");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const isFormValid =
+    formData.email &&
+    formData.password.length >= 8 &&
+    formData.password === formData.confirmPassword &&
+    usernameStatus.available === true &&
+    formData.termsAccepted;
+
+  return (
+    <div className="min-h-screen bg-black flex items-center justify-center p-4">
+      <div className="w-full max-w-sm">
+        {/* Logo and Header */}
+        <div className="mb-10">
+          <div className="flex justify-center mb-6">
+            <div className="h-8 w-8 rounded bg-[#00f3ff]/20 flex items-center justify-center">
+              <span className="text-[#00f3ff] text-sm font-bold">L</span>
+            </div>
+          </div>
+          <h1 className="text-2xl font-semibold tracking-tight text-center text-white mb-2">
+            Create Account
+          </h1>
+          <p className="text-sm text-neutral-400 text-center">
+            Join LOOKSMAXX and start your analysis
+          </p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Email */}
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1.5">Email</label>
+            <input
+              type="email"
+              value={formData.email}
+              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+              className="w-full h-11 px-3.5 text-sm bg-black border border-neutral-700 rounded-lg text-white focus:outline-none focus:border-[#00f3ff] transition-all"
+              required
+            />
+          </div>
+
+          {/* Username */}
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1.5">
+              Username <span className="text-neutral-600">(shown on leaderboard)</span>
+            </label>
+            <div className="relative">
+              <input
+                type="text"
+                value={formData.username}
+                onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+                placeholder="Choose a unique username"
+                className={`w-full h-11 px-3.5 pr-10 text-sm bg-black border rounded-lg text-white focus:outline-none transition-all ${
+                  usernameStatus.available === true
+                    ? "border-green-500"
+                    : usernameStatus.available === false
+                    ? "border-red-500"
+                    : "border-neutral-700 focus:border-[#00f3ff]"
+                }`}
+                required
+              />
+              <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                {usernameStatus.checking ? (
+                  <LoaderIcon className="w-4 h-4 text-neutral-500" />
+                ) : usernameStatus.available === true ? (
+                  <CheckIcon className="w-4 h-4 text-green-500" />
+                ) : usernameStatus.available === false ? (
+                  <XIcon className="w-4 h-4 text-red-500" />
+                ) : null}
+              </div>
+            </div>
+            {usernameStatus.reason && (
+              <p
+                className={`text-xs mt-1 ${
+                  usernameStatus.available ? "text-green-400" : "text-red-400"
+                }`}
+              >
+                {usernameStatus.reason}
+              </p>
+            )}
+            <p className="text-xs text-neutral-600 mt-1">
+              3-30 characters, letters, numbers, and underscores only
+            </p>
+          </div>
+
+          {/* Password */}
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1.5">Password</label>
+            <input
+              type="password"
+              value={formData.password}
+              onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+              className="w-full h-11 px-3.5 text-sm bg-black border border-neutral-700 rounded-lg text-white focus:outline-none focus:border-[#00f3ff] transition-all"
+              required
+              minLength={8}
+            />
+            {formData.password && formData.password.length < 8 && (
+              <p className="text-xs text-neutral-500 mt-1">Minimum 8 characters</p>
+            )}
+          </div>
+
+          {/* Confirm Password */}
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1.5">Confirm Password</label>
+            <input
+              type="password"
+              value={formData.confirmPassword}
+              onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
+              className={`w-full h-11 px-3.5 text-sm bg-black border rounded-lg text-white focus:outline-none transition-all ${
+                formData.confirmPassword && formData.password !== formData.confirmPassword
+                  ? "border-red-500"
+                  : "border-neutral-700 focus:border-[#00f3ff]"
+              }`}
+              required
+            />
+            {formData.confirmPassword && formData.password !== formData.confirmPassword && (
+              <p className="text-xs text-red-400 mt-1">Passwords do not match</p>
+            )}
+          </div>
+
+          {/* Terms & Conditions Checkbox */}
+          <div className="flex items-start gap-3 pt-2">
+            <input
+              type="checkbox"
+              id="terms"
+              checked={formData.termsAccepted}
+              onChange={(e) => setFormData({ ...formData, termsAccepted: e.target.checked })}
+              className="mt-0.5 w-4 h-4 rounded border-neutral-600 bg-black text-[#00f3ff] focus:ring-[#00f3ff] focus:ring-offset-black cursor-pointer"
+            />
+            <label htmlFor="terms" className="text-sm text-neutral-400 cursor-pointer">
+              I have read and agree to the{" "}
+              <Link
+                href="/terms"
+                target="_blank"
+                className="text-[#00f3ff] hover:underline"
+              >
+                Terms & Conditions
+              </Link>
+              . I understand that my score and username will be displayed on the public
+              leaderboard.
+            </label>
+          </div>
+
+          {/* Error Message */}
+          {error && (
+            <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
+              {error}
+            </div>
+          )}
+
+          {/* Submit Button */}
+          <button
+            type="submit"
+            disabled={isLoading || !isFormValid}
+            className="w-full h-11 bg-[#00f3ff] hover:shadow-[0_0_20px_rgba(0,243,255,0.3)] disabled:bg-neutral-800 disabled:text-neutral-500 disabled:cursor-not-allowed disabled:shadow-none text-black font-medium rounded-lg transition-all"
+          >
+            {isLoading ? "Creating Account..." : "Create Account"}
+          </button>
+
+          {/* Login Link */}
+          <p className="text-center text-neutral-500 text-sm pt-2">
+            Already have an account?{" "}
+            <Link href="/login" className="text-[#00f3ff] hover:underline">
+              Log in
+            </Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  );
+}

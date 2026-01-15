@@ -1,0 +1,178 @@
+/**
+ * CSRF Protection Utilities for Next.js Frontend
+ *
+ * Provides functions to:
+ * 1. Fetch CSRF token from backend
+ * 2. Include token in requests
+ * 3. Handle token refresh on expiry
+ */
+
+// Backend API URL
+const BACKEND_API_URL =
+  process.env.NEXT_PUBLIC_BACKEND_API_URL ||
+  process.env.BACKEND_API_URL ||
+  "https://splice-api-production.up.railway.app";
+
+// CSRF token header name (must match backend)
+const CSRF_HEADER_NAME = "x-csrf-token";
+
+// Token cache
+let csrfToken: string | null = null;
+let tokenExpiresAt: number = 0;
+
+/**
+ * Fetch a fresh CSRF token from the backend
+ * @returns {Promise<string>} The CSRF token
+ * @throws {Error} If token fetch fails
+ */
+export async function fetchCsrfToken(): Promise<string> {
+  try {
+    const response = await fetch(`${BACKEND_API_URL}/auth/csrf-token`, {
+      method: "GET",
+      credentials: "include", // Include cookies for CSRF
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch CSRF token: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (!data.csrfToken) {
+      throw new Error("No CSRF token in response");
+    }
+
+    // Cache the token
+    csrfToken = data.csrfToken;
+    tokenExpiresAt = Date.now() + (data.expiresIn || 86400) * 1000 - 60000; // 1 minute buffer
+
+    return data.csrfToken;
+  } catch (error) {
+    console.error("[CSRF] Failed to fetch token:", error);
+    throw error;
+  }
+}
+
+/**
+ * Get the current CSRF token, fetching a new one if needed
+ * @returns {Promise<string>} The CSRF token
+ */
+export async function getCsrfToken(): Promise<string> {
+  // Check if we have a valid cached token
+  if (csrfToken && Date.now() < tokenExpiresAt) {
+    return csrfToken;
+  }
+
+  // Fetch a new token
+  return fetchCsrfToken();
+}
+
+/**
+ * Clear the cached CSRF token (useful after logout)
+ */
+export function clearCsrfToken(): void {
+  csrfToken = null;
+  tokenExpiresAt = 0;
+}
+
+/**
+ * Add CSRF token to fetch headers
+ * @param {HeadersInit} headers - Existing headers
+ * @returns {Promise<Headers>} Headers with CSRF token added
+ */
+export async function addCsrfHeader(
+  headers: HeadersInit = {}
+): Promise<Headers> {
+  const token = await getCsrfToken();
+  const newHeaders = new Headers(headers);
+  newHeaders.set(CSRF_HEADER_NAME, token);
+  return newHeaders;
+}
+
+/**
+ * Fetch wrapper that automatically includes CSRF token
+ * Use this for all state-changing requests (POST, PUT, DELETE)
+ *
+ * @param {string} url - Request URL
+ * @param {RequestInit} options - Fetch options
+ * @returns {Promise<Response>} Fetch response
+ */
+export async function csrfFetch(
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const method = options.method?.toUpperCase() || "GET";
+
+  // Only add CSRF token for state-changing methods
+  if (["POST", "PUT", "DELETE", "PATCH"].includes(method)) {
+    const token = await getCsrfToken();
+
+    // Create new headers with CSRF token
+    const headers = new Headers(options.headers || {});
+    headers.set(CSRF_HEADER_NAME, token);
+
+    options = {
+      ...options,
+      headers,
+      credentials: "include", // Ensure cookies are sent
+    };
+  }
+
+  const response = await fetch(url, options);
+
+  // If we get a 403 with CSRF error, try refreshing the token once
+  if (response.status === 403) {
+    const data = await response.clone().json().catch(() => ({}));
+
+    if (
+      data.error?.includes("CSRF") ||
+      data.message?.includes("CSRF") ||
+      data.message?.includes("refresh")
+    ) {
+      console.log("[CSRF] Token rejected, fetching new token...");
+
+      // Clear cached token and fetch new one
+      clearCsrfToken();
+      const newToken = await fetchCsrfToken();
+
+      // Retry the request with new token
+      const headers = new Headers(options.headers || {});
+      headers.set(CSRF_HEADER_NAME, newToken);
+
+      return fetch(url, {
+        ...options,
+        headers,
+        credentials: "include",
+      });
+    }
+  }
+
+  return response;
+}
+
+/**
+ * Hook-friendly CSRF token fetcher
+ * Returns an object with token and loading state
+ */
+export interface CsrfState {
+  token: string | null;
+  loading: boolean;
+  error: Error | null;
+}
+
+/**
+ * Create headers object with CSRF token for form submissions
+ * @param {string} token - CSRF token
+ * @returns {Record<string, string>} Headers object
+ */
+export function createCsrfHeaders(token: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    [CSRF_HEADER_NAME]: token,
+  };
+}
+
+export { CSRF_HEADER_NAME };

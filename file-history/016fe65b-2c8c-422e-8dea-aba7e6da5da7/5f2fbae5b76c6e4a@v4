@@ -1,0 +1,174 @@
+import { NextResponse } from 'next/server';
+import { analyzeHarmony, analyzeFrontProfile, analyzeSideProfile } from '@/lib/scoring/analyzer';
+import { calculatePSL } from '@/lib/psl-calculator';
+import { classifyFromRatios } from '@/lib/archetype-classifier';
+
+// Greek Substitution Cipher Map
+const GREEK_MAP: Record<string, string> = {
+    '0': 'θ',
+    '1': 'ι',
+    '2': 'κ',
+    '3': 'λ',
+    '4': 'μ',
+    '5': 'ν',
+    '6': 'ξ',
+    '7': 'ο',
+    '8': 'π',
+    '9': 'ρ',
+    '.': '·',
+    '-': '–',
+};
+
+// Helper: Obfuscate a number or string value
+function obfuscateValue(value: unknown, isString: boolean = false): unknown {
+    if (typeof value === 'number') {
+        const str = value.toFixed(2);
+        return str.split('').map(char => GREEK_MAP[char] || char).join('');
+    }
+    if (typeof value === 'string') {
+        return isString ? 'Locked' : value;
+    }
+    return value;
+}
+
+// Recursive function to walk through the JSON object and obfuscate
+function obfuscateObject(obj: unknown): unknown {
+    if (Array.isArray(obj)) {
+        return obj.map(item => obfuscateObject(item));
+    }
+
+    if (typeof obj === 'object' && obj !== null) {
+        const newObj: Record<string, unknown> = {};
+        for (const key in obj as Record<string, unknown>) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                const val = (obj as Record<string, unknown>)[key];
+
+                // Content that should be obfuscated as "Locked" strings
+                const isQualitativeString = ['notes', 'tone', 'acne_level', 'acne_scarring', 'pore_visibility', 'texture_issues', 'density', 'texture', 'color', 'alignment'].includes(key);
+
+                if (typeof val === 'object' && val !== null) {
+                    newObj[key] = obfuscateObject(val);
+                } else if (typeof val === 'number') {
+                    newObj[key] = obfuscateValue(val);
+                } else if (typeof val === 'string' && isQualitativeString) {
+                    newObj[key] = 'Locked';
+                } else {
+                    newObj[key] = val;
+                }
+            }
+        }
+        return newObj;
+    }
+
+    return obj;
+}
+
+export async function POST(request: Request) {
+    try {
+        const body = await request.json();
+        const {
+            frontLandmarks,
+            sideLandmarks,
+            frontPhoto, // base64
+            sidePhoto,  // base64
+            gender,
+            ethnicity,
+            isPaid,
+            heightCm,
+            weightKg,
+            bodyFat,
+            muscleLevel
+        } = body;
+
+        if (!frontLandmarks || !sideLandmarks) {
+            return NextResponse.json(
+                { error: 'Missing landmarks' },
+                { status: 400 }
+            );
+        }
+
+        // 1. Calculate Full Analysis (Server-Side)
+        const frontAnalysis = analyzeFrontProfile(frontLandmarks, gender, ethnicity);
+        const sideAnalysis = sideLandmarks.length > 0
+            ? analyzeSideProfile(sideLandmarks, gender, ethnicity)
+            : { measurements: [], overallScore: 0, standardizedScore: 0, qualityTier: 'average', categoryScores: {} };
+
+        const harmony = analyzeHarmony(frontLandmarks, sideLandmarks, gender, ethnicity);
+
+        // 2. Calculate Archetypes
+        const frontRatios = frontAnalysis.measurements.map(m => ({ ...m, id: m.metricId }));
+        const sideRatios = sideAnalysis && sideAnalysis.measurements
+            ? sideAnalysis.measurements.map(m => ({ ...m, id: m.metricId }))
+            : [];
+
+        // @ts-expect-error - Expected partial mismatch between MetricScoreResult and Ratio
+        const archetype = classifyFromRatios(frontRatios, sideRatios, gender, ethnicity);
+
+        // 3. Calculate PSL
+        const failos = harmony.flaws.map(f => f.metricId);
+        const psl = calculatePSL({
+            faceScore: harmony.overallScore,
+            heightCm: heightCm || (gender === 'male' ? 178 : 165),
+            gender,
+            weightKg,
+            bodyAnalysis: bodyFat ? {
+                bodyFatPercent: bodyFat,
+                muscleLevel: muscleLevel || 'average'
+            } : undefined,
+            failos
+        });
+
+        // 4. Integrage Claude Vision (New)
+        let visionData = null;
+        if (frontPhoto) {
+            try {
+                const pythonApiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+                // Extract base64 data from data URL if needed
+                const cleanFront = frontPhoto.replace(/^data:image\/\w+;base64,/, '');
+                const cleanSide = sidePhoto?.replace(/^data:image\/\w+;base64,/, '');
+
+                const visionResponse = await fetch(`${pythonApiUrl}/physique/extract-face`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        front_face_base64: cleanFront,
+                        side_face_base64: cleanSide
+                    })
+                });
+
+                if (visionResponse.ok) {
+                    visionData = await visionResponse.json();
+                } else {
+                    console.warn('Vision API failed:', await visionResponse.text());
+                }
+            } catch (err) {
+                console.error('Failed to call Vision API:', err);
+            }
+        }
+
+        // 5. Prepare Response
+        let responseData: Record<string, unknown> = {
+            frontAnalysis,
+            sideAnalysis,
+            harmony,
+            archetype,
+            psl,
+            vision: visionData
+        };
+
+        // 6. Obfuscate if not paid
+        if (!isPaid) {
+            responseData = obfuscateObject(responseData) as Record<string, unknown>;
+            responseData.isObfuscated = true;
+        }
+
+        return NextResponse.json(responseData);
+
+    } catch (error) {
+        console.error('Analysis API Error:', error);
+        return NextResponse.json(
+            { error: 'Internal Server Error' },
+            { status: 500 }
+        );
+    }
+}

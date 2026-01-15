@@ -1,0 +1,277 @@
+#!/usr/bin/env node
+/**
+ * RunPod Model Router Proxy
+ * Routes requests to different RunPod endpoints based on model name
+ * Fixes DeepSeek-R1 reasoning_content format for compatibility
+ *
+ * Usage: node server.js
+ * Then configure Roo Code to use: http://localhost:4141/v1
+ */
+
+const http = require('http');
+const https = require('https');
+
+const PORT = 4141;
+const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY || 'rpa_8H2ANK7W7XGX7AN4H4LJX0AMQIUXJ3OO7T4S2XFX1ru6w3';
+
+// Model name -> RunPod endpoint mapping
+const ENDPOINTS = {
+  // User-friendly aliases
+  'architect': {
+    endpoint: '4oa1b4awkenwvn',
+    model: 'huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated',
+    isReasoning: true  // Has reasoning_content
+  },
+  'code': {
+    endpoint: 'zvmsecj976oelz',
+    model: 'huihui-ai/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated',
+    isReasoning: false
+  },
+  'research': {
+    endpoint: 'ghj3ehldsv8c8n',
+    model: 'huihui-ai/Huihui-Qwen3-Next-80B-A3B-Thinking-abliterated',
+    isReasoning: true
+  },
+  'quick': {
+    endpoint: '4s8uzmhs935609',
+    model: 'DavidAU/Qwen3-4B-Thinking-2507-Claude-4.5-Opus-High-Reasoning-Distill-Heretic-Abliterated',
+    isReasoning: false
+  },
+
+  // Also support full model names
+  'huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated': {
+    endpoint: '4oa1b4awkenwvn',
+    model: 'huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated',
+    isReasoning: true
+  },
+  'huihui-ai/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated': {
+    endpoint: 'zvmsecj976oelz',
+    model: 'huihui-ai/Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated',
+    isReasoning: false
+  },
+  'huihui-ai/Huihui-Qwen3-Next-80B-A3B-Thinking-abliterated': {
+    endpoint: 'ghj3ehldsv8c8n',
+    model: 'huihui-ai/Huihui-Qwen3-Next-80B-A3B-Thinking-abliterated',
+    isReasoning: true
+  }
+};
+
+// Default endpoint if model not found
+const DEFAULT_ENDPOINT = ENDPOINTS['architect'];
+
+function getEndpointConfig(modelName) {
+  if (ENDPOINTS[modelName]) {
+    return ENDPOINTS[modelName];
+  }
+
+  const lowerModel = modelName.toLowerCase();
+  for (const [key, value] of Object.entries(ENDPOINTS)) {
+    if (key.toLowerCase() === lowerModel) {
+      return value;
+    }
+  }
+
+  console.log(`[WARN] Unknown model "${modelName}", using default (architect)`);
+  return DEFAULT_ENDPOINT;
+}
+
+// Transform DeepSeek-R1 reasoning response to standard OpenAI format
+function transformResponse(responseData, config) {
+  try {
+    const data = JSON.parse(responseData);
+
+    if (data.choices && data.choices.length > 0) {
+      for (const choice of data.choices) {
+        if (choice.message) {
+          const reasoning = (choice.message.reasoning_content || '').trim();
+          const content = (choice.message.content || '').trim();
+
+          // Combine reasoning and content, only show thinking if non-empty
+          if (reasoning && content) {
+            choice.message.content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
+          } else if (reasoning && !content) {
+            choice.message.content = reasoning;
+          } else if (content) {
+            choice.message.content = content;
+          } else {
+            choice.message.content = '';
+          }
+
+          // Remove the non-standard field
+          delete choice.message.reasoning_content;
+        }
+
+        // Handle streaming delta format too
+        if (choice.delta) {
+          const reasoning = (choice.delta.reasoning_content || '').trim();
+          const content = (choice.delta.content || '').trim();
+
+          if (reasoning && content) {
+            choice.delta.content = reasoning + content;
+          } else if (reasoning) {
+            choice.delta.content = reasoning;
+          } else {
+            choice.delta.content = content;
+          }
+          delete choice.delta.reasoning_content;
+        }
+      }
+    }
+
+    return JSON.stringify(data);
+  } catch (e) {
+    // If parsing fails, return original
+    return responseData;
+  }
+}
+
+function proxyRequest(req, res, body) {
+  let requestBody;
+  try {
+    requestBody = JSON.parse(body);
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    return;
+  }
+
+  const requestedModel = requestBody.model || 'architect';
+  const config = getEndpointConfig(requestedModel);
+  const isStreaming = requestBody.stream === true;
+
+  // Replace model name with actual HuggingFace model name
+  requestBody.model = config.model;
+
+  const runpodUrl = `https://api.runpod.ai/v2/${config.endpoint}/openai/v1${req.url.replace('/v1', '')}`;
+
+  console.log(`[${new Date().toISOString()}] ${requestedModel} -> ${config.endpoint}${isStreaming ? ' (streaming)' : ''}`);
+
+  const urlObj = new URL(runpodUrl);
+  const options = {
+    hostname: urlObj.hostname,
+    port: 443,
+    path: urlObj.pathname + urlObj.search,
+    method: req.method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${RUNPOD_API_KEY}`
+    }
+  };
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    // For streaming responses, we need to transform each chunk
+    if (isStreaming) {
+      res.writeHead(proxyRes.statusCode, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      proxyRes.on('data', (chunk) => {
+        const lines = chunk.toString().split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+            const jsonStr = line.slice(6);
+            const transformed = transformResponse(jsonStr, config);
+            res.write(`data: ${transformed}\n`);
+          } else if (line.trim()) {
+            res.write(line + '\n');
+          }
+        }
+      });
+
+      proxyRes.on('end', () => {
+        res.end();
+      });
+    } else {
+      // For non-streaming, collect full response and transform
+      let responseData = '';
+      proxyRes.on('data', (chunk) => {
+        responseData += chunk.toString();
+      });
+
+      proxyRes.on('end', () => {
+        const transformed = transformResponse(responseData, config);
+        res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+        res.end(transformed);
+      });
+    }
+  });
+
+  proxyReq.on('error', (e) => {
+    console.error(`[ERROR] Proxy error: ${e.message}`);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `Proxy error: ${e.message}` }));
+  });
+
+  proxyReq.write(JSON.stringify(requestBody));
+  proxyReq.end();
+}
+
+const server = http.createServer((req, res) => {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Handle /v1/models endpoint - return available models
+  if (req.url === '/v1/models' && req.method === 'GET') {
+    const models = {
+      object: 'list',
+      data: [
+        { id: 'architect', object: 'model', owned_by: 'runpod', description: '32B DeepSeek-R1 - Best for code review & reasoning ($4.97/hr)' },
+        { id: 'code', object: 'model', owned_by: 'runpod', description: '30B Qwen3-Coder MoE - Best for code generation ($4.97/hr)' },
+        { id: 'research', object: 'model', owned_by: 'runpod', description: '80B Qwen3-Next - Deep analysis, 2x A100 ($9.94/hr)' },
+        { id: 'quick', object: 'model', owned_by: 'runpod', description: '4B Qwen3 - Fast responses ($1.12/hr) [DISABLED]' }
+      ]
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(models));
+    return;
+  }
+
+  // Handle chat completions
+  if (req.url.startsWith('/v1/') && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => proxyRequest(req, res, body));
+    return;
+  }
+
+  // Health check
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', endpoints: Object.keys(ENDPOINTS).filter(k => k.length < 15) }));
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+server.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════════════════════════╗
+║           RunPod Model Router Proxy Started                ║
+║           (with DeepSeek-R1 format fix)                    ║
+╠════════════════════════════════════════════════════════════╣
+║  URL: http://localhost:${PORT}/v1                            ║
+║                                                            ║
+║  Available Models:                                         ║
+║    - architect  (32B) - Code review & reasoning            ║
+║    - code       (30B) - Code generation                    ║
+║    - research   (80B) - Deep analysis (2x A100)            ║
+║    - quick      (4B)  - Fast responses [DISABLED]          ║
+║                                                            ║
+║  Configure Roo Code:                                       ║
+║    Base URL: http://localhost:${PORT}/v1                     ║
+║    Model ID: architect (or code, research)                 ║
+╚════════════════════════════════════════════════════════════╝
+`);
+});

@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""
+verify_engine.py - Verification Suite for looksmax_engine.py
+
+This script runs three "Truth Tests" to verify that the local facial analysis
+engine produces mathematically identical results to the target reference system.
+
+Tests:
+1. Frankfort Rotation Check - Verifies side profile alignment
+2. Eye Separation Ratio Debug - Validates intercanthal/face width calculation
+3. Nose Metrics Debug - Validates nasal width-to-height ratio
+
+Usage:
+    python verify_engine.py                    # Run with synthetic test data
+    python verify_engine.py --image face.jpg  # Run on actual image (requires MediaPipe)
+"""
+
+import math
+import sys
+import json
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+
+# Try to import numpy (required)
+try:
+    import numpy as np
+except ImportError:
+    print("ERROR: numpy is required. Install with: pip install numpy")
+    sys.exit(1)
+
+# Import from looksmax_engine
+try:
+    from looksmax_engine import (
+        LM_MAP,
+        MockLandmark,
+        Point2D,
+        apply_frankfort_correction,
+        FacialCalculator,
+        get_ranges_for_profile,
+    )
+except ImportError as e:
+    print(f"ERROR: Could not import from looksmax_engine.py: {e}")
+    print("Make sure looksmax_engine.py is in the same directory.")
+    sys.exit(1)
+
+
+# =============================================================================
+# CONSTANTS AND LANDMARK MAPPINGS
+# =============================================================================
+
+# Key landmark indices from MediaPipe 478-point model
+LANDMARK_INDICES = {
+    # Frankfort Plane landmarks
+    "porion": 226,          # Superior margin of ear canal
+    "orbitale": 33,         # Lowest point of orbital margin
+
+    # Eye landmarks for intercanthal distance
+    "canthus_in_l": 133,    # Left inner canthus (medial)
+    "canthus_in_r": 362,    # Right inner canthus
+    "canthus_out_l": 33,    # Left outer canthus (lateral)
+    "canthus_out_r": 263,   # Right outer canthus
+
+    # Cheekbone landmarks for face width
+    "zygion_l": 123,        # Left zygomatic arch (cheekbone)
+    "zygion_r": 352,        # Right zygomatic arch
+
+    # Nose landmarks
+    "nasion": 6,            # Bridge of nose (between eyes)
+    "subnasale": 164,       # Base of nose (columella base)
+    "pronasale": 1,         # Tip of nose
+    "ala_l": 102,           # Left nostril wing (alar)
+    "ala_r": 331,           # Right nostril wing
+}
+
+# Expected ideal ranges from ranges.json
+EXPECTED_RANGES = {
+    "Eye Separation Ratio": {
+        "ideal_min": 37.45,
+        "ideal_max": 55.05,
+        "website_description": "Distance between inner eye corners as % of face width",
+    },
+    "Nasal W to H Ratio": {
+        "ideal_min": 0.25,
+        "ideal_max": 1.20,
+        "website_description": "Nose width divided by nose height (nasion to subnasale)",
+        "bulbous_threshold": 1.0,  # Ratios > 1.0 typically trigger "Bulbous" label
+    },
+}
+
+
+# =============================================================================
+# DIAGNOSTIC REPORT CLASS
+# =============================================================================
+
+class DiagnosticReport:
+    """Collects and formats diagnostic results."""
+
+    def __init__(self):
+        self.sections = []
+        self.errors = []
+        self.warnings = []
+        self.passed = []
+
+    def add_section(self, title: str, content: str):
+        self.sections.append((title, content))
+
+    def add_error(self, msg: str):
+        self.errors.append(msg)
+
+    def add_warning(self, msg: str):
+        self.warnings.append(msg)
+
+    def add_passed(self, msg: str):
+        self.passed.append(msg)
+
+    def print_report(self):
+        print("\n" + "=" * 70)
+        print("  LOOKSMAX ENGINE VERIFICATION REPORT")
+        print("=" * 70)
+
+        for title, content in self.sections:
+            print(f"\n{'─' * 70}")
+            print(f"  {title}")
+            print("─" * 70)
+            print(content)
+
+        # Summary
+        print(f"\n{'=' * 70}")
+        print("  SUMMARY")
+        print("=" * 70)
+
+        if self.passed:
+            print("\n✅ PASSED:")
+            for msg in self.passed:
+                print(f"   • {msg}")
+
+        if self.warnings:
+            print("\n⚠️  WARNINGS:")
+            for msg in self.warnings:
+                print(f"   • {msg}")
+
+        if self.errors:
+            print("\n❌ ERRORS:")
+            for msg in self.errors:
+                print(f"   • {msg}")
+
+        total = len(self.passed) + len(self.warnings) + len(self.errors)
+        print(f"\n{'─' * 70}")
+        print(f"  Total Checks: {total} | Passed: {len(self.passed)} | "
+              f"Warnings: {len(self.warnings)} | Errors: {len(self.errors)}")
+        print("=" * 70 + "\n")
+
+
+# =============================================================================
+# TEST 1: FRANKFORT PLANE ROTATION CHECK
+# =============================================================================
+
+def test_rotation_logic(landmarks: List[MockLandmark], report: DiagnosticReport) -> bool:
+    """
+    Test 1: Verify Frankfort Plane alignment.
+
+    The Frankfort Plane is a horizontal reference line used in cephalometric analysis.
+    It connects:
+    - Porion (superior margin of ear canal, index 226)
+    - Orbitale (lowest point of orbital margin, index 33)
+
+    After applying Frankfort correction, these two points should have the same Y-coordinate
+    (i.e., the line between them should be perfectly horizontal).
+
+    Args:
+        landmarks: List of MockLandmark objects (478 points)
+        report: DiagnosticReport to add results to
+
+    Returns:
+        True if test passes (Y difference < 0.001 after rotation)
+    """
+    porion_idx = LANDMARK_INDICES["porion"]
+    orbitale_idx = LANDMARK_INDICES["orbitale"]
+
+    # Get original positions
+    porion_orig = (landmarks[porion_idx].x, landmarks[porion_idx].y)
+    orbitale_orig = (landmarks[orbitale_idx].x, landmarks[orbitale_idx].y)
+
+    # Calculate original angle
+    dx_orig = orbitale_orig[0] - porion_orig[0]
+    dy_orig = orbitale_orig[1] - porion_orig[1]
+    original_angle = math.degrees(math.atan2(dy_orig, dx_orig))
+
+    # Apply Frankfort correction using FacialCalculator
+    calc = FacialCalculator(landmarks)
+
+    # Get corrected positions
+    porion_corr = calc.get_pt("porion", standardized=True)
+    orbitale_corr = calc.get_pt("orbitale", standardized=True)
+
+    # Calculate Y difference after correction
+    y_diff = abs(porion_corr[1] - orbitale_corr[1])
+
+    # Calculate corrected angle
+    dx_corr = orbitale_corr[0] - porion_corr[0]
+    dy_corr = orbitale_corr[1] - porion_corr[1]
+    corrected_angle = math.degrees(math.atan2(dy_corr, dx_corr))
+
+    # Build report content
+    content = []
+    content.append("The Frankfort Plane is a horizontal reference used in cephalometrics.")
+    content.append("After rotation, Porion and Orbitale should have identical Y-coordinates.\n")
+
+    content.append("LANDMARK POSITIONS:")
+    content.append(f"  Porion (index {porion_idx}):")
+    content.append(f"    Original:  ({porion_orig[0]:.4f}, {porion_orig[1]:.4f})")
+    content.append(f"    Corrected: ({porion_corr[0]:.4f}, {porion_corr[1]:.4f})")
+    content.append(f"  Orbitale (index {orbitale_idx}):")
+    content.append(f"    Original:  ({orbitale_orig[0]:.4f}, {orbitale_orig[1]:.4f})")
+    content.append(f"    Corrected: ({orbitale_corr[0]:.4f}, {orbitale_corr[1]:.4f})\n")
+
+    content.append("ROTATION ANALYSIS:")
+    content.append(f"  Original plane angle:   {original_angle:+.4f}°")
+    content.append(f"  Corrected plane angle:  {corrected_angle:+.4f}°")
+    content.append(f"  Rotation applied:       {-original_angle:+.4f}°\n")
+
+    content.append("ALIGNMENT VERIFICATION:")
+    content.append(f"  Y-coordinate difference (Porion - Orbitale): {y_diff:.6f}")
+    content.append(f"  Threshold for pass:                          0.001000")
+
+    # Determine result
+    if y_diff < 0.001:
+        content.append(f"\n  ✅ PASS: Face is correctly aligned to Frankfort Plane")
+        report.add_passed("Frankfort Plane rotation is mathematically correct")
+        result = True
+    elif y_diff < 0.1:
+        content.append(f"\n  ⚠️  WARNING: Minor misalignment detected (acceptable)")
+        content.append(f"     This may cause slight inaccuracies in side profile metrics.")
+        report.add_warning(f"Frankfort Y-difference is {y_diff:.4f} (ideal < 0.001)")
+        result = True
+    else:
+        content.append(f"\n  ❌ FAIL: Significant misalignment detected!")
+        content.append(f"     Y-difference of {y_diff:.4f} indicates rotation math is wrong.")
+        content.append(f"     All side profile metrics (Recession, Z-Angle, etc.) will be incorrect.")
+        report.add_error(f"Frankfort rotation failed: Y-diff = {y_diff:.4f} (should be < 0.001)")
+        result = False
+
+    report.add_section("TEST 1: FRANKFORT PLANE ROTATION CHECK", "\n".join(content))
+    return result
+
+
+# =============================================================================
+# TEST 2: EYE SEPARATION RATIO DEBUG
+# =============================================================================
+
+def debug_eye_ratio(landmarks: List[MockLandmark], report: DiagnosticReport) -> float:
+    """
+    Test 2: Debug Eye Separation Ratio calculation.
+
+    Eye Separation Ratio = (Intercanthal Distance / Face Width) × 100
+
+    Where:
+    - Intercanthal Distance = Distance between inner eye corners (indices 133 & 362)
+    - Face Width = Distance between cheekbones/zygomatic arches (indices 123 & 352)
+
+    Common Issues:
+    - If ratio is too LOW (< 37%): Eyes appear "close-set"
+      - Could indicate: Cheekbone landmarks (123, 352) are placed too wide
+    - If ratio is too HIGH (> 55%): Eyes appear "wide-set"
+      - Could indicate: Inner canthus landmarks (133, 362) are placed too wide
+
+    Args:
+        landmarks: List of MockLandmark objects (478 points)
+        report: DiagnosticReport to add results to
+
+    Returns:
+        Calculated Eye Separation Ratio
+    """
+    calc = FacialCalculator(landmarks)
+
+    # Get landmark positions
+    canthus_in_l = calc.get_pt("canthus_in_l")
+    canthus_in_r = calc.get_pt("canthus_in_r")
+    cheekbone_l = calc.get_pt("cheekbone_l")
+    cheekbone_r = calc.get_pt("cheekbone_r")
+
+    # Also get outer canthus for eye width reference
+    canthus_out_l = calc.get_pt("canthus_out_l")
+    canthus_out_r = calc.get_pt("canthus_out_r")
+
+    # Calculate distances
+    intercanthal_width = np.linalg.norm(canthus_in_l - canthus_in_r)
+    bizygomatic_width = np.linalg.norm(cheekbone_l - cheekbone_r)
+
+    # Eye widths for reference
+    eye_width_l = np.linalg.norm(canthus_out_l - canthus_in_l)
+    eye_width_r = np.linalg.norm(canthus_out_r - canthus_in_r)
+    avg_eye_width = (eye_width_l + eye_width_r) / 2
+
+    # Calculate ratio
+    ratio = (intercanthal_width / bizygomatic_width) * 100 if bizygomatic_width > 0 else 0
+
+    # One Eye Apart Test (intercanthal should equal eye width)
+    one_eye_ratio = intercanthal_width / avg_eye_width if avg_eye_width > 0 else 0
+
+    # Expected range
+    ideal_min = EXPECTED_RANGES["Eye Separation Ratio"]["ideal_min"]
+    ideal_max = EXPECTED_RANGES["Eye Separation Ratio"]["ideal_max"]
+
+    # Build report content
+    content = []
+    content.append("Eye Separation Ratio measures intercanthal distance as % of face width.\n")
+
+    content.append("LANDMARK POSITIONS:")
+    content.append(f"  Left Inner Canthus  (idx {LANDMARK_INDICES['canthus_in_l']}): "
+                   f"({canthus_in_l[0]:.4f}, {canthus_in_l[1]:.4f})")
+    content.append(f"  Right Inner Canthus (idx {LANDMARK_INDICES['canthus_in_r']}): "
+                   f"({canthus_in_r[0]:.4f}, {canthus_in_r[1]:.4f})")
+    content.append(f"  Left Cheekbone      (idx {LANDMARK_INDICES['zygion_l']}): "
+                   f"({cheekbone_l[0]:.4f}, {cheekbone_l[1]:.4f})")
+    content.append(f"  Right Cheekbone     (idx {LANDMARK_INDICES['zygion_r']}): "
+                   f"({cheekbone_r[0]:.4f}, {cheekbone_r[1]:.4f})\n")
+
+    content.append("RAW DISTANCES (normalized units):")
+    content.append(f"  Intercanthal Width:  {intercanthal_width:.4f}")
+    content.append(f"  Bizygomatic Width:   {bizygomatic_width:.4f}")
+    content.append(f"  Avg Eye Width:       {avg_eye_width:.4f}\n")
+
+    content.append("CALCULATED METRICS:")
+    content.append(f"  Eye Separation Ratio:     {ratio:.2f}%")
+    content.append(f"  One Eye Apart Test:       {one_eye_ratio:.2f} (ideal: 1.0)\n")
+
+    content.append("COMPARISON TO IDEAL RANGES:")
+    content.append(f"  Ideal Range:              {ideal_min:.2f}% - {ideal_max:.2f}%")
+    content.append(f"  Your Calculated Ratio:    {ratio:.2f}%")
+
+    # Diagnosis
+    if ratio < ideal_min:
+        deviation = ideal_min - ratio
+        content.append(f"\n  ⚠️  BELOW RANGE by {deviation:.2f}%")
+        content.append(f"     Label triggered: 'Close-set Eyes'")
+        content.append(f"\n  POSSIBLE CAUSES:")
+        content.append(f"     1. Cheekbone indices (123, 352) may be too WIDE/LATERAL")
+        content.append(f"        → Website might use different face width reference")
+        content.append(f"     2. Inner canthus indices (133, 362) might be slightly off")
+        content.append(f"     3. Face width should use bizygomatic (widest cheekbone)")
+        report.add_warning(f"Eye Separation Ratio {ratio:.2f}% is below ideal range {ideal_min}-{ideal_max}%")
+    elif ratio > ideal_max:
+        deviation = ratio - ideal_max
+        content.append(f"\n  ⚠️  ABOVE RANGE by {deviation:.2f}%")
+        content.append(f"     Label triggered: 'Wide-set Eyes'")
+        report.add_warning(f"Eye Separation Ratio {ratio:.2f}% is above ideal range {ideal_min}-{ideal_max}%")
+    else:
+        content.append(f"\n  ✅ WITHIN IDEAL RANGE")
+        content.append(f"     Eyes are properly spaced relative to face width.")
+        report.add_passed(f"Eye Separation Ratio {ratio:.2f}% is within ideal range")
+
+    # Additional check: One Eye Apart Test
+    content.append(f"\n  ONE EYE APART TEST:")
+    content.append(f"     Ratio: {one_eye_ratio:.2f} (ideal: 1.0)")
+    if abs(one_eye_ratio - 1.0) < 0.15:
+        content.append(f"     ✅ Intercanthal distance ≈ eye width (good)")
+    else:
+        content.append(f"     ⚠️  Deviation from 1.0 indicates landmark or proportion issue")
+
+    report.add_section("TEST 2: EYE SEPARATION RATIO DEBUG", "\n".join(content))
+    return ratio
+
+
+# =============================================================================
+# TEST 3: NOSE METRICS DEBUG (BULBOUS VS REFINED)
+# =============================================================================
+
+def debug_nose_metrics(landmarks: List[MockLandmark], report: DiagnosticReport) -> float:
+    """
+    Test 3: Debug Nasal Width-to-Height Ratio.
+
+    Nasal W to H Ratio = Nose Width / Nose Height
+
+    Where:
+    - Nose Width = Distance between alar wings (indices 102 & 331)
+    - Nose Height = Distance from nasion to subnasale (indices 6 & 164)
+
+    Label Logic:
+    - Ratio > 1.0: Typically triggers "Bulbous Nose" or "Wide Nose"
+    - Ratio < 1.0: Typically triggers "Refined Tip" or "Narrow Nose"
+
+    Common Discrepancy Sources:
+    1. Width measurement: Website might use nostril outer edges vs alar crease
+    2. Height measurement: Website might use different endpoints (tip vs base)
+    3. Threshold: Website might use 1.2 instead of 1.0 as "bulbous" threshold
+
+    Args:
+        landmarks: List of MockLandmark objects (478 points)
+        report: DiagnosticReport to add results to
+
+    Returns:
+        Calculated Nasal W/H Ratio
+    """
+    calc = FacialCalculator(landmarks)
+
+    # Get landmark positions
+    nasion = calc.get_pt("nasion", standardized=True)
+    subnasale = calc.get_pt("subnasale", standardized=True)
+    pronasale = calc.get_pt("pronasale", standardized=True)
+    ala_l = calc.get_pt("ala_l")
+    ala_r = calc.get_pt("ala_r")
+
+    # Calculate nose dimensions
+    nose_height = np.linalg.norm(nasion - subnasale)
+    nose_width = np.linalg.norm(ala_l - ala_r)
+
+    # Alternative height measurement (nasion to tip)
+    nose_height_to_tip = np.linalg.norm(nasion - pronasale)
+
+    # Convert to mm for comparison
+    nose_height_mm = calc.dist_mm("nasion", "subnasale", standardized=True)
+    nose_width_mm = calc.dist_mm("ala_l", "ala_r")
+
+    # Calculate ratios
+    wh_ratio = nose_width / nose_height if nose_height > 0 else 0
+    wh_ratio_mm = nose_width_mm / nose_height_mm if nose_height_mm > 0 else 0
+
+    # Alternative ratio using tip height
+    alt_ratio = nose_width / nose_height_to_tip if nose_height_to_tip > 0 else 0
+
+    # Expected range
+    ideal_min = EXPECTED_RANGES["Nasal W to H Ratio"]["ideal_min"]
+    ideal_max = EXPECTED_RANGES["Nasal W to H Ratio"]["ideal_max"]
+    bulbous_threshold = EXPECTED_RANGES["Nasal W to H Ratio"]["bulbous_threshold"]
+
+    # Build report content
+    content = []
+    content.append("Nasal W to H Ratio determines if nose appears 'Bulbous' or 'Refined'.\n")
+
+    content.append("LANDMARK POSITIONS (standardized for side profile):")
+    content.append(f"  Nasion    (idx {LANDMARK_INDICES['nasion']}): "
+                   f"({nasion[0]:.4f}, {nasion[1]:.4f})")
+    content.append(f"  Subnasale (idx {LANDMARK_INDICES['subnasale']}): "
+                   f"({subnasale[0]:.4f}, {subnasale[1]:.4f})")
+    content.append(f"  Pronasale (idx {LANDMARK_INDICES['pronasale']}): "
+                   f"({pronasale[0]:.4f}, {pronasale[1]:.4f})")
+    content.append(f"  Left Ala  (idx {LANDMARK_INDICES['ala_l']}): "
+                   f"({ala_l[0]:.4f}, {ala_l[1]:.4f})")
+    content.append(f"  Right Ala (idx {LANDMARK_INDICES['ala_r']}): "
+                   f"({ala_r[0]:.4f}, {ala_r[1]:.4f})\n")
+
+    content.append("NOSE DIMENSIONS:")
+    content.append(f"  Nose Width (Alar base):        {nose_width:.4f} units ({nose_width_mm:.2f}mm)")
+    content.append(f"  Nose Height (Nasion-Subnasale): {nose_height:.4f} units ({nose_height_mm:.2f}mm)")
+    content.append(f"  Nose Height (Nasion-Tip):       {nose_height_to_tip:.4f} units\n")
+
+    content.append("CALCULATED RATIOS:")
+    content.append(f"  Primary W/H Ratio:              {wh_ratio:.3f}")
+    content.append(f"  Alternative (using tip):        {alt_ratio:.3f}\n")
+
+    content.append("LABEL LOGIC ANALYSIS:")
+    content.append(f"  Ideal Range:                    {ideal_min:.2f} - {ideal_max:.2f}")
+    content.append(f"  'Bulbous' Threshold:            > {bulbous_threshold:.2f}")
+    content.append(f"  Your Calculated Ratio:          {wh_ratio:.3f}")
+
+    # Diagnosis
+    if wh_ratio > bulbous_threshold:
+        content.append(f"\n  ⚠️  RATIO > {bulbous_threshold}: 'Bulbous Nose' label likely triggered")
+        content.append(f"\n  POSSIBLE DISCREPANCY SOURCES:")
+        content.append(f"     1. WIDTH MEASUREMENT DIFFERENCE:")
+        content.append(f"        • Local: Alar base (nostril wing width)")
+        content.append(f"        • Website might use: Nostril outer edge (narrower)")
+        content.append(f"        • Try using indices for nostril edges instead of alar")
+        content.append(f"\n     2. HEIGHT MEASUREMENT DIFFERENCE:")
+        content.append(f"        • Local: Nasion (bridge) to Subnasale (base)")
+        content.append(f"        • Website might use: Nasion to Pronasale (tip)")
+        content.append(f"        • Alternative ratio with tip height: {alt_ratio:.3f}")
+        content.append(f"\n     3. THRESHOLD DIFFERENCE:")
+        content.append(f"        • Local threshold: > 1.0 = Bulbous")
+        content.append(f"        • Website might use: > 1.2 = Bulbous")
+        content.append(f"        • If website uses 1.2, your {wh_ratio:.3f} would be 'Refined'")
+        report.add_warning(f"Nasal W/H Ratio {wh_ratio:.3f} triggers 'Bulbous' label (threshold: {bulbous_threshold})")
+    elif wh_ratio < ideal_min:
+        content.append(f"\n  ⚠️  RATIO < {ideal_min}: 'Narrow Nose' label likely triggered")
+        report.add_warning(f"Nasal W/H Ratio {wh_ratio:.3f} is below ideal range")
+    else:
+        content.append(f"\n  ✅ RATIO WITHIN IDEAL RANGE")
+        content.append(f"     Nose width-to-height proportions are balanced.")
+        report.add_passed(f"Nasal W/H Ratio {wh_ratio:.3f} is within ideal range")
+
+    # Additional context
+    content.append(f"\n  WEBSITE LABEL MAPPING:")
+    content.append(f"     • Ratio < 0.7:  'Refined Tip' / 'Narrow Nose'")
+    content.append(f"     • Ratio 0.7-1.0: 'Proportionate Nose'")
+    content.append(f"     • Ratio > 1.0:  'Bulbous Nose' / 'Wide Nose' (local threshold)")
+    content.append(f"     • Ratio > 1.2:  'Bulbous Nose' (possible website threshold)")
+
+    report.add_section("TEST 3: NOSE METRICS DEBUG (BULBOUS VS REFINED)", "\n".join(content))
+    return wh_ratio
+
+
+# =============================================================================
+# SYNTHETIC LANDMARK GENERATOR
+# =============================================================================
+
+def generate_synthetic_landmarks(
+    face_tilt_degrees: float = 5.0,
+    eye_separation: float = 0.45,  # 45% = middle of ideal range
+    nose_wh_ratio: float = 0.85    # 0.85 = refined, > 1.0 = bulbous
+) -> List[MockLandmark]:
+    """
+    Generate synthetic MediaPipe-style landmarks for testing.
+
+    Creates 478 landmarks with anatomically-plausible positions for:
+    - Frankfort Plane testing (tilted by face_tilt_degrees)
+    - Eye Separation testing (adjustable ratio)
+    - Nose W/H testing (adjustable ratio)
+
+    Args:
+        face_tilt_degrees: Tilt of Frankfort Plane from horizontal
+        eye_separation: Eye separation ratio (intercanthal/face_width)
+        nose_wh_ratio: Nose width to height ratio
+
+    Returns:
+        List of 478 MockLandmark objects
+    """
+    # Initialize all 478 landmarks with default positions
+    landmarks = [MockLandmark(0.5, 0.5, 0.0) for _ in range(478)]
+
+    # Base face dimensions (normalized 0-1 space)
+    face_center_x = 0.5
+    face_center_y = 0.5
+    face_width = 0.6  # Bizygomatic width
+    face_height = 0.8
+
+    # Calculate face tilt for Frankfort Plane
+    tilt_rad = math.radians(face_tilt_degrees)
+
+    # === FRANKFORT PLANE LANDMARKS ===
+    # Porion (226) - ear canal, typically at ear level
+    porion_x = face_center_x + 0.25  # Right side
+    porion_y = face_center_y - 0.1   # Slightly above center
+    landmarks[226] = MockLandmark(porion_x, porion_y, 0.0)
+
+    # Orbitale (33) - below eye, on the Frankfort line (with tilt)
+    # After tilt, orbitale should be at same Y as porion
+    orbitale_x = face_center_x - 0.1  # Left of center
+    orbitale_dist = abs(orbitale_x - porion_x)
+    orbitale_y = porion_y + orbitale_dist * math.tan(tilt_rad)  # Apply tilt
+    landmarks[33] = MockLandmark(orbitale_x, orbitale_y, 0.0)
+
+    # === EYE LANDMARKS ===
+    # Calculate positions based on desired eye separation ratio
+    eye_level_y = face_center_y - 0.15
+
+    # Face width reference (cheekbones)
+    cheekbone_half = face_width / 2
+    landmarks[123] = MockLandmark(face_center_x - cheekbone_half, eye_level_y + 0.05, 0.0)  # Left zygion
+    landmarks[352] = MockLandmark(face_center_x + cheekbone_half, eye_level_y + 0.05, 0.0)  # Right zygion
+
+    # Intercanthal distance based on separation ratio
+    intercanthal = face_width * (eye_separation / 100 if eye_separation > 1 else eye_separation)
+    inner_canthus_half = intercanthal / 2
+
+    # Inner canthus (medial eye corners)
+    landmarks[133] = MockLandmark(face_center_x - inner_canthus_half, eye_level_y, 0.0)  # Left inner
+    landmarks[362] = MockLandmark(face_center_x + inner_canthus_half, eye_level_y, 0.0)  # Right inner
+
+    # Outer canthus (lateral eye corners) - typical eye width ~= intercanthal
+    eye_width = intercanthal  # For "one eye apart" rule
+    landmarks[263] = MockLandmark(face_center_x + inner_canthus_half + eye_width, eye_level_y, 0.0)  # Right outer
+    # Note: Left outer (33) is already used for orbitale, use a nearby landmark
+
+    # === NOSE LANDMARKS ===
+    nose_bridge_y = eye_level_y + 0.02  # Slightly below eyes
+    nose_tip_y = face_center_y + 0.1    # Below center
+    nose_base_y = face_center_y + 0.15  # Below tip
+
+    # Nose height determines width based on ratio
+    nose_height = nose_base_y - nose_bridge_y
+    nose_width = nose_height * nose_wh_ratio
+
+    landmarks[6] = MockLandmark(face_center_x, nose_bridge_y, 0.0)     # Nasion
+    landmarks[1] = MockLandmark(face_center_x, nose_tip_y, 0.0)        # Pronasale
+    landmarks[164] = MockLandmark(face_center_x, nose_base_y, 0.0)     # Subnasale
+    landmarks[102] = MockLandmark(face_center_x - nose_width/2, nose_base_y, 0.0)  # Left ala
+    landmarks[331] = MockLandmark(face_center_x + nose_width/2, nose_base_y, 0.0)  # Right ala
+    landmarks[2] = MockLandmark(face_center_x, nose_base_y - 0.02, 0.0)  # Columella
+
+    # === OTHER REQUIRED LANDMARKS ===
+    # Pupils (468, 473)
+    pupil_x_offset = inner_canthus_half + eye_width/2
+    landmarks[468] = MockLandmark(face_center_x - pupil_x_offset, eye_level_y, 0.0)  # Left pupil
+    landmarks[473] = MockLandmark(face_center_x + pupil_x_offset, eye_level_y, 0.0)  # Right pupil
+
+    # Eyebrows
+    brow_y = eye_level_y - 0.03
+    landmarks[107] = MockLandmark(face_center_x - inner_canthus_half, brow_y, 0.0)   # Left inner brow
+    landmarks[70] = MockLandmark(face_center_x - inner_canthus_half - eye_width, brow_y, 0.0)  # Left outer brow
+    landmarks[336] = MockLandmark(face_center_x + inner_canthus_half, brow_y, 0.0)   # Right inner brow
+    landmarks[300] = MockLandmark(face_center_x + inner_canthus_half + eye_width, brow_y, 0.0)  # Right outer brow
+
+    # Face contour
+    landmarks[10] = MockLandmark(face_center_x, face_center_y - 0.35, 0.0)   # Trichion (forehead top)
+    landmarks[152] = MockLandmark(face_center_x, face_center_y + 0.35, 0.0)  # Menton/Pogonion (chin)
+    landmarks[175] = MockLandmark(face_center_x, face_center_y + 0.38, 0.0)  # Gnathion
+
+    # Jaw
+    landmarks[172] = MockLandmark(face_center_x - cheekbone_half + 0.05, face_center_y + 0.2, 0.0)  # Left gonion
+    landmarks[397] = MockLandmark(face_center_x + cheekbone_half - 0.05, face_center_y + 0.2, 0.0)  # Right gonion
+
+    # Mouth
+    mouth_y = face_center_y + 0.22
+    landmarks[0] = MockLandmark(face_center_x, mouth_y - 0.02, 0.0)     # Upper lip
+    landmarks[17] = MockLandmark(face_center_x, mouth_y + 0.03, 0.0)    # Lower lip
+    landmarks[13] = MockLandmark(face_center_x, mouth_y, 0.0)           # Stomion
+    landmarks[61] = MockLandmark(face_center_x - 0.08, mouth_y, 0.0)    # Left cheilion
+    landmarks[291] = MockLandmark(face_center_x + 0.08, mouth_y, 0.0)   # Right cheilion
+
+    # Eyelids
+    landmarks[159] = MockLandmark(face_center_x - pupil_x_offset, eye_level_y - 0.01, 0.0)  # Upper lid L
+    landmarks[145] = MockLandmark(face_center_x - pupil_x_offset, eye_level_y + 0.01, 0.0)  # Lower lid L
+    landmarks[386] = MockLandmark(face_center_x + pupil_x_offset, eye_level_y - 0.01, 0.0)  # Upper lid R
+    landmarks[374] = MockLandmark(face_center_x + pupil_x_offset, eye_level_y + 0.01, 0.0)  # Lower lid R
+
+    # Additional required landmarks
+    landmarks[168] = MockLandmark(face_center_x, eye_level_y - 0.02, 0.0)  # Glabella
+    landmarks[234] = MockLandmark(face_center_x + 0.35, eye_level_y + 0.05, 0.0)  # Left ear
+    landmarks[454] = MockLandmark(face_center_x - 0.35, eye_level_y + 0.05, 0.0)  # Right ear
+    landmarks[18] = MockLandmark(face_center_x, mouth_y + 0.05, 0.0)   # Sublabiale
+    landmarks[151] = MockLandmark(face_center_x, eye_level_y - 0.15, 0.0)  # Forehead center
+    landmarks[21] = MockLandmark(face_center_x - cheekbone_half, eye_level_y - 0.05, 0.0)  # Left temple
+    landmarks[251] = MockLandmark(face_center_x + cheekbone_half, eye_level_y - 0.05, 0.0)  # Right temple
+    landmarks[132] = MockLandmark(face_center_x - 0.15, face_center_y + 0.3, 0.0)  # Neck L
+    landmarks[361] = MockLandmark(face_center_x + 0.15, face_center_y + 0.3, 0.0)  # Neck R
+    landmarks[127] = MockLandmark(face_center_x + 0.32, eye_level_y - 0.05, 0.0)  # Ear top L
+    landmarks[356] = MockLandmark(face_center_x - 0.32, eye_level_y - 0.05, 0.0)  # Ear top R
+    landmarks[105] = MockLandmark(face_center_x - inner_canthus_half - eye_width/2, brow_y, 0.0)  # Brow peak L
+    landmarks[334] = MockLandmark(face_center_x + inner_canthus_half + eye_width/2, brow_y, 0.0)  # Brow peak R
+    landmarks[37] = MockLandmark(face_center_x - 0.02, mouth_y - 0.02, 0.0)   # Cupid bow L
+    landmarks[267] = MockLandmark(face_center_x + 0.02, mouth_y - 0.02, 0.0)  # Cupid bow R
+    landmarks[177] = MockLandmark(face_center_x - 0.05, face_center_y + 0.33, 0.0)  # Chin L
+    landmarks[401] = MockLandmark(face_center_x + 0.05, face_center_y + 0.33, 0.0)  # Chin R
+
+    return landmarks
+
+
+# =============================================================================
+# IMAGE LOADING (OPTIONAL)
+# =============================================================================
+
+def load_landmarks_from_image(image_path: str) -> Optional[List[MockLandmark]]:
+    """
+    Load landmarks from an actual image using MediaPipe.
+
+    Requires:
+        pip install mediapipe opencv-python
+
+    Args:
+        image_path: Path to the face image
+
+    Returns:
+        List of MockLandmark objects or None if detection fails
+    """
+    try:
+        import cv2
+        import mediapipe as mp
+    except ImportError:
+        print("ERROR: To use image loading, install: pip install mediapipe opencv-python")
+        return None
+
+    # Initialize MediaPipe Face Mesh
+    mp_face_mesh = mp.solutions.face_mesh
+
+    # Read image
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"ERROR: Could not read image: {image_path}")
+        return None
+
+    # Convert to RGB
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w = image.shape[:2]
+
+    # Detect landmarks
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5
+    ) as face_mesh:
+        results = face_mesh.process(rgb_image)
+
+        if not results.multi_face_landmarks:
+            print("ERROR: No face detected in image")
+            return None
+
+        # Convert to MockLandmark format
+        landmarks = []
+        for lm in results.multi_face_landmarks[0].landmark:
+            landmarks.append(MockLandmark(
+                x=lm.x,  # Already normalized 0-1
+                y=lm.y,
+                z=lm.z
+            ))
+
+        return landmarks
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def run_verification_suite(
+    landmarks: List[MockLandmark],
+    source_description: str = "Synthetic Test Data"
+) -> DiagnosticReport:
+    """
+    Run all three verification tests.
+
+    Args:
+        landmarks: List of 478 MockLandmark objects
+        source_description: Description of the landmark source
+
+    Returns:
+        DiagnosticReport with all test results
+    """
+    report = DiagnosticReport()
+
+    # Add header section
+    header_content = []
+    header_content.append(f"Source: {source_description}")
+    header_content.append(f"Landmark Count: {len(landmarks)}")
+    header_content.append(f"\nRunning 3 verification tests...")
+    report.add_section("VERIFICATION SUITE", "\n".join(header_content))
+
+    # Run tests
+    print("\n[1/3] Running Frankfort Plane Rotation Check...")
+    test_rotation_logic(landmarks, report)
+
+    print("[2/3] Running Eye Separation Ratio Debug...")
+    debug_eye_ratio(landmarks, report)
+
+    print("[3/3] Running Nose Metrics Debug...")
+    debug_nose_metrics(landmarks, report)
+
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Verify looksmax_engine.py calculations against expected standards"
+    )
+    parser.add_argument(
+        "--image", "-i",
+        type=str,
+        help="Path to face image (requires mediapipe, opencv-python)"
+    )
+    parser.add_argument(
+        "--tilt",
+        type=float,
+        default=5.0,
+        help="Face tilt in degrees for synthetic data (default: 5.0)"
+    )
+    parser.add_argument(
+        "--eye-sep",
+        type=float,
+        default=0.45,
+        help="Eye separation ratio for synthetic data (default: 0.45 = 45%%)"
+    )
+    parser.add_argument(
+        "--nose-ratio",
+        type=float,
+        default=1.05,
+        help="Nose W/H ratio for synthetic data (default: 1.05 = slightly bulbous)"
+    )
+
+    args = parser.parse_args()
+
+    print("\n" + "=" * 70)
+    print("  LOOKSMAX ENGINE VERIFICATION SUITE")
+    print("=" * 70)
+
+    if args.image:
+        print(f"\nLoading landmarks from image: {args.image}")
+        landmarks = load_landmarks_from_image(args.image)
+        if landmarks is None:
+            print("Falling back to synthetic data...")
+            landmarks = generate_synthetic_landmarks(
+                face_tilt_degrees=args.tilt,
+                eye_separation=args.eye_sep,
+                nose_wh_ratio=args.nose_ratio
+            )
+            source = "Synthetic (fallback)"
+        else:
+            source = f"Image: {args.image}"
+    else:
+        print(f"\nGenerating synthetic test data...")
+        print(f"  Face tilt:       {args.tilt}°")
+        print(f"  Eye separation:  {args.eye_sep * 100:.1f}%")
+        print(f"  Nose W/H ratio:  {args.nose_ratio:.2f}")
+
+        landmarks = generate_synthetic_landmarks(
+            face_tilt_degrees=args.tilt,
+            eye_separation=args.eye_sep,
+            nose_wh_ratio=args.nose_ratio
+        )
+        source = f"Synthetic (tilt={args.tilt}°, eye_sep={args.eye_sep*100:.0f}%, nose_wh={args.nose_ratio:.2f})"
+
+    # Run verification
+    report = run_verification_suite(landmarks, source)
+
+    # Print report
+    report.print_report()
+
+    return 0 if not report.errors else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

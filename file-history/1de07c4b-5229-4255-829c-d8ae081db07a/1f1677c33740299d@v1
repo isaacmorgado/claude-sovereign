@@ -1,0 +1,380 @@
+// Backend API client for UXP plugin
+// Connects to Splice backend for auth, billing, and audio processing
+
+const API_BASE = 'http://localhost:3001/api'
+
+interface ApiResponse<T> {
+  success: boolean
+  data?: T
+  error?: string
+  message?: string
+}
+
+export interface AuthTokens {
+  accessToken: string
+  refreshToken: string
+}
+
+export interface User {
+  id: string
+  email: string
+  name?: string
+  plan: 'free' | 'pro' | 'enterprise'
+  createdAt: string
+}
+
+export interface UsageStats {
+  used: number
+  limit: number
+  resetDate: string
+  plan: string
+}
+
+export interface AudioJob {
+  id: string
+  type: 'transcription' | 'vocal-isolation'
+  status: 'pending' | 'processing' | 'completed' | 'failed'
+  progress: number
+  result?: AudioJobResult
+  error?: string
+  createdAt: string
+  completedAt?: string
+}
+
+export interface AudioJobResult {
+  transcription?: TranscriptionResult
+  vocalIsolation?: VocalIsolationResult
+}
+
+export interface TranscriptionResult {
+  text: string
+  segments: TranscriptionSegment[]
+  language: string
+  duration: number
+}
+
+export interface TranscriptionSegment {
+  start: number
+  end: number
+  text: string
+  confidence: number
+}
+
+export interface VocalIsolationResult {
+  vocalsUrl: string
+  instrumentalUrl: string
+  duration: number
+}
+
+type AuthChangeCallback = (user: User | null) => void
+
+class BackendClient {
+  private accessToken: string | null = null
+  private refreshToken: string | null = null
+  private currentUser: User | null = null
+  private authChangeCallbacks: AuthChangeCallback[] = []
+
+  constructor() {
+    this.loadTokensFromStorage()
+  }
+
+  private async loadTokensFromStorage(): Promise<void> {
+    try {
+      // UXP storage API
+      const uxp = await import('uxp')
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      try {
+        const tokenFile = await dataFolder.getEntry('splice-tokens.json')
+        if (tokenFile) {
+          const contents = await tokenFile.read()
+          const data = JSON.parse(contents)
+          this.accessToken = data.accessToken || null
+          this.refreshToken = data.refreshToken || null
+        }
+      } catch {
+        // File doesn't exist yet, that's fine
+      }
+    } catch {
+      // Not in UXP environment (dev mode), use memory only
+      console.log('[BackendClient] Running outside UXP, tokens will not persist')
+    }
+  }
+
+  private async saveTokensToStorage(): Promise<void> {
+    try {
+      const uxp = await import('uxp')
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      const tokenFile = await dataFolder.createFile('splice-tokens.json', { overwrite: true })
+      await tokenFile.write(JSON.stringify({
+        accessToken: this.accessToken,
+        refreshToken: this.refreshToken
+      }))
+    } catch {
+      // Not in UXP environment
+    }
+  }
+
+  private async clearTokensFromStorage(): Promise<void> {
+    try {
+      const uxp = await import('uxp')
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      try {
+        const tokenFile = await dataFolder.getEntry('splice-tokens.json')
+        if (tokenFile) {
+          await tokenFile.delete()
+        }
+      } catch {
+        // File doesn't exist
+      }
+    } catch {
+      // Not in UXP environment
+    }
+  }
+
+  setTokens(tokens: AuthTokens): void {
+    this.accessToken = tokens.accessToken
+    this.refreshToken = tokens.refreshToken
+    this.saveTokensToStorage()
+  }
+
+  clearTokens(): void {
+    this.accessToken = null
+    this.refreshToken = null
+    this.currentUser = null
+    this.clearTokensFromStorage()
+    this.notifyAuthChange(null)
+  }
+
+  onAuthChange(callback: AuthChangeCallback): () => void {
+    this.authChangeCallbacks.push(callback)
+    return () => {
+      this.authChangeCallbacks = this.authChangeCallbacks.filter(cb => cb !== callback)
+    }
+  }
+
+  private notifyAuthChange(user: User | null): void {
+    this.currentUser = user
+    this.authChangeCallbacks.forEach(cb => cb(user))
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<T> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string>),
+    }
+
+    if (this.accessToken) {
+      headers['Authorization'] = `Bearer ${this.accessToken}`
+    }
+
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      headers,
+    })
+
+    // Handle 401 with token refresh
+    if (response.status === 401 && this.refreshToken) {
+      const refreshed = await this.refreshTokens()
+      if (refreshed) {
+        headers['Authorization'] = `Bearer ${this.accessToken}`
+        const retryResponse = await fetch(`${API_BASE}${endpoint}`, {
+          ...options,
+          headers,
+        })
+        return this.handleResponse<T>(retryResponse)
+      }
+    }
+
+    return this.handleResponse<T>(response)
+  }
+
+  private async handleResponse<T>(response: Response): Promise<T> {
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ message: response.statusText }))
+      throw new Error(error.error || error.message || 'Request failed')
+    }
+
+    const result: ApiResponse<T> = await response.json()
+    if (!result.success || result.data === undefined) {
+      throw new Error(result.error || result.message || 'Request failed')
+    }
+    return result.data
+  }
+
+  private async refreshTokens(): Promise<boolean> {
+    try {
+      const response = await fetch(`${API_BASE}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: this.refreshToken }),
+      })
+
+      if (!response.ok) {
+        this.clearTokens()
+        return false
+      }
+
+      const result: ApiResponse<AuthTokens> = await response.json()
+      if (!result.success || !result.data) {
+        this.clearTokens()
+        return false
+      }
+      this.setTokens(result.data)
+      return true
+    } catch {
+      this.clearTokens()
+      return false
+    }
+  }
+
+  // ==================== Auth ====================
+
+  async login(email: string, password: string): Promise<{ user: User; tokens: AuthTokens }> {
+    const data = await this.request<{ user: User; tokens: AuthTokens }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    })
+    this.setTokens(data.tokens)
+    this.notifyAuthChange(data.user)
+    return data
+  }
+
+  async register(email: string, password: string, name?: string): Promise<{ user: User; tokens: AuthTokens }> {
+    const data = await this.request<{ user: User; tokens: AuthTokens }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, name }),
+    })
+    this.setTokens(data.tokens)
+    this.notifyAuthChange(data.user)
+    return data
+  }
+
+  async logout(): Promise<void> {
+    try {
+      await fetch(`${API_BASE}/auth/logout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+        },
+        body: JSON.stringify({ refreshToken: this.refreshToken }),
+      })
+    } finally {
+      this.clearTokens()
+    }
+  }
+
+  async getMe(): Promise<User> {
+    const user = await this.request<User>('/auth/me')
+    this.notifyAuthChange(user)
+    return user
+  }
+
+  isAuthenticated(): boolean {
+    return !!this.accessToken
+  }
+
+  getUser(): User | null {
+    return this.currentUser
+  }
+
+  // ==================== Usage ====================
+
+  async getUsage(): Promise<UsageStats> {
+    return this.request<UsageStats>('/usage')
+  }
+
+  async checkUsage(minutes: number): Promise<{ allowed: boolean; remaining: number }> {
+    return this.request<{ allowed: boolean; remaining: number }>(`/audio/check?minutes=${minutes}`)
+  }
+
+  // ==================== Audio Jobs ====================
+
+  async submitTranscription(audioFile: File): Promise<AudioJob> {
+    const formData = new FormData()
+    formData.append('audio', audioFile)
+
+    const response = await fetch(`${API_BASE}/audio/transcribe`, {
+      method: 'POST',
+      headers: {
+        ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+      },
+      body: formData,
+    })
+
+    return this.handleResponse<AudioJob>(response)
+  }
+
+  async submitVocalIsolation(audioFile: File): Promise<AudioJob> {
+    const formData = new FormData()
+    formData.append('audio', audioFile)
+
+    const response = await fetch(`${API_BASE}/audio/isolate-vocals`, {
+      method: 'POST',
+      headers: {
+        ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+      },
+      body: formData,
+    })
+
+    return this.handleResponse<AudioJob>(response)
+  }
+
+  async getJobs(): Promise<AudioJob[]> {
+    return this.request<AudioJob[]>('/audio/jobs')
+  }
+
+  async getJob(jobId: string): Promise<AudioJob> {
+    return this.request<AudioJob>(`/audio/jobs/${jobId}`)
+  }
+
+  async pollJobUntilComplete(
+    jobId: string,
+    onProgress?: (job: AudioJob) => void,
+    intervalMs: number = 2000
+  ): Promise<AudioJob> {
+    return new Promise((resolve, reject) => {
+      const poll = async () => {
+        try {
+          const job = await this.getJob(jobId)
+          onProgress?.(job)
+
+          if (job.status === 'completed') {
+            resolve(job)
+          } else if (job.status === 'failed') {
+            reject(new Error(job.error || 'Job failed'))
+          } else {
+            setTimeout(poll, intervalMs)
+          }
+        } catch (error) {
+          reject(error)
+        }
+      }
+      poll()
+    })
+  }
+
+  // ==================== Billing ====================
+
+  async createCheckout(tier: 'pro' | 'enterprise', interval: 'monthly' | 'yearly' = 'monthly'): Promise<{ url: string }> {
+    return this.request<{ url: string }>('/billing/checkout', {
+      method: 'POST',
+      body: JSON.stringify({ tier, interval }),
+    })
+  }
+}
+
+// Singleton instance
+export const backendClient = new BackendClient()

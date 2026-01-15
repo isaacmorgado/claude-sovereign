@@ -1,0 +1,461 @@
+     1→/**
+     2→ * SPLICE Face Detection Service
+     3→ *
+     4→ * Detects and tracks faces in video frames for social reframe.
+     5→ * Uses lightweight frame sampling approach for performance.
+     6→ */
+     7→
+     8→const { spawn } = require('child_process');
+     9→const fs = require('fs');
+    10→const path = require('path');
+    11→const os = require('os');
+    12→
+    13→// SECURITY: Import path validation utility
+    14→const { validateAudioPath } = require('./securityUtils');
+    15→
+    16→// ============================================================================
+    17→// FACE DETECTION
+    18→// ============================================================================
+    19→
+    20→/**
+    21→ * Detect faces in video using FFmpeg frame extraction
+    22→ * @param {string} videoPath - Path to video file
+    23→ * @param {Object} options - Detection options
+    24→ * @returns {Promise<Object>} Face detection results
+    25→ */
+    26→async function detectFaces(videoPath, options = {}) {
+    27→  const {
+    28→    sampleRate = 1, // Sample every N seconds
+    29→    maxFrames = 100,
+    30→    minConfidence = 0.5
+    31→  } = options;
+    32→
+    33→  // SECURITY: Validate video path to prevent path traversal/injection attacks
+    34→  // validateAudioPath also accepts video extensions (.mp4, .mov, .mkv, .avi)
+    35→  const pathValidation = await validateAudioPath(videoPath);
+    36→  if (!pathValidation.valid) {
+    37→    return {
+    38→      success: false,
+    39→      error: `Invalid video path: ${pathValidation.error}`,
+    40→      faces: []
+    41→    };
+    42→  }
+    43→  const validatedPath = pathValidation.path;
+    44→
+    45→  console.log(`[SPLICE Face] Analyzing video: ${validatedPath}`);
+    46→
+    47→  try {
+    48→    // Get video info - use validated path
+    49→    const videoInfo = await getVideoInfo(validatedPath);
+    50→
+    51→    // Sample frames - use validated path
+    52→    const frames = await sampleFrames(validatedPath, {
+    53→      sampleRate,
+    54→      maxFrames,
+    55→      duration: videoInfo.duration
+    56→    });
+    57→
+    58→    // Analyze frames for faces using center-of-mass approach
+    59→    // (Simulated - in production would use face-api.js or similar)
+    60→    const faceData = analyzeFramesForFaces(frames, videoInfo);
+    61→
+    62→    // Generate face tracks
+    63→    const tracks = generateFaceTracks(faceData, videoInfo);
+    64→
+    65→    return {
+    66→      success: true,
+    67→      videoInfo: {
+    68→        width: videoInfo.width,
+    69→        height: videoInfo.height,
+    70→        duration: videoInfo.duration,
+    71→        frameRate: videoInfo.frameRate
+    72→      },
+    73→      facesDetected: tracks.length,
+    74→      tracks,
+    75→      metadata: {
+    76→        sampleRate,
+    77→        framesAnalyzed: frames.length,
+    78→        processingTime: Date.now()
+    79→      }
+    80→    };
+    81→
+    82→  } catch (err) {
+    83→    console.error('[SPLICE Face] Detection error:', err);
+    84→    return {
+    85→      success: false,
+    86→      error: err.message,
+    87→      faces: []
+    88→    };
+    89→  }
+    90→}
+    91→
+    92→/**
+    93→ * Track faces throughout video
+    94→ * @param {string} videoPath - Path to video
+    95→ * @param {Object} options - Tracking options
+    96→ * @returns {Promise<Object>} Face tracking data
+    97→ */
+    98→async function trackFaces(videoPath, options = {}) {
+    99→  const {
+   100→    sampleRate = 0.5, // Sample every 0.5 seconds for smoother tracking
+   101→    smoothing = 0.3 // Smoothing factor for position interpolation
+   102→  } = options;
+   103→
+   104→  const detection = await detectFaces(videoPath, { sampleRate });
+   105→
+   106→  if (!detection.success) {
+   107→    return detection;
+   108→  }
+   109→
+   110→  // Apply smoothing to face positions
+   111→  const smoothedTracks = detection.tracks.map(track => ({
+   112→    ...track,
+   113→    positions: smoothPositions(track.positions, smoothing)
+   114→  }));
+   115→
+   116→  return {
+   117→    success: true,
+   118→    videoInfo: detection.videoInfo,
+   119→    tracks: smoothedTracks,
+   120→    totalFrames: Math.ceil(detection.videoInfo.duration * detection.videoInfo.frameRate),
+   121→    metadata: {
+   122→      ...detection.metadata,
+   123→      smoothing
+   124→    }
+   125→  };
+   126→}
+   127→
+   128→/**
+   129→ * Identify primary speaker based on audio/face correlation
+   130→ * @param {Array} faces - Face track data
+   131→ * @param {Object} audioAnalysis - Audio analysis with speaker segments
+   132→ * @returns {Object} Speaker identification
+   133→ */
+   134→function identifySpeaker(faces, audioAnalysis = null) {
+   135→  if (!faces || faces.length === 0) {
+   136→    return {
+   137→      success: false,
+   138→      error: 'No faces to identify',
+   139→      primarySpeaker: null
+   140→    };
+   141→  }
+   142→
+   143→  // Without audio, use largest/most-centered face as primary
+   144→  if (!audioAnalysis) {
+   145→    const scored = faces.map((face, index) => {
+   146→      // Score based on size and center position
+   147→      const avgSize = face.positions.reduce((sum, p) => sum + (p.width * p.height), 0) / face.positions.length;
+   148→      const avgCenterX = face.positions.reduce((sum, p) => sum + (p.x + p.width / 2), 0) / face.positions.length;
+   149→      const centerScore = 1 - Math.abs(avgCenterX - 0.5); // 0.5 = center
+   150→
+   151→      return {
+   152→        faceIndex: index,
+   153→        trackId: face.trackId,
+   154→        score: avgSize * centerScore,
+   155→        avgSize,
+   156→        centerScore
+   157→      };
+   158→    });
+   159→
+   160→    scored.sort((a, b) => b.score - a.score);
+   161→
+   162→    return {
+   163→      success: true,
+   164→      primarySpeaker: scored[0]?.trackId || null,
+   165→      rankings: scored,
+   166→      method: 'size-center'
+   167→    };
+   168→  }
+   169→
+   170→  // With audio, correlate face movement with speech
+   171→  // (Simplified - full implementation would analyze lip movement)
+   172→  return {
+   173→    success: true,
+   174→    primarySpeaker: faces[0]?.trackId,
+   175→    method: 'audio-correlation',
+   176→    note: 'Audio correlation requires additional processing'
+   177→  };
+   178→}
+   179→
+   180→// ============================================================================
+   181→// HELPER FUNCTIONS
+   182→// ============================================================================
+   183→
+   184→/**
+   185→ * Get video information using FFprobe
+   186→ */
+   187→async function getVideoInfo(videoPath) {
+   188→  return new Promise((resolve, reject) => {
+   189→    const ffprobe = spawn('ffprobe', [
+   190→      '-v', 'quiet',
+   191→      '-print_format', 'json',
+   192→      '-show_format',
+   193→      '-show_streams',
+   194→      videoPath
+   195→    ]);
+   196→
+   197→    let output = '';
+   198→    let error = '';
+   199→
+   200→    ffprobe.stdout.on('data', data => output += data);
+   201→    ffprobe.stderr.on('data', data => error += data);
+   202→
+   203→    ffprobe.on('close', code => {
+   204→      if (code !== 0) {
+   205→        // Return defaults if ffprobe fails
+   206→        resolve({
+   207→          width: 1920,
+   208→          height: 1080,
+   209→          duration: 60,
+   210→          frameRate: 30
+   211→        });
+   212→        return;
+   213→      }
+   214→
+   215→      try {
+   216→        const info = JSON.parse(output);
+   217→        const videoStream = info.streams?.find(s => s.codec_type === 'video') || {};
+   218→        const format = info.format || {};
+   219→
+   220→        const frameRateStr = videoStream.r_frame_rate || '30/1';
+   221→        const [num, den] = frameRateStr.split('/').map(Number);
+   222→        const frameRate = den ? num / den : 30;
+   223→
+   224→        resolve({
+   225→          width: videoStream.width || 1920,
+   226→          height: videoStream.height || 1080,
+   227→          duration: parseFloat(format.duration) || 60,
+   228→          frameRate: Math.round(frameRate)
+   229→        });
+   230→      } catch (e) {
+   231→        resolve({
+   232→          width: 1920,
+   233→          height: 1080,
+   234→          duration: 60,
+   235→          frameRate: 30
+   236→        });
+   237→      }
+   238→    });
+   239→  });
+   240→}
+   241→
+   242→/**
+   243→ * Sample frames from video
+   244→ */
+   245→async function sampleFrames(videoPath, options) {
+   246→  const { sampleRate, maxFrames, duration } = options;
+   247→
+   248→  const frameCount = Math.min(maxFrames, Math.floor(duration / sampleRate));
+   249→  const frames = [];
+   250→
+   251→  for (let i = 0; i < frameCount; i++) {
+   252→    const timestamp = i * sampleRate;
+   253→    frames.push({
+   254→      index: i,
+   255→      timestamp,
+   256→      // In production, would extract actual frame data
+   257→      // For now, simulate frame info
+   258→      analyzed: true
+   259→    });
+   260→  }
+   261→
+   262→  return frames;
+   263→}
+   264→
+   265→/**
+   266→ * Analyze frames for face positions
+   267→ * Simulated face detection - in production would use face-api.js or ML model
+   268→ */
+   269→function analyzeFramesForFaces(frames, videoInfo) {
+   270→  const faceData = [];
+   271→
+   272→  // Simulate detecting a centered face (typical talking-head scenario)
+   273→  const centerX = 0.5;
+   274→  const centerY = 0.4; // Slightly above center
+   275→  const faceWidth = 0.25; // 25% of frame width
+   276→  const faceHeight = 0.35; // 35% of frame height
+   277→
+   278→  frames.forEach((frame, index) => {
+   279→    // Add slight movement variation
+   280→    const jitterX = (Math.random() - 0.5) * 0.02;
+   281→    const jitterY = (Math.random() - 0.5) * 0.02;
+   282→
+   283→    faceData.push({
+   284→      frameIndex: index,
+   285→      timestamp: frame.timestamp,
+   286→      faces: [{
+   287→        x: centerX - faceWidth / 2 + jitterX,
+   288→        y: centerY - faceHeight / 2 + jitterY,
+   289→        width: faceWidth,
+   290→        height: faceHeight,
+   291→        confidence: 0.95
+   292→      }]
+   293→    });
+   294→  });
+   295→
+   296→  return faceData;
+   297→}
+   298→
+   299→/**
+   300→ * Generate face tracks from frame-by-frame detections
+   301→ */
+   302→function generateFaceTracks(faceData, videoInfo) {
+   303→  if (faceData.length === 0) return [];
+   304→
+   305→  // Simple single-track approach (assumes one primary face)
+   306→  const track = {
+   307→    trackId: 'face_0',
+   308→    startTime: faceData[0].timestamp,
+   309→    endTime: faceData[faceData.length - 1].timestamp,
+   310→    positions: faceData.map(fd => ({
+   311→      timestamp: fd.timestamp,
+   312→      ...fd.faces[0]
+   313→    })),
+   314→    averageConfidence: faceData.reduce((sum, fd) =>
+   315→      sum + (fd.faces[0]?.confidence || 0), 0) / faceData.length
+   316→  };
+   317→
+   318→  return [track];
+   319→}
+   320→
+   321→/**
+   322→ * Smooth face positions using exponential moving average
+   323→ */
+   324→function smoothPositions(positions, smoothing) {
+   325→  if (positions.length < 2) return positions;
+   326→
+   327→  const smoothed = [positions[0]];
+   328→
+   329→  for (let i = 1; i < positions.length; i++) {
+   330→    const prev = smoothed[i - 1];
+   331→    const curr = positions[i];
+   332→
+   333→    smoothed.push({
+   334→      timestamp: curr.timestamp,
+   335→      x: prev.x * smoothing + curr.x * (1 - smoothing),
+   336→      y: prev.y * smoothing + curr.y * (1 - smoothing),
+   337→      width: prev.width * smoothing + curr.width * (1 - smoothing),
+   338→      height: prev.height * smoothing + curr.height * (1 - smoothing),
+   339→      confidence: curr.confidence
+   340→    });
+   341→  }
+   342→
+   343→  return smoothed;
+   344→}
+   345→
+   346→/**
+   347→ * Get face bounding box at specific time
+   348→ */
+   349→function getFaceAtTime(track, timestamp) {
+   350→  if (!track || !track.positions || track.positions.length === 0) {
+   351→    return null;
+   352→  }
+   353→
+   354→  // Find closest position
+   355→  let closest = track.positions[0];
+   356→  let minDiff = Math.abs(timestamp - closest.timestamp);
+   357→
+   358→  for (const pos of track.positions) {
+   359→    const diff = Math.abs(timestamp - pos.timestamp);
+   360→    if (diff < minDiff) {
+   361→      minDiff = diff;
+   362→      closest = pos;
+   363→    }
+   364→  }
+   365→
+   366→  return closest;
+   367→}
+   368→
+   369→/**
+   370→ * Calculate optimal crop region for aspect ratio
+   371→ */
+   372→function calculateCropRegion(facePosition, targetAspect, videoInfo, padding = 0.2) {
+   373→  if (!facePosition) {
+   374→    // Default center crop
+   375→    return calculateCenterCrop(targetAspect, videoInfo);
+   376→  }
+   377→
+   378→  const { width: videoWidth, height: videoHeight } = videoInfo;
+   379→  const targetHeight = videoHeight;
+   380→  const targetWidth = targetHeight * targetAspect;
+   381→
+   382→  // Face center in pixels
+   383→  const faceCenterX = (facePosition.x + facePosition.width / 2) * videoWidth;
+   384→  const faceCenterY = (facePosition.y + facePosition.height / 2) * videoHeight;
+   385→
+   386→  // Calculate crop region centered on face
+   387→  let cropX = faceCenterX - targetWidth / 2;
+   388→  let cropY = faceCenterY - targetHeight * 0.4; // Keep face in upper portion
+   389→
+   390→  // Apply bounds
+   391→  cropX = Math.max(0, Math.min(cropX, videoWidth - targetWidth));
+   392→  cropY = Math.max(0, Math.min(cropY, videoHeight - targetHeight));
+   393→
+   394→  return {
+   395→    x: cropX / videoWidth,
+   396→    y: cropY / videoHeight,
+   397→    width: targetWidth / videoWidth,
+   398→    height: targetHeight / videoHeight,
+   399→    pixelX: Math.round(cropX),
+   400→    pixelY: Math.round(cropY),
+   401→    pixelWidth: Math.round(targetWidth),
+   402→    pixelHeight: Math.round(targetHeight)
+   403→  };
+   404→}
+   405→
+   406→/**
+   407→ * Calculate center crop for aspect ratio
+   408→ */
+   409→function calculateCenterCrop(targetAspect, videoInfo) {
+   410→  const { width: videoWidth, height: videoHeight } = videoInfo;
+   411→  const videoAspect = videoWidth / videoHeight;
+   412→
+   413→  let cropWidth, cropHeight, cropX, cropY;
+   414→
+   415→  if (targetAspect < videoAspect) {
+   416→    // Target is narrower, crop sides
+   417→    cropHeight = videoHeight;
+   418→    cropWidth = cropHeight * targetAspect;
+   419→    cropY = 0;
+   420→    cropX = (videoWidth - cropWidth) / 2;
+   421→  } else {
+   422→    // Target is wider, crop top/bottom
+   423→    cropWidth = videoWidth;
+   424→    cropHeight = cropWidth / targetAspect;
+   425→    cropX = 0;
+   426→    cropY = (videoHeight - cropHeight) / 2;
+   427→  }
+   428→
+   429→  return {
+   430→    x: cropX / videoWidth,
+   431→    y: cropY / videoHeight,
+   432→    width: cropWidth / videoWidth,
+   433→    height: cropHeight / videoHeight,
+   434→    pixelX: Math.round(cropX),
+   435→    pixelY: Math.round(cropY),
+   436→    pixelWidth: Math.round(cropWidth),
+   437→    pixelHeight: Math.round(cropHeight)
+   438→  };
+   439→}
+   440→
+   441→// ============================================================================
+   442→// EXPORTS
+   443→// ============================================================================
+   444→
+   445→module.exports = {
+   446→  detectFaces,
+   447→  trackFaces,
+   448→  identifySpeaker,
+   449→  getFaceAtTime,
+   450→  calculateCropRegion,
+   451→  calculateCenterCrop,
+   452→  // Helpers for testing
+   453→  getVideoInfo,
+   454→  smoothPositions,
+   455→  generateFaceTracks
+   456→};
+   457→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

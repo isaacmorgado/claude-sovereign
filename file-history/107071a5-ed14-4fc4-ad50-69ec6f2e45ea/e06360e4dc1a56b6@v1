@@ -1,0 +1,298 @@
+/**
+ * Cloudflare R2 Storage Service
+ * Handles music file uploads and signed URL generation
+ */
+
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+// Initialize R2 client (lazy initialization)
+let s3Client = null;
+
+function getS3Client() {
+  if (!s3Client) {
+    // Validate required environment variables
+    const requiredEnvVars = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET_NAME'];
+    const missing = requiredEnvVars.filter(v => !process.env[v]);
+
+    if (missing.length > 0) {
+      throw new Error(`Missing R2 environment variables: ${missing.join(', ')}`);
+    }
+
+    s3Client = new S3Client({
+      region: 'auto',
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+      }
+    });
+  }
+  return s3Client;
+}
+
+/**
+ * Generate storage key for music file
+ * @param {string} customerId - Stripe customer ID
+ * @param {string} jobId - Music generation job ID
+ * @param {string} filename - File name (e.g., 'master.wav', 'preview.mp3')
+ * @returns {string} Storage key path
+ */
+function generateStorageKey(customerId, jobId, filename = 'master.wav') {
+  // Sanitize inputs
+  const safeCustomerId = customerId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const safeJobId = jobId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '');
+
+  return `${safeCustomerId}/${safeJobId}/${safeFilename}`;
+}
+
+/**
+ * Upload music file to R2
+ * @param {Buffer} buffer - File buffer
+ * @param {string} key - Storage key (use generateStorageKey)
+ * @param {Object} metadata - Optional metadata
+ * @returns {Promise<{success: boolean, key: string, size: number}>}
+ */
+async function uploadMusic(buffer, key, metadata = {}) {
+  const client = getS3Client();
+
+  // Determine content type from key
+  let contentType = 'audio/wav';
+  if (key.endsWith('.mp3')) contentType = 'audio/mpeg';
+  else if (key.endsWith('.json')) contentType = 'application/json';
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    Metadata: {
+      ...metadata,
+      'uploaded-at': new Date().toISOString()
+    }
+  });
+
+  await client.send(command);
+
+  return {
+    success: true,
+    key,
+    size: buffer.length
+  };
+}
+
+/**
+ * Upload metadata JSON file
+ * @param {string} key - Storage key for metadata file
+ * @param {Object} metadata - Metadata object to store
+ * @returns {Promise<{success: boolean, key: string}>}
+ */
+async function uploadMetadata(key, metadata) {
+  const buffer = Buffer.from(JSON.stringify(metadata, null, 2));
+  return uploadMusic(buffer, key, { type: 'metadata' });
+}
+
+/**
+ * Upload buffer to R2 with specified content type
+ * @param {string} key - Storage key
+ * @param {Buffer} buffer - File buffer
+ * @param {string} contentType - Content type (e.g., 'audio/wav')
+ * @returns {Promise<{success: boolean, key: string, size: number}>}
+ */
+async function uploadBuffer(key, buffer, contentType = 'audio/wav') {
+  const client = getS3Client();
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    Metadata: {
+      'uploaded-at': new Date().toISOString()
+    }
+  });
+
+  await client.send(command);
+
+  return {
+    success: true,
+    key,
+    size: buffer.length
+  };
+}
+
+/**
+ * Download file from R2 as buffer
+ * @param {string} key - Storage key
+ * @returns {Promise<Buffer>} File buffer
+ */
+async function downloadFile(key) {
+  const client = getS3Client();
+
+  const command = new GetObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  });
+
+  const response = await client.send(command);
+
+  // Convert stream to buffer
+  const chunks = [];
+  for await (const chunk of response.Body) {
+    chunks.push(chunk);
+  }
+
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Get signed download URL for music file
+ * @param {string} key - Storage key
+ * @param {number} expiresIn - URL expiration in seconds (default 1 hour)
+ * @returns {Promise<string>} Signed URL
+ */
+async function getSignedDownloadUrl(key, expiresIn = 3600) {
+  const client = getS3Client();
+
+  const command = new GetObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  });
+
+  return getSignedUrl(client, command, { expiresIn });
+}
+
+/**
+ * Get signed upload URL (for direct client uploads)
+ * @param {string} key - Storage key
+ * @param {string} contentType - File content type
+ * @param {number} expiresIn - URL expiration in seconds (default 30 minutes)
+ * @returns {Promise<{url: string, key: string, expiresIn: number}>}
+ */
+async function getSignedUploadUrl(key, contentType = 'audio/wav', expiresIn = 1800) {
+  const client = getS3Client();
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
+    ContentType: contentType
+  });
+
+  const url = await getSignedUrl(client, command, { expiresIn });
+
+  return {
+    url,
+    key,
+    expiresIn
+  };
+}
+
+/**
+ * Delete music file from R2
+ * @param {string} key - Storage key
+ * @returns {Promise<{success: boolean}>}
+ */
+async function deleteMusic(key) {
+  const client = getS3Client();
+
+  const command = new DeleteObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  });
+
+  await client.send(command);
+
+  return { success: true };
+}
+
+/**
+ * Delete all files for a job (master, preview, metadata)
+ * @param {string} customerId - Stripe customer ID
+ * @param {string} jobId - Music generation job ID
+ * @returns {Promise<{success: boolean, deleted: string[]}>}
+ */
+async function deleteJobFiles(customerId, jobId) {
+  const files = ['master.wav', 'preview.mp3', 'metadata.json'];
+  const deleted = [];
+
+  for (const file of files) {
+    const key = generateStorageKey(customerId, jobId, file);
+    try {
+      await deleteMusic(key);
+      deleted.push(key);
+    } catch (error) {
+      // Ignore not found errors
+      if (error.name !== 'NoSuchKey') {
+        console.error(`Failed to delete ${key}:`, error.message);
+      }
+    }
+  }
+
+  return { success: true, deleted };
+}
+
+/**
+ * Check if file exists in R2
+ * @param {string} key - Storage key
+ * @returns {Promise<boolean>}
+ */
+async function fileExists(key) {
+  const client = getS3Client();
+
+  try {
+    const command = new HeadObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key
+    });
+
+    await client.send(command);
+    return true;
+  } catch (error) {
+    if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get file metadata (size, content type, etc.)
+ * @param {string} key - Storage key
+ * @returns {Promise<{size: number, contentType: string, lastModified: Date}|null>}
+ */
+async function getFileInfo(key) {
+  const client = getS3Client();
+
+  try {
+    const command = new HeadObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key
+    });
+
+    const response = await client.send(command);
+
+    return {
+      size: response.ContentLength,
+      contentType: response.ContentType,
+      lastModified: response.LastModified
+    };
+  } catch (error) {
+    if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+module.exports = {
+  generateStorageKey,
+  uploadMusic,
+  uploadMetadata,
+  getSignedDownloadUrl,
+  getSignedUploadUrl,
+  deleteMusic,
+  deleteJobFiles,
+  fileExists,
+  getFileInfo
+};

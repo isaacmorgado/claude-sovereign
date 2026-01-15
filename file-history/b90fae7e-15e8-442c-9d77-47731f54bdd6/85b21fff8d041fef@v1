@@ -1,0 +1,1837 @@
+/**
+ * SPLICE CEP Host Script
+ * ExtendScript for Premiere Pro
+ *
+ * Provides all Premiere Pro API functions called via jsx.evalScript()
+ * Based on proven patterns from FireCut and SPLICE UXP builder
+ */
+
+// ============================================================================
+// GLOBAL CONSTANTS & STATE
+// ============================================================================
+var SPLICE_VERSION = "6.0.8";
+var TICKS_PER_SECOND = 254016000000;
+var time_tolerance = 0.01; // 10ms tolerance for clip matching
+var temp_bin = null;
+var sequence_default_timecode = null;
+
+// Color label indices (Premiere Pro standard)
+var COLOR_LABELS = {
+    NONE: 0,
+    VIOLET: 1,
+    IRIS: 2,
+    CARIBBEAN: 3,
+    LAVENDER: 4,
+    CERULEAN: 5,
+    FOREST: 6,
+    ROSE: 7,
+    MANGO: 8,
+    PURPLE: 9,
+    BLUE: 10,
+    TEAL: 11,
+    MAGENTA: 12,
+    TAN: 13,
+    GREEN: 14,
+    BROWN: 15,
+    YELLOW: 16
+};
+
+// Segment type to color mapping
+var SEGMENT_COLORS = {
+    speech: COLOR_LABELS.FOREST,
+    take: COLOR_LABELS.LAVENDER,
+    best_take: COLOR_LABELS.CERULEAN,
+    silence: COLOR_LABELS.VIOLET,
+    wide_shot: COLOR_LABELS.YELLOW,
+    speaker_a: COLOR_LABELS.MANGO,
+    speaker_b: COLOR_LABELS.CARIBBEAN
+};
+
+// Timecode display formats
+var TIMECODES = {
+    TIMEDISPLAY_Frames: 4
+};
+
+// Translation map for localized effect names
+var translations = {
+    "Motion": ["Motion", "Mouvement", "Bewegung", "Movimiento", "Movimento"],
+    "Transform": ["Transform", "Transformation", "Transformieren", "Transformar"],
+    "Scale": ["Scale", "Echelle", "Skalierung", "Escala"],
+    "Scale Height": ["Scale Height", "Hauteur de l'echelle", "Skalierungshoehe"],
+    "Scale Width": ["Scale Width", "Largeur de l'echelle", "Skalierungsbreite"],
+    "Position": ["Position", "Posicion", "Posicao"],
+    "Anchor Point": ["Anchor Point", "Point d'ancrage", "Ankerpunkt"],
+    "Rotation": ["Rotation", "Rotacion", "Rotacao"],
+    "Opacity": ["Opacity", "Opacite", "Deckkraft", "Opacidad"]
+};
+
+// Project item types
+var project_item_type = {
+    "clip": 1,
+    "bin": 2,
+    "root": 3,
+    "file": 4
+};
+
+// ============================================================================
+// SECURITY: INPUT VALIDATION UTILITIES (CEP-CRIT-001)
+// Prevents path traversal, command injection, and null byte attacks
+// ============================================================================
+
+/**
+ * Validate and sanitize file paths to prevent path traversal attacks
+ * @param {string} path - File path to validate
+ * @returns {Object} { valid: boolean, path: string, error: string }
+ */
+function validateFilePath(path) {
+    if (!path || typeof path !== 'string') {
+        return { valid: false, path: null, error: 'Invalid path: must be a non-empty string' };
+    }
+
+    // Check for null bytes (CVE potential)
+    if (path.indexOf('\0') !== -1 || path.indexOf('\x00') !== -1) {
+        return { valid: false, path: null, error: 'Invalid path: null bytes detected' };
+    }
+
+    // Normalize path separators
+    var normalized = path.replace(/\\/g, '/');
+
+    // Check for directory traversal attempts
+    if (normalized.indexOf('../') !== -1 || normalized.indexOf('..\\') !== -1) {
+        return { valid: false, path: null, error: 'Invalid path: directory traversal detected' };
+    }
+
+    // Check for potentially dangerous characters in paths (command injection)
+    var dangerousChars = /[`$();|&<>]/;
+    if (dangerousChars.test(path)) {
+        return { valid: false, path: null, error: 'Invalid path: dangerous characters detected' };
+    }
+
+    // Check for protocol handlers that could be exploited
+    var protocolPattern = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+    if (protocolPattern.test(path) && !path.match(/^[A-Z]:\//i)) {
+        // Allow Windows drive letters (C:/) but block other protocols (javascript:, data:, etc.)
+        return { valid: false, path: null, error: 'Invalid path: protocol handlers not allowed' };
+    }
+
+    return { valid: true, path: path, error: null };
+}
+
+/**
+ * Validate sequence name to prevent XSS and injection
+ * @param {string} name - Sequence name to validate
+ * @returns {Object} { valid: boolean, name: string, error: string }
+ */
+function validateSequenceName(name) {
+    if (!name || typeof name !== 'string') {
+        return { valid: false, name: null, error: 'Invalid name: must be a non-empty string' };
+    }
+
+    // Check for null bytes
+    if (name.indexOf('\0') !== -1) {
+        return { valid: false, name: null, error: 'Invalid name: null bytes detected' };
+    }
+
+    // Check for potentially dangerous characters (file system reserved on Windows)
+    var invalidChars = /[<>:"|?*]/;
+    if (invalidChars.test(name)) {
+        return { valid: false, name: null, error: 'Invalid name: contains reserved characters' };
+    }
+
+    // Limit length to prevent buffer overflows
+    if (name.length > 255) {
+        return { valid: false, name: null, error: 'Invalid name: exceeds maximum length (255)' };
+    }
+
+    return { valid: true, name: name, error: null };
+}
+
+/**
+ * Validate numeric parameters to prevent injection and DoS
+ * @param {*} value - Value to validate
+ * @param {number} min - Minimum allowed value
+ * @param {number} max - Maximum allowed value
+ * @param {string} paramName - Parameter name for error messages
+ * @returns {Object} { valid: boolean, value: number, error: string }
+ */
+function validateNumericParam(value, min, max, paramName) {
+    if (value === undefined || value === null) {
+        return { valid: false, value: null, error: paramName + ' is required' };
+    }
+
+    var num = parseFloat(value);
+    if (isNaN(num)) {
+        return { valid: false, value: null, error: paramName + ' must be a number' };
+    }
+
+    if (num < min || num > max) {
+        return { valid: false, value: null, error: paramName + ' must be between ' + min + ' and ' + max };
+    }
+
+    return { valid: true, value: num, error: null };
+}
+
+/**
+ * Sanitize string for safe use in Premiere Pro operations
+ * @param {string} str - String to sanitize
+ * @returns {string} Sanitized string
+ */
+function sanitizeString(str) {
+    if (!str || typeof str !== 'string') {
+        return '';
+    }
+
+    // Remove null bytes
+    str = str.replace(/\0/g, '');
+
+    // Escape special characters that could be problematic in ExtendScript
+    str = str.replace(/[\r\n]/g, ' ');
+
+    return str;
+}
+
+/**
+ * Validate array of time values (for markers, cuts, etc.)
+ * @param {Array} times - Array of time values
+ * @param {number} maxLength - Maximum array length (DoS prevention)
+ * @returns {Object} { valid: boolean, times: Array, error: string }
+ */
+function validateTimeArray(times, maxLength) {
+    if (!times || !Array.isArray(times)) {
+        return { valid: false, times: null, error: 'Times must be an array' };
+    }
+
+    maxLength = maxLength || 10000; // Default limit
+    if (times.length > maxLength) {
+        return { valid: false, times: null, error: 'Too many time values (max: ' + maxLength + ')' };
+    }
+
+    for (var i = 0; i < times.length; i++) {
+        var validation = validateNumericParam(times[i], 0, Number.MAX_VALUE, 'time[' + i + ']');
+        if (!validation.valid) {
+            return { valid: false, times: null, error: validation.error };
+        }
+    }
+
+    return { valid: true, times: times, error: null };
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+/**
+ * Check if QE (Quality Engine) DOM is available
+ * QE provides extended functionality not available in standard DOM
+ */
+function isQEAvailable() {
+    try {
+        return typeof qe !== 'undefined' && qe !== null && qe.project;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Enable QE DOM if not already enabled
+ * @returns {boolean} true if QE is now available
+ */
+function enableQE() {
+    try {
+        if (isQEAvailable()) return true;
+        app.enableQE();
+        return isQEAvailable();
+    } catch (e) {
+        $.writeln('[SPLICE] enableQE failed: ' + e.message);
+        return false;
+    }
+}
+
+/**
+ * Safe wrapper for QE operations
+ * @param {Function} operation - The QE operation to execute
+ * @param {string} operationName - Name for error reporting
+ * @returns {Object} Result or error object
+ */
+function safeQEOperation(operation, operationName) {
+    try {
+        if (!isQEAvailable()) {
+            if (!enableQE()) {
+                return { error: "QE not available. Please ensure Premiere Pro supports QE DOM." };
+            }
+        }
+        return operation();
+    } catch (e) {
+        return { error: operationName + " failed: " + e.message };
+    }
+}
+
+function initialise() {
+    try {
+        storeDefaultTimecode();
+        // Try to enable QE on startup
+        var qeStatus = enableQE();
+        return JSON.stringify({ success: true, version: SPLICE_VERSION, qeAvailable: qeStatus });
+    } catch (e) {
+        $.writeln('[SPLICE] initialise error: ' + e.message);
+        return JSON.stringify({ success: false, error: e.message, version: SPLICE_VERSION });
+    }
+}
+
+function storeDefaultTimecode() {
+    try {
+        if (app && app.project && app.project.activeSequence) {
+            sequence_default_timecode = app.project.activeSequence.getSettings().videoDisplayFormat;
+        }
+    } catch (e) {
+        $.writeln('[SPLICE] storeDefaultTimecode failed: ' + e.message);
+    }
+}
+
+/**
+ * Check if a sequence is currently open/active in the Timeline
+ * Streamlined version - removes excessive logging for better performance
+ * @returns {boolean} true if a sequence is open
+ */
+function checkSequenceOpen() {
+    try {
+        // Quick validation checks without logging every step
+        if (!app || !app.project || !app.project.sequences) {
+            $.writeln('[SPLICE] checkSequenceOpen: ERROR - Premiere Pro app/project not ready');
+            return false;
+        }
+
+        // Primary check: Standard DOM activeSequence
+        if (app.project.activeSequence) {
+            // Verify sequence has basic properties
+            var seq = app.project.activeSequence;
+            if (seq.name && seq.sequenceID) {
+                $.writeln('[SPLICE] checkSequenceOpen: ✓ Active sequence found: ' + seq.name);
+                return true;
+            }
+        }
+
+        // Fallback: Try QE DOM if standard DOM failed
+        if (enableQE()) {
+            try {
+                var qeSeq = qe.project.getActiveSequence();
+                if (qeSeq && qeSeq.name) {
+                    $.writeln('[SPLICE] checkSequenceOpen: ✓ Active sequence found via QE: ' + qeSeq.name);
+                    return true;
+                }
+            } catch (qeErr) {
+                // Silent fallback failure - not critical
+            }
+        }
+
+        $.writeln('[SPLICE] checkSequenceOpen: ✗ No active sequence found');
+        return false;
+    } catch (e) {
+        $.writeln('[SPLICE] checkSequenceOpen: ERROR - ' + e.message);
+        return false;
+    }
+}
+
+function getVersion() {
+    return SPLICE_VERSION;
+}
+
+// ============================================================================
+// TIME CONVERSION UTILITIES
+// ============================================================================
+
+/**
+ * Get the actual frames per second from the sequence
+ * videoFrameRate.seconds gives seconds per frame, so we need to invert it
+ */
+function getActualFrameRate() {
+    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+    // secsPerFrame is e.g., 0.03333... for 30fps, so 1/secsPerFrame = 30
+    return 1 / secsPerFrame;
+}
+
+function quantise_time(time_seconds) {
+    // Get seconds per frame (e.g., 0.0333 for 30fps)
+    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+    // Round to nearest frame boundary
+    return secsPerFrame * Math.round(time_seconds / secsPerFrame);
+}
+
+function frames_to_time(number_of_frames) {
+    // seconds per frame * number of frames = total seconds
+    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+    return number_of_frames * secsPerFrame;
+}
+
+function frames_to_ticks(number_of_frames) {
+    // Convert frames to ticks: frames * seconds_per_frame * ticks_per_second
+    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+    return number_of_frames * secsPerFrame * TICKS_PER_SECOND;
+}
+
+function seconds_to_ticks(seconds) {
+    return seconds * TICKS_PER_SECOND;
+}
+
+function ticks_to_seconds(ticks) {
+    return ticks / TICKS_PER_SECOND;
+}
+
+function getVideoFrameRateInSeconds() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) {
+            $.writeln('[SPLICE] getVideoFrameRateInSeconds: No active sequence');
+            return null;
+        }
+        return seq.getSettings().videoFrameRate.seconds;
+    } catch (e) {
+        $.writeln('[SPLICE] getVideoFrameRateInSeconds error: ' + e.message);
+        return null;
+    }
+}
+
+function secondsToCurrentTimecode(seconds) {
+    var seq = app.project.activeSequence;
+    if (seq) {
+        var t = new Time();
+        t.seconds = parseFloat(seconds);
+        var settings = app.project.activeSequence.getSettings();
+        return t.getFormatted(settings.videoFrameRate, settings.videoDisplayFormat);
+    }
+    return false;
+}
+
+// ============================================================================
+// TIMECODE FORMAT
+// ============================================================================
+
+function setTimecodeToFrames() {
+    var seq = app.project.activeSequence;
+    if (seq) {
+        var currentSeqSettings = app.project.activeSequence.getSettings();
+        if (currentSeqSettings.videoDisplayFormat != TIMECODES.TIMEDISPLAY_Frames) {
+            currentSeqSettings.videoDisplayFormat = TIMECODES.TIMEDISPLAY_Frames;
+            app.project.activeSequence.setSettings(currentSeqSettings);
+        }
+    }
+}
+
+function setTimecodeToDefault() {
+    var seq = app.project.activeSequence;
+    if (seq && sequence_default_timecode) {
+        var currentSeqSettings = app.project.activeSequence.getSettings();
+        currentSeqSettings.videoDisplayFormat = sequence_default_timecode;
+        app.project.activeSequence.setSettings(currentSeqSettings);
+    }
+}
+
+function getTimecodeFormat() {
+    return app.project.activeSequence.getSettings().videoDisplayFormat;
+}
+
+function setTimecodeFormat(format) {
+    format = parseInt(format);
+    var seq = app.project.activeSequence;
+    if (seq) {
+        var currentSeqSettings = app.project.activeSequence.getSettings();
+        currentSeqSettings.videoDisplayFormat = format;
+        app.project.activeSequence.setSettings(currentSeqSettings);
+    }
+    return true;
+}
+
+// ============================================================================
+// SEQUENCE & PROJECT OPERATIONS
+// ============================================================================
+
+function getActiveSequence() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // Safely get settings with fallbacks
+        var frameRate = null;
+        try {
+            var settings = seq.getSettings();
+            if (settings && settings.videoFrameRate) {
+                frameRate = settings.videoFrameRate.seconds;
+            }
+        } catch (settingsErr) {
+            $.writeln('[SPLICE] getActiveSequence: Failed to get settings: ' + settingsErr.message);
+        }
+
+        return JSON.stringify({
+            name: seq.name || "Unknown",
+            id: seq.sequenceID || null,
+            duration: seq.end || 0,
+            videoTrackCount: seq.videoTracks ? seq.videoTracks.numTracks : 0,
+            audioTrackCount: seq.audioTracks ? seq.audioTracks.numTracks : 0,
+            frameRate: frameRate,
+            width: seq.frameSizeHorizontal || 0,
+            height: seq.frameSizeVertical || 0
+        });
+    } catch (e) {
+        $.writeln('[SPLICE] getActiveSequence error: ' + e.message);
+        return JSON.stringify({ error: "getActiveSequence failed: " + e.message });
+    }
+}
+
+function getAllSequences() {
+    try {
+        if (!app || !app.project || !app.project.sequences) {
+            return JSON.stringify({ error: "No project open" });
+        }
+
+        var sequences = [];
+        var numSeqs = app.project.sequences.numSequences;
+
+        for (var i = 0; i < numSeqs; i++) {
+            var seq = app.project.sequences[i];
+            if (seq) {
+                sequences.push({
+                    name: seq.name || "Unknown",
+                    id: seq.sequenceID || null,
+                    index: i
+                });
+            }
+        }
+
+        return JSON.stringify(sequences);
+    } catch (e) {
+        $.writeln('[SPLICE] getAllSequences error: ' + e.message);
+        return JSON.stringify({ error: "getAllSequences failed: " + e.message });
+    }
+}
+
+function getSequenceSettings() {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    var settings = seq.getSettings();
+    return JSON.stringify({
+        frameRate: settings.videoFrameRate.seconds,
+        width: settings.videoFrameWidth,
+        height: settings.videoFrameHeight,
+        displayFormat: settings.videoDisplayFormat
+    });
+}
+
+function cloneSequence(newName) {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    try {
+        // Clone the sequence
+        seq.clone();
+
+        // Find the cloned sequence (last one with matching name pattern)
+        var clonedSeq = null;
+        for (var i = app.project.sequences.numSequences - 1; i >= 0; i--) {
+            var s = app.project.sequences[i];
+            if (s.name.indexOf(seq.name) === 0 && s.sequenceID !== seq.sequenceID) {
+                clonedSeq = s;
+                break;
+            }
+        }
+
+        if (clonedSeq && newName) {
+            clonedSeq.name = newName;
+        }
+
+        return JSON.stringify({
+            success: true,
+            sequenceId: clonedSeq ? clonedSeq.sequenceID : null,
+            name: clonedSeq ? clonedSeq.name : newName
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function createNewSequence(name) {
+    try {
+        app.project.createNewSequence(name);
+        var seq = app.project.activeSequence;
+        return JSON.stringify({
+            success: true,
+            sequenceId: seq.sequenceID,
+            name: seq.name
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function setActiveSequence(sequenceId) {
+    for (var i = 0; i < app.project.sequences.numSequences; i++) {
+        if (app.project.sequences[i].sequenceID === sequenceId) {
+            app.project.activeSequence = app.project.sequences[i];
+            return JSON.stringify({ success: true });
+        }
+    }
+    return JSON.stringify({ error: "Sequence not found" });
+}
+
+/**
+ * Seek playhead to a specific time in seconds
+ */
+function seekToTime(seconds) {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    try {
+        // Convert seconds to ticks
+        var ticks = seconds * TICKS_PER_SECOND;
+
+        // Create a Time object and set position
+        var playerPos = seq.getPlayerPosition();
+        playerPos.seconds = seconds;
+        seq.setPlayerPosition(playerPos.ticks.toString());
+
+        return JSON.stringify({ success: true, position: seconds });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+/**
+ * Get current playhead position in seconds
+ */
+function getPlayerPosition() {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    try {
+        var pos = seq.getPlayerPosition();
+        return JSON.stringify({
+            ticks: pos.ticks,
+            seconds: pos.seconds
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// RAZOR OPERATIONS
+// ============================================================================
+
+function razorSequenceAtFrames(frames) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for razor operation" });
+    }
+    try {
+        frames = String(frames);
+        setTimecodeToFrames();
+        qe.project.getActiveSequence().razor(frames);
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: "Razor failed: " + e.message });
+    }
+}
+
+function razorSequenceAtSeconds(seconds) {
+    try {
+        var frames = parseInt(Math.round(seconds / app.project.activeSequence.getSettings().videoFrameRate.seconds)).toString();
+        return razorSequenceAtFrames(frames);
+    } catch (e) {
+        return JSON.stringify({ error: "Razor at seconds failed: " + e.message });
+    }
+}
+
+function razorSequenceAtFramesArray(silences_array) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for razor operation" });
+    }
+    try {
+        setTimecodeToFrames();
+        silences_array = JSON.parse(silences_array);
+        var razorCount = 0;
+        for (var i = 0; i < silences_array.length; i++) {
+            for (var j = 0; j < silences_array[i].length; j++) {
+                var frames = String(silences_array[i][j]);
+                qe.project.getActiveSequence().razor(frames);
+                razorCount++;
+            }
+        }
+        return JSON.stringify({ success: true, razorCount: razorCount });
+    } catch (e) {
+        return JSON.stringify({ error: "Razor array failed: " + e.message });
+    }
+}
+
+function razorTrackAtFrames(trackType, trackIndex, frames) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for track razor" });
+    }
+    try {
+        frames = String(frames);
+        setTimecodeToFrames();
+        if (trackType == "video") {
+            qe.project.getActiveSequence().getVideoTrackAt(trackIndex).razor(frames);
+        } else if (trackType == "audio") {
+            qe.project.getActiveSequence().getAudioTrackAt(trackIndex).razor(frames);
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: "Track razor failed: " + e.message });
+    }
+}
+
+function razorTrackAtSeconds(trackType, trackIndex, seconds) {
+    try {
+        var frames = parseInt(Math.round(seconds / app.project.activeSequence.getSettings().videoFrameRate.seconds)).toString();
+        return razorTrackAtFrames(trackType, trackIndex, frames);
+    } catch (e) {
+        return JSON.stringify({ error: "Track razor at seconds failed: " + e.message });
+    }
+}
+
+// ============================================================================
+// CLIP OPERATIONS
+// ============================================================================
+
+/**
+ * Get currently selected clips in the timeline
+ * @returns {string} JSON with selected clip data or error
+ */
+function getSelectedClips() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var selection = seq.getSelection();
+        var clips = [];
+
+        for (var i = 0; i < selection.length; i++) {
+            var clip = selection[i];
+            clips.push({
+                index: i,
+                name: clip.name,
+                start: clip.start.seconds,
+                end: clip.end.seconds,
+                duration: clip.duration.seconds,
+                inPoint: clip.inPoint ? clip.inPoint.seconds : null,
+                outPoint: clip.outPoint ? clip.outPoint.seconds : null,
+                mediaPath: clip.projectItem ? clip.projectItem.getMediaPath() : null
+            });
+        }
+
+        $.writeln('[SPLICE] getSelectedClips: Found ' + clips.length + ' selected clips');
+        return JSON.stringify({
+            count: clips.length,
+            clips: clips
+        });
+    } catch (e) {
+        $.writeln('[SPLICE] getSelectedClips error: ' + e.message);
+        return JSON.stringify({ error: "getSelectedClips failed: " + e.message });
+    }
+}
+
+function getClipsInTrack(trackIndex, trackType) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var tracks = trackType === "audio" ? seq.audioTracks : seq.videoTracks;
+        if (trackIndex < 0 || trackIndex >= tracks.numTracks) {
+            return JSON.stringify({ error: "Invalid track index: " + trackIndex + " (max: " + (tracks.numTracks - 1) + ")" });
+        }
+
+        var clips = [];
+        var trackClips = tracks[trackIndex].clips;
+        for (var i = 0; i < trackClips.numItems; i++) {
+            var clip = trackClips[i];
+            clips.push({
+                index: i,
+                name: clip.name,
+                start: clip.start.seconds,
+                end: clip.end.seconds,
+                duration: clip.duration.seconds,
+                inPoint: clip.inPoint.seconds,
+                outPoint: clip.outPoint.seconds,
+                mediaPath: clip.projectItem ? clip.projectItem.getMediaPath() : null
+            });
+        }
+        return JSON.stringify(clips);
+    } catch (e) {
+        $.writeln('[SPLICE] getClipsInTrack error: ' + e.message);
+        return JSON.stringify({ error: "getClipsInTrack failed: " + e.message });
+    }
+}
+
+function getClipsInTrack_Timings_Seconds(trackIndex, trackType) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var tracks = trackType === "audio" ? seq.audioTracks : seq.videoTracks;
+        if (trackIndex < 0 || trackIndex >= tracks.numTracks) {
+            return JSON.stringify({ error: "Invalid track index: " + trackIndex });
+        }
+
+        var clips = [];
+        var trackClips = tracks[trackIndex].clips;
+        for (var i = 0; i < trackClips.numItems; i++) {
+            clips.push([
+                trackClips[i].start.seconds,
+                trackClips[i].end.seconds
+            ]);
+        }
+        return JSON.stringify(clips);
+    } catch (e) {
+        $.writeln('[SPLICE] getClipsInTrack_Timings_Seconds error: ' + e.message);
+        return JSON.stringify({ error: "getClipsInTrack_Timings_Seconds failed: " + e.message });
+    }
+}
+
+function deleteClipsAtSilencePointsInTrack(silences, trackType, trackIndex) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // Validate trackType
+        if (trackType !== "video" && trackType !== "audio") {
+            return JSON.stringify({ error: "Invalid track type: " + trackType });
+        }
+
+        // Parse silences JSON
+        var silencesArr;
+        try {
+            silencesArr = JSON.parse(silences);
+        } catch (parseErr) {
+            return JSON.stringify({ error: "Invalid silences JSON: " + parseErr.message });
+        }
+
+        // Get tracks and validate index
+        var tracks = trackType === "video" ? seq.videoTracks : seq.audioTracks;
+        if (trackIndex < 0 || trackIndex >= tracks.numTracks) {
+            return JSON.stringify({ error: "Invalid track index: " + trackIndex + " (max: " + (tracks.numTracks - 1) + ")" });
+        }
+
+        var clips = tracks[trackIndex].clips;
+        var deleted = 0;
+
+        // Iterate backwards to avoid index shifting (use numItems, not length)
+        for (var i = clips.numItems - 1; i >= 0; i--) {
+            var clip = clips[i];
+            var start = clip.start.seconds;
+            var end = clip.end.seconds;
+            var center = (start + end) / 2;
+
+            for (var j = 0; j < silencesArr.length; j++) {
+                var silence = silencesArr[j];
+                var silenceCenter = (silence[0] + silence[1]) / 2;
+                if (silenceCenter > start && silenceCenter < end) {
+                    clip.remove(false, false);
+                    deleted++;
+                    break;
+                }
+            }
+        }
+
+        $.writeln('[SPLICE] deleteClipsAtSilencePointsInTrack: Deleted ' + deleted + ' clips from ' + trackType + ' track ' + trackIndex);
+        return JSON.stringify({ deleted: deleted });
+    } catch (e) {
+        $.writeln('[SPLICE] deleteClipsAtSilencePointsInTrack error: ' + e.message);
+        return JSON.stringify({ error: "deleteClipsAtSilencePointsInTrack failed: " + e.message });
+    }
+}
+
+function makeRemainingClipsContiguousInTrack(silences, deltas, trackType, trackIndex) {
+    silences = JSON.parse(silences);
+    deltas = JSON.parse(deltas);
+
+    var clips;
+    if (trackType == "video") {
+        clips = app.project.activeSequence.videoTracks[trackIndex].clips;
+    } else if (trackType == "audio") {
+        clips = app.project.activeSequence.audioTracks[trackIndex].clips;
+    }
+
+    for (var i = 0; i < clips.length; i++) {
+        var clip = clips[i];
+        var end = clip.end.seconds;
+        var num_silences = -1;
+
+        for (var j = 0; j < silences.length; j++) {
+            if (end > silences[j][1]) {
+                num_silences++;
+            }
+        }
+
+        if (num_silences > -1 && num_silences < deltas.length) {
+            var delta = deltas[num_silences];
+            var t_start = clip.start;
+            t_start.seconds = t_start.seconds - delta;
+            clip.start = t_start;
+            var t_end = clip.end;
+            t_end.seconds = t_end.seconds - delta;
+            clip.end = t_end;
+        }
+    }
+    return JSON.stringify({ success: true });
+}
+
+function removeClipByIndex(trackType, trackIndex, clipIndex) {
+    try {
+        if (trackType == "video") {
+            app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex].remove(false, false);
+        } else if (trackType == "audio") {
+            app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex].remove(false, false);
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function setClipInOutPoints(trackType, trackIndex, clipIndex, inPoint, outPoint) {
+    try {
+        var clip;
+        if (trackType == "video") {
+            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+        } else if (trackType == "audio") {
+            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+        }
+
+        if (inPoint !== null) {
+            var inTime = new Time();
+            inTime.seconds = inPoint;
+            clip.inPoint = inTime;
+        }
+        if (outPoint !== null) {
+            var outTime = new Time();
+            outTime.seconds = outPoint;
+            clip.outPoint = outTime;
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function setClipStartEnd(trackType, trackIndex, clipIndex, startSeconds, endSeconds) {
+    try {
+        var clip;
+        if (trackType == "video") {
+            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+        } else if (trackType == "audio") {
+            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+        }
+
+        if (startSeconds !== null) {
+            var startTime = clip.start;
+            startTime.seconds = startSeconds;
+            clip.start = startTime;
+        }
+        if (endSeconds !== null) {
+            var endTime = clip.end;
+            endTime.seconds = endSeconds;
+            clip.end = endTime;
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// TRACK OPERATIONS
+// ============================================================================
+
+function getTrackNames(trackType) {
+    if (!isQEAvailable() && !enableQE()) {
+        // Fallback: use standard DOM
+        var ret = [];
+        try {
+            if (trackType == "video") {
+                for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+                    ret.push("V" + (i + 1));
+                }
+            } else if (trackType == "audio") {
+                for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+                    ret.push("A" + (i + 1));
+                }
+            }
+        } catch (e) {
+            return JSON.stringify({ error: "Failed to get track names: " + e.message });
+        }
+        return JSON.stringify(ret);
+    }
+
+    try {
+        var ret = [];
+        if (trackType == "video") {
+            for (var i = 0; i < qe.project.getActiveSequence().numVideoTracks; i++) {
+                ret.push(qe.project.getActiveSequence().getVideoTrackAt(i).name);
+            }
+        } else if (trackType == "audio") {
+            for (var i = 0; i < qe.project.getActiveSequence().numAudioTracks; i++) {
+                ret.push(qe.project.getActiveSequence().getAudioTrackAt(i).name);
+            }
+        }
+        return JSON.stringify(ret);
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to get track names: " + e.message });
+    }
+}
+
+function getNumTracks(trackType) {
+    try {
+        if (trackType == "video") {
+            return app.project.activeSequence.videoTracks.numTracks;
+        } else if (trackType == "audio") {
+            return app.project.activeSequence.audioTracks.numTracks;
+        }
+        return 0;
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to get track count: " + e.message });
+    }
+}
+
+function addVideoTrack() {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for adding tracks" });
+    }
+    try {
+        var trackId = qe.project.getActiveSequence().numVideoTracks;
+        qe.project.getActiveSequence().addTracks(1, trackId, 0, 0);
+        return JSON.stringify({ success: true, trackId: trackId });
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to add video track: " + e.message });
+    }
+}
+
+function addAudioTrack() {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for adding tracks" });
+    }
+    try {
+        var trackId = qe.project.getActiveSequence().numAudioTracks;
+        qe.project.getActiveSequence().addTracks(0, 0, 1, 1, trackId);
+        return JSON.stringify({ success: true, trackId: trackId });
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to add audio track: " + e.message });
+    }
+}
+
+function removeVideoTrack(trackIndex) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for removing tracks" });
+    }
+    try {
+        qe.project.getActiveSequence().removeVideoTrack(trackIndex);
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to remove video track: " + e.message });
+    }
+}
+
+function removeAudioTrack(trackIndex) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for removing tracks" });
+    }
+    try {
+        qe.project.getActiveSequence().removeAudioTrack(trackIndex);
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: "Failed to remove audio track: " + e.message });
+    }
+}
+
+// ============================================================================
+// MUTE STATE
+// ============================================================================
+
+function getMuteState() {
+    var mute_state_video = [];
+    for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+        mute_state_video.push(app.project.activeSequence.videoTracks[i].isMuted());
+    }
+    var mute_state_audio = [];
+    for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+        mute_state_audio.push(app.project.activeSequence.audioTracks[i].isMuted());
+    }
+    return JSON.stringify({ audio: mute_state_audio, video: mute_state_video });
+}
+
+function setMuteState(mute_state) {
+    mute_state = JSON.parse(mute_state);
+    for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+        if (i < mute_state.video.length) {
+            app.project.activeSequence.videoTracks[i].setMute(mute_state.video[i]);
+        }
+    }
+    for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+        if (i < mute_state.audio.length) {
+            app.project.activeSequence.audioTracks[i].setMute(mute_state.audio[i]);
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// PROJECT ITEM OPERATIONS
+// ============================================================================
+
+function findItemByName(bin, name) {
+    for (var i = 0; i < bin.children.numItems; i++) {
+        if (bin.children[i].name === name) {
+            return bin.children[i];
+        }
+        if (bin.children[i].children !== undefined) {
+            var item = findItemByName(bin.children[i], name);
+            if (item) return item;
+        }
+    }
+    return null;
+}
+
+function findItemByPath(bin, path) {
+    for (var i = 0; i < bin.children.numItems; i++) {
+        var item = bin.children[i];
+        if (item.getMediaPath && item.getMediaPath() === path) {
+            return item;
+        }
+        if (item.children !== undefined) {
+            var found = findItemByPath(item, path);
+            if (found) return found;
+        }
+    }
+    return null;
+}
+
+function importFile(filePath) {
+    try {
+        var success = app.project.importFiles([filePath], true, app.project.rootItem, false);
+        if (success) {
+            // Find the imported item
+            var item = findItemByPath(app.project.rootItem, filePath);
+            return JSON.stringify({
+                success: true,
+                nodeId: item ? item.nodeId : null
+            });
+        }
+        return JSON.stringify({ error: "Import failed" });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function getSpliceBin() {
+    var rootItemChildren = app.project.rootItem.children;
+    var spliceBin = null;
+
+    for (var i = 0; i < rootItemChildren.numItems; i++) {
+        if (rootItemChildren[i].name === "SPLICE" && rootItemChildren[i].type === 2) {
+            spliceBin = rootItemChildren[i];
+            break;
+        }
+    }
+
+    if (!spliceBin) {
+        app.project.rootItem.createBin("SPLICE");
+        return getSpliceBin();
+    }
+
+    return spliceBin;
+}
+
+function getAllProjectItems() {
+    var items = [];
+
+    function collectItems(bin, path) {
+        for (var i = 0; i < bin.children.numItems; i++) {
+            var item = bin.children[i];
+            var itemPath = path + "/" + item.name;
+
+            items.push({
+                nodeId: item.nodeId,
+                name: item.name,
+                type: item.type,
+                treePath: itemPath,
+                mediaPath: item.getMediaPath ? item.getMediaPath() : null
+            });
+
+            if (item.children !== undefined && item.type === 2) {
+                collectItems(item, itemPath);
+            }
+        }
+    }
+
+    collectItems(app.project.rootItem, "");
+    return JSON.stringify(items);
+}
+
+// ============================================================================
+// CLIP INSERTION
+// ============================================================================
+
+function insertClipAtTime(projectItemNodeId, trackIndex, startSeconds, trackType) {
+    try {
+        var item = findItemByNodeId(app.project.rootItem, projectItemNodeId);
+        if (!item) {
+            return JSON.stringify({ error: "Project item not found" });
+        }
+
+        var targetTime = new Time();
+        targetTime.seconds = startSeconds;
+
+        if (trackType === "video") {
+            app.project.activeSequence.videoTracks[trackIndex].insertClip(item, targetTime);
+        } else if (trackType === "audio") {
+            app.project.activeSequence.audioTracks[trackIndex].insertClip(item, targetTime);
+        }
+
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function findItemByNodeId(bin, nodeId) {
+    for (var i = 0; i < bin.children.numItems; i++) {
+        if (bin.children[i].nodeId === nodeId) {
+            return bin.children[i];
+        }
+        if (bin.children[i].children !== undefined) {
+            var found = findItemByNodeId(bin.children[i], nodeId);
+            if (found) return found;
+        }
+    }
+    return null;
+}
+
+// ============================================================================
+// MARKER OPERATIONS
+// ============================================================================
+
+function createMarker(timeSeconds, name, duration, comments, colorIndex) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var marker = markers.createMarker(timeSeconds);
+
+        if (name) marker.name = name;
+        if (comments) marker.comments = comments;
+        if (colorIndex !== undefined) marker.setColorByIndex(colorIndex);
+        if (duration && duration > 0) {
+            // Set marker end time properly using a Time object
+            var endTime = new Time();
+            endTime.seconds = marker.start.seconds + duration;
+            marker.end = endTime;
+        }
+
+        return JSON.stringify({
+            success: true,
+            guid: marker.guid
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function getMarkers() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var result = [];
+
+        for (var i = 0; i < markers.numMarkers; i++) {
+            var marker = markers[i];
+            result.push({
+                guid: marker.guid,
+                name: marker.name,
+                comments: marker.comments,
+                start: marker.start.seconds,
+                end: marker.end.seconds,
+                type: marker.type
+            });
+        }
+
+        return JSON.stringify(result);
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function deleteMarker(markerGuid) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        for (var i = 0; i < markers.numMarkers; i++) {
+            if (markers[i].guid === markerGuid) {
+                markers[i].remove();
+                return JSON.stringify({ success: true });
+            }
+        }
+        return JSON.stringify({ error: "Marker not found" });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function deleteAllMarkers() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var count = markers.numMarkers;
+
+        // Delete from end to beginning to avoid index shifting
+        for (var i = count - 1; i >= 0; i--) {
+            markers[i].remove();
+        }
+
+        return JSON.stringify({ success: true, deleted: count });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function deleteMarkersByName(namePattern) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var deleted = 0;
+
+        for (var i = markers.numMarkers - 1; i >= 0; i--) {
+            if (markers[i].name && markers[i].name.indexOf(namePattern) !== -1) {
+                markers[i].remove();
+                deleted++;
+            }
+        }
+
+        return JSON.stringify({ success: true, deleted: deleted });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// COLOR LABEL OPERATIONS
+// ============================================================================
+
+function setClipColorLabel(trackType, trackIndex, clipIndex, colorIndex) {
+    try {
+        var clip;
+        if (trackType == "video") {
+            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+        } else if (trackType == "audio") {
+            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+        }
+
+        if (clip && clip.projectItem) {
+            clip.projectItem.setColorLabel(colorIndex);
+        }
+        return JSON.stringify({ success: true });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function setProjectItemColorLabel(nodeId, colorIndex) {
+    try {
+        var item = findItemByNodeId(app.project.rootItem, nodeId);
+        if (item) {
+            item.setColorLabel(colorIndex);
+            return JSON.stringify({ success: true });
+        }
+        return JSON.stringify({ error: "Item not found" });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// SEQUENCE BUILDING (CORE v3.5 FUNCTIONALITY)
+// ============================================================================
+
+function buildSequenceFromCutList(cutListJson) {
+    try {
+        var cutList = JSON.parse(cutListJson);
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // Clone the sequence
+        var newSequenceName = seq.name + "_SPLICE";
+        seq.clone();
+
+        // Find the cloned sequence
+        var newSeq = null;
+        for (var i = app.project.sequences.numSequences - 1; i >= 0; i--) {
+            var s = app.project.sequences[i];
+            if (s.name.indexOf(seq.name) === 0 && s.sequenceID !== seq.sequenceID) {
+                newSeq = s;
+                break;
+            }
+        }
+
+        if (!newSeq) {
+            return JSON.stringify({ error: "Failed to clone sequence" });
+        }
+
+        newSeq.name = newSequenceName;
+        app.project.activeSequence = newSeq;
+
+        // Clear all clips from the new sequence
+        clearSequence();
+
+        // Insert segments
+        var currentPosition = 0;
+        var stats = {
+            segmentsInserted: 0,
+            totalDuration: 0
+        };
+
+        for (var i = 0; i < cutList.segments.length; i++) {
+            var segment = cutList.segments[i];
+
+            // Find the source project item
+            var sourceItem = null;
+            if (segment.sourcePath) {
+                sourceItem = findItemByPath(app.project.rootItem, segment.sourcePath);
+            }
+            if (!sourceItem && segment.sourceName) {
+                sourceItem = findItemByName(app.project.rootItem, segment.sourceName);
+            }
+
+            if (!sourceItem) continue;
+
+            // Set color label
+            if (segment.colorHint && SEGMENT_COLORS[segment.colorHint]) {
+                sourceItem.setColorLabel(SEGMENT_COLORS[segment.colorHint]);
+            } else if (segment.type && SEGMENT_COLORS[segment.type]) {
+                sourceItem.setColorLabel(SEGMENT_COLORS[segment.type]);
+            }
+
+            // Insert clip at current position
+            var targetTime = new Time();
+            targetTime.seconds = currentPosition;
+
+            newSeq.videoTracks[0].insertClip(sourceItem, targetTime);
+
+            // Set in/out points
+            var clipDuration = segment.outPoint - segment.inPoint;
+            var videoClips = newSeq.videoTracks[0].clips;
+            var insertedClip = videoClips[videoClips.numItems - 1];
+
+            if (insertedClip) {
+                var inTime = new Time();
+                inTime.seconds = segment.inPoint;
+                insertedClip.inPoint = inTime;
+
+                var outTime = new Time();
+                outTime.seconds = segment.outPoint;
+                insertedClip.outPoint = outTime;
+
+                // Set clip name if takeLabel provided
+                if (segment.takeLabel) {
+                    insertedClip.name = segment.takeLabel;
+                }
+            }
+
+            currentPosition += clipDuration;
+            stats.segmentsInserted++;
+            stats.totalDuration += clipDuration;
+        }
+
+        return JSON.stringify({
+            success: true,
+            sequenceName: newSequenceName,
+            stats: stats
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function clearSequence() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var removed = { video: 0, audio: 0 };
+
+        // Remove all video clips
+        for (var t = 0; t < seq.videoTracks.numTracks; t++) {
+            var clips = seq.videoTracks[t].clips;
+            for (var i = clips.numItems - 1; i >= 0; i--) {
+                clips[i].remove(false, false);
+                removed.video++;
+            }
+        }
+
+        // Remove all audio clips
+        for (var t = 0; t < seq.audioTracks.numTracks; t++) {
+            var clips = seq.audioTracks[t].clips;
+            for (var i = clips.numItems - 1; i >= 0; i--) {
+                clips[i].remove(false, false);
+                removed.audio++;
+            }
+        }
+
+        $.writeln('[SPLICE] clearSequence: Removed ' + removed.video + ' video clips, ' + removed.audio + ' audio clips');
+        return JSON.stringify({ success: true, removed: removed });
+    } catch (e) {
+        $.writeln('[SPLICE] clearSequence error: ' + e.message);
+        return JSON.stringify({ error: "Clear sequence failed: " + e.message });
+    }
+}
+
+// ============================================================================
+// WORK AREA
+// ============================================================================
+
+function getWorkArea() {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    return JSON.stringify({
+        inPoint: seq.getInPoint(),
+        outPoint: seq.getOutPoint()
+    });
+}
+
+function setWorkArea(inPoint, outPoint) {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+    seq.setInPoint(inPoint);
+    seq.setOutPoint(outPoint);
+    return JSON.stringify({ success: true });
+}
+
+// ============================================================================
+// AUDIO EXPORT
+// ============================================================================
+
+function exportSequenceAudio(outputPath, inPoint, outPoint) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // Use the AME (Adobe Media Encoder) for export
+        var encoder = app.encoder;
+        if (!encoder) {
+            return JSON.stringify({ error: "Media Encoder not available" });
+        }
+
+        // Create export preset for WAV
+        var presetPath = encoder.getDefaultPresetPath();
+
+        // Queue the export
+        encoder.encodeSequence(
+            seq,
+            outputPath,
+            presetPath,
+            0, // WorkAreaType: 0 = entire, 1 = work area
+            false // removeOnCompletion
+        );
+
+        return JSON.stringify({ success: true, outputPath: outputPath });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+/**
+ * Export sequence audio for SPLICE analysis
+ * Uses AME to export WAV audio to temp folder
+ * @returns {Object} { success, outputPath } or { error }
+ */
+function exportSequenceAudioForAnalysis() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // Generate temp file path
+        var tempFolder = Folder.temp.fsName;
+        var timestamp = new Date().getTime();
+        var outputPath = tempFolder + "/splice_audio_" + timestamp + ".wav";
+
+        // Check if we have audio tracks with content
+        var hasAudio = false;
+        for (var i = 0; i < seq.audioTracks.numTracks; i++) {
+            if (seq.audioTracks[i].clips.numItems > 0) {
+                hasAudio = true;
+                break;
+            }
+        }
+
+        if (!hasAudio) {
+            return JSON.stringify({ error: "Sequence has no audio clips" });
+        }
+
+        // Use AME for export if available
+        if (app.encoder && app.encoder.encodeSequence) {
+            // Find audio-only preset or use default
+            var presetPath = null;
+            try {
+                // Try to find WAV preset in common locations
+                var presetFolders = [
+                    Folder.appData.fsName + "/Adobe/Common/AME/15.0/Presets",
+                    Folder.appData.fsName + "/Adobe/Common/AME/14.0/Presets",
+                    app.path + "/MediaIO/systempresets/58534430_4d756c74-6962697400000000/WAV 48kHz.epr"
+                ];
+
+                for (var i = 0; i < presetFolders.length; i++) {
+                    var presetFile = new File(presetFolders[i]);
+                    if (presetFile.exists) {
+                        presetPath = presetFile.fsName;
+                        break;
+                    }
+                }
+
+                // Fall back to default preset
+                if (!presetPath) {
+                    presetPath = app.encoder.getDefaultPresetPath();
+                }
+            } catch (e) {
+                presetPath = app.encoder.getDefaultPresetPath();
+            }
+
+            // Start the encode
+            var success = app.encoder.encodeSequence(
+                seq,
+                outputPath,
+                presetPath,
+                0, // WorkAreaType: 0 = entire sequence
+                false // removeOnCompletion
+            );
+
+            if (success) {
+                return JSON.stringify({ success: true, outputPath: outputPath, method: "ame" });
+            }
+        }
+
+        // Fallback: Try to get the source audio path from first clip
+        return getFirstClipAudioPath();
+
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+/**
+ * Get the audio/video file path from the first clip in the timeline
+ * Used as fallback when AME export is not available
+ * @returns {Object} { success, path } or { error }
+ */
+function getFirstClipAudioPath() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        // First try audio tracks
+        for (var i = 0; i < seq.audioTracks.numTracks; i++) {
+            var track = seq.audioTracks[i];
+            if (track.clips.numItems > 0) {
+                var clip = track.clips[0];
+                if (clip.projectItem && clip.projectItem.getMediaPath) {
+                    var mediaPath = clip.projectItem.getMediaPath();
+                    if (mediaPath && mediaPath.length > 0) {
+                        return JSON.stringify({ success: true, path: mediaPath, method: "audio_track" });
+                    }
+                }
+            }
+        }
+
+        // Fall back to video tracks (which may have linked audio)
+        for (var i = 0; i < seq.videoTracks.numTracks; i++) {
+            var track = seq.videoTracks[i];
+            if (track.clips.numItems > 0) {
+                var clip = track.clips[0];
+                if (clip.projectItem && clip.projectItem.getMediaPath) {
+                    var mediaPath = clip.projectItem.getMediaPath();
+                    if (mediaPath && mediaPath.length > 0) {
+                        return JSON.stringify({ success: true, path: mediaPath, method: "video_track" });
+                    }
+                }
+            }
+        }
+
+        return JSON.stringify({ error: "No clips with media paths found in sequence" });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+function moveClipByNTracks(currentTrackId, clipStartTime, nTracksToMove, trackType) {
+    if (!isQEAvailable() && !enableQE()) {
+        return JSON.stringify({ error: "QE not available for moving clips between tracks" });
+    }
+
+    try {
+        var accuracy = 3;
+        var search_start_time = clipStartTime.toFixed(accuracy);
+
+        if (trackType == "audio") {
+            var numClipsInTrack = qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).numItems;
+            for (var j = 0; j < numClipsInTrack; j++) {
+                if (qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).getItemAt(j).start.secs.toFixed(accuracy) == search_start_time) {
+                    qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).getItemAt(j).moveToTrack(0, nTracksToMove, "0");
+                    return JSON.stringify({ success: true });
+                }
+            }
+        } else if (trackType == "video") {
+            var numClipsInTrack = qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).numItems;
+            for (var j = 0; j < numClipsInTrack; j++) {
+                if (qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).getItemAt(j).start.secs.toFixed(accuracy) == search_start_time) {
+                    qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).getItemAt(j).moveToTrack(nTracksToMove, 0, "0");
+                    return JSON.stringify({ success: true });
+                }
+            }
+        }
+        return JSON.stringify({ error: "Clip not found at specified time" });
+    } catch (e) {
+        return JSON.stringify({ error: "Move clip failed: " + e.message });
+    }
+}
+
+function linkIdenticalClipsInTracks(videoTrackIndex, audioTrackIndex) {
+    var selected_clips = app.project.activeSequence.getSelection();
+    for (var i = 0; i < selected_clips.length; i++) {
+        selected_clips[i].setSelected(false, false);
+    }
+
+    var video_clips = app.project.activeSequence.videoTracks[videoTrackIndex].clips;
+    var audio_clips = app.project.activeSequence.audioTracks[audioTrackIndex].clips;
+
+    for (var i = 0; i < video_clips.numItems; i++) {
+        var video_clip = video_clips[i];
+        var video_start = video_clip.start.seconds;
+
+        for (var j = 0; j < audio_clips.numItems; j++) {
+            var audio_clip = audio_clips[j];
+            var audio_start = audio_clip.start.seconds;
+
+            if (Math.abs(video_start - audio_start) < time_tolerance) {
+                video_clip.setSelected(true, false);
+                audio_clip.setSelected(true, false);
+                app.project.activeSequence.linkSelection();
+                video_clip.setSelected(false, false);
+                audio_clip.setSelected(false, false);
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// ZOOM OPERATIONS (Phase 3)
+// ============================================================================
+
+function addZoomMarker(startSeconds, scale, duration, easing) {
+    try {
+        var name = "ZOOM: " + scale + "%";
+        var comments = "Duration: " + duration + "s | Easing: " + (easing || "ease-in-out");
+        return createMarker(startSeconds, name, duration, comments, COLOR_LABELS.YELLOW);
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// CHAPTER OPERATIONS (Phase 3)
+// ============================================================================
+
+function addChapterMarker(timeSeconds, title, description) {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var marker = markers.createMarker(timeSeconds);
+
+        marker.name = title;
+        if (description) marker.comments = description;
+        marker.setColorByIndex(COLOR_LABELS.BLUE);
+        marker.setTypeAsChapter();
+
+        return JSON.stringify({
+            success: true,
+            guid: marker.guid
+        });
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+function getChapterMarkers() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var markers = seq.markers;
+        var chapters = [];
+
+        for (var i = 0; i < markers.numMarkers; i++) {
+            var marker = markers[i];
+            if (marker.type === "Chapter") {
+                chapters.push({
+                    guid: marker.guid,
+                    name: marker.name,
+                    comments: marker.comments,
+                    start: marker.start.seconds
+                });
+            }
+        }
+
+        return JSON.stringify(chapters);
+    } catch (e) {
+        return JSON.stringify({ error: e.message });
+    }
+}
+
+// ============================================================================
+// UNDO OPERATIONS
+// ============================================================================
+
+function undo() {
+    app.project.undo();
+    return true;
+}
+
+function redo() {
+    app.project.redo();
+    return true;
+}
+
+// ============================================================================
+// DEBUG / LOGGING
+// ============================================================================
+
+function log(message) {
+    $.writeln("[SPLICE] " + message);
+}
+
+function getDebugInfo() {
+    return JSON.stringify({
+        version: SPLICE_VERSION,
+        hasActiveSequence: app.project.activeSequence ? true : false,
+        sequenceName: app.project.activeSequence ? app.project.activeSequence.name : null,
+        numSequences: app.project.sequences.numSequences,
+        numProjectItems: app.project.rootItem.children.numItems
+    });
+}
+
+// NOTE: Do NOT auto-initialize on load - CEP will call initialise() explicitly
+// when the panel is ready. Auto-initialization can fail if no project is open.
+$.writeln('[SPLICE] hostScript.jsx loaded - version ' + SPLICE_VERSION);

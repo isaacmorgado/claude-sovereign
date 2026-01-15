@@ -1,0 +1,561 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  AgentTaskManager,
+  getTaskManager,
+  resetTaskManager,
+  type TaskStatus,
+} from './task-manager.js';
+import { makeFakeConfig } from '../test-utils/config.js';
+import type { Config } from '../config/config.js';
+import type { AgentDefinition, OutputObject } from './types.js';
+import { AgentTerminateMode } from './types.js';
+
+// Mock the LocalAgentExecutor
+const mockExecutorRun = vi.fn();
+const mockExecutorCreate = vi.fn();
+
+vi.mock('./local-executor.js', () => ({
+  LocalAgentExecutor: {
+    create: (...args: unknown[]) => mockExecutorCreate(...args),
+  },
+}));
+
+vi.mock('../utils/debugLogger.js', () => ({
+  debugLogger: {
+    log: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+const createMockDefinition = (name = 'test-agent'): AgentDefinition => ({
+  kind: 'local',
+  name,
+  description: 'A test agent',
+  displayName: 'Test Agent',
+  promptConfig: {
+    systemPrompt: 'You are a test agent.',
+  },
+  modelConfig: {
+    model: 'gemini-test',
+    temp: 0.5,
+    top_p: 0.95,
+  },
+  runConfig: {
+    max_time_minutes: 5,
+  },
+  inputConfig: {
+    inputs: {
+      query: { type: 'string', description: 'The query', required: true },
+    },
+  },
+});
+
+const createMockOutput = (result = 'Test result'): OutputObject => ({
+  terminate_reason: AgentTerminateMode.GOAL,
+  result,
+});
+
+describe('AgentTaskManager', () => {
+  let config: Config;
+  let taskManager: AgentTaskManager;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    resetTaskManager();
+    config = makeFakeConfig();
+    taskManager = new AgentTaskManager(config);
+
+    // Default mock implementation for executor
+    mockExecutorCreate.mockImplementation(() =>
+      Promise.resolve({
+        run: mockExecutorRun,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    resetTaskManager();
+  });
+
+  describe('spawnBackground', () => {
+    it('should create a task with pending status and return task ID', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}), // Never resolves
+      );
+
+      const definition = createMockDefinition();
+      const inputs = { query: 'test query' };
+
+      const result = await taskManager.spawnBackground(definition, inputs);
+
+      expect(result.status).toBe('spawned');
+      expect(result.taskId).toBeDefined();
+      expect(typeof result.taskId).toBe('string');
+      expect(result.taskId.length).toBeGreaterThan(0);
+
+      const task = taskManager.getTask(result.taskId);
+      expect(task).toBeDefined();
+      expect(task?.agentName).toBe('test-agent');
+      expect(task?.agentDisplayName).toBe('Test Agent');
+      expect(task?.inputs).toEqual(inputs);
+    });
+
+    it('should start executing the agent in background', async () => {
+      const output = createMockOutput();
+      mockExecutorRun.mockResolvedValue(output);
+
+      const definition = createMockDefinition();
+      const inputs = { query: 'test query' };
+
+      const result = await taskManager.spawnBackground(definition, inputs);
+
+      // Wait for background execution to complete
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(result.taskId);
+        return task?.status === 'completed';
+      });
+
+      expect(mockExecutorCreate).toHaveBeenCalledWith(
+        definition,
+        config,
+        expect.any(Function),
+      );
+      expect(mockExecutorRun).toHaveBeenCalledWith(
+        inputs,
+        expect.any(AbortSignal),
+      );
+
+      const task = taskManager.getTask(result.taskId);
+      expect(task?.status).toBe('completed');
+      expect(task?.result).toEqual(output);
+    });
+
+    it('should handle execution errors gracefully', async () => {
+      const errorMessage = 'Execution failed';
+      mockExecutorRun.mockRejectedValue(new Error(errorMessage));
+
+      const definition = createMockDefinition();
+      const inputs = { query: 'test query' };
+
+      const result = await taskManager.spawnBackground(definition, inputs);
+
+      // Wait for background execution to complete with error
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(result.taskId);
+        return task?.status === 'error';
+      });
+
+      const task = taskManager.getTask(result.taskId);
+      expect(task?.status).toBe('error');
+      expect(task?.error).toBe(errorMessage);
+      expect(task?.completedAt).toBeDefined();
+    });
+
+    it('should reject non-local agents', async () => {
+      const definition: AgentDefinition = {
+        kind: 'remote',
+        name: 'remote-agent',
+        description: 'A remote agent',
+        agentCardUrl: 'https://example.com/agent',
+        inputConfig: {
+          inputs: {},
+        },
+      };
+      const inputs = { query: 'test' };
+
+      const result = await taskManager.spawnBackground(definition, inputs);
+
+      // Wait for error status
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(result.taskId);
+        return task?.status === 'error';
+      });
+
+      const task = taskManager.getTask(result.taskId);
+      expect(task?.status).toBe('error');
+      expect(task?.error).toContain('Background execution only supports local agents');
+    });
+  });
+
+  describe('getOutput', () => {
+    it('should return task immediately when blocking is false', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}), // Never resolves
+      );
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      const task = await taskManager.getOutput(taskId, { block: false });
+
+      expect(task.id).toBe(taskId);
+      expect(['pending', 'running']).toContain(task.status);
+    });
+
+    it('should wait for completion when blocking is true', async () => {
+      let resolveExecution: (value: OutputObject) => void;
+      const executionPromise = new Promise<OutputObject>((resolve) => {
+        resolveExecution = resolve;
+      });
+      mockExecutorRun.mockReturnValue(executionPromise);
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      // Start getting output (will block)
+      const outputPromise = taskManager.getOutput(taskId, { block: true });
+
+      // Resolve the execution
+      const output = createMockOutput('Completed result');
+      resolveExecution!(output);
+
+      const task = await outputPromise;
+
+      expect(task.status).toBe('completed');
+      expect(task.result).toEqual(output);
+    });
+
+    it('should return current status on timeout', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}), // Never resolves
+      );
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      // Wait a bit for the task to start running
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(taskId);
+        return task?.status === 'running';
+      });
+
+      const task = await taskManager.getOutput(taskId, {
+        block: true,
+        timeout: 50,
+      });
+
+      expect(task.status).toBe('running');
+    });
+
+    it('should throw error for unknown task ID', async () => {
+      await expect(
+        taskManager.getOutput('non-existent-id', { block: false }),
+      ).rejects.toThrow("Task 'non-existent-id' not found");
+    });
+
+    it('should return completed task immediately even when blocking', async () => {
+      const output = createMockOutput();
+      mockExecutorRun.mockResolvedValue(output);
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      // Wait for completion
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(taskId);
+        return task?.status === 'completed';
+      });
+
+      const startTime = Date.now();
+      const task = await taskManager.getOutput(taskId, {
+        block: true,
+        timeout: 5000,
+      });
+      const elapsed = Date.now() - startTime;
+
+      expect(task.status).toBe('completed');
+      expect(elapsed).toBeLessThan(100); // Should return immediately
+    });
+  });
+
+  describe('cancelTask', () => {
+    it('should cancel a running task', async () => {
+      let abortSignal: AbortSignal | undefined;
+      mockExecutorRun.mockImplementation(
+        (_inputs: unknown, signal: AbortSignal) => {
+          abortSignal = signal;
+          return new Promise((_, reject) => {
+            signal.addEventListener('abort', () => {
+              reject(new Error('Aborted'));
+            });
+          });
+        },
+      );
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      // Wait for task to start running
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(taskId);
+        return task?.status === 'running';
+      });
+
+      const cancelled = taskManager.cancelTask(taskId);
+
+      expect(cancelled).toBe(true);
+      expect(abortSignal?.aborted).toBe(true);
+
+      // Wait for cancelled status
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(taskId);
+        return task?.status === 'cancelled';
+      });
+
+      const task = taskManager.getTask(taskId);
+      expect(task?.status).toBe('cancelled');
+      expect(task?.error).toBe('Task was cancelled');
+    });
+
+    it('should return false for completed task', async () => {
+      const output = createMockOutput();
+      mockExecutorRun.mockResolvedValue(output);
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      // Wait for completion
+      await vi.waitFor(() => {
+        const task = taskManager.getTask(taskId);
+        return task?.status === 'completed';
+      });
+
+      const cancelled = taskManager.cancelTask(taskId);
+
+      expect(cancelled).toBe(false);
+    });
+
+    it('should throw for non-existent task', () => {
+      expect(() => taskManager.cancelTask('non-existent')).toThrow(
+        "Task 'non-existent' not found",
+      );
+    });
+  });
+
+  describe('listTasks', () => {
+    it('should return all tasks', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}), // Never resolves
+      );
+
+      const definition1 = createMockDefinition('agent-1');
+      const definition2 = createMockDefinition('agent-2');
+
+      await taskManager.spawnBackground(definition1, { query: 'test1' });
+      await taskManager.spawnBackground(definition2, { query: 'test2' });
+
+      const tasks = taskManager.listTasks();
+
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map((t) => t.agentName)).toContain('agent-1');
+      expect(tasks.map((t) => t.agentName)).toContain('agent-2');
+    });
+
+    it('should return copies of tasks, not references', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}),
+      );
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      const tasks = taskManager.listTasks();
+      const task = tasks.find((t) => t.id === taskId)!;
+
+      // Modifying the returned task should not affect the internal state
+      (task as { status: TaskStatus }).status = 'error';
+
+      const freshTasks = taskManager.listTasks();
+      const freshTask = freshTasks.find((t) => t.id === taskId)!;
+
+      expect(freshTask.status).not.toBe('error');
+    });
+  });
+
+  describe('listTasksByStatus', () => {
+    it('should filter tasks by status', async () => {
+      const completedOutput = createMockOutput();
+
+      // First task completes
+      mockExecutorRun.mockResolvedValueOnce(completedOutput);
+      const definition1 = createMockDefinition('completed-agent');
+      await taskManager.spawnBackground(definition1, { query: 'test1' });
+
+      // Second task never completes
+      mockExecutorRun.mockImplementationOnce(
+        () => new Promise(() => {}),
+      );
+      const definition2 = createMockDefinition('running-agent');
+      await taskManager.spawnBackground(definition2, { query: 'test2' });
+
+      // Wait for first task to complete
+      await vi.waitFor(() => {
+        const tasks = taskManager.listTasksByStatus('completed');
+        return tasks.length === 1;
+      });
+
+      const completedTasks = taskManager.listTasksByStatus('completed');
+      const runningTasks = taskManager.listTasksByStatus('running');
+
+      expect(completedTasks).toHaveLength(1);
+      expect(completedTasks[0].agentName).toBe('completed-agent');
+
+      expect(runningTasks).toHaveLength(1);
+      expect(runningTasks[0].agentName).toBe('running-agent');
+    });
+  });
+
+  describe('clearFinishedTasks', () => {
+    it('should remove completed, errored, and cancelled tasks', async () => {
+      // Completed task
+      mockExecutorRun.mockResolvedValueOnce(createMockOutput());
+      const def1 = createMockDefinition('completed');
+      await taskManager.spawnBackground(def1, { query: 'test' });
+
+      // Error task
+      mockExecutorRun.mockRejectedValueOnce(new Error('Failed'));
+      const def2 = createMockDefinition('errored');
+      await taskManager.spawnBackground(def2, { query: 'test' });
+
+      // Running task (never completes)
+      mockExecutorRun.mockImplementationOnce(
+        () => new Promise(() => {}),
+      );
+      const def3 = createMockDefinition('running');
+      await taskManager.spawnBackground(def3, { query: 'test' });
+
+      // Wait for first two to finish
+      await vi.waitFor(() => {
+        const completed = taskManager.listTasksByStatus('completed');
+        const errored = taskManager.listTasksByStatus('error');
+        return completed.length === 1 && errored.length === 1;
+      });
+
+      expect(taskManager.listTasks()).toHaveLength(3);
+
+      taskManager.clearFinishedTasks();
+
+      const remainingTasks = taskManager.listTasks();
+      expect(remainingTasks).toHaveLength(1);
+      expect(remainingTasks[0].agentName).toBe('running');
+    });
+  });
+
+  describe('hasRunningTasks', () => {
+    it('should return true when there are running tasks', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}),
+      );
+
+      const definition = createMockDefinition();
+      await taskManager.spawnBackground(definition, { query: 'test' });
+
+      // Wait for task to start running
+      await vi.waitFor(() => taskManager.hasRunningTasks());
+
+      expect(taskManager.hasRunningTasks()).toBe(true);
+    });
+
+    it('should return false when all tasks are complete', async () => {
+      mockExecutorRun.mockResolvedValue(createMockOutput());
+
+      const definition = createMockDefinition();
+      await taskManager.spawnBackground(definition, { query: 'test' });
+
+      // Wait for completion
+      await vi.waitFor(() => !taskManager.hasRunningTasks());
+
+      expect(taskManager.hasRunningTasks()).toBe(false);
+    });
+
+    it('should return false when no tasks exist', () => {
+      expect(taskManager.hasRunningTasks()).toBe(false);
+    });
+  });
+
+  describe('getTask', () => {
+    it('should return a copy of the task', async () => {
+      mockExecutorRun.mockImplementation(
+        () => new Promise(() => {}),
+      );
+
+      const definition = createMockDefinition();
+      const { taskId } = await taskManager.spawnBackground(definition, {
+        query: 'test',
+      });
+
+      const task = taskManager.getTask(taskId);
+
+      expect(task).toBeDefined();
+      expect(task?.id).toBe(taskId);
+    });
+
+    it('should return undefined for unknown task', () => {
+      const task = taskManager.getTask('unknown-id');
+      expect(task).toBeUndefined();
+    });
+  });
+});
+
+describe('getTaskManager singleton', () => {
+  beforeEach(() => {
+    resetTaskManager();
+  });
+
+  afterEach(() => {
+    resetTaskManager();
+  });
+
+  it('should create singleton instance with config', () => {
+    const config = makeFakeConfig();
+    const manager = getTaskManager(config);
+
+    expect(manager).toBeInstanceOf(AgentTaskManager);
+  });
+
+  it('should return same instance on subsequent calls', () => {
+    const config = makeFakeConfig();
+    const manager1 = getTaskManager(config);
+    const manager2 = getTaskManager();
+
+    expect(manager1).toBe(manager2);
+  });
+
+  it('should throw if config not provided on first call', () => {
+    expect(() => getTaskManager()).toThrow(
+      'Config is required to initialize AgentTaskManager',
+    );
+  });
+
+  it('should be resettable for testing', () => {
+    const config = makeFakeConfig();
+    const manager1 = getTaskManager(config);
+
+    resetTaskManager();
+
+    const manager2 = getTaskManager(config);
+
+    expect(manager1).not.toBe(manager2);
+  });
+});

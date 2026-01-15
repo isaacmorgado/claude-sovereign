@@ -1,0 +1,253 @@
+/**
+ * Asset Manager - Handles deduplication and organization of captured assets
+ */
+
+const fs = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
+const { URL } = require('url');
+
+class AssetManager {
+  constructor(outputDir) {
+    this.outputDir = outputDir;
+    this.assets = new Map(); // URL -> { hash, path, type, size }
+    this.hashes = new Set(); // For deduplication by content
+    this.urlMap = new Map(); // Original URL -> Local path
+  }
+
+  /**
+   * Generate a hash of the content for deduplication
+   */
+  hashContent(content) {
+    const data = typeof content === 'string' ? content : Buffer.from(content);
+    return crypto.createHash('md5').update(data).digest('hex');
+  }
+
+  /**
+   * Check if we already have this asset (by URL or content hash)
+   */
+  async has(url) {
+    return this.assets.has(url);
+  }
+
+  /**
+   * Check if content already exists (deduplication by hash)
+   */
+  hasContent(content) {
+    const hash = this.hashContent(content);
+    return this.hashes.has(hash);
+  }
+
+  /**
+   * Generate a safe filename from URL
+   */
+  generateFilename(url, extension) {
+    try {
+      const parsed = new URL(url);
+      let filename = parsed.pathname.split('/').pop() || 'index';
+
+      // Clean up the filename
+      filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+      // Remove existing extension if we're adding a new one
+      if (extension) {
+        filename = filename.replace(/\.[^.]+$/, '') + extension;
+      }
+
+      // Add hash if filename already exists
+      const hash = this.hashContent(url).substring(0, 8);
+
+      // Ensure reasonable length
+      if (filename.length > 100) {
+        filename = filename.substring(0, 92) + '_' + hash + (extension || '');
+      }
+
+      return filename;
+    } catch {
+      return 'asset_' + this.hashContent(url).substring(0, 12) + (extension || '');
+    }
+  }
+
+  /**
+   * Get unique filename to avoid collisions
+   */
+  async getUniqueFilename(dir, filename) {
+    let finalName = filename;
+    let counter = 1;
+
+    while (true) {
+      try {
+        await fs.access(path.join(dir, finalName));
+        // File exists, try next number
+        const ext = path.extname(filename);
+        const base = path.basename(filename, ext);
+        finalName = `${base}_${counter}${ext}`;
+        counter++;
+      } catch {
+        // File doesn't exist, we can use this name
+        break;
+      }
+    }
+
+    return finalName;
+  }
+
+  /**
+   * Save an asset to the appropriate directory
+   */
+  async save(url, content, type, extension) {
+    // Check for duplicate content
+    const hash = this.hashContent(content);
+    if (this.hashes.has(hash)) {
+      // Already have this content, just map URL to existing file
+      for (const [existingUrl, info] of this.assets) {
+        if (info.hash === hash) {
+          this.urlMap.set(url, info.localPath);
+          return info.localPath;
+        }
+      }
+    }
+
+    // Generate filename
+    let filename = this.generateFilename(url, extension);
+    const dir = path.join(this.outputDir, type);
+
+    // Ensure unique filename
+    filename = await this.getUniqueFilename(dir, filename);
+    const localPath = path.join(type, filename);
+    const fullPath = path.join(this.outputDir, localPath);
+
+    // Write file
+    try {
+      if (typeof content === 'string') {
+        await fs.writeFile(fullPath, content, 'utf-8');
+      } else {
+        await fs.writeFile(fullPath, content);
+      }
+
+      // Track the asset
+      const size = typeof content === 'string' ? Buffer.byteLength(content) : content.length;
+      this.assets.set(url, {
+        hash,
+        localPath,
+        type,
+        size,
+        filename,
+        savedAt: new Date().toISOString(),
+      });
+      this.hashes.add(hash);
+      this.urlMap.set(url, localPath);
+
+      return localPath;
+    } catch (error) {
+      console.error(`Failed to save asset ${url}: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get local path for a URL
+   */
+  getLocalPath(url) {
+    return this.urlMap.get(url);
+  }
+
+  /**
+   * Generate an index of all captured assets
+   */
+  async generateIndex() {
+    const index = {
+      generatedAt: new Date().toISOString(),
+      totalAssets: this.assets.size,
+      totalSize: 0,
+      byType: {},
+      assets: [],
+    };
+
+    for (const [url, info] of this.assets) {
+      index.totalSize += info.size;
+
+      if (!index.byType[info.type]) {
+        index.byType[info.type] = { count: 0, size: 0 };
+      }
+      index.byType[info.type].count++;
+      index.byType[info.type].size += info.size;
+
+      index.assets.push({
+        originalUrl: url,
+        localPath: info.localPath,
+        type: info.type,
+        size: info.size,
+        hash: info.hash,
+      });
+    }
+
+    // Save index
+    await fs.writeFile(
+      path.join(this.outputDir, 'assets-index.json'),
+      JSON.stringify(index, null, 2)
+    );
+
+    // Also generate a URL mapping file for easy reference
+    const urlMapping = {};
+    for (const [url, localPath] of this.urlMap) {
+      urlMapping[url] = localPath;
+    }
+
+    await fs.writeFile(
+      path.join(this.outputDir, 'url-mapping.json'),
+      JSON.stringify(urlMapping, null, 2)
+    );
+
+    return index;
+  }
+
+  /**
+   * Get statistics about captured assets
+   */
+  getStats() {
+    const stats = {
+      total: this.assets.size,
+      byType: {},
+      totalSize: 0,
+      duplicatesAvoided: this.urlMap.size - this.assets.size,
+    };
+
+    for (const [, info] of this.assets) {
+      stats.totalSize += info.size;
+      if (!stats.byType[info.type]) {
+        stats.byType[info.type] = 0;
+      }
+      stats.byType[info.type]++;
+    }
+
+    return stats;
+  }
+
+  /**
+   * Rewrite URLs in HTML/CSS content to use local paths
+   */
+  rewriteUrls(content, baseUrl) {
+    let rewritten = content;
+
+    for (const [originalUrl, localPath] of this.urlMap) {
+      // Create relative path versions
+      const patterns = [
+        originalUrl,
+        originalUrl.replace(/^https?:/, ''),
+        new URL(originalUrl).pathname,
+      ];
+
+      for (const pattern of patterns) {
+        // Escape special regex characters
+        const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(escaped, 'g');
+        rewritten = rewritten.replace(regex, localPath);
+      }
+    }
+
+    return rewritten;
+  }
+}
+
+module.exports = AssetManager;

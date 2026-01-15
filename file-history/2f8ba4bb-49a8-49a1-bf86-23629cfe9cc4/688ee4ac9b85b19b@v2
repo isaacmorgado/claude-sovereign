@@ -1,0 +1,86 @@
+import type { Request, Response, NextFunction } from 'express';
+import * as userRepository from '../db/repositories/user-repository.js';
+import type { AuthenticatedRequest, ApiResponse } from '../types/api.js';
+import { TIER_LIMITS } from '../types/user.js';
+
+export interface UsageCheckResult {
+  allowed: boolean;
+  currentUsage: number;
+  limit: number;
+  remaining: number;
+}
+
+export async function checkUsageLimit(
+  req: Request,
+  res: Response<ApiResponse<UsageCheckResult>>,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user.id;
+
+    // Check if usage needs to be reset (billing cycle renewal)
+    await userRepository.resetUsageIfNeeded(userId);
+
+    // Fetch fresh user data after potential reset
+    const user = await userRepository.findById(userId);
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+      return;
+    }
+
+    const limit = TIER_LIMITS[user.subscription_tier];
+    const currentUsage = user.usage_minutes_used;
+    const remaining = Math.max(0, limit - currentUsage);
+
+    if (currentUsage >= limit) {
+      res.status(402).json({
+        success: false,
+        error: 'Usage limit exceeded. Please upgrade your plan.',
+        data: {
+          allowed: false,
+          currentUsage,
+          limit,
+          remaining: 0,
+        },
+      });
+      return;
+    }
+
+    // Attach usage info to request for downstream handlers
+    (authReq as AuthenticatedRequest & { usageInfo: UsageCheckResult }).usageInfo = {
+      allowed: true,
+      currentUsage,
+      limit,
+      remaining,
+    };
+
+    next();
+  } catch (error) {
+    console.error('Usage limit check error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check usage limit',
+    });
+  }
+}
+
+export async function recordUsage(
+  userId: string,
+  minutes: number
+): Promise<{ success: boolean; newUsage: number; limit: number }> {
+  const user = await userRepository.incrementUsage(userId, minutes);
+  if (!user) {
+    throw new Error('Failed to record usage');
+  }
+
+  const limit = TIER_LIMITS[user.subscription_tier];
+  return {
+    success: true,
+    newUsage: user.usage_minutes_used,
+    limit,
+  };
+}

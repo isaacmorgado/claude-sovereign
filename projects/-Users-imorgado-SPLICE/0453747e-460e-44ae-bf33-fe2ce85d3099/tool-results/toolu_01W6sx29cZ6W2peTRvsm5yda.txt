@@ -1,0 +1,1444 @@
+     1→/**
+     2→ * Usage Tracking Service
+     3→ *
+     4→ * Tracks user credit balances and usage for billing.
+     5→ * Uses PostgreSQL for persistence.
+     6→ */
+     7→
+     8→const { Pool } = require('pg');
+     9→const { reportHoursOverage, reportMusicOverage } = require('./stripeUsageReporting');
+    10→
+    11→// PostgreSQL connection pool with proper limits
+    12→const pool = new Pool({
+    13→  connectionString: process.env.DATABASE_URL,
+    14→  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    15→  // PERFORMANCE: Set connection pool limits
+    16→  max: 20,                    // Maximum number of clients in the pool
+    17→  idleTimeoutMillis: 30000,   // Close idle connections after 30 seconds
+    18→  connectionTimeoutMillis: 5000  // Timeout after 5 seconds when getting connection
+    19→});
+    20→
+    21→// Hours per tier (regular processing)
+    22→// Pricing: Starter $15/mo, Pro $39/mo, Team $129/mo
+    23→// Target margins: 79-82%
+    24→const TIER_HOURS = {
+    25→  starter: 4,    // 4 hrs/month
+    26→  pro: 15,       // 15 hrs/month
+    27→  team: 50,      // 50 hrs/month
+    28→  cancelled: 0
+    29→};
+    30→
+    31→// Overage rate for processing hours beyond included
+    32→const HOURS_OVERAGE_RATE = 2.00; // $2/hour
+    33→
+    34→// Isolation minutes per tier (sized to maintain 80% margins)
+    35→const TIER_ISOLATION_MINUTES = {
+    36→  starter: 0,     // No isolation access
+    37→  pro: 45,        // 45 minutes included
+    38→  team: 180,      // 3 hours included
+    39→  cancelled: 0
+    40→};
+    41→
+    42→// Convert to hours for database storage
+    43→const TIER_ISOLATION_HOURS = {
+    44→  starter: 0,
+    45→  pro: TIER_ISOLATION_MINUTES.pro / 60,      // 0.75 hours
+    46→  team: TIER_ISOLATION_MINUTES.team / 60,    // 3 hours
+    47→  cancelled: 0
+    48→};
+    49→
+    50→// Overage rate for isolation beyond included minutes
+    51→const ISOLATION_OVERAGE_RATE = 0.10; // $0.10 per minute (85% margin)
+    52→
+    53→/**
+    54→ * Initialize database tables
+    55→ */
+    56→async function initDatabase() {
+    57→  const client = await pool.connect();
+    58→  try {
+    59→    await client.query(`
+    60→      CREATE TABLE IF NOT EXISTS users (
+    61→        id SERIAL PRIMARY KEY,
+    62→        stripe_customer_id VARCHAR(255) UNIQUE NOT NULL,
+    63→        email VARCHAR(255),
+    64→        tier VARCHAR(50) DEFAULT 'starter',
+    65→        hours_remaining DECIMAL(10,4) DEFAULT 15,
+    66→        hours_total DECIMAL(10,4) DEFAULT 15,
+    67→        isolation_hours_remaining DECIMAL(10,4) DEFAULT 0,
+    68→        isolation_hours_total DECIMAL(10,4) DEFAULT 0,
+    69→        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    70→        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    71→      )
+    72→    `);
+    73→
+    74→    // Add isolation columns if they don't exist (for existing databases)
+    75→    await client.query(`
+    76→      DO $$
+    77→      BEGIN
+    78→        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'isolation_hours_remaining') THEN
+    79→          ALTER TABLE users ADD COLUMN isolation_hours_remaining DECIMAL(10,4) DEFAULT 0;
+    80→        END IF;
+    81→        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'isolation_hours_total') THEN
+    82→          ALTER TABLE users ADD COLUMN isolation_hours_total DECIMAL(10,4) DEFAULT 0;
+    83→        END IF;
+    84→      END $$;
+    85→    `);
+    86→
+    87→    await client.query(`
+    88→      CREATE TABLE IF NOT EXISTS usage_log (
+    89→        id SERIAL PRIMARY KEY,
+    90→        user_id INTEGER REFERENCES users(id),
+    91→        stripe_customer_id VARCHAR(255),
+    92→        audio_duration_seconds DECIMAL(10,2),
+    93→        hours_used DECIMAL(10,6),
+    94→        endpoint VARCHAR(100),
+    95→        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    96→      )
+    97→    `);
+    98→
+    99→    await client.query(`
+   100→      CREATE INDEX IF NOT EXISTS idx_users_stripe_customer_id ON users(stripe_customer_id)
+   101→    `);
+   102→
+   103→    await client.query(`
+   104→      CREATE INDEX IF NOT EXISTS idx_usage_log_user_id ON usage_log(user_id)
+   105→    `);
+   106→
+   107→    // PERFORMANCE: Add composite index for efficient customer usage history queries
+   108→    await client.query(`
+   109→      CREATE INDEX IF NOT EXISTS idx_usage_log_customer_created
+   110→      ON usage_log(stripe_customer_id, created_at DESC)
+   111→    `);
+   112→
+   113→    // Webhook events table for idempotency
+   114→    await client.query(`
+   115→      CREATE TABLE IF NOT EXISTS webhook_events (
+   116→        id SERIAL PRIMARY KEY,
+   117→        event_id VARCHAR(255) UNIQUE NOT NULL,
+   118→        event_type VARCHAR(100),
+   119→        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   120→      )
+   121→    `);
+   122→
+   123→    await client.query(`
+   124→      CREATE INDEX IF NOT EXISTS idx_webhook_events_event_id ON webhook_events(event_id)
+   125→    `);
+   126→
+   127→    console.log('[UsageTracking] Database initialized');
+   128→  } finally {
+   129→    client.release();
+   130→  }
+   131→}
+   132→
+   133→/**
+   134→ * Get or create a user by Stripe customer ID
+   135→ * PERF-005: Uses INSERT...ON CONFLICT upsert for single-query operation
+   136→ */
+   137→async function getOrCreateUser(stripeCustomerId, email = null) {
+   138→  // Use upsert with ON CONFLICT DO UPDATE to ensure RETURNING works for both cases
+   139→  // The update sets stripe_customer_id = EXCLUDED.stripe_customer_id (no-op) to trigger RETURNING
+   140→  const result = await pool.query(
+   141→    `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total)
+   142→     VALUES ($1, $2, 'starter', $3, $3, $4, $4)
+   143→     ON CONFLICT (stripe_customer_id) DO UPDATE
+   144→     SET stripe_customer_id = EXCLUDED.stripe_customer_id
+   145→     RETURNING *`,
+   146→    [stripeCustomerId, email, TIER_HOURS.starter, TIER_ISOLATION_HOURS.starter]
+   147→  );
+   148→
+   149→  return result.rows[0];
+   150→}
+   151→
+   152→/**
+   153→ * Check if a customer exists in the database (without creating)
+   154→ * SECURITY: Used to validate legacy auth attempts
+   155→ */
+   156→async function customerExists(stripeCustomerId) {
+   157→  if (!stripeCustomerId) return false;
+   158→
+   159→  try {
+   160→    const result = await pool.query(
+   161→      'SELECT 1 FROM users WHERE stripe_customer_id = $1 LIMIT 1',
+   162→      [stripeCustomerId]
+   163→    );
+   164→    return result.rows.length > 0;
+   165→  } catch (err) {
+   166→    console.error('[SPLICE] customerExists check failed:', err.message);
+   167→    return false;
+   168→  }
+   169→}
+   170→
+   171→/**
+   172→ * Get user's current credit balance
+   173→ */
+   174→async function getBalance(stripeCustomerId) {
+   175→  const user = await getOrCreateUser(stripeCustomerId);
+   176→  const hoursTotal = parseFloat(user.hours_total);
+   177→  const hoursRemaining = parseFloat(user.hours_remaining);
+   178→  const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   179→  const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   180→
+   181→  // Tier display names
+   182→  const tierNames = {
+   183→    starter: 'Starter',
+   184→    pro: 'Pro',
+   185→    team: 'Team',
+   186→    cancelled: 'Cancelled'
+   187→  };
+   188→
+   189→  return {
+   190→    hoursRemaining,
+   191→    hoursTotal,
+   192→    isolationHoursRemaining,
+   193→    isolationHoursTotal,
+   194→    tier: user.tier,
+   195→    tierName: tierNames[user.tier] || user.tier,
+   196→    percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   197→    isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   198→    hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   199→    isolationOverageRate: ISOLATION_OVERAGE_RATE
+   200→  };
+   201→}
+   202→
+   203→/**
+   204→ * Check if user has enough credits for estimated duration
+   205→ */
+   206→async function hasCredits(stripeCustomerId, estimatedSeconds = 0) {
+   207→  const balance = await getBalance(stripeCustomerId);
+   208→  const estimatedHours = estimatedSeconds / 3600;
+   209→  return balance.hoursRemaining >= estimatedHours;
+   210→}
+   211→
+   212→/**
+   213→ * Reserve credits atomically using SELECT ... FOR UPDATE
+   214→ * This prevents race conditions where multiple requests pass credit check
+   215→ * before any deduction occurs.
+   216→ *
+   217→ * @param {string} stripeCustomerId - Customer ID
+   218→ * @param {number} estimatedSeconds - Estimated processing time in seconds
+   219→ * @param {string} endpoint - Endpoint name for tracking
+   220→ * @returns {Promise<{success: boolean, reservationId?: string, error?: string}>}
+   221→ */
+   222→async function reserveCredits(stripeCustomerId, estimatedSeconds = 0, endpoint = 'unknown') {
+   223→  const estimatedHours = estimatedSeconds / 3600;
+   224→  const client = await pool.connect();
+   225→
+   226→  try {
+   227→    await client.query('BEGIN');
+   228→
+   229→    // Lock the row for this customer - prevents concurrent modifications
+   230→    const result = await client.query(
+   231→      `SELECT id, hours_remaining FROM users
+   232→       WHERE stripe_customer_id = $1
+   233→       FOR UPDATE`,
+   234→      [stripeCustomerId]
+   235→    );
+   236→
+   237→    if (result.rows.length === 0) {
+   238→      // Create user if doesn't exist (within transaction)
+   239→      const newUser = await client.query(
+   240→        `INSERT INTO users (stripe_customer_id, tier, hours_remaining, hours_total)
+   241→         VALUES ($1, 'starter', $2, $2)
+   242→         RETURNING id, hours_remaining`,
+   243→        [stripeCustomerId, TIER_HOURS.starter]
+   244→      );
+   245→      result.rows = newUser.rows;
+   246→    }
+   247→
+   248→    const user = result.rows[0];
+   249→    const hoursRemaining = parseFloat(user.hours_remaining);
+   250→
+   251→    // Check if enough credits
+   252→    if (hoursRemaining < estimatedHours) {
+   253→      await client.query('ROLLBACK');
+   254→      return {
+   255→        success: false,
+   256→        error: 'Insufficient credits',
+   257→        hoursRemaining,
+   258→        hoursRequired: estimatedHours
+   259→      };
+   260→    }
+   261→
+   262→    // Generate unique reservation ID
+   263→    const reservationId = `res_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+   264→
+   265→    // Reserve credits by deducting the estimated amount
+   266→    await client.query(
+   267→      `UPDATE users
+   268→       SET hours_remaining = hours_remaining - $1,
+   269→           updated_at = CURRENT_TIMESTAMP
+   270→       WHERE stripe_customer_id = $2`,
+   271→      [estimatedHours, stripeCustomerId]
+   272→    );
+   273→
+   274→    // Log the reservation
+   275→    await client.query(
+   276→      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   277→       VALUES ($1, $2, $3, $4, $5)`,
+   278→      [user.id, stripeCustomerId, estimatedSeconds, estimatedHours, `${endpoint}:reserved`]
+   279→    );
+   280→
+   281→    await client.query('COMMIT');
+   282→
+   283→    console.log(`[UsageTracking] Reserved ${estimatedHours.toFixed(4)}hrs for ${stripeCustomerId} (${reservationId})`);
+   284→
+   285→    return {
+   286→      success: true,
+   287→      reservationId,
+   288→      hoursReserved: estimatedHours,
+   289→      hoursRemaining: hoursRemaining - estimatedHours
+   290→    };
+   291→  } catch (err) {
+   292→    await client.query('ROLLBACK');
+   293→    console.error('[UsageTracking] Reservation error:', err);
+   294→    throw err;
+   295→  } finally {
+   296→    client.release();
+   297→  }
+   298→}
+   299→
+   300→/**
+   301→ * Confirm a reservation (finalize usage) or adjust for actual duration
+   302→ * Optimized: uses RETURNING to avoid extra SELECT after UPDATE
+   303→ *
+   304→ * @param {string} stripeCustomerId - Customer ID
+   305→ * @param {number} actualSeconds - Actual processing time in seconds
+   306→ * @param {number} reservedSeconds - Originally reserved seconds
+   307→ * @param {string} endpoint - Endpoint name
+   308→ * @returns {Promise<object>} Updated balance
+   309→ */
+   310→async function confirmReservation(stripeCustomerId, actualSeconds, reservedSeconds, endpoint = 'unknown') {
+   311→  const actualHours = actualSeconds / 3600;
+   312→  const reservedHours = reservedSeconds / 3600;
+   313→  const difference = reservedHours - actualHours;
+   314→
+   315→  const client = await pool.connect();
+   316→  try {
+   317→    await client.query('BEGIN');
+   318→
+   319→    // Lock the row and get current state
+   320→    const result = await client.query(
+   321→      `SELECT id, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier
+   322→       FROM users
+   323→       WHERE stripe_customer_id = $1
+   324→       FOR UPDATE`,
+   325→      [stripeCustomerId]
+   326→    );
+   327→
+   328→    if (result.rows.length === 0) {
+   329→      await client.query('ROLLBACK');
+   330→      throw new Error('User not found');
+   331→    }
+   332→
+   333→    let user = result.rows[0];
+   334→
+   335→    // If actual usage was less than reserved, refund the difference
+   336→    if (difference > 0) {
+   337→      const updateResult = await client.query(
+   338→        `UPDATE users
+   339→         SET hours_remaining = hours_remaining + $1,
+   340→             updated_at = CURRENT_TIMESTAMP
+   341→         WHERE stripe_customer_id = $2
+   342→         RETURNING hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   343→        [difference, stripeCustomerId]
+   344→      );
+   345→      user = { ...user, ...updateResult.rows[0] };
+   346→
+   347→      // Log the adjustment
+   348→      await client.query(
+   349→        `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   350→         VALUES ($1, $2, $3, $4, $5)`,
+   351→        [user.id, stripeCustomerId, -(reservedSeconds - actualSeconds), -difference, `${endpoint}:adjusted`]
+   352→      );
+   353→    } else if (difference < 0) {
+   354→      // Actual usage was more than reserved - deduct the extra
+   355→      const updateResult = await client.query(
+   356→        `UPDATE users
+   357→         SET hours_remaining = GREATEST(0, hours_remaining - $1),
+   358→             updated_at = CURRENT_TIMESTAMP
+   359→         WHERE stripe_customer_id = $2
+   360→         RETURNING hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   361→        [-difference, stripeCustomerId]
+   362→      );
+   363→      user = { ...user, ...updateResult.rows[0] };
+   364→
+   365→      // Log the additional usage
+   366→      await client.query(
+   367→        `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   368→         VALUES ($1, $2, $3, $4, $5)`,
+   369→        [user.id, stripeCustomerId, actualSeconds - reservedSeconds, -difference, `${endpoint}:additional`]
+   370→      );
+   371→    }
+   372→
+   373→    await client.query('COMMIT');
+   374→
+   375→    console.log(`[UsageTracking] Confirmed ${actualHours.toFixed(4)}hrs (reserved: ${reservedHours.toFixed(4)}) for ${stripeCustomerId}`);
+   376→
+   377→    // Build balance from data we already have (no extra SELECT needed)
+   378→    const hoursTotal = parseFloat(user.hours_total);
+   379→    const hoursRemaining = parseFloat(user.hours_remaining);
+   380→    const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   381→    const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   382→
+   383→    const tierNames = {
+   384→      starter: 'Starter',
+   385→      pro: 'Pro',
+   386→      team: 'Team',
+   387→      cancelled: 'Cancelled'
+   388→    };
+   389→
+   390→    return {
+   391→      hoursRemaining,
+   392→      hoursTotal,
+   393→      isolationHoursRemaining,
+   394→      isolationHoursTotal,
+   395→      tier: user.tier,
+   396→      tierName: tierNames[user.tier] || user.tier,
+   397→      percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   398→      isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   399→      hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   400→      isolationOverageRate: ISOLATION_OVERAGE_RATE
+   401→    };
+   402→  } catch (err) {
+   403→    await client.query('ROLLBACK');
+   404→    throw err;
+   405→  } finally {
+   406→    client.release();
+   407→  }
+   408→}
+   409→
+   410→/**
+   411→ * Release a reservation (refund credits on processing failure)
+   412→ * Optimized: uses RETURNING to avoid extra SELECT after UPDATE
+   413→ *
+   414→ * @param {string} stripeCustomerId - Customer ID
+   415→ * @param {number} reservedSeconds - Originally reserved seconds
+   416→ * @param {string} endpoint - Endpoint name
+   417→ * @param {string} reason - Reason for release
+   418→ * @returns {Promise<object>} Updated balance
+   419→ */
+   420→async function releaseReservation(stripeCustomerId, reservedSeconds, endpoint = 'unknown', reason = 'failed') {
+   421→  const reservedHours = reservedSeconds / 3600;
+   422→
+   423→  const client = await pool.connect();
+   424→  try {
+   425→    await client.query('BEGIN');
+   426→
+   427→    // Lock the row and get id for logging
+   428→    const result = await client.query(
+   429→      `SELECT id FROM users
+   430→       WHERE stripe_customer_id = $1
+   431→       FOR UPDATE`,
+   432→      [stripeCustomerId]
+   433→    );
+   434→
+   435→    if (result.rows.length === 0) {
+   436→      await client.query('ROLLBACK');
+   437→      throw new Error('User not found');
+   438→    }
+   439→
+   440→    const userId = result.rows[0].id;
+   441→
+   442→    // Refund the reserved amount with RETURNING
+   443→    const updateResult = await client.query(
+   444→      `UPDATE users
+   445→       SET hours_remaining = hours_remaining + $1,
+   446→           updated_at = CURRENT_TIMESTAMP
+   447→       WHERE stripe_customer_id = $2
+   448→       RETURNING hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   449→      [reservedHours, stripeCustomerId]
+   450→    );
+   451→
+   452→    const user = updateResult.rows[0];
+   453→
+   454→    // Log the refund
+   455→    await client.query(
+   456→      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   457→       VALUES ($1, $2, $3, $4, $5)`,
+   458→      [userId, stripeCustomerId, -reservedSeconds, -reservedHours, `${endpoint}:released:${reason}`]
+   459→    );
+   460→
+   461→    await client.query('COMMIT');
+   462→
+   463→    console.log(`[UsageTracking] Released ${reservedHours.toFixed(4)}hrs for ${stripeCustomerId} (${reason})`);
+   464→
+   465→    // Build balance from RETURNING data (no extra SELECT needed)
+   466→    const hoursTotal = parseFloat(user.hours_total);
+   467→    const hoursRemaining = parseFloat(user.hours_remaining);
+   468→    const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   469→    const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   470→
+   471→    const tierNames = {
+   472→      starter: 'Starter',
+   473→      pro: 'Pro',
+   474→      team: 'Team',
+   475→      cancelled: 'Cancelled'
+   476→    };
+   477→
+   478→    return {
+   479→      hoursRemaining,
+   480→      hoursTotal,
+   481→      isolationHoursRemaining,
+   482→      isolationHoursTotal,
+   483→      tier: user.tier,
+   484→      tierName: tierNames[user.tier] || user.tier,
+   485→      percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   486→      isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   487→      hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   488→      isolationOverageRate: ISOLATION_OVERAGE_RATE
+   489→    };
+   490→  } catch (err) {
+   491→    await client.query('ROLLBACK');
+   492→    throw err;
+   493→  } finally {
+   494→    client.release();
+   495→  }
+   496→}
+   497→
+   498→/**
+   499→ * Check if user can use vocal isolation
+   500→ * Returns: { allowed, hasIncludedHours, overageRequired, overageCost }
+   501→ */
+   502→async function checkIsolationAccess(stripeCustomerId, estimatedMinutes = 0) {
+   503→  const balance = await getBalance(stripeCustomerId);
+   504→
+   505→  // Starter tier has no isolation access
+   506→  if (!balance.hasIsolationAccess) {
+   507→    return {
+   508→      allowed: false,
+   509→      reason: 'upgrade_required',
+   510→      message: 'Vocal isolation requires Pro or Team tier',
+   511→      hasIncludedHours: false,
+   512→      overageRequired: false,
+   513→      overageCost: 0
+   514→    };
+   515→  }
+   516→
+   517→  const estimatedHours = estimatedMinutes / 60;
+   518→  const remainingIncluded = balance.isolationHoursRemaining;
+   519→
+   520→  // Check if within included hours
+   521→  if (remainingIncluded >= estimatedHours) {
+   522→    return {
+   523→      allowed: true,
+   524→      reason: 'included',
+   525→      message: `Using ${estimatedMinutes.toFixed(1)} min of included isolation time`,
+   526→      hasIncludedHours: true,
+   527→      overageRequired: false,
+   528→      overageCost: 0,
+   529→      isolationHoursRemaining: remainingIncluded - estimatedHours
+   530→    };
+   531→  }
+   532→
+   533→  // Calculate overage
+   534→  const overageMinutes = estimatedMinutes - (remainingIncluded * 60);
+   535→  const overageCost = overageMinutes * ISOLATION_OVERAGE_RATE;
+   536→
+   537→  return {
+   538→    allowed: true,
+   539→    reason: 'overage',
+   540→    message: `${remainingIncluded > 0 ? `Using ${(remainingIncluded * 60).toFixed(1)} included min + ` : ''}${overageMinutes.toFixed(1)} min overage ($${overageCost.toFixed(2)})`,
+   541→    hasIncludedHours: remainingIncluded > 0,
+   542→    overageRequired: true,
+   543→    overageMinutes,
+   544→    overageCost,
+   545→    isolationHoursRemaining: 0
+   546→  };
+   547→}
+   548→
+   549→/**
+   550→ * Deduct isolation usage from user's balance
+   551→ * Returns overage cost if beyond included hours
+   552→ * Uses SELECT...FOR UPDATE to prevent race conditions (like confirmReservation)
+   553→ */
+   554→async function deductIsolationUsage(stripeCustomerId, audioDurationSeconds, endpoint = 'isolate-vocals') {
+   555→  const durationMinutes = audioDurationSeconds / 60;
+   556→  const durationHours = audioDurationSeconds / 3600;
+   557→
+   558→  const client = await pool.connect();
+   559→  try {
+   560→    await client.query('BEGIN');
+   561→
+   562→    // Lock the row for this customer - prevents concurrent modifications
+   563→    const userResult = await client.query(
+   564→      `SELECT id, isolation_hours_remaining, isolation_hours_total, hours_remaining, hours_total, tier
+   565→       FROM users WHERE stripe_customer_id = $1
+   566→       FOR UPDATE`,
+   567→      [stripeCustomerId]
+   568→    );
+   569→
+   570→    if (userResult.rows.length === 0) {
+   571→      await client.query('ROLLBACK');
+   572→      throw new Error('User not found');
+   573→    }
+   574→
+   575→    const user = userResult.rows[0];
+   576→    const remainingIncluded = parseFloat(user.isolation_hours_remaining || 0);
+   577→
+   578→    let overageCost = 0;
+   579→    let hoursFromIncluded = 0;
+   580→    let overageMinutes = 0;
+   581→
+   582→    if (remainingIncluded >= durationHours) {
+   583→      // Fully covered by included hours
+   584→      hoursFromIncluded = durationHours;
+   585→    } else {
+   586→      // Partial or full overage
+   587→      hoursFromIncluded = remainingIncluded;
+   588→      overageMinutes = durationMinutes - (remainingIncluded * 60);
+   589→      overageCost = overageMinutes * ISOLATION_OVERAGE_RATE;
+   590→    }
+   591→
+   592→    // Update isolation balance with RETURNING to get new values
+   593→    const updateResult = await client.query(
+   594→      `UPDATE users
+   595→       SET isolation_hours_remaining = GREATEST(0, isolation_hours_remaining - $1),
+   596→           updated_at = CURRENT_TIMESTAMP
+   597→       WHERE stripe_customer_id = $2
+   598→       RETURNING isolation_hours_remaining, isolation_hours_total, hours_remaining, hours_total, tier`,
+   599→      [durationHours, stripeCustomerId]
+   600→    );
+   601→
+   602→    const updatedUser = updateResult.rows[0];
+   603→
+   604→    // Log usage (mark as isolation)
+   605→    await client.query(
+   606→      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   607→       VALUES ($1, $2, $3, $4, $5)`,
+   608→      [user.id, stripeCustomerId, audioDurationSeconds, durationHours, endpoint]
+   609→    );
+   610→
+   611→    await client.query('COMMIT');
+   612→
+   613→    // Build balance from RETURNING data (no extra SELECT needed)
+   614→    const hoursTotal = parseFloat(updatedUser.hours_total);
+   615→    const hoursRemaining = parseFloat(updatedUser.hours_remaining);
+   616→    const isolationHoursTotal = parseFloat(updatedUser.isolation_hours_total || 0);
+   617→    const isolationHoursRemaining = parseFloat(updatedUser.isolation_hours_remaining || 0);
+   618→
+   619→    const tierNames = {
+   620→      starter: 'Starter',
+   621→      pro: 'Pro',
+   622→      team: 'Team',
+   623→      cancelled: 'Cancelled'
+   624→    };
+   625→
+   626→    return {
+   627→      hoursRemaining,
+   628→      hoursTotal,
+   629→      isolationHoursRemaining,
+   630→      isolationHoursTotal,
+   631→      tier: updatedUser.tier,
+   632→      tierName: tierNames[updatedUser.tier] || updatedUser.tier,
+   633→      percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   634→      isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   635→      hasIsolationAccess: TIER_ISOLATION_HOURS[updatedUser.tier] > 0,
+   636→      isolationOverageRate: ISOLATION_OVERAGE_RATE,
+   637→      isolationUsed: {
+   638→        durationMinutes,
+   639→        hoursFromIncluded,
+   640→        overageMinutes,
+   641→        overageCost
+   642→      }
+   643→    };
+   644→  } catch (err) {
+   645→    await client.query('ROLLBACK');
+   646→    throw err;
+   647→  } finally {
+   648→    client.release();
+   649→  }
+   650→}
+   651→
+   652→/**
+   653→ * Deduct usage from user's balance
+   654→ * Optimized: uses RETURNING to avoid extra SELECT after UPDATE
+   655→ * Uses transaction with rollback on failure for atomic UPDATE + INSERT
+   656→ * Reports overage to Stripe for billing when user exceeds included hours
+   657→ */
+   658→async function deductUsage(stripeCustomerId, audioDurationSeconds, endpoint = 'unknown') {
+   659→  const hoursUsed = audioDurationSeconds / 3600;
+   660→
+   661→  const client = await pool.connect();
+   662→  try {
+   663→    await client.query('BEGIN');
+   664→
+   665→    // First get current balance to calculate overage
+   666→    const currentResult = await client.query(
+   667→      `SELECT id, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier
+   668→       FROM users WHERE stripe_customer_id = $1 FOR UPDATE`,
+   669→      [stripeCustomerId]
+   670→    );
+   671→
+   672→    if (currentResult.rows.length === 0) {
+   673→      await client.query('ROLLBACK');
+   674→      throw new Error('User not found');
+   675→    }
+   676→
+   677→    const currentUser = currentResult.rows[0];
+   678→    const currentRemaining = parseFloat(currentUser.hours_remaining);
+   679→
+   680→    // Calculate overage (hours used beyond what's remaining)
+   681→    let overageHours = 0;
+   682→    if (hoursUsed > currentRemaining) {
+   683→      overageHours = hoursUsed - currentRemaining;
+   684→    }
+   685→
+   686→    // Update balance (clamp at 0)
+   687→    const updateResult = await client.query(
+   688→      `UPDATE users
+   689→       SET hours_remaining = GREATEST(0, hours_remaining - $1),
+   690→           updated_at = CURRENT_TIMESTAMP
+   691→       WHERE stripe_customer_id = $2
+   692→       RETURNING id, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   693→      [hoursUsed, stripeCustomerId]
+   694→    );
+   695→
+   696→    const user = updateResult.rows[0];
+   697→
+   698→    // Log usage
+   699→    await client.query(
+   700→      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+   701→       VALUES ($1, $2, $3, $4, $5)`,
+   702→      [user.id, stripeCustomerId, audioDurationSeconds, hoursUsed, endpoint]
+   703→    );
+   704→
+   705→    await client.query('COMMIT');
+   706→
+   707→    // Report overage to Stripe if any (after commit to not block transaction)
+   708→    let overageCharge = 0;
+   709→    if (overageHours > 0) {
+   710→      overageCharge = overageHours * HOURS_OVERAGE_RATE;
+   711→      const usageReport = await reportHoursOverage(stripeCustomerId, overageHours);
+   712→      if (usageReport.success) {
+   713→        console.log(`[SPLICE] Hours overage reported to Stripe: ${stripeCustomerId} - ${overageHours.toFixed(2)}hrs ($${overageCharge.toFixed(2)})`);
+   714→      } else {
+   715→        console.warn(`[SPLICE] Hours overage billing failed: ${usageReport.error}`);
+   716→      }
+   717→    }
+   718→
+   719→    // Build balance from RETURNING data (no extra SELECT needed)
+   720→    const hoursTotal = parseFloat(user.hours_total);
+   721→    const hoursRemaining = parseFloat(user.hours_remaining);
+   722→    const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   723→    const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   724→
+   725→    const tierNames = {
+   726→      starter: 'Starter',
+   727→      pro: 'Pro',
+   728→      team: 'Team',
+   729→      cancelled: 'Cancelled'
+   730→    };
+   731→
+   732→    return {
+   733→      hoursRemaining,
+   734→      hoursTotal,
+   735→      isolationHoursRemaining,
+   736→      isolationHoursTotal,
+   737→      tier: user.tier,
+   738→      tierName: tierNames[user.tier] || user.tier,
+   739→      percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   740→      isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   741→      hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   742→      isolationOverageRate: ISOLATION_OVERAGE_RATE,
+   743→      overageHours,
+   744→      overageCharge
+   745→    };
+   746→  } catch (err) {
+   747→    await client.query('ROLLBACK');
+   748→    throw err;
+   749→  } finally {
+   750→    client.release();
+   751→  }
+   752→}
+   753→
+   754→/**
+   755→ * Reset user's hours for new billing period
+   756→ * Optimized: uses RETURNING to avoid extra SELECT after UPDATE
+   757→ */
+   758→async function resetHours(stripeCustomerId, tier) {
+   759→  const hours = tier in TIER_HOURS ? TIER_HOURS[tier] : TIER_HOURS.starter;
+   760→  const isolationHours = tier in TIER_ISOLATION_HOURS ? TIER_ISOLATION_HOURS[tier] : 0;
+   761→
+   762→  const result = await pool.query(
+   763→    `UPDATE users
+   764→     SET hours_remaining = $1, hours_total = $1,
+   765→         isolation_hours_remaining = $2, isolation_hours_total = $2,
+   766→         tier = $3, updated_at = CURRENT_TIMESTAMP
+   767→     WHERE stripe_customer_id = $4
+   768→     RETURNING hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   769→    [hours, isolationHours, tier, stripeCustomerId]
+   770→  );
+   771→
+   772→  if (result.rows.length === 0) {
+   773→    // User doesn't exist, create and return default balance
+   774→    return await getBalance(stripeCustomerId);
+   775→  }
+   776→
+   777→  const user = result.rows[0];
+   778→  const hoursTotal = parseFloat(user.hours_total);
+   779→  const hoursRemaining = parseFloat(user.hours_remaining);
+   780→  const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   781→  const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   782→
+   783→  const tierNames = {
+   784→    starter: 'Starter',
+   785→    pro: 'Pro',
+   786→    team: 'Team',
+   787→    cancelled: 'Cancelled'
+   788→  };
+   789→
+   790→  return {
+   791→    hoursRemaining,
+   792→    hoursTotal,
+   793→    isolationHoursRemaining,
+   794→    isolationHoursTotal,
+   795→    tier: user.tier,
+   796→    tierName: tierNames[user.tier] || user.tier,
+   797→    percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   798→    isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   799→    hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   800→    isolationOverageRate: ISOLATION_OVERAGE_RATE
+   801→  };
+   802→}
+   803→
+   804→/**
+   805→ * Update user's tier (from Stripe webhook)
+   806→ * Optimized: uses RETURNING and INSERT...ON CONFLICT for upsert
+   807→ */
+   808→async function updateTier(stripeCustomerId, tier, email = null) {
+   809→  const hours = tier in TIER_HOURS ? TIER_HOURS[tier] : TIER_HOURS.starter;
+   810→  const isolationHours = tier in TIER_ISOLATION_HOURS ? TIER_ISOLATION_HOURS[tier] : 0;
+   811→
+   812→  // Use upsert (INSERT...ON CONFLICT) with RETURNING to handle create/update in one query
+   813→  const result = await pool.query(
+   814→    `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total)
+   815→     VALUES ($1, $2, $3, $4, $4, $5, $5)
+   816→     ON CONFLICT (stripe_customer_id) DO UPDATE
+   817→     SET tier = $3, hours_remaining = $4, hours_total = $4,
+   818→         isolation_hours_remaining = $5, isolation_hours_total = $5,
+   819→         updated_at = CURRENT_TIMESTAMP
+   820→     RETURNING hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+   821→    [stripeCustomerId, email, tier, hours, isolationHours]
+   822→  );
+   823→
+   824→  const user = result.rows[0];
+   825→  const hoursTotal = parseFloat(user.hours_total);
+   826→  const hoursRemaining = parseFloat(user.hours_remaining);
+   827→  const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+   828→  const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+   829→
+   830→  const tierNames = {
+   831→    starter: 'Starter',
+   832→    pro: 'Pro',
+   833→    team: 'Team',
+   834→    cancelled: 'Cancelled'
+   835→  };
+   836→
+   837→  return {
+   838→    hoursRemaining,
+   839→    hoursTotal,
+   840→    isolationHoursRemaining,
+   841→    isolationHoursTotal,
+   842→    tier: user.tier,
+   843→    tierName: tierNames[user.tier] || user.tier,
+   844→    percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+   845→    isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+   846→    hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+   847→    isolationOverageRate: ISOLATION_OVERAGE_RATE
+   848→  };
+   849→}
+   850→
+   851→/**
+   852→ * Get usage history for a user
+   853→ */
+   854→async function getUsageHistory(stripeCustomerId, limit = 50) {
+   855→  const result = await pool.query(
+   856→    `SELECT * FROM usage_log
+   857→     WHERE stripe_customer_id = $1
+   858→     ORDER BY created_at DESC
+   859→     LIMIT $2`,
+   860→    [stripeCustomerId, limit]
+   861→  );
+   862→  return result.rows;
+   863→}
+   864→
+   865→/**
+   866→ * Check if webhook event has already been processed (idempotency)
+   867→ */
+   868→async function isEventProcessed(eventId) {
+   869→  const result = await pool.query(
+   870→    'SELECT id FROM webhook_events WHERE event_id = $1',
+   871→    [eventId]
+   872→  );
+   873→  return result.rows.length > 0;
+   874→}
+   875→
+   876→/**
+   877→ * Record a processed webhook event
+   878→ */
+   879→async function recordWebhookEvent(eventId, eventType) {
+   880→  try {
+   881→    await pool.query(
+   882→      'INSERT INTO webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING',
+   883→      [eventId, eventType]
+   884→    );
+   885→  } catch (err) {
+   886→    // Ignore duplicate key errors (race condition safety)
+   887→    if (err.code !== '23505') throw err;
+   888→  }
+   889→}
+   890→
+   891→// =============================================================================
+   892→// Music Credits Functions (Phase 4 - AI Music Feature)
+   893→// =============================================================================
+   894→
+   895→// Music credits per tier
+   896→// Matches new pricing: Starter $15/mo, Pro $39/mo, Team $129/mo
+   897→const TIER_MUSIC_CREDITS = {
+   898→  starter: 2,    // 2 songs/month
+   899→  pro: 10,       // 10 songs/month
+   900→  team: 50,      // 50 songs/month
+   901→  cancelled: 0
+   902→};
+   903→
+   904→// Flat overage rate for music (simplified pricing)
+   905→const MUSIC_OVERAGE_RATE = 1.00; // $1/song for all tiers
+   906→
+   907→// Legacy overage rates (kept for backwards compatibility)
+   908→const MUSIC_OVERAGE_RATES = {
+   909→  starter: 1.00,  // $1.00/song
+   910→  pro: 1.00,      // $1.00/song
+   911→  team: 1.00      // $1.00/song
+   912→};
+   913→
+   914→/**
+   915→ * Get music credits balance for a customer
+   916→ * @param {string} stripeCustomerId - Stripe customer ID
+   917→ * @returns {Promise<{remaining: number, total: number, tier: string}>}
+   918→ */
+   919→async function getMusicCredits(stripeCustomerId) {
+   920→  const result = await pool.query(
+   921→    `SELECT music_credits_remaining, music_credits_total, tier
+   922→     FROM users
+   923→     WHERE stripe_customer_id = $1`,
+   924→    [stripeCustomerId]
+   925→  );
+   926→
+   927→  if (result.rows.length === 0) {
+   928→    return { remaining: 0, total: 0, tier: 'starter' };
+   929→  }
+   930→
+   931→  const row = result.rows[0];
+   932→  return {
+   933→    remaining: row.music_credits_remaining || 0,
+   934→    total: row.music_credits_total || TIER_MUSIC_CREDITS[row.tier] || 0,
+   935→    tier: row.tier || 'starter'
+   936→  };
+   937→}
+   938→
+   939→/**
+   940→ * Check if customer has music credits available
+   941→ * @param {string} stripeCustomerId - Stripe customer ID
+   942→ * @returns {Promise<boolean>}
+   943→ */
+   944→async function hasMusicCredits(stripeCustomerId) {
+   945→  const credits = await getMusicCredits(stripeCustomerId);
+   946→  return credits.remaining > 0;
+   947→}
+   948→
+   949→/**
+   950→ * Deduct one music credit from customer
+   951→ * @param {string} stripeCustomerId - Stripe customer ID
+   952→ * @returns {Promise<{success: boolean, remaining: number, charged: number}>}
+   953→ */
+   954→async function deductMusicCredit(stripeCustomerId) {
+   955→  const client = await pool.connect();
+   956→  try {
+   957→    await client.query('BEGIN');
+   958→
+   959→    // Lock row for update
+   960→    const result = await client.query(
+   961→      `SELECT music_credits_remaining, tier
+   962→       FROM users
+   963→       WHERE stripe_customer_id = $1
+   964→       FOR UPDATE`,
+   965→      [stripeCustomerId]
+   966→    );
+   967→
+   968→    if (result.rows.length === 0) {
+   969→      await client.query('ROLLBACK');
+   970→      return { success: false, remaining: 0, charged: 0, error: 'User not found' };
+   971→    }
+   972→
+   973→    const { music_credits_remaining } = result.rows[0];
+   974→    let charged = 0;
+   975→
+   976→    if (music_credits_remaining > 0) {
+   977→      // Deduct from included credits
+   978→      await client.query(
+   979→        `UPDATE users
+   980→         SET music_credits_remaining = music_credits_remaining - 1,
+   981→             updated_at = CURRENT_TIMESTAMP
+   982→         WHERE stripe_customer_id = $1`,
+   983→        [stripeCustomerId]
+   984→      );
+   985→    } else {
+   986→      // Overage - charge flat rate ($1/song)
+   987→      charged = MUSIC_OVERAGE_RATE;
+   988→
+   989→      // Report overage to Stripe meter for billing
+   990→      const usageReport = await reportMusicOverage(stripeCustomerId, 1);
+   991→      if (usageReport.success) {
+   992→        console.log(`[SPLICE] Music overage reported to Stripe: ${stripeCustomerId} - $${charged}`);
+   993→      } else {
+   994→        console.warn(`[SPLICE] Music overage billing failed: ${usageReport.error}`);
+   995→      }
+   996→    }
+   997→
+   998→    // Log the usage
+   999→    await client.query(
+  1000→      `INSERT INTO music_usage_log (stripe_customer_id, credits_used, overage_charged)
+  1001→       VALUES ($1, 1, $2)
+  1002→       ON CONFLICT DO NOTHING`,
+  1003→      [stripeCustomerId, charged]
+  1004→    );
+  1005→
+  1006→    await client.query('COMMIT');
+  1007→
+  1008→    const newCredits = await getMusicCredits(stripeCustomerId);
+  1009→    return {
+  1010→      success: true,
+  1011→      remaining: newCredits.remaining,
+  1012→      charged
+  1013→    };
+  1014→
+  1015→  } catch (err) {
+  1016→    await client.query('ROLLBACK');
+  1017→    console.error('[SPLICE] Music credit deduction error:', err.message);
+  1018→    return { success: false, remaining: 0, charged: 0, error: err.message };
+  1019→  } finally {
+  1020→    client.release();
+  1021→  }
+  1022→}
+  1023→
+  1024→/**
+  1025→ * Reset music credits based on tier (called on subscription renewal)
+  1026→ * @param {string} stripeCustomerId - Stripe customer ID
+  1027→ * @param {string} tier - Subscription tier
+  1028→ */
+  1029→async function resetMusicCredits(stripeCustomerId, tier) {
+  1030→  const credits = TIER_MUSIC_CREDITS[tier] || TIER_MUSIC_CREDITS.starter;
+  1031→
+  1032→  await pool.query(
+  1033→    `UPDATE users
+  1034→     SET music_credits_remaining = $2,
+  1035→         music_credits_total = $2,
+  1036→         music_credits_reset_at = CURRENT_TIMESTAMP,
+  1037→         updated_at = CURRENT_TIMESTAMP
+  1038→     WHERE stripe_customer_id = $1`,
+  1039→    [stripeCustomerId, credits]
+  1040→  );
+  1041→}
+  1042→
+  1043→/**
+  1044→ * Add music credits (for promotional or overage purchases)
+  1045→ * @param {string} stripeCustomerId - Stripe customer ID
+  1046→ * @param {number} credits - Number of credits to add
+  1047→ * @returns {Promise<{success: boolean, newBalance: number}>}
+  1048→ */
+  1049→async function addMusicCredits(stripeCustomerId, credits) {
+  1050→  const result = await pool.query(
+  1051→    `UPDATE users
+  1052→     SET music_credits_remaining = music_credits_remaining + $2,
+  1053→         updated_at = CURRENT_TIMESTAMP
+  1054→     WHERE stripe_customer_id = $1
+  1055→     RETURNING music_credits_remaining`,
+  1056→    [stripeCustomerId, credits]
+  1057→  );
+  1058→
+  1059→  if (result.rows.length === 0) {
+  1060→    return { success: false, newBalance: 0 };
+  1061→  }
+  1062→
+  1063→  return {
+  1064→    success: true,
+  1065→    newBalance: result.rows[0].music_credits_remaining
+  1066→  };
+  1067→}
+  1068→
+  1069→/**
+  1070→ * Get music usage history for a customer
+  1071→ * @param {string} stripeCustomerId - Stripe customer ID
+  1072→ * @param {number} limit - Max records to return
+  1073→ * @returns {Promise<Object[]>}
+  1074→ */
+  1075→async function getMusicUsageHistory(stripeCustomerId, limit = 50) {
+  1076→  const result = await pool.query(
+  1077→    `SELECT * FROM music_usage_log
+  1078→     WHERE stripe_customer_id = $1
+  1079→     ORDER BY created_at DESC
+  1080→     LIMIT $2`,
+  1081→    [stripeCustomerId, limit]
+  1082→  );
+  1083→  return result.rows;
+  1084→}
+  1085→
+  1086→/**
+  1087→ * Initialize music credits columns (migration helper)
+  1088→ */
+  1089→async function initMusicCreditsColumns() {
+  1090→  const client = await pool.connect();
+  1091→  try {
+  1092→    // Add music credits columns if they don't exist
+  1093→    await client.query(`
+  1094→      DO $$
+  1095→      BEGIN
+  1096→        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'music_credits_remaining') THEN
+  1097→          ALTER TABLE users ADD COLUMN music_credits_remaining INTEGER DEFAULT 5;
+  1098→        END IF;
+  1099→        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'music_credits_total') THEN
+  1100→          ALTER TABLE users ADD COLUMN music_credits_total INTEGER DEFAULT 5;
+  1101→        END IF;
+  1102→        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'music_credits_reset_at') THEN
+  1103→          ALTER TABLE users ADD COLUMN music_credits_reset_at TIMESTAMP;
+  1104→        END IF;
+  1105→      END $$;
+  1106→    `);
+  1107→
+  1108→    // Create music usage log table
+  1109→    await client.query(`
+  1110→      CREATE TABLE IF NOT EXISTS music_usage_log (
+  1111→        id SERIAL PRIMARY KEY,
+  1112→        stripe_customer_id VARCHAR(255) NOT NULL,
+  1113→        credits_used INTEGER DEFAULT 1,
+  1114→        overage_charged DECIMAL(10,2) DEFAULT 0,
+  1115→        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  1116→      )
+  1117→    `);
+  1118→
+  1119→    await client.query(`
+  1120→      CREATE INDEX IF NOT EXISTS idx_music_usage_customer
+  1121→      ON music_usage_log(stripe_customer_id)
+  1122→    `);
+  1123→
+  1124→    console.log('[SPLICE] Music credits columns initialized');
+  1125→  } finally {
+  1126→    client.release();
+  1127→  }
+  1128→}
+  1129→
+  1130→// Variations credits cost (equivalent to 2.5 music credits)
+  1131→const VARIATIONS_CREDIT_COST = 2.5;
+  1132→
+  1133→// Overage rates for variations (higher than single music due to 3 parallel generations)
+  1134→const VARIATIONS_OVERAGE_RATES = {
+  1135→  starter: 1.25,  // $1.25/variations (2.5x $0.50)
+  1136→  pro: 0.75,      // $0.75/variations (2.5x $0.30)
+  1137→  team: 0.50      // $0.50/variations (2.5x $0.20)
+  1138→};
+  1139→
+  1140→// Scene-aware music credits cost (1.5 credits for transcript analysis + generation)
+  1141→const SCENE_AWARE_CREDIT_COST = 1.5;
+  1142→
+  1143→// Overage rates for scene-aware music (75% margin)
+  1144→const SCENE_AWARE_OVERAGE_RATES = {
+  1145→  starter: 0.75,  // $0.75/scene-aware (1.5x $0.50)
+  1146→  pro: 0.45,      // $0.45/scene-aware (1.5x $0.30)
+  1147→  team: 0.30      // $0.30/scene-aware (1.5x $0.20)
+  1148→};
+  1149→
+  1150→/**
+  1151→ * Check if customer has enough credits for variations (2.5 credits)
+  1152→ * @param {string} stripeCustomerId - Stripe customer ID
+  1153→ * @returns {Promise<{canGenerate: boolean, creditsAvailable: number, creditsRequired: number}>}
+  1154→ */
+  1155→async function checkVariationsCredits(stripeCustomerId) {
+  1156→  const credits = await getMusicCredits(stripeCustomerId);
+  1157→  const creditsRequired = VARIATIONS_CREDIT_COST;
+  1158→
+  1159→  // Allow if they have at least 1 credit (we'll charge overage for the rest)
+  1160→  // Or if they're on a paid tier (overage allowed)
+  1161→  const canGenerate = credits.remaining > 0 || credits.tier !== 'cancelled';
+  1162→
+  1163→  return {
+  1164→    canGenerate,
+  1165→    creditsAvailable: credits.remaining,
+  1166→    creditsRequired,
+  1167→    tier: credits.tier
+  1168→  };
+  1169→}
+  1170→
+  1171→/**
+  1172→ * Deduct variations credit from customer (2.5 credits worth)
+  1173→ * @param {string} stripeCustomerId - Stripe customer ID
+  1174→ * @returns {Promise<{success: boolean, remaining: number, charged: number}>}
+  1175→ */
+  1176→async function deductVariationsCredit(stripeCustomerId) {
+  1177→  const client = await pool.connect();
+  1178→  try {
+  1179→    await client.query('BEGIN');
+  1180→
+  1181→    // Lock row for update
+  1182→    const result = await client.query(
+  1183→      `SELECT music_credits_remaining, tier
+  1184→       FROM users
+  1185→       WHERE stripe_customer_id = $1
+  1186→       FOR UPDATE`,
+  1187→      [stripeCustomerId]
+  1188→    );
+  1189→
+  1190→    if (result.rows.length === 0) {
+  1191→      await client.query('ROLLBACK');
+  1192→      return { success: false, remaining: 0, charged: 0, error: 'User not found' };
+  1193→    }
+  1194→
+  1195→    const { music_credits_remaining, tier } = result.rows[0];
+  1196→    let charged = 0;
+  1197→    let creditsDeducted = 0;
+  1198→
+  1199→    // Determine how many credits to deduct vs overage to charge
+  1200→    if (music_credits_remaining >= VARIATIONS_CREDIT_COST) {
+  1201→      // Have enough credits - deduct 2.5 (rounded up to 3 for integer credits)
+  1202→      creditsDeducted = Math.ceil(VARIATIONS_CREDIT_COST);
+  1203→      await client.query(
+  1204→        `UPDATE users
+  1205→         SET music_credits_remaining = music_credits_remaining - $2,
+  1206→             updated_at = CURRENT_TIMESTAMP
+  1207→         WHERE stripe_customer_id = $1`,
+  1208→        [stripeCustomerId, creditsDeducted]
+  1209→      );
+  1210→    } else if (music_credits_remaining > 0) {
+  1211→      // Partial credits - deduct what they have and charge overage for the rest
+  1212→      const creditsPortion = music_credits_remaining;
+  1213→      const overagePortion = VARIATIONS_CREDIT_COST - creditsPortion;
+  1214→      const overageRate = MUSIC_OVERAGE_RATES[tier] || MUSIC_OVERAGE_RATES.starter;
+  1215→      charged = overagePortion * overageRate;
+  1216→
+  1217→      creditsDeducted = creditsPortion;
+  1218→      await client.query(
+  1219→        `UPDATE users
+  1220→         SET music_credits_remaining = 0,
+  1221→             updated_at = CURRENT_TIMESTAMP
+  1222→         WHERE stripe_customer_id = $1`,
+  1223→        [stripeCustomerId]
+  1224→      );
+  1225→
+  1226→      console.log(`[SPLICE] Variations partial overage: ${stripeCustomerId} used ${creditsPortion} credits, charged $${charged.toFixed(2)}`);
+  1227→    } else {
+  1228→      // No credits - full overage
+  1229→      charged = VARIATIONS_OVERAGE_RATES[tier] || VARIATIONS_OVERAGE_RATES.starter;
+  1230→      console.log(`[SPLICE] Variations full overage: ${stripeCustomerId} charged $${charged.toFixed(2)}`);
+  1231→    }
+  1232→
+  1233→    // Log the usage
+  1234→    await client.query(
+  1235→      `INSERT INTO music_usage_log (stripe_customer_id, credits_used, overage_charged)
+  1236→       VALUES ($1, $2, $3)
+  1237→       ON CONFLICT DO NOTHING`,
+  1238→      [stripeCustomerId, creditsDeducted, charged]
+  1239→    );
+  1240→
+  1241→    await client.query('COMMIT');
+  1242→
+  1243→    const newCredits = await getMusicCredits(stripeCustomerId);
+  1244→    return {
+  1245→      success: true,
+  1246→      remaining: newCredits.remaining,
+  1247→      creditsDeducted,
+  1248→      charged
+  1249→    };
+  1250→
+  1251→  } catch (err) {
+  1252→    await client.query('ROLLBACK');
+  1253→    console.error('[SPLICE] Variations credit deduction error:', err.message);
+  1254→    return { success: false, remaining: 0, charged: 0, error: err.message };
+  1255→  } finally {
+  1256→    client.release();
+  1257→  }
+  1258→}
+  1259→
+  1260→/**
+  1261→ * Check if customer has enough credits for scene-aware music (1.5 credits)
+  1262→ * @param {string} stripeCustomerId - Stripe customer ID
+  1263→ * @returns {Promise<{canGenerate: boolean, creditsAvailable: number, creditsRequired: number}>}
+  1264→ */
+  1265→async function checkSceneAwareCredits(stripeCustomerId) {
+  1266→  const credits = await getMusicCredits(stripeCustomerId);
+  1267→  const creditsRequired = SCENE_AWARE_CREDIT_COST;
+  1268→
+  1269→  // Allow if they have at least 1 credit (we'll charge overage for the rest)
+  1270→  // Or if they're on a paid tier (overage allowed)
+  1271→  const canGenerate = credits.remaining > 0 || credits.tier !== 'cancelled';
+  1272→
+  1273→  return {
+  1274→    canGenerate,
+  1275→    creditsAvailable: credits.remaining,
+  1276→    creditsRequired,
+  1277→    tier: credits.tier
+  1278→  };
+  1279→}
+  1280→
+  1281→/**
+  1282→ * Deduct scene-aware music credit from customer (1.5 credits worth)
+  1283→ * @param {string} stripeCustomerId - Stripe customer ID
+  1284→ * @returns {Promise<{success: boolean, remaining: number, charged: number}>}
+  1285→ */
+  1286→async function deductSceneAwareCredit(stripeCustomerId) {
+  1287→  const client = await pool.connect();
+  1288→  try {
+  1289→    await client.query('BEGIN');
+  1290→
+  1291→    // Lock row for update
+  1292→    const result = await client.query(
+  1293→      `SELECT music_credits_remaining, tier
+  1294→       FROM users
+  1295→       WHERE stripe_customer_id = $1
+  1296→       FOR UPDATE`,
+  1297→      [stripeCustomerId]
+  1298→    );
+  1299→
+  1300→    if (result.rows.length === 0) {
+  1301→      await client.query('ROLLBACK');
+  1302→      return { success: false, remaining: 0, charged: 0, error: 'User not found' };
+  1303→    }
+  1304→
+  1305→    const { music_credits_remaining, tier } = result.rows[0];
+  1306→    let charged = 0;
+  1307→    let creditsDeducted = 0;
+  1308→
+  1309→    // Determine how many credits to deduct vs overage to charge
+  1310→    if (music_credits_remaining >= SCENE_AWARE_CREDIT_COST) {
+  1311→      // Have enough credits - deduct 1.5 (rounded up to 2 for integer credits)
+  1312→      creditsDeducted = Math.ceil(SCENE_AWARE_CREDIT_COST);
+  1313→      await client.query(
+  1314→        `UPDATE users
+  1315→         SET music_credits_remaining = music_credits_remaining - $2,
+  1316→             updated_at = CURRENT_TIMESTAMP
+  1317→         WHERE stripe_customer_id = $1`,
+  1318→        [stripeCustomerId, creditsDeducted]
+  1319→      );
+  1320→    } else if (music_credits_remaining > 0) {
+  1321→      // Partial credits - deduct what they have and charge overage for the rest
+  1322→      const creditsPortion = music_credits_remaining;
+  1323→      const overagePortion = SCENE_AWARE_CREDIT_COST - creditsPortion;
+  1324→      const overageRate = MUSIC_OVERAGE_RATES[tier] || MUSIC_OVERAGE_RATES.starter;
+  1325→      charged = overagePortion * overageRate;
+  1326→
+  1327→      creditsDeducted = creditsPortion;
+  1328→      await client.query(
+  1329→        `UPDATE users
+  1330→         SET music_credits_remaining = 0,
+  1331→             updated_at = CURRENT_TIMESTAMP
+  1332→         WHERE stripe_customer_id = $1`,
+  1333→        [stripeCustomerId]
+  1334→      );
+  1335→
+  1336→      console.log(`[SPLICE] Scene-aware partial overage: ${stripeCustomerId} used ${creditsPortion} credits, charged $${charged.toFixed(2)}`);
+  1337→    } else {
+  1338→      // No credits - full overage
+  1339→      charged = SCENE_AWARE_OVERAGE_RATES[tier] || SCENE_AWARE_OVERAGE_RATES.starter;
+  1340→      console.log(`[SPLICE] Scene-aware full overage: ${stripeCustomerId} charged $${charged.toFixed(2)}`);
+  1341→    }
+  1342→
+  1343→    // Log the usage
+  1344→    await client.query(
+  1345→      `INSERT INTO music_usage_log (stripe_customer_id, credits_used, overage_charged)
+  1346→       VALUES ($1, $2, $3)
+  1347→       ON CONFLICT DO NOTHING`,
+  1348→      [stripeCustomerId, creditsDeducted, charged]
+  1349→    );
+  1350→
+  1351→    await client.query('COMMIT');
+  1352→
+  1353→    const newCredits = await getMusicCredits(stripeCustomerId);
+  1354→    return {
+  1355→      success: true,
+  1356→      remaining: newCredits.remaining,
+  1357→      creditsDeducted,
+  1358→      charged
+  1359→    };
+  1360→
+  1361→  } catch (err) {
+  1362→    await client.query('ROLLBACK');
+  1363→    console.error('[SPLICE] Scene-aware credit deduction error:', err.message);
+  1364→    return { success: false, remaining: 0, charged: 0, error: err.message };
+  1365→  } finally {
+  1366→    client.release();
+  1367→  }
+  1368→}
+  1369→
+  1370→/**
+  1371→ * Close the database connection pool
+  1372→ * Used for graceful shutdown
+  1373→ */
+  1374→async function closePool() {
+  1375→  await pool.end();
+  1376→}
+  1377→
+  1378→/**
+  1379→ * Check database connectivity
+  1380→ * Used for health checks
+  1381→ */
+  1382→async function checkDatabase() {
+  1383→  const client = await pool.connect();
+  1384→  try {
+  1385→    const result = await client.query('SELECT 1 as health');
+  1386→    return result.rows[0].health === 1;
+  1387→  } finally {
+  1388→    client.release();
+  1389→  }
+  1390→}
+  1391→
+  1392→module.exports = {
+  1393→  initDatabase,
+  1394→  getOrCreateUser,
+  1395→  customerExists,
+  1396→  getBalance,
+  1397→  hasCredits,
+  1398→  reserveCredits,
+  1399→  confirmReservation,
+  1400→  releaseReservation,
+  1401→  checkIsolationAccess,
+  1402→  deductUsage,
+  1403→  deductIsolationUsage,
+  1404→  resetHours,
+  1405→  updateTier,
+  1406→  getUsageHistory,
+  1407→  isEventProcessed,
+  1408→  recordWebhookEvent,
+  1409→  // Music credits functions
+  1410→  getMusicCredits,
+  1411→  hasMusicCredits,
+  1412→  deductMusicCredit,
+  1413→  resetMusicCredits,
+  1414→  addMusicCredits,
+  1415→  getMusicUsageHistory,
+  1416→  initMusicCreditsColumns,
+  1417→  // Variations credits functions
+  1418→  checkVariationsCredits,
+  1419→  deductVariationsCredit,
+  1420→  // Scene-aware credits functions
+  1421→  checkSceneAwareCredits,
+  1422→  deductSceneAwareCredit,
+  1423→  // Pool management
+  1424→  closePool,
+  1425→  checkDatabase,
+  1426→  // Constants
+  1427→  TIER_HOURS,
+  1428→  TIER_ISOLATION_MINUTES,
+  1429→  TIER_ISOLATION_HOURS,
+  1430→  ISOLATION_OVERAGE_RATE,
+  1431→  HOURS_OVERAGE_RATE,
+  1432→  TIER_MUSIC_CREDITS,
+  1433→  MUSIC_OVERAGE_RATE,
+  1434→  MUSIC_OVERAGE_RATES,
+  1435→  VARIATIONS_CREDIT_COST,
+  1436→  VARIATIONS_OVERAGE_RATES,
+  1437→  SCENE_AWARE_CREDIT_COST,
+  1438→  SCENE_AWARE_OVERAGE_RATES
+  1439→};
+  1440→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

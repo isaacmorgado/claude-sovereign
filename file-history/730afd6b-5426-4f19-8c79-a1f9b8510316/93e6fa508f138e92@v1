@@ -1,0 +1,960 @@
+# SPLICE Feature Integration Plan
+## Based on FireCut Analysis & Current SPLICE Architecture
+
+**Generated**: 2025-12-25
+**Target Version**: SPLICE v4.0
+**Current Status**: v3.5 (82% FireCut Parity)
+
+---
+
+## Executive Summary
+
+This plan integrates 5 priority features into SPLICE based on comprehensive analysis of:
+- FireCut deobfuscated source code (`/Users/imorgado/Desktop/Fireside_Deobstuficated`)
+- Current SPLICE backend (14 services, 5,200+ LOC)
+- Current SPLICE plugin (14 files, 3,700+ LOC)
+
+### Features to Implement
+
+| Feature | Priority | Effort | Impact |
+|---------|----------|--------|--------|
+| **1. Auto Zoom** | HIGH | 8-10 hrs | Major differentiator |
+| **2. Multitrack UI** | HIGH | 6-8 hrs | Backend done, UI needed |
+| **3. J-Cut Support** | HIGH | 4-6 hrs | Podcast workflow |
+| **4. Chapter Detection** | MEDIUM | 5-7 hrs | YouTube optimization |
+| **5. Takes Labeling & Color Coding** | HIGH | 3-4 hrs | Already partially done |
+
+**Total Estimated Effort**: 26-35 hours
+
+### Features NOT Being Implemented
+- B-Roll Auto-Insert (excluded per user request)
+- Highlight Extraction (excluded per user request)
+- Auto-Reframe 9:16 (excluded per user request)
+
+---
+
+## 1. AUTO ZOOM IMPLEMENTATION
+
+### FireCut Analysis
+
+**Source**: `/Users/imorgado/Desktop/Fireside_Deobstuficated/firecut_host_decoded.jsx`
+**Lines**: 1847-2100
+
+**FireCut Approach**:
+1. Uses **Adjustment Layers** (AI Adjustment Layer) for non-destructive zooms
+2. Applies **Transform effect** with keyframes for Scale and Anchor Point
+3. Implements **easing curves** with configurable power parameter
+4. Supports asymmetric easing (different in/out animation speeds)
+
+**Key FireCut Functions**:
+```javascript
+addZoomAtTime(trackIndex, start, scale, duration, center)
+addZoomAnimation(trackIndex, start, duration, scaleStart, scalePeak, scaleEnd, easing)
+addZoomAtTimeAndCenterAsymmetric(trackIndex, start, duration, scaleStart,
+    scalePeak, scaleEnd, centerX, centerY, easingIn, easingOut)
+```
+
+**Easing Curve Implementation**:
+```javascript
+function easing_curve(t, power) {
+    const coefficient = Math.pow(2, power - 1);
+    return (1 - Math.pow(2, -power * t)) / coefficient;
+}
+```
+
+### SPLICE Implementation Plan
+
+#### Backend Changes (`splice-backend/services/`)
+
+**New File**: `zoomGenerator.js`
+```javascript
+/**
+ * Zoom Generator Service
+ * Generates zoom keyframe data for cut list integration
+ */
+
+const ZOOM_PRESETS = {
+  subtle: { scale: 110, duration: 0.6, easing: 2 },
+  medium: { scale: 120, duration: 0.8, easing: 3 },
+  dramatic: { scale: 140, duration: 1.0, easing: 4 }
+};
+
+const ZOOM_FREQUENCIES = {
+  low: 60,      // ~1 per minute
+  medium: 30,   // ~2 per minute
+  high: 15      // ~4 per minute
+};
+
+function generateZoomPoints(transcript, settings) {
+  const { frequency, preset, placement } = settings;
+  const zoomPoints = [];
+
+  // Find emphasis points (sentence starts, keywords, speaker changes)
+  const emphasisPoints = findEmphasisPoints(transcript, placement);
+
+  // Select zoom points based on frequency
+  const intervalSeconds = ZOOM_FREQUENCIES[frequency] || 30;
+  let lastZoomTime = 0;
+
+  for (const point of emphasisPoints) {
+    if (point.time - lastZoomTime >= intervalSeconds) {
+      zoomPoints.push({
+        type: 'zoom',
+        startTime: point.time,
+        duration: ZOOM_PRESETS[preset].duration,
+        scale: ZOOM_PRESETS[preset].scale,
+        easing: ZOOM_PRESETS[preset].easing,
+        centerPoint: point.center || { x: 0.5, y: 0.5 },
+        reason: point.reason
+      });
+      lastZoomTime = point.time;
+    }
+  }
+
+  return zoomPoints;
+}
+
+function findEmphasisPoints(transcript, placement) {
+  // Placement options: 'sentence_start', 'keywords', 'random', 'speaker_change'
+  // Implementation varies by placement type
+}
+
+module.exports = { generateZoomPoints, ZOOM_PRESETS, ZOOM_FREQUENCIES };
+```
+
+**Modify**: `cutListGenerator.js`
+```javascript
+// Add zoom data to cut list format
+function generateCutList(options) {
+  // ... existing code ...
+
+  // Add zoom points if enabled
+  if (options.zoomSettings?.enabled) {
+    const zoomPoints = generateZoomPoints(
+      options.transcript,
+      options.zoomSettings
+    );
+    cutList.zooms = zoomPoints;
+  }
+
+  return cutList;
+}
+```
+
+#### Plugin Changes (`splice-plugin/js/`)
+
+**Modify**: `builder.js` - Add zoom application
+```javascript
+/**
+ * Apply zoom keyframes to adjustment layer
+ * Uses UXP APIs for non-destructive editing
+ */
+async function applyZooms(sequence, zoomPoints, project) {
+  if (!zoomPoints || zoomPoints.length === 0) return;
+
+  // Get or create adjustment layer
+  const adjustmentLayer = await getOrCreateAdjustmentLayer(project, sequence);
+
+  for (const zoom of zoomPoints) {
+    await project.lockedAccess(async () => {
+      await project.executeTransaction((compoundAction) => {
+        const startTime = pproBuilder.TickTime.createWithSeconds(zoom.startTime);
+        const endTime = pproBuilder.TickTime.createWithSeconds(
+          zoom.startTime + zoom.duration
+        );
+
+        // Generate keyframes
+        const keyframes = generateZoomKeyframes(zoom);
+
+        // Apply to Transform effect
+        for (const kf of keyframes) {
+          // Scale keyframes
+          const scaleAction = adjustmentLayer.createSetPropertyKeyframeAction(
+            'Transform', 'Scale', kf.time, kf.scale
+          );
+          compoundAction.addAction(scaleAction);
+
+          // Anchor point keyframes (for center point)
+          if (kf.anchor) {
+            const anchorAction = adjustmentLayer.createSetPropertyKeyframeAction(
+              'Transform', 'Anchor Point', kf.time, kf.anchor
+            );
+            compoundAction.addAction(anchorAction);
+          }
+        }
+      }, 'SPLICE: Apply Zoom Effects');
+    });
+  }
+}
+
+function generateZoomKeyframes(zoom) {
+  const keyframes = [];
+  const frameCount = Math.ceil(zoom.duration * 30); // Assume 30fps
+
+  for (let i = 0; i <= frameCount; i++) {
+    const t = i / frameCount;
+    const easedT = easingCurve(t, zoom.easing);
+
+    // Calculate scale: start -> peak -> end
+    let scale;
+    if (t < 0.5) {
+      scale = 100 + (zoom.scale - 100) * easingCurve(t * 2, zoom.easing);
+    } else {
+      scale = zoom.scale - (zoom.scale - 100) * easingCurve((t - 0.5) * 2, zoom.easing);
+    }
+
+    keyframes.push({
+      time: zoom.startTime + (i / 30),
+      scale: [scale, scale],
+      anchor: zoom.centerPoint ? [
+        zoom.centerPoint.x * 1920, // Assume 1080p
+        zoom.centerPoint.y * 1080
+      ] : null
+    });
+  }
+
+  return keyframes;
+}
+
+function easingCurve(t, power) {
+  const coefficient = Math.pow(2, power - 1);
+  return (1 - Math.pow(2, -power * t)) / coefficient;
+}
+```
+
+**Modify**: `index.html` - Add zoom UI
+```html
+<!-- Add to Options Panel -->
+<div class="option-group zoom-options">
+  <label>
+    <input type="checkbox" id="enableZoom"> Enable Auto Zoom
+  </label>
+
+  <div id="zoomSettings" class="collapsed">
+    <div class="option-row">
+      <label for="zoomFrequency">Frequency:</label>
+      <select id="zoomFrequency">
+        <option value="low">Low (~1/min)</option>
+        <option value="medium" selected>Medium (~2/min)</option>
+        <option value="high">High (~4/min)</option>
+      </select>
+    </div>
+
+    <div class="option-row">
+      <label for="zoomPreset">Intensity:</label>
+      <select id="zoomPreset">
+        <option value="subtle">Subtle (110%)</option>
+        <option value="medium" selected>Medium (120%)</option>
+        <option value="dramatic">Dramatic (140%)</option>
+      </select>
+    </div>
+
+    <div class="option-row">
+      <label for="zoomPlacement">Placement:</label>
+      <select id="zoomPlacement">
+        <option value="sentence_start" selected>Sentence Starts</option>
+        <option value="keywords">Keywords</option>
+        <option value="random">Random</option>
+      </select>
+    </div>
+  </div>
+</div>
+```
+
+---
+
+## 2. MULTITRACK UI IMPLEMENTATION
+
+### Current SPLICE Status
+
+**Backend**: FULLY IMPLEMENTED in `multitrackAnalysis.js` (725 LOC)
+- Speaker diarization via RMS analysis
+- Gaussian smoothing for speaker detection
+- Wide shot detection logic
+- Auto-balance algorithm
+
+**Missing**: UI panel to configure and trigger multitrack analysis
+
+### FireCut Analysis
+
+**Source**: `/Users/imorgado/Desktop/Fireside_Deobstuficated/multitrack/`
+**Key Files**: `main_clean.js`, `helpers_clean.js`, `ui_clean.js`
+
+**FireCut UI Elements**:
+1. Speaker-to-track mapping dropdowns
+2. Audio threshold sliders per speaker
+3. Speaker boost controls (-50 to +50 dB)
+4. Wide shot percentage slider
+5. Min shot duration control
+6. Cutaway configuration
+
+### SPLICE Implementation Plan
+
+#### Plugin Changes (`splice-plugin/`)
+
+**Modify**: `index.html` - Add Multitrack Panel
+```html
+<!-- Add new section after Advanced Options -->
+<div id="multitrackSection" class="feature-section collapsed">
+  <button id="multitrackToggle" class="section-toggle">
+    Multitrack Editing <span class="toggle-icon">+</span>
+  </button>
+
+  <div id="multitrackPanel" class="section-content">
+    <!-- Speaker Configuration -->
+    <div class="speaker-config">
+      <h4>Speaker Configuration</h4>
+      <div id="speakerList">
+        <!-- Dynamically populated -->
+      </div>
+      <button id="addSpeaker" class="btn-secondary">+ Add Speaker</button>
+    </div>
+
+    <!-- Track Mapping -->
+    <div class="track-mapping">
+      <h4>Video Track Mapping</h4>
+      <div id="trackMappingList">
+        <!-- Shows: Speaker 1 -> Track 3 dropdown -->
+      </div>
+    </div>
+
+    <!-- Parameters -->
+    <div class="multitrack-params">
+      <div class="param-row">
+        <label>Min Shot Duration:</label>
+        <input type="range" id="minShotDuration" min="0.5" max="5" step="0.25" value="2">
+        <span id="minShotDurationValue">2.0s</span>
+      </div>
+
+      <div class="param-row">
+        <label>Wide Shot %:</label>
+        <input type="range" id="wideShot" min="0" max="50" value="20">
+        <span id="wideShotValue">20%</span>
+      </div>
+
+      <div class="param-row">
+        <label>Switching Smoothing:</label>
+        <input type="range" id="switchSmoothing" min="0" max="100" value="50">
+        <span id="switchSmoothingValue">50</span>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="multitrack-actions">
+      <button id="analyzeMultitrack" class="btn-primary">Analyze Speakers</button>
+      <button id="autoBalance" class="btn-secondary">Auto-Balance</button>
+      <button id="applyMultitrack" class="btn-success" disabled>Apply Cuts</button>
+    </div>
+
+    <!-- Preview -->
+    <div id="multitrackPreview" class="hidden">
+      <h4>Speaker Distribution</h4>
+      <div id="distributionChart">
+        <!-- Bar chart showing speaker screentime -->
+      </div>
+      <div id="decisionList">
+        <!-- List of cut decisions with timestamps -->
+      </div>
+    </div>
+  </div>
+</div>
+```
+
+**New File**: `multitrack.js`
+```javascript
+/**
+ * Multitrack UI Module
+ * Connects multitrackAnalysis.js backend to user interface
+ */
+
+let speakerConfig = [];
+let trackMapping = {};
+let analysisResults = null;
+
+function initMultitrackUI() {
+  // Toggle section
+  document.getElementById('multitrackToggle').addEventListener('click', () => {
+    document.getElementById('multitrackSection').classList.toggle('collapsed');
+  });
+
+  // Add speaker
+  document.getElementById('addSpeaker').addEventListener('click', addSpeaker);
+
+  // Analyze button
+  document.getElementById('analyzeMultitrack').addEventListener('click', analyzeMultitrack);
+
+  // Auto-balance
+  document.getElementById('autoBalance').addEventListener('click', autoBalance);
+
+  // Apply cuts
+  document.getElementById('applyMultitrack').addEventListener('click', applyMultitrackCuts);
+
+  // Parameter updates
+  setupParameterListeners();
+}
+
+async function analyzeMultitrack() {
+  const settings = getMultitrackSettings();
+  setStatus('Analyzing speakers...');
+
+  try {
+    const response = await fetchWithTimeout(`${getBackendUrl()}/multitrack`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        wavPath: currentWavPath,
+        speakers: speakerConfig,
+        trackMapping: trackMapping,
+        settings: settings
+      })
+    });
+
+    analysisResults = await response.json();
+    displayMultitrackResults(analysisResults);
+    document.getElementById('applyMultitrack').disabled = false;
+    setStatus('Analysis complete - review and apply');
+  } catch (err) {
+    setStatus('Analysis failed: ' + err.message);
+  }
+}
+
+function displayMultitrackResults(results) {
+  // Show distribution chart
+  const chartContainer = document.getElementById('distributionChart');
+  chartContainer.innerHTML = '';
+
+  for (const speaker of results.speakerStats) {
+    const bar = document.createElement('div');
+    bar.className = 'distribution-bar';
+    bar.style.width = `${speaker.percentage}%`;
+    bar.style.backgroundColor = getSpeakerColor(speaker.index);
+    bar.innerHTML = `<span>${speaker.name}: ${speaker.percentage.toFixed(1)}%</span>`;
+    chartContainer.appendChild(bar);
+  }
+
+  // Show decision list
+  const decisionList = document.getElementById('decisionList');
+  decisionList.innerHTML = '';
+
+  for (const decision of results.decisions) {
+    const item = document.createElement('div');
+    item.className = 'decision-item';
+    item.innerHTML = `
+      <span class="decision-time">${formatTime(decision.start)} - ${formatTime(decision.end)}</span>
+      <span class="decision-speaker">${decision.speaker}</span>
+      <span class="decision-reason">${decision.reason}</span>
+      <button class="decision-seek" data-time="${decision.start}">></button>
+    `;
+    decisionList.appendChild(item);
+  }
+
+  document.getElementById('multitrackPreview').classList.remove('hidden');
+}
+
+async function applyMultitrackCuts() {
+  if (!analysisResults) return;
+
+  setStatus('Applying multitrack cuts...');
+
+  try {
+    // Generate cut list from decisions
+    const cutList = {
+      version: '3.5',
+      source: analysisResults.source,
+      segments: analysisResults.decisions.map(d => ({
+        type: d.speaker === 'Wide Shot' ? 'wide_shot' : 'speaker',
+        sourceName: d.trackName,
+        sourcePath: d.trackPath,
+        inPoint: d.start,
+        outPoint: d.end,
+        speaker: d.speaker,
+        videoTrack: d.videoTrack
+      })),
+      metadata: {
+        isMultitrack: true,
+        speakerCount: speakerConfig.length
+      }
+    };
+
+    // Build sequence using existing builder
+    await window.spliceBuilder.buildSequenceFromCutList(cutList, {
+      colorCode: true,
+      suffix: '_MULTITRACK'
+    });
+
+    setStatus('Multitrack sequence created');
+  } catch (err) {
+    setStatus('Failed to apply: ' + err.message);
+  }
+}
+```
+
+---
+
+## 3. J-CUT SUPPORT (PODCAST SYNC)
+
+### FireCut Analysis
+
+**Source**: `/Users/imorgado/Desktop/Fireside_Deobstuficated/firecut_host_decoded.jsx`
+**Key Function**: `moveAllClipsInTrack()` (lines 892-932)
+
+**FireCut J-Cut Approach**:
+1. Shift audio track earlier/later than video
+2. Cut clips at content boundaries
+3. Shift back to original alignment
+4. Creates natural audio lead-in/lead-out
+
+```javascript
+// FireCut J-cut flow
+moveAllClipsInTrack('audio', trackIndex, -0.5);  // Shift audio 0.5s earlier
+// ... perform cuts ...
+moveAllClipsInTrack('audio', trackIndex, +0.5);  // Shift back
+```
+
+### SPLICE Implementation Plan
+
+#### Backend Changes
+
+**Modify**: `cutListGenerator.js`
+```javascript
+// Add J-cut parameters to cut list format
+function generateCutList(options) {
+  const { jcutSettings } = options;
+
+  // For each segment, calculate audio offset
+  for (const segment of segments) {
+    if (jcutSettings?.enabled) {
+      segment.audioInPoint = segment.inPoint - jcutSettings.leadIn;
+      segment.audioOutPoint = segment.outPoint + jcutSettings.leadOut;
+      segment.hasAudioOffset = true;
+    }
+  }
+
+  return cutList;
+}
+```
+
+#### Plugin Changes
+
+**Modify**: `builder.js`
+```javascript
+// Handle J-cut segments with separate audio/video timing
+async function insertSegmentWithJCut(segment, editor, project) {
+  const videoPosition = pproBuilder.TickTime.createWithSeconds(segment.position);
+  const videoIn = pproBuilder.TickTime.createWithSeconds(segment.inPoint);
+  const videoOut = pproBuilder.TickTime.createWithSeconds(segment.outPoint);
+
+  // Insert video
+  const videoAction = editor.createInsertProjectItemAction(
+    segment.sourceItem,
+    videoPosition,
+    segment.videoTrack,
+    -1,  // No audio on video track
+    false
+  );
+
+  // Insert audio with offset
+  if (segment.hasAudioOffset) {
+    const audioIn = pproBuilder.TickTime.createWithSeconds(segment.audioInPoint);
+    const audioOut = pproBuilder.TickTime.createWithSeconds(segment.audioOutPoint);
+
+    const audioAction = editor.createInsertProjectItemAction(
+      segment.sourceItem,
+      videoPosition,  // Same position
+      -1,  // No video
+      segment.audioTrack,
+      false
+    );
+
+    // Set audio in/out points separately
+    // This creates the J-cut effect
+  }
+}
+```
+
+**Modify**: `index.html` - Add J-Cut UI
+```html
+<div class="jcut-options">
+  <label>
+    <input type="checkbox" id="enableJCut"> Enable J-Cuts (Podcast Mode)
+  </label>
+
+  <div id="jcutSettings" class="collapsed">
+    <div class="option-row">
+      <label>Audio Lead-in:</label>
+      <input type="range" id="jcutLeadIn" min="0" max="1" step="0.1" value="0.3">
+      <span id="jcutLeadInValue">0.3s</span>
+    </div>
+    <div class="option-row">
+      <label>Audio Lead-out:</label>
+      <input type="range" id="jcutLeadOut" min="0" max="1" step="0.1" value="0.2">
+      <span id="jcutLeadOutValue">0.2s</span>
+    </div>
+  </div>
+</div>
+```
+
+---
+
+## 4. CHAPTER DETECTION
+
+### FireCut Analysis
+
+**Source**: `/Users/imorgado/Desktop/Fireside_Deobstuficated/firecut_host_decoded.jsx`
+**Key Functions**:
+- `createChapterMarker()` (line 1567)
+- `addChapterClip()` (line 1612)
+- `getChapterMarkers()` (line 1589)
+
+**FireCut Approach**:
+1. Uses GPT-4 to analyze transcript for topic changes
+2. Creates timeline markers at chapter boundaries
+3. Generates YouTube-formatted timestamps
+4. Optional: adds motion graphics title cards
+
+### SPLICE Implementation Plan
+
+#### Backend Changes
+
+**New File**: `chapterDetection.js`
+```javascript
+/**
+ * Chapter Detection Service
+ * Analyzes transcript to identify topic/chapter boundaries
+ */
+
+const OpenAI = require('openai');
+const openai = new OpenAI();
+
+async function detectChapters(transcript, settings = {}) {
+  const { maxChapters = 10, minChapterLength = 60 } = settings;
+
+  const prompt = `Analyze this transcript and identify natural chapter breaks.
+For each chapter, provide:
+1. Start time (seconds)
+2. A short title (3-5 words)
+3. Brief description (1 sentence)
+
+Rules:
+- Maximum ${maxChapters} chapters
+- Minimum ${minChapterLength} seconds per chapter
+- First chapter starts at 0:00
+- Identify topic/subject changes
+
+Transcript:
+${transcript.text}
+
+Return as JSON array: [{ startTime, title, description }]`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'You are a video chapter detection expert.' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.3,
+    response_format: { type: 'json_object' }
+  });
+
+  const chapters = JSON.parse(response.choices[0].message.content);
+
+  return {
+    chapters: chapters.chapters || chapters,
+    youtubeTimestamps: formatYouTubeTimestamps(chapters),
+    markers: chapters.map(ch => ({
+      time: ch.startTime,
+      name: ch.title,
+      comment: ch.description
+    }))
+  };
+}
+
+function formatYouTubeTimestamps(chapters) {
+  return chapters.map(ch => {
+    const mins = Math.floor(ch.startTime / 60);
+    const secs = Math.floor(ch.startTime % 60);
+    const time = `${mins}:${secs.toString().padStart(2, '0')}`;
+    return `${time} ${ch.title}`;
+  }).join('\n');
+}
+
+module.exports = { detectChapters };
+```
+
+**Modify**: `server.js` - Add chapters endpoint
+```javascript
+app.post('/chapters', requireCredits({ endpoint: 'chapters' }), async (req, res) => {
+  try {
+    const { transcript, settings } = req.body;
+    const chapters = await detectChapters(transcript, settings);
+
+    await req.deductUsage(5); // 5 seconds per chapter detection
+
+    res.json({ success: true, ...chapters });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+```
+
+#### Plugin Changes
+
+**Modify**: `builder.js` - Add marker creation
+```javascript
+async function createChapterMarkers(sequence, chapters, project) {
+  const markers = await ppro.Markers.getMarkers(sequence);
+
+  await project.lockedAccess(async () => {
+    await project.executeTransaction((compoundAction) => {
+      for (const chapter of chapters) {
+        const startTime = ppro.TickTime.createWithSeconds(chapter.time);
+        const duration = ppro.TickTime.createWithSeconds(1); // 1 second marker
+
+        const action = markers.createAddMarkerAction(
+          `Chapter: ${chapter.name}`,
+          ppro.Marker.MARKER_TYPE_CHAPTER,
+          startTime,
+          duration,
+          chapter.comment || ''
+        );
+        compoundAction.addAction(action);
+      }
+    }, 'SPLICE: Add Chapter Markers');
+  });
+}
+```
+
+**Modify**: `index.html` - Add Chapter UI
+```html
+<div class="chapter-section">
+  <label>
+    <input type="checkbox" id="enableChapters"> Detect Chapters
+  </label>
+
+  <div id="chapterSettings" class="collapsed">
+    <div class="option-row">
+      <label>Max Chapters:</label>
+      <input type="number" id="maxChapters" min="3" max="20" value="10">
+    </div>
+    <div class="option-row">
+      <label>Min Length:</label>
+      <input type="number" id="minChapterLength" min="30" max="300" value="60">
+      <span>seconds</span>
+    </div>
+  </div>
+</div>
+
+<!-- Chapter Results -->
+<div id="chapterResults" class="hidden">
+  <h4>Detected Chapters</h4>
+  <div id="chapterList"></div>
+  <button id="copyYouTubeTimestamps">Copy YouTube Timestamps</button>
+  <button id="addChapterMarkers">Add to Timeline</button>
+</div>
+```
+
+---
+
+## 5. TAKES LABELING & COLOR CODING
+
+### Current SPLICE Status
+
+**Already Implemented** in `builder.js`:
+```javascript
+const SPLICE_COLORS = {
+  SPEECH: COLOR_LABELS.GREEN,        // Green for speech
+  SILENCE: COLOR_LABELS.VIOLET,      // Purple for silence
+  BEST_TAKE: COLOR_LABELS.CERULEAN   // Light blue for best take
+};
+```
+
+### Enhancements Needed
+
+#### Modify: `cutListGenerator.js`
+```javascript
+// Add take numbering and labels
+function generateCutList(options) {
+  let takeNumber = 1;
+
+  for (const segment of segments) {
+    if (segment.type === 'best_take' || segment.type === 'take') {
+      segment.takeLabel = `Take ${takeNumber}`;
+      segment.takeNumber = takeNumber;
+
+      // Add short label from take detection
+      if (segment.take?.shortLabel) {
+        segment.takeLabel += `: ${segment.take.shortLabel}`;
+      }
+
+      takeNumber++;
+    }
+  }
+
+  cutList.metadata.takesLabeled = true;
+  return cutList;
+}
+```
+
+#### Modify: `builder.js`
+```javascript
+// Apply take labels and colors
+async function applyTakeLabeling(sequence, segments, project) {
+  const videoTrack = await sequence.getVideoTrack(0);
+  const trackItems = await videoTrack.getTrackItems(
+    ppro.Constants.TrackItemType.CLIP, false
+  );
+
+  await project.lockedAccess(async () => {
+    await project.executeTransaction((compoundAction) => {
+      for (let i = 0; i < segments.length && i < trackItems.length; i++) {
+        const segment = segments[i];
+        const clip = trackItems[i];
+
+        // Set clip name/label
+        if (segment.takeLabel) {
+          const nameAction = clip.createSetNameAction(segment.takeLabel);
+          compoundAction.addAction(nameAction);
+        }
+
+        // Set color based on type
+        const colorIndex = getColorForSegmentType(segment.type);
+        const colorAction = clip.projectItem.createSetColorLabelAction(colorIndex);
+        compoundAction.addAction(colorAction);
+      }
+    }, 'SPLICE: Label Takes');
+  });
+}
+
+function getColorForSegmentType(type) {
+  switch (type) {
+    case 'best_take':
+      return COLOR_LABELS.CERULEAN;  // Light blue
+    case 'take':
+      return COLOR_LABELS.LAVENDER;  // Light purple
+    case 'speech':
+      return COLOR_LABELS.GREEN;     // Green
+    case 'silence':
+      return COLOR_LABELS.VIOLET;    // Purple
+    case 'wide_shot':
+      return COLOR_LABELS.YELLOW;    // Yellow
+    default:
+      return COLOR_LABELS.NONE;
+  }
+}
+```
+
+---
+
+## Implementation Phases
+
+### Phase 1: Foundation (Week 1)
+
+| Task | Effort | Dependencies |
+|------|--------|--------------|
+| Takes labeling & color coding | 3-4 hrs | None |
+| J-Cut basic support | 4-6 hrs | cutListGenerator.js |
+| UI infrastructure updates | 2-3 hrs | index.html, main.js |
+
+**Deliverables**:
+- Enhanced take detection with labels
+- Color-coded clips in timeline
+- Basic J-cut toggle in UI
+
+### Phase 2: Multitrack (Week 2)
+
+| Task | Effort | Dependencies |
+|------|--------|--------------|
+| Multitrack UI panel | 4-5 hrs | index.html |
+| Multitrack.js module | 3-4 hrs | multitrackAnalysis.js (done) |
+| Speaker distribution preview | 2-3 hrs | Chart rendering |
+
+**Deliverables**:
+- Complete multitrack UI
+- Speaker-to-track mapping
+- Visual distribution preview
+
+### Phase 3: Zoom & Chapters (Week 3)
+
+| Task | Effort | Dependencies |
+|------|--------|--------------|
+| Zoom generator service | 3-4 hrs | transcript data |
+| Zoom keyframe application | 4-5 hrs | builder.js, UXP APIs |
+| Chapter detection service | 3-4 hrs | OpenAI integration |
+| Chapter marker creation | 2-3 hrs | UXP Markers API |
+
+**Deliverables**:
+- Auto zoom with presets
+- Chapter detection & markers
+- YouTube timestamp export
+
+### Phase 4: Polish & Testing (Week 4)
+
+| Task | Effort | Dependencies |
+|------|--------|--------------|
+| E2E test suite for new features | 3-4 hrs | All features |
+| UI/UX polish | 2-3 hrs | Design feedback |
+| Documentation updates | 2 hrs | CLAUDE.md, README |
+| Performance optimization | 2-3 hrs | Profiling |
+
+**Deliverables**:
+- Complete test coverage
+- Production-ready features
+- Updated documentation
+
+---
+
+## File Modifications Summary
+
+### Backend (`splice-backend/`)
+
+| File | Action | Changes |
+|------|--------|---------|
+| `services/zoomGenerator.js` | NEW | Zoom point generation |
+| `services/chapterDetection.js` | NEW | Chapter analysis |
+| `services/cutListGenerator.js` | MODIFY | Add zoom, J-cut, chapter data |
+| `server.js` | MODIFY | Add /chapters endpoint |
+
+### Plugin (`splice-plugin/`)
+
+| File | Action | Changes |
+|------|--------|---------|
+| `js/multitrack.js` | NEW | Multitrack UI module |
+| `js/builder.js` | MODIFY | Zoom, J-cut, labeling |
+| `js/main.js` | MODIFY | New feature wiring |
+| `index.html` | MODIFY | UI panels for all features |
+
+---
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| UXP API limitations | Medium | High | Test early, have fallbacks |
+| Performance with many zooms | Medium | Medium | Batch keyframe operations |
+| OpenAI chapter quality | Low | Medium | Allow manual override |
+| Multitrack complexity | Medium | Medium | Incremental UI release |
+
+---
+
+## Success Metrics
+
+| Metric | Target | Measurement |
+|--------|--------|-------------|
+| Auto Zoom accuracy | 90%+ appropriate | User feedback survey |
+| Multitrack speaker detection | 95%+ correct | Test with known speakers |
+| Chapter detection relevance | 85%+ useful | A/B test vs manual |
+| J-Cut smoothness | No audio glitches | QA testing |
+| Color coding consistency | 100% applied | Automated tests |
+
+---
+
+## Conclusion
+
+This integration plan provides a clear roadmap to achieve 95%+ FireCut parity while maintaining SPLICE's performance advantages. The phased approach ensures incremental value delivery and allows for user feedback incorporation.
+
+**Total Effort**: 26-35 hours across 4 weeks
+**Result**: SPLICE v4.0 with complete podcast/video editing workflow
+
+---
+
+*Generated: 2025-12-25 | Based on comprehensive FireCut deobfuscation analysis*

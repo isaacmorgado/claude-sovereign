@@ -1,0 +1,997 @@
+/**
+ * SPLICE CEP Panel Configuration
+ * Backend URLs, paths, and utility functions
+ */
+
+// ============================================================================
+// BACKEND CONFIGURATION
+// ============================================================================
+const SPLICE_CONFIG = {
+    VERSION: '6.0.3',
+    BACKEND_PROD: 'https://splice-api-production.up.railway.app',
+    BACKEND_DEV: 'https://127.0.0.1:3847',
+    FETCH_TIMEOUT: 120000, // 2 minutes
+    RETRY_ATTEMPTS: 3,
+    RETRY_DELAY: 1000
+};
+
+/**
+ * Get the backend URL based on environment
+ */
+function getBackendUrl() {
+    // Check for development mode
+    const isDev = window.location.protocol === 'file:' ||
+                  window.location.hostname === 'localhost' ||
+                  window.location.hostname === '127.0.0.1';
+
+    // Allow override via localStorage
+    const customUrl = localStorage.getItem('spliceBackendUrl');
+    if (customUrl) return customUrl;
+
+    return isDev ? SPLICE_CONFIG.BACKEND_DEV : SPLICE_CONFIG.BACKEND_PROD;
+}
+
+// ============================================================================
+// JSX BRIDGE - Communicate with Premiere Pro
+// ============================================================================
+const jsx = {
+    cs: null,
+    _initPromise: null,
+    _initialized: false,
+
+    /**
+     * Initialize the CSInterface
+     * Returns a promise that resolves when ready (true/false)
+     * Does NOT reject - gracefully handles missing CEP environment
+     */
+    init: function() {
+        if (this._initPromise) return this._initPromise;
+
+        this._initPromise = new Promise((resolve) => {
+            try {
+                if (typeof CSInterface !== 'undefined') {
+                    this.cs = new CSInterface();
+                    // Verify we're in a real CEP environment by checking for __adobe_cep__
+                    if (window.__adobe_cep__) {
+                        this._initialized = true;
+                        console.log('[JSX] CSInterface initialized successfully (CEP environment detected)');
+                    } else {
+                        // CSInterface exists but no CEP runtime - browser/dev mode
+                        this._initialized = true;
+                        console.log('[JSX] CSInterface initialized (development/browser mode)');
+                    }
+                } else {
+                    console.warn('[JSX] CSInterface not available - panel may not function correctly');
+                    this._initialized = false;
+                }
+            } catch (err) {
+                console.error('[JSX] Failed to initialize CSInterface:', err);
+                this._initialized = false;
+            }
+            resolve(this._initialized);
+        });
+
+        return this._initPromise;
+    },
+
+    /**
+     * Ensure JSX is initialized before making calls
+     */
+    ensureInitialized: async function() {
+        if (!this._initialized) {
+            await this.init();
+        }
+        if (!this.cs) {
+            throw new Error('CSInterface not initialized. Make sure you are running in CEP environment.');
+        }
+    },
+
+    /**
+     * Execute ExtendScript in Premiere Pro
+     * @param {string} script - ExtendScript to execute
+     * @returns {Promise<any>} - Parsed result
+     */
+    evalScript: async function(script) {
+        await this.ensureInitialized();
+
+        return new Promise((resolve, reject) => {
+            this.cs.evalScript(script, (result) => {
+                if (result === 'undefined' || result === undefined) {
+                    resolve(null);
+                    return;
+                }
+
+                // Check for EvalScript error or ExtendScript runtime errors
+                if (typeof result === 'string' && (
+                    result.indexOf('EvalScript error') !== -1 ||
+                    result.indexOf('Error:') !== -1 ||
+                    result.indexOf('TypeError:') !== -1 ||
+                    result.indexOf('ReferenceError:') !== -1
+                )) {
+                    reject(new Error(result));
+                    return;
+                }
+
+                // Try to parse JSON
+                try {
+                    const parsed = JSON.parse(result);
+                    if (parsed.error) {
+                        reject(new Error(parsed.error));
+                    } else {
+                        resolve(parsed);
+                    }
+                } catch (e) {
+                    // Return as-is if not JSON
+                    resolve(result);
+                }
+            });
+        });
+    },
+
+    /**
+     * Call a JSX function with arguments
+     * @param {string} funcName - Function name
+     * @param {...any} args - Arguments to pass
+     * @returns {Promise<any>}
+     */
+    call: async function(funcName, ...args) {
+        await this.ensureInitialized();
+
+        const escapedArgs = args.map(arg => {
+            if (arg === null || arg === undefined) return 'null';
+            if (typeof arg === 'string') {
+                // Escape backslashes first, then other special chars
+                return `'${arg
+                    .replace(/\\/g, '\\\\')
+                    .replace(/'/g, "\\'")
+                    .replace(/\r/g, '\\r')
+                    .replace(/\n/g, '\\n')
+                    .replace(/\t/g, '\\t')}'`;
+            }
+            if (typeof arg === 'object') {
+                return `'${JSON.stringify(arg)
+                    .replace(/\\/g, '\\\\')
+                    .replace(/'/g, "\\'")}'`;
+            }
+            return String(arg);
+        });
+
+        const script = `${funcName}(${escapedArgs.join(', ')})`;
+        return this.evalScript(script);
+    }
+};
+
+// ============================================================================
+// FETCH UTILITIES
+// ============================================================================
+
+/**
+ * Fetch with timeout support
+ * @param {string} url - URL to fetch
+ * @param {object} options - Fetch options
+ * @param {number} timeout - Timeout in ms
+ */
+async function fetchWithTimeout(url, options = {}, timeout = SPLICE_CONFIG.FETCH_TIMEOUT) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeout}ms`);
+        }
+        throw error;
+    }
+}
+
+/**
+ * Parse error response from backend
+ * @param {Response} response - Fetch response
+ */
+async function parseErrorResponse(response) {
+    try {
+        const data = await response.json();
+        return data.error || data.message || `HTTP ${response.status}`;
+    } catch {
+        return `HTTP ${response.status}: ${response.statusText}`;
+    }
+}
+
+/**
+ * Get auth headers for API requests
+ */
+function getAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const settings = getSettings();
+
+    if (settings.customerId) {
+        headers['x-stripe-customer-id'] = settings.customerId;
+    }
+    if (settings.licenseKey) {
+        headers['x-license-key'] = settings.licenseKey;
+    }
+
+    return headers;
+}
+
+// ============================================================================
+// SETTINGS MANAGEMENT
+// ============================================================================
+
+const DEFAULT_SETTINGS = {
+    sensitivity: 50,
+    minSilenceLength: 0.5,
+    sourceIsolated: false,
+    enableTakesDetection: true,
+    enableJCut: false,
+    jcutLeadIn: 0.3,
+    jcutLeadOut: 0.2,
+    enableZoom: false,
+    zoomFrequency: 'medium',
+    zoomPreset: 'medium',
+    zoomPlacement: 'sentence_start',
+    enableChapters: false,
+    maxChapters: 10,
+    minChapterLength: 60,
+    enableProfanity: false,
+    profanityLanguage: 'en',
+    bleepType: 'standard',
+    customerId: null,
+    licenseKey: null,
+    expandedOptions: false,
+    activePreset: 'podcast',
+    rememberOptions: false
+};
+
+/**
+ * Get settings from localStorage
+ */
+function getSettings() {
+    try {
+        const stored = localStorage.getItem('spliceSettings');
+        if (stored) {
+            return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
+        }
+    } catch (e) {
+        console.warn('[Config] Error loading settings:', e);
+    }
+    return { ...DEFAULT_SETTINGS };
+}
+
+/**
+ * Save settings to localStorage
+ */
+function saveSettings(settings) {
+    try {
+        const merged = { ...getSettings(), ...settings };
+        localStorage.setItem('spliceSettings', JSON.stringify(merged));
+        return true;
+    } catch (e) {
+        console.warn('[Config] Error saving settings:', e);
+        return false;
+    }
+}
+
+/**
+ * Clear specific setting
+ */
+function clearSetting(key) {
+    const settings = getSettings();
+    delete settings[key];
+    localStorage.setItem('spliceSettings', JSON.stringify(settings));
+}
+
+// ============================================================================
+// OFFLINE DETECTION
+// ============================================================================
+
+let isOnlineState = true;
+let offlineCheckInterval = null;
+
+/**
+ * Check if online
+ */
+function isOnline() {
+    return isOnlineState && navigator.onLine;
+}
+
+/**
+ * Initialize offline detection
+ */
+function initOfflineDetection() {
+    // Browser events
+    window.addEventListener('online', () => {
+        isOnlineState = true;
+        updateOfflineUI(true);
+    });
+
+    window.addEventListener('offline', () => {
+        isOnlineState = false;
+        updateOfflineUI(false);
+    });
+
+    // Periodic check
+    offlineCheckInterval = setInterval(async () => {
+        try {
+            const response = await fetchWithTimeout(
+                `${getBackendUrl()}/health`,
+                { method: 'GET' },
+                5000
+            );
+            isOnlineState = response.ok;
+        } catch {
+            isOnlineState = false;
+        }
+        updateOfflineUI(isOnlineState);
+    }, 30000);
+}
+
+/**
+ * Update UI based on online state
+ */
+function updateOfflineUI(online) {
+    const goBtn = document.getElementById('goBtn');
+    const status = document.getElementById('status');
+
+    if (goBtn) {
+        goBtn.disabled = !online;
+    }
+
+    if (status) {
+        if (!online) {
+            status.textContent = 'Offline - Check your connection';
+            status.style.color = '#dc3545';
+        } else {
+            // Reset status when back online
+            status.textContent = 'Ready';
+            status.style.color = '#888';
+        }
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * SECURITY: Escape HTML to prevent XSS attacks
+ * Use this when inserting untrusted content into innerHTML
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string safe for innerHTML
+ */
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    if (typeof str !== 'string') str = String(str);
+
+    const escapeMap = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#x27;',
+        '/': '&#x2F;',
+        '`': '&#x60;'
+    };
+
+    return str.replace(/[&<>"'\/`]/g, char => escapeMap[char]);
+}
+
+/**
+ * SECURITY: Create safe HTML from template with escaped values
+ * @param {TemplateStringsArray} strings - Template strings
+ * @param {...any} values - Values to escape
+ * @returns {string} HTML with escaped values
+ */
+function safeHtml(strings, ...values) {
+    return strings.reduce((result, str, i) => {
+        const value = values[i - 1];
+        const escaped = escapeHtml(value);
+        return result + escaped + str;
+    });
+}
+
+/**
+ * Format time in MM:SS or HH:MM:SS
+ */
+function formatTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) return '0:00';
+
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+
+    if (hours > 0) {
+        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Set status message
+ */
+function setStatus(message, isError = false) {
+    const status = document.getElementById('status');
+    if (status) {
+        status.textContent = message;
+        status.style.color = isError ? '#dc3545' : '#888';
+    }
+}
+
+/**
+ * Debounce function calls
+ */
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// ============================================================================
+// PRESET PROFILES
+// ============================================================================
+
+/**
+ * Detection presets for different content types.
+ * Each preset defines optimal settings for a specific use case.
+ */
+const PRESETS = {
+    // Custom - user-defined settings (default)
+    custom: {
+        name: 'Custom',
+        description: 'Your custom settings',
+        icon: 'settings',
+        settings: null // Uses current user settings
+    },
+
+    // Podcast - longer pauses are natural, be conservative
+    podcast: {
+        name: 'Podcast',
+        description: 'Longer natural pauses, J-Cuts enabled',
+        icon: 'mic',
+        settings: {
+            sensitivity: 35,
+            threshold: -35,
+            minSilenceLength: 0.8,
+            paddingStart: 0.15,
+            paddingEnd: 0.15,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.3,
+            jCutLeadOut: 0.2
+        }
+    },
+
+    // Interview - balanced, respects speaker pauses
+    interview: {
+        name: 'Interview',
+        description: 'Balanced cuts, J-Cuts for smooth transitions',
+        icon: 'people',
+        settings: {
+            sensitivity: 50,
+            threshold: -32,
+            minSilenceLength: 0.5,
+            paddingStart: 0.12,
+            paddingEnd: 0.08,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.25,
+            jCutLeadOut: 0.15
+        }
+    },
+
+    // Reaction video - fast pacing, quick cuts
+    reaction: {
+        name: 'Reaction',
+        description: 'Fast-paced, tight cuts for energy',
+        icon: 'bolt',
+        settings: {
+            sensitivity: 70,
+            threshold: -28,
+            minSilenceLength: 0.3,
+            paddingStart: 0.05,
+            paddingEnd: 0.03,
+            enableTakesDetection: false,
+            enableJCut: false,
+            jCutLeadIn: 0,
+            jCutLeadOut: 0
+        }
+    },
+
+    // Tutorial/Educational - preserve thinking pauses
+    tutorial: {
+        name: 'Tutorial',
+        description: 'Preserves teaching pace, J-Cuts enabled',
+        icon: 'school',
+        settings: {
+            sensitivity: 30,
+            threshold: -38,
+            minSilenceLength: 1.0,
+            paddingStart: 0.2,
+            paddingEnd: 0.15,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.35,
+            jCutLeadOut: 0.25
+        }
+    },
+
+    // Vlog/YouTube - punchy edits, engagement-focused
+    vlog: {
+        name: 'Vlog',
+        description: 'Punchy edits for YouTube engagement',
+        icon: 'videocam',
+        settings: {
+            sensitivity: 65,
+            threshold: -30,
+            minSilenceLength: 0.35,
+            paddingStart: 0.08,
+            paddingEnd: 0.05,
+            enableTakesDetection: true,
+            enableJCut: false,
+            jCutLeadIn: 0,
+            jCutLeadOut: 0
+        }
+    }
+};
+
+/**
+ * List of built-in preset IDs
+ */
+const BUILT_IN_PRESET_IDS = ['custom', 'podcast', 'interview', 'reaction', 'tutorial', 'vlog'];
+
+/**
+ * Get all available presets
+ * @returns {Object} All preset definitions
+ */
+function getPresets() {
+    return { ...PRESETS };
+}
+
+/**
+ * Get a specific preset by name
+ * @param {string} presetName - Name of the preset
+ * @returns {Object|null} Preset definition or null if not found
+ */
+function getPreset(presetName) {
+    return PRESETS[presetName] || null;
+}
+
+/**
+ * Check if a preset is a built-in preset
+ * @param {string} id - Preset ID to check
+ * @returns {boolean} True if built-in, false if custom
+ */
+function isBuiltInPreset(id) {
+    return BUILT_IN_PRESET_IDS.includes(id);
+}
+
+/**
+ * Apply a preset to current settings
+ * @param {string} presetName - Name of the preset to apply
+ * @returns {Object} The applied settings
+ */
+function applyPreset(presetName) {
+    const preset = PRESETS[presetName];
+
+    if (!preset) {
+        console.warn(`[SPLICE] Unknown preset: ${presetName}`);
+        return getSettings();
+    }
+
+    // Custom preset uses current settings
+    if (presetName === 'custom' || !preset.settings) {
+        saveSettings({ activePreset: 'custom' });
+        return getSettings();
+    }
+
+    // Apply preset settings
+    const newSettings = {
+        ...preset.settings,
+        activePreset: presetName
+    };
+
+    saveSettings(newSettings);
+    console.log(`[SPLICE] Applied preset: ${preset.name}`);
+
+    return getSettings();
+}
+
+/**
+ * Get the currently active preset
+ * @returns {string} Active preset name
+ */
+function getActivePreset() {
+    const settings = getSettings();
+    return settings.activePreset || 'custom';
+}
+
+/**
+ * Initialize preset selector
+ */
+function initPresetSelector() {
+    const presetSelector = document.getElementById('presetSelector');
+    const sensitivitySlider = document.getElementById('sensitivitySlider');
+
+    if (!presetSelector) return;
+
+    // Set initial value from settings
+    const settings = getSettings();
+    presetSelector.value = settings.activePreset || 'podcast';
+
+    // Handle preset change
+    presetSelector.addEventListener('change', () => {
+        const presetId = presetSelector.value;
+        const appliedSettings = applyPreset(presetId);
+
+        // Update sensitivity slider to match preset
+        if (sensitivitySlider && appliedSettings.sensitivity !== undefined) {
+            sensitivitySlider.value = appliedSettings.sensitivity;
+            // Update display value
+            const sensitivityValue = document.getElementById('sensitivityValue');
+            if (sensitivityValue) {
+                sensitivityValue.textContent = appliedSettings.sensitivity;
+            }
+        }
+
+        // Update takes detection checkbox
+        const enableTakesDetection = document.getElementById('enableTakesDetection');
+        if (enableTakesDetection && appliedSettings.enableTakesDetection !== undefined) {
+            enableTakesDetection.checked = appliedSettings.enableTakesDetection;
+        }
+
+        // Update J-Cut checkbox
+        const enableJCut = document.getElementById('enableJCut');
+        if (enableJCut && appliedSettings.enableJCut !== undefined) {
+            enableJCut.checked = appliedSettings.enableJCut;
+            // Toggle J-Cut settings visibility
+            const jcutSettings = document.getElementById('jcutSettings');
+            if (jcutSettings) {
+                jcutSettings.classList.toggle('collapsed', !appliedSettings.enableJCut);
+            }
+        }
+
+        const preset = getPreset(presetId);
+        if (preset) {
+            setStatus(`Preset: ${preset.name} - ${preset.description}`);
+        }
+    });
+
+    // Switch to custom when user manually changes sensitivity
+    if (sensitivitySlider) {
+        sensitivitySlider.addEventListener('change', () => {
+            if (presetSelector.value !== 'custom') {
+                presetSelector.value = 'custom';
+                saveSettings({ activePreset: 'custom' });
+            }
+        });
+    }
+}
+
+// ============================================================================
+// LOGIN MODAL
+// ============================================================================
+
+/**
+ * Validate license key format: SPLICE-XXXX-XXXX-XXXX
+ * Character set excludes confusing chars: 0/O, 1/I/L
+ */
+function isValidLicenseKeyFormat(key) {
+    if (!key || typeof key !== 'string') return false;
+    const normalized = key.toUpperCase().trim();
+    const pattern = /^SPLICE-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}$/;
+    return pattern.test(normalized);
+}
+
+/**
+ * Initialize login modal handlers
+ */
+function initLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const closeLoginBtn = document.getElementById('closeLoginBtn');
+    const saveLoginBtn = document.getElementById('saveLoginBtn');
+    const licenseKeyInput = document.getElementById('licenseKeyInput');
+    const creditBadge = document.getElementById('creditBadge');
+
+    // Handle credit badge click - retry on error, or show login modal
+    if (creditBadge) {
+        creditBadge.addEventListener('click', async () => {
+            if (creditBadge.classList.contains('error')) {
+                creditBadge.textContent = '...';
+                if (typeof refreshCredits === 'function') {
+                    await refreshCredits();
+                }
+                return;
+            }
+            showLoginModal();
+        });
+    }
+
+    // Close login modal
+    if (closeLoginBtn && loginModal) {
+        closeLoginBtn.addEventListener('click', () => {
+            loginModal.classList.add('hidden');
+        });
+    }
+
+    // Close on backdrop click
+    if (loginModal) {
+        loginModal.addEventListener('click', (e) => {
+            if (e.target === loginModal) {
+                loginModal.classList.add('hidden');
+            }
+        });
+    }
+
+    // Activate license key
+    if (saveLoginBtn) {
+        saveLoginBtn.addEventListener('click', async () => {
+            const licenseKey = licenseKeyInput?.value?.trim()?.toUpperCase();
+
+            if (!licenseKey) {
+                showLoginError('Please enter your license key');
+                return;
+            }
+
+            if (!isValidLicenseKeyFormat(licenseKey)) {
+                showLoginError('Invalid format. Expected: SPLICE-XXXX-XXXX-XXXX');
+                return;
+            }
+
+            saveLoginBtn.disabled = true;
+            saveLoginBtn.textContent = 'Activating...';
+
+            try {
+                const response = await fetchWithTimeout(`${getBackendUrl()}/license/activate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: licenseKey })
+                }, SPLICE_CONFIG.FETCH_TIMEOUT);
+
+                const result = await response.json();
+
+                if (!result.success) {
+                    showLoginError(result.error || 'Activation failed');
+                    return;
+                }
+
+                saveSettings({ customerId: result.customerId });
+                loginModal?.classList.add('hidden');
+
+                if (typeof refreshCredits === 'function') {
+                    await refreshCredits();
+                }
+
+                setStatus(`License activated! ${result.tierName} tier`);
+            } catch (err) {
+                console.error('[SPLICE] License activation error:', err);
+                showLoginError('Connection error. Check server is running.');
+            } finally {
+                saveLoginBtn.disabled = false;
+                saveLoginBtn.textContent = 'Activate';
+            }
+        });
+    }
+
+    // Email lookup
+    const lookupLicenseBtn = document.getElementById('lookupLicenseBtn');
+    const lookupEmailInput = document.getElementById('lookupEmailInput');
+
+    if (lookupLicenseBtn) {
+        lookupLicenseBtn.addEventListener('click', async () => {
+            const email = lookupEmailInput?.value?.trim()?.toLowerCase();
+
+            if (!email) {
+                showLoginError('Please enter your email address');
+                return;
+            }
+
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showLoginError('Please enter a valid email address');
+                return;
+            }
+
+            lookupLicenseBtn.disabled = true;
+            lookupLicenseBtn.textContent = 'Looking up...';
+
+            try {
+                const response = await fetchWithTimeout(`${getBackendUrl()}/license/lookup`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                }, 30000);
+
+                const result = await response.json();
+
+                // Note: For security, the backend does NOT return the license key directly.
+                // It sends the key via email to prevent enumeration attacks.
+                if (result.success) {
+                    setStatus(result.message || 'If a license exists, it will be sent to your email.');
+                } else {
+                    showLoginError(result.error || 'Lookup failed. Please try again.');
+                }
+            } catch (err) {
+                console.error('[SPLICE] License lookup error:', err);
+                showLoginError('Failed to look up license. Please try again.');
+            } finally {
+                lookupLicenseBtn.disabled = false;
+                lookupLicenseBtn.textContent = 'Lookup';
+            }
+        });
+    }
+
+    // Handle external URL buttons
+    // CEP panels cannot use target="_blank" for security reasons.
+    // Must use CSInterface.openURLInDefaultBrowser() instead.
+    initExternalLinkButtons();
+}
+
+/**
+ * Initialize all external link buttons that need CSInterface.openURLInDefaultBrowser()
+ * CEP panels cannot use target="_blank" due to security restrictions
+ */
+function initExternalLinkButtons() {
+    console.log('[SPLICE DEBUG] initExternalLinkButtons called');
+    
+    // Check if CSInterface is available
+    if (typeof CSInterface === 'undefined') {
+        console.error('[SPLICE DEBUG] CSInterface is not defined - cannot open external URLs');
+        return;
+    }
+    
+    let cs;
+    try {
+        cs = new CSInterface();
+        console.log('[SPLICE DEBUG] CSInterface created successfully');
+    } catch (e) {
+        console.error('[SPLICE DEBUG] Failed to create CSInterface:', e);
+        return;
+    }
+    
+    // Buy a License button
+    const buyLicenseBtn = document.querySelector('.btn-buy-license');
+    console.log('[SPLICE DEBUG] buyLicenseBtn found:', !!buyLicenseBtn, buyLicenseBtn);
+    
+    if (buyLicenseBtn) {
+        buyLicenseBtn.addEventListener('click', (e) => {
+            console.log('[SPLICE DEBUG] Buy License button clicked!');
+            e.preventDefault();
+            e.stopPropagation();
+            
+            // VISUAL INDICATOR: Change button to show click was received
+            buyLicenseBtn.textContent = 'Opening...';
+            buyLicenseBtn.style.backgroundColor = '#28a745';
+            
+            try {
+                console.log('[SPLICE DEBUG] Calling openURLInDefaultBrowser...');
+                cs.openURLInDefaultBrowser('https://spliceclips.com/pricing');
+                console.log('[SPLICE DEBUG] openURLInDefaultBrowser called successfully');
+                
+                // Reset button after a delay
+                setTimeout(() => {
+                    buyLicenseBtn.textContent = 'Buy License';
+                    buyLicenseBtn.style.backgroundColor = '';
+                }, 2000);
+            } catch (err) {
+                console.error('[SPLICE DEBUG] openURLInDefaultBrowser failed:', err);
+                buyLicenseBtn.textContent = 'ERROR: ' + err.message;
+                buyLicenseBtn.style.backgroundColor = '#dc3545';
+            }
+        });
+        console.log('[SPLICE DEBUG] Click event listener attached to buyLicenseBtn');
+    } else {
+        console.error('[SPLICE DEBUG] .btn-buy-license button NOT FOUND in DOM');
+    }
+    
+    // View Plans button (in upgrade modal)
+    const viewPlansBtn = document.querySelector('.btn-view-plans');
+    if (viewPlansBtn) {
+        viewPlansBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const url = viewPlansBtn.dataset.url || 'https://spliceclips.com/pricing';
+            cs.openURLInDefaultBrowser(url);
+        });
+    }
+    
+    // Referral link button
+    const referralBtn = document.querySelector('.btn-referral');
+    if (referralBtn) {
+        referralBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const url = referralBtn.dataset.url || 'https://splice.video/referrals';
+            cs.openURLInDefaultBrowser(url);
+        });
+    }
+}
+
+/**
+ * Show login modal
+ */
+function showLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const loginError = document.getElementById('loginError');
+    if (loginError) loginError.style.display = 'none';
+    if (loginModal) loginModal.classList.remove('hidden');
+}
+
+/**
+ * Show login error message
+ */
+function showLoginError(message) {
+    const loginError = document.getElementById('loginError');
+    if (loginError) {
+        loginError.textContent = message;
+        loginError.style.display = 'block';
+    }
+}
+
+/**
+ * Check if user is logged in
+ */
+function isLoggedIn() {
+    const settings = getSettings();
+    return !!settings.customerId;
+}
+
+/**
+ * Logout - clear customer ID
+ */
+function logout() {
+    saveSettings({ customerId: null });
+    if (typeof clearCreditsCache === 'function') {
+        clearCreditsCache();
+    }
+    if (typeof updateCreditDisplay === 'function') {
+        updateCreditDisplay(null);
+    }
+    setStatus('Logged out');
+}
+
+// Initialize JSX bridge when loaded
+document.addEventListener('DOMContentLoaded', () => {
+    jsx.init();
+});
+
+// Export for modules
+window.SPLICE_CONFIG = SPLICE_CONFIG;
+window.getBackendUrl = getBackendUrl;
+window.fetchWithTimeout = fetchWithTimeout;
+window.parseErrorResponse = parseErrorResponse;
+window.getAuthHeaders = getAuthHeaders;
+window.getSettings = getSettings;
+window.saveSettings = saveSettings;
+window.clearSetting = clearSetting;
+window.isOnline = isOnline;
+window.initOfflineDetection = initOfflineDetection;
+window.formatTime = formatTime;
+window.setStatus = setStatus;
+window.debounce = debounce;
+window.jsx = jsx;
+window.PRESETS = PRESETS;
+window.getPresets = getPresets;
+window.getPreset = getPreset;
+window.applyPreset = applyPreset;
+window.getActivePreset = getActivePreset;
+window.isBuiltInPreset = isBuiltInPreset;
+window.initPresetSelector = initPresetSelector;
+window.initLoginModal = initLoginModal;
+window.showLoginModal = showLoginModal;
+window.isLoggedIn = isLoggedIn;
+window.logout = logout;
+window.escapeHtml = escapeHtml;
+window.safeHtml = safeHtml;

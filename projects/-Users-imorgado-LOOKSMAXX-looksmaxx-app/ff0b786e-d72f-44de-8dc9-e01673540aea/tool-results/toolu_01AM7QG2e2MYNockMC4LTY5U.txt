@@ -1,0 +1,1046 @@
+     1→'use client';
+     2→
+     3→import { useState, useRef, useCallback, useEffect } from 'react';
+     4→import Image from 'next/image';
+     5→import { motion } from 'framer-motion';
+     6→import {
+     7→  ChevronLeft,
+     8→  ChevronRight,
+     9→  ChevronUp,
+    10→  ChevronDown,
+    11→  Check,
+    12→  Info,
+    13→  Scan,
+    14→  Loader2,
+    15→  Move,
+    16→  Focus,
+    17→  AlertTriangle,
+    18→  X,
+    19→} from 'lucide-react';
+    20→
+    21→
+    22→import {
+    23→  LandmarkPoint,
+    24→  FRONT_PROFILE_LANDMARKS,
+    25→  SIDE_PROFILE_LANDMARKS,
+    26→  getLandmarkColor,
+    27→  FRONT_LANDMARK_CATEGORIES,
+    28→  SIDE_LANDMARK_CATEGORIES,
+    29→} from '@/lib/landmarks';
+    30→import { getLandmarkImagePath, getLandmarkPlacementGuide } from '@/lib/landmarkImages';
+    31→import { detectFromImageUrl } from '@/lib/mediapipeDetection';
+    32→
+    33→interface LandmarkAnalysisToolProps {
+    34→  imageUrl: string;
+    35→  mode: 'front' | 'side';
+    36→  initialLandmarks?: LandmarkPoint[];
+    37→  onLandmarksChange?: (landmarks: LandmarkPoint[]) => void;
+    38→  onComplete?: (landmarks: LandmarkPoint[]) => void;
+    39→  onBack?: () => void;
+    40→}
+    41→
+    42→function getOrderedLandmarks(mode: 'front' | 'side'): string[] {
+    43→  const landmarks = mode === 'front' ? FRONT_PROFILE_LANDMARKS : SIDE_PROFILE_LANDMARKS;
+    44→  return landmarks.map(lm => lm.id);
+    45→}
+    46→
+    47→export function LandmarkAnalysisTool({
+    48→  imageUrl,
+    49→  mode,
+    50→  initialLandmarks,
+    51→  onLandmarksChange,
+    52→  onComplete,
+    53→  onBack,
+    54→}: LandmarkAnalysisToolProps) {
+    55→  const containerRef = useRef<HTMLDivElement>(null);
+    56→  const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
+    57→  const [containerSize, setContainerSize] = useState<{ width: number; height: number } | null>(null);
+    58→  const defaultLandmarks = mode === 'front' ? FRONT_PROFILE_LANDMARKS : SIDE_PROFILE_LANDMARKS;
+    59→  const categories = mode === 'front' ? FRONT_LANDMARK_CATEGORIES : SIDE_LANDMARK_CATEGORIES;
+    60→  const orderedIds = getOrderedLandmarks(mode);
+    61→
+    62→  const [landmarks, setLandmarks] = useState<LandmarkPoint[]>(
+    63→    initialLandmarks || defaultLandmarks
+    64→  );
+    65→  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+    66→  const [zoomLevel, setZoomLevel] = useState(2); // 2x/4x/8x discrete levels
+    67→
+    68→  // Reset state when mode changes (fixes side profile starting at step 52)
+    69→  useEffect(() => {
+    70→    const newLandmarks = mode === 'front' ? FRONT_PROFILE_LANDMARKS : SIDE_PROFILE_LANDMARKS;
+    71→    setCurrentStepIndex(0);
+    72→    setPlacedLandmarks(new Set());
+    73→    setHasAutoDetected(false);
+    74→    setDetectionFailed(false);
+    75→    setLandmarks(newLandmarks);
+    76→    setPan({ x: 0, y: 0 });
+    77→    setZoomLevel(2); // Reset to 2x
+    78→  }, [mode]);
+    79→  const [pan, setPan] = useState({ x: 0, y: 0 });
+    80→  const [isDragging, setIsDragging] = useState(false);
+    81→  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+    82→  const [pressedKeys, setPressedKeys] = useState<Set<string>>(new Set());
+    83→  const [activeTab, setActiveTab] = useState<'info' | 'reference'>('info');
+    84→  const [isDetecting, setIsDetecting] = useState(true);
+    85→  const [hasAutoDetected, setHasAutoDetected] = useState(false);
+    86→  const [autoZoomEnabled, setAutoZoomEnabled] = useState(true);
+    87→  const [detectionFailed, setDetectionFailed] = useState(false);
+    88→  const [placedLandmarks, setPlacedLandmarks] = useState<Set<string>>(new Set());
+    89→  // Frankfort Plane for side profile visualization (from server detection)
+    90→  const [frankfortPlane, setFrankfortPlane] = useState<{
+    91→    angle: number;
+    92→    orbitale: { x: number; y: number };
+    93→    porion: { x: number; y: number };
+    94→  } | null>(null);
+    95→
+    96→  const currentLandmarkId = orderedIds[currentStepIndex];
+    97→  const currentLandmark = landmarks.find((lm) => lm.id === currentLandmarkId);
+    98→  const totalSteps = orderedIds.length;
+    99→  const progress = ((currentStepIndex + 1) / totalSteps) * 100;
+   100→
+   101→  const color = currentLandmark
+   102→    ? getLandmarkColor(currentLandmark.id, categories)
+   103→    : '#00f3ff';
+   104→
+   105→  // Load image dimensions on mount
+   106→  useEffect(() => {
+   107→    const img = new window.Image();
+   108→    img.onload = () => {
+   109→      setImageDimensions({ width: img.naturalWidth, height: img.naturalHeight });
+   110→    };
+   111→    img.src = imageUrl;
+   112→  }, [imageUrl]);
+   113→
+   114→  // Track container size changes with ResizeObserver
+   115→  useEffect(() => {
+   116→    if (!containerRef.current) return;
+   117→
+   118→    const observer = new ResizeObserver((entries) => {
+   119→      const { width, height } = entries[0].contentRect;
+   120→      setContainerSize({ width, height });
+   121→    });
+   122→
+   123→    observer.observe(containerRef.current);
+   124→    return () => observer.disconnect();
+   125→  }, []);
+   126→
+   127→  // Calculate the rendered image bounds within the container (accounting for object-contain)
+   128→  const getImageBounds = useCallback(() => {
+   129→    if (!containerRef.current || !imageDimensions || !containerSize) {
+   130→      return { offsetX: 0, offsetY: 0, renderedWidth: 1, renderedHeight: 1, containerWidth: 1, containerHeight: 1 };
+   131→    }
+   132→
+   133→    const containerWidth = containerSize.width;
+   134→    const containerHeight = containerSize.height;
+   135→    const imageAspect = imageDimensions.width / imageDimensions.height;
+   136→    const containerAspect = containerWidth / containerHeight;
+   137→
+   138→    let renderedWidth: number;
+   139→    let renderedHeight: number;
+   140→    let offsetX = 0;
+   141→    let offsetY = 0;
+   142→
+   143→    if (imageAspect > containerAspect) {
+   144→      renderedWidth = containerWidth;
+   145→      renderedHeight = containerWidth / imageAspect;
+   146→      offsetY = (containerHeight - renderedHeight) / 2;
+   147→    } else {
+   148→      renderedHeight = containerHeight;
+   149→      renderedWidth = containerHeight * imageAspect;
+   150→      offsetX = (containerWidth - renderedWidth) / 2;
+   151→    }
+   152→
+   153→    return { offsetX, offsetY, renderedWidth, renderedHeight, containerWidth, containerHeight };
+   154→  }, [imageDimensions, containerSize]);
+   155→
+   156→  // Get what normalized coordinates the center orb points to on the image
+   157→  const getCrosshairNormalizedPosition = useCallback(() => {
+   158→    const bounds = getImageBounds();
+   159→    if (!bounds.renderedWidth || !bounds.renderedHeight) {
+   160→      return { x: 0.5, y: 0.5 };
+   161→    }
+   162→
+   163→    // The container center (where the orb is) in screen coordinates
+   164→    const containerCenterX = bounds.containerWidth / 2;
+   165→    const containerCenterY = bounds.containerHeight / 2;
+   166→
+   167→    // The transform is: translate(pan.x, pan.y) scale(zoomLevel)
+   168→    // To find what image point is at container center, we reverse this:
+   169→    // 1. The point at container center after transform comes from:
+   170→    //    screenPos = imagePos * zoomLevel + pan
+   171→    // 2. Solving for imagePos:
+   172→    //    imagePos = (screenPos - pan) / zoomLevel
+   173→    const imageX = (containerCenterX - pan.x) / zoomLevel;
+   174→    const imageY = (containerCenterY - pan.y) / zoomLevel;
+   175→
+   176→    // Convert to normalized (0-1) coordinates within the image
+   177→    const normalizedX = (imageX - bounds.offsetX) / bounds.renderedWidth;
+   178→    const normalizedY = (imageY - bounds.offsetY) / bounds.renderedHeight;
+   179→
+   180→    return {
+   181→      x: Math.max(0, Math.min(1, normalizedX)),
+   182→      y: Math.max(0, Math.min(1, normalizedY)),
+   183→    };
+   184→  }, [getImageBounds, pan, zoomLevel]);
+   185→
+   186→  // Convert normalized image coordinates (0-1) to pixel position within the container
+   187→  // Note: This is used for landmarks INSIDE the transformed container, so no zoom/pan needed
+   188→  const getLandmarkPixelPosition = useCallback((x: number, y: number) => {
+   189→    const bounds = getImageBounds();
+   190→    // Position relative to container (the parent transform handles zoom/pan)
+   191→    const pixelX = bounds.offsetX + x * bounds.renderedWidth;
+   192→    const pixelY = bounds.offsetY + y * bounds.renderedHeight;
+   193→    return { left: pixelX, top: pixelY };
+   194→  }, [getImageBounds]);
+   195→
+   196→  useEffect(() => {
+   197→    onLandmarksChange?.(landmarks);
+   198→  }, [landmarks, onLandmarksChange]);
+   199→
+   200→  // Confirm placement: set current landmark to where crosshair points
+   201→  const confirmPlacement = useCallback(() => {
+   202→    const pos = getCrosshairNormalizedPosition();
+   203→    setLandmarks((prev) =>
+   204→      prev.map((lm) =>
+   205→        lm.id === currentLandmarkId ? { ...lm, x: pos.x, y: pos.y } : lm
+   206→      )
+   207→    );
+   208→    setPlacedLandmarks((prev) => new Set(prev).add(currentLandmarkId));
+   209→  }, [currentLandmarkId, getCrosshairNormalizedPosition]);
+   210→
+   211→  // Handle click - confirms placement at crosshair position
+   212→  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   213→  const handleContainerClick = useCallback(() => {
+   214→    if (isDragging) return;
+   215→    confirmPlacement();
+   216→  }, [isDragging, confirmPlacement]);
+   217→
+   218→  // Mouse down - start dragging to pan
+   219→  const handleMouseDown = useCallback(
+   220→    (e: React.MouseEvent) => {
+   221→      if (e.button === 0) {
+   222→        setIsDragging(true);
+   223→        setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+   224→      }
+   225→    },
+   226→    [pan]
+   227→  );
+   228→
+   229→  // Mouse move - pan the image
+   230→  const handleMouseMove = useCallback(
+   231→    (e: React.MouseEvent) => {
+   232→      if (isDragging) {
+   233→        setPan({
+   234→          x: e.clientX - dragStart.x,
+   235→          y: e.clientY - dragStart.y,
+   236→        });
+   237→      }
+   238→    },
+   239→    [isDragging, dragStart]
+   240→  );
+   241→
+   242→  const handleMouseUp = useCallback(() => {
+   243→    setIsDragging(false);
+   244→  }, []);
+   245→
+   246→  const handleResetZoom = useCallback(() => {
+   247→    setZoomLevel(2); // Reset to 2x
+   248→    setPan({ x: 0, y: 0 });
+   249→  }, []);
+   250→
+   251→  // Pan the image using arrow keys (moves the crosshair target point on the image)
+   252→  const panImage = useCallback((direction: 'up' | 'down' | 'left' | 'right') => {
+   253→    const step = 20; // pixels to pan per keypress
+   254→    setPan((prev) => {
+   255→      switch (direction) {
+   256→        case 'up': return { ...prev, y: prev.y + step };
+   257→        case 'down': return { ...prev, y: prev.y - step };
+   258→        case 'left': return { ...prev, x: prev.x + step };
+   259→        case 'right': return { ...prev, x: prev.x - step };
+   260→        default: return prev;
+   261→      }
+   262→    });
+   263→  }, []);
+   264→
+   265→  const handleNext = useCallback(() => {
+   266→    // Confirm placement at current crosshair position before moving to next
+   267→    confirmPlacement();
+   268→
+   269→    if (currentStepIndex < totalSteps - 1) {
+   270→      setCurrentStepIndex((prev) => prev + 1);
+   271→      // Don't reset zoom - let zoomToLandmark handle it
+   272→    } else {
+   273→      onComplete?.(landmarks);
+   274→    }
+   275→  }, [currentStepIndex, totalSteps, landmarks, onComplete, confirmPlacement]);
+   276→
+   277→
+   278→  const handlePrevious = useCallback(() => {
+   279→    if (currentStepIndex > 0) {
+   280→      setCurrentStepIndex((prev) => prev - 1);
+   281→      handleResetZoom();
+   282→    } else {
+   283→      onBack?.();
+   284→    }
+   285→  }, [currentStepIndex, handleResetZoom, onBack]);
+   286→
+   287→  // Landmark-specific zoom levels for optimal precision
+   288→  // Fine detail landmarks (pupils, eyelids) get higher zoom, larger areas get lower zoom
+   289→  const LANDMARK_ZOOM_LEVELS: Record<string, number> = {
+   290→    // 2x zoom - larger landmarks
+   291→    trichion: 2,
+   292→    left_temporal: 2, right_temporal: 2,
+   293→    left_auricular_lateral: 2, right_auricular_lateral: 2,
+   294→
+   295→    // 4x zoom - medium detail landmarks
+   296→    left_pupila: 4, right_pupila: 4,
+   297→    left_canthus_medialis: 4, left_canthus_lateralis: 4,
+   298→    right_canthus_medialis: 4, right_canthus_lateralis: 4,
+   299→    left_sulcus_palpebralis_lateralis: 4, right_sulcus_palpebralis_lateralis: 4,
+   300→    left_supercilium_medialis: 4, left_supercilium_medial_corner: 4,
+   301→    left_supercilium_superior: 4, left_supercilium_apex: 4, left_supercilium_lateralis: 4,
+   302→    right_supercilium_medialis: 4, right_supercilium_medial_corner: 4,
+   303→    right_supercilium_superior: 4, right_supercilium_apex: 4, right_supercilium_lateralis: 4,
+   304→    left_ala_nasi: 4, right_ala_nasi: 4,
+   305→    nasal_base: 4, subnasale: 4,
+   306→    left_dorsum_nasi: 4, right_dorsum_nasi: 4,
+   307→    labrale_superius: 4, cupids_bow: 4, mouth_middle: 4,
+   308→    labrale_inferius: 4, left_cheilion: 4, right_cheilion: 4,
+   309→    left_gonion_superior: 4, left_gonion_inferior: 4,
+   310→    right_gonion_superior: 4, right_gonion_inferior: 4,
+   311→    left_mentum_lateralis: 4, right_mentum_lateralis: 4, menton: 4,
+   312→    left_zygion: 2, right_zygion: 2,
+   313→    left_cervical_lateralis: 4, right_cervical_lateralis: 4,
+   314→
+   315→    // 8x zoom - fine detail landmarks (eyelids)
+   316→    left_palpebra_superior: 8, left_palpebra_inferior: 8,
+   317→    right_palpebra_superior: 8, right_palpebra_inferior: 8,
+   318→    left_pretarsal_skin_crease: 8, right_pretarsal_skin_crease: 8,
+   319→
+   320→    // ========== SIDE PROFILE LANDMARKS ==========
+   321→    // Note: Some IDs shared with front profile (trichion, subnasale, menton) - zoom applies to both
+   322→    // 2x zoom - larger side landmarks
+   323→    vertex: 2,
+   324→    occiput: 2,
+   325→    neckPoint: 2,
+   326→    forehead: 2, // Separate from glabella
+   327→
+   328→    // 4x zoom - medium detail side landmarks
+   329→    porion: 4,
+   330→    orbitale: 4,
+   331→    tragus: 4,
+   332→    intertragicNotch: 4,
+   333→    cornealApex: 4,
+   334→    eyelidEnd: 4, // Lateral eyelid end in side profile
+   335→    lowerEyelid: 4, // Lower eyelid margin in side profile
+   336→    cheekbone: 4,
+   337→    glabella: 4,
+   338→    nasion: 4,
+   339→    pronasale: 4,
+   340→    rhinion: 4,
+   341→    supratip: 4,
+   342→    infratip: 4,
+   343→    columella: 4,
+   344→    subalare: 4,
+   345→    labraleSuperius: 4,
+   346→    cheilion: 4,
+   347→    labraleInferius: 4,
+   348→    sublabiale: 4,
+   349→    pogonion: 4,
+   350→    // menton: 4 already defined in front section (applies to both profiles)
+   351→    cervicalPoint: 4,
+   352→    gonionTop: 4,
+   353→    gonionBottom: 4,
+   354→  };
+   355→
+   356→  // Auto-zoom to the current landmark's region - centers the landmark under the fixed orb
+   357→  const zoomToLandmark = useCallback((landmarkId: string) => {
+   358→    if (!autoZoomEnabled || !containerRef.current || !containerSize || !imageDimensions) return;
+   359→
+   360→    const landmark = landmarks.find(lm => lm.id === landmarkId);
+   361→    if (!landmark) return;
+   362→
+   363→    const bounds = getImageBounds();
+   364→    if (bounds.renderedWidth <= 1 || bounds.renderedHeight <= 1) return; // Bounds not ready
+   365→
+   366→    // Use landmark-specific zoom level, default to 2x
+   367→    const newZoom = LANDMARK_ZOOM_LEVELS[landmarkId] || 2;
+   368→    setZoomLevel(newZoom);
+   369→
+   370→    // Calculate pan so the landmark appears at container center (under the fixed orb)
+   371→    const containerCenterX = bounds.containerWidth / 2;
+   372→    const containerCenterY = bounds.containerHeight / 2;
+   373→
+   374→    // Where the landmark is in unzoomed image space
+   375→    const landmarkX = bounds.offsetX + landmark.x * bounds.renderedWidth;
+   376→    const landmarkY = bounds.offsetY + landmark.y * bounds.renderedHeight;
+   377→
+   378→    // Pan needed: after zoom, landmark should be at container center
+   379→    // Transform is: translate(pan) scale(zoom) with origin at 0,0
+   380→    // A point at landmarkPos ends up at: landmarkPos * zoom + pan
+   381→    // We want it at containerCenter, so: pan = containerCenter - landmarkPos * zoom
+   382→    setPan({
+   383→      x: containerCenterX - landmarkX * newZoom,
+   384→      y: containerCenterY - landmarkY * newZoom,
+   385→    });
+   386→  }, [autoZoomEnabled, landmarks, getImageBounds, containerSize, imageDimensions]);
+   387→
+   388→  // Auto-detect landmarks using Human.js/MediaPipe
+   389→  const handleAutoDetect = useCallback(async () => {
+   390→    setIsDetecting(true);
+   391→    setDetectionFailed(false);
+   392→    setFrankfortPlane(null);
+   393→    try {
+   394→      const result = await detectFromImageUrl(imageUrl, mode);
+   395→      console.log('[DEBUG] Detection result:', result);
+   396→      console.log('[DEBUG] Sample landmarks:', result?.landmarks.slice(0, 5));
+   397→      if (result && result.landmarks.length > 0) {
+   398→        // Update landmarks with detected positions
+   399→        setLandmarks(prev =>
+   400→          prev.map(lm => {
+   401→            const detected = result.landmarks.find(d => d.id === lm.id);
+   402→            if (detected) {
+   403→              return { ...lm, x: detected.x, y: detected.y };
+   404→            }
+   405→            return lm;
+   406→          })
+   407→        );
+   408→        setHasAutoDetected(true);
+   409→        setDetectionFailed(false);
+   410→
+   411→        // Capture Frankfort Plane for side profile (from server-side detection)
+   412→        if (mode === 'side' && result.frankfortPlane) {
+   413→          console.log('[DEBUG] Frankfort Plane:', result.frankfortPlane);
+   414→          setFrankfortPlane(result.frankfortPlane);
+   415→        }
+   416→
+   417→        // Zoom to first landmark after detection
+   418→        zoomToLandmark(orderedIds[0]);
+   419→      } else {
+   420→        // Detection returned no results - common for side profile
+   421→        console.log('[DEBUG] No landmarks detected - manual placement required');
+   422→        setDetectionFailed(true);
+   423→        setHasAutoDetected(false);
+   424→      }
+   425→    } catch (error) {
+   426→      console.error('Auto-detection failed:', error);
+   427→      setDetectionFailed(true);
+   428→    } finally {
+   429→      setIsDetecting(false);
+   430→    }
+   431→  }, [imageUrl, mode, orderedIds, zoomToLandmark]);
+   432→
+   433→  // Auto-detect after image dimensions are loaded (prevents race condition)
+   434→  useEffect(() => {
+   435→    if (imageDimensions) {
+   436→      handleAutoDetect();
+   437→    }
+   438→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   439→  }, [imageDimensions]); // Run after dimensions are loaded
+   440→
+   441→  // Auto-zoom when step changes or container size becomes available
+   442→  useEffect(() => {
+   443→    if (hasAutoDetected && autoZoomEnabled && currentLandmarkId && containerSize) {
+   444→      zoomToLandmark(currentLandmarkId);
+   445→    }
+   446→  }, [currentStepIndex, currentLandmarkId, hasAutoDetected, autoZoomEnabled, zoomToLandmark, containerSize]);
+   447→
+   448→  // Keyboard handlers with proper state tracking
+   449→  useEffect(() => {
+   450→    const handleKeyDown = (e: KeyboardEvent) => {
+   451→      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'Backspace', 'r', 'R'].includes(e.key)) {
+   452→        e.preventDefault();
+   453→      }
+   454→
+   455→      setPressedKeys((prev) => new Set(prev).add(e.key));
+   456→
+   457→      switch (e.key) {
+   458→        case 'ArrowUp': panImage('up'); break;
+   459→        case 'ArrowDown': panImage('down'); break;
+   460→        case 'ArrowLeft': panImage('left'); break;
+   461→        case 'ArrowRight': panImage('right'); break;
+   462→        case 'Enter': handleNext(); break;
+   463→        case 'Backspace': handlePrevious(); break;
+   464→        case 'r':
+   465→        case 'R': handleResetZoom(); break;
+   466→      }
+   467→    };
+   468→
+   469→    const handleKeyUp = (e: KeyboardEvent) => {
+   470→      setPressedKeys((prev) => {
+   471→        const next = new Set(prev);
+   472→        next.delete(e.key);
+   473→        return next;
+   474→      });
+   475→    };
+   476→
+   477→    window.addEventListener('keydown', handleKeyDown);
+   478→    window.addEventListener('keyup', handleKeyUp);
+   479→    return () => {
+   480→      window.removeEventListener('keydown', handleKeyDown);
+   481→      window.removeEventListener('keyup', handleKeyUp);
+   482→    };
+   483→  }, [panImage, handleNext, handlePrevious, handleResetZoom]);
+   484→
+   485→  const isKeyPressed = (key: string) => pressedKeys.has(key);
+   486→
+   487→  return (
+   488→    <div className="fixed inset-0 bg-black">
+   489→      <div className="flex flex-col md:flex-row h-full gap-3 p-3 md:p-4">
+   490→        {/* Sidebar - Right on desktop */}
+   491→        <div className="w-full md:w-80 flex-shrink-0 flex flex-col gap-3 md:order-2 overflow-hidden md:overflow-y-auto">
+   492→          {/* Progress Card */}
+   493→          <div className="bg-neutral-900 rounded-xl border border-neutral-800 overflow-hidden flex-shrink-0">
+   494→            <div className="p-4">
+   495→              <div className="flex items-center justify-between text-xs text-neutral-400 mb-2">
+   496→                <span>Step {currentStepIndex + 1} of {totalSteps}</span>
+   497→                <span>{Math.round(progress)}%</span>
+   498→              </div>
+   499→              <div className="h-1.5 bg-neutral-800 rounded-full overflow-hidden mb-3">
+   500→                <motion.div
+   501→                  className="h-full rounded-full"
+   502→                  style={{ width: `${progress}%`, backgroundColor: '#00f3ff' }}
+   503→                  transition={{ duration: 0.3 }}
+   504→                />
+   505→              </div>
+   506→              <div className="flex items-center gap-2">
+   507→                <div className="w-6 h-6 bg-[#00f3ff] rounded-full flex items-center justify-center flex-shrink-0">
+   508→                  <Check className="w-3.5 h-3.5 text-black" />
+   509→                </div>
+   510→                <span className="text-sm font-medium text-white">
+   511→                  {currentStepIndex} placed
+   512→                </span>
+   513→              </div>
+   514→            </div>
+   515→
+   516→            {/* View Tabs */}
+   517→            <div className="flex border-t border-neutral-800">
+   518→              <button
+   519→                onClick={() => setActiveTab('info')}
+   520→                className={`flex-1 py-2.5 text-xs font-medium transition-colors ${activeTab === 'info'
+   521→                  ? 'text-[#00f3ff] border-b-2 border-[#00f3ff]'
+   522→                  : 'text-neutral-500 hover:text-neutral-300'
+   523→                  }`}
+   524→              >
+   525→                Current Point
+   526→              </button>
+   527→              <button
+   528→                onClick={() => setActiveTab('reference')}
+   529→                className={`flex-1 py-2.5 text-xs font-medium transition-colors ${activeTab === 'reference'
+   530→                  ? 'text-[#00f3ff] border-b-2 border-[#00f3ff]'
+   531→                  : 'text-neutral-500 hover:text-neutral-300'
+   532→                  }`}
+   533→              >
+   534→                Reference
+   535→              </button>
+   536→            </div>
+   537→
+   538→            {/* Info/Reference Content */}
+   539→            <div className="bg-neutral-900/50">
+   540→              {activeTab === 'info' ? (
+   541→                <div>
+   542→                  {/* Photo Reference Image */}
+   543→                  {currentLandmark && getLandmarkImagePath(currentLandmark.id, mode, 'photo') ? (
+   544→                    <div className="relative w-full aspect-square bg-neutral-800">
+   545→                      <Image
+   546→                        src={getLandmarkImagePath(currentLandmark.id, mode, 'photo')!}
+   547→                        alt={currentLandmark.label}
+   548→                        fill
+   549→                        className="object-contain"
+   550→                        unoptimized
+   551→                      />
+   552→                    </div>
+   553→                  ) : (
+   554→                    <div className="w-full aspect-square bg-neutral-800 flex items-center justify-center">
+   555→                      <div
+   556→                        className="w-14 h-14 rounded-full flex items-center justify-center"
+   557→                        style={{ backgroundColor: `${color}20`, border: `2px solid ${color}` }}
+   558→                      >
+   559→                        <div className="w-4 h-4 rounded-full" style={{ backgroundColor: color }} />
+   560→                      </div>
+   561→                    </div>
+   562→                  )}
+   563→                  <div className="p-3 text-center border-t border-neutral-800">
+   564→                    <p className="text-sm font-semibold text-white">{currentLandmark?.label}</p>
+   565→                    <p className="text-xs text-[#00f3ff] mt-0.5 font-mono">{currentLandmark?.medicalTerm}</p>
+   566→                  </div>
+   567→                </div>
+   568→              ) : (
+   569→                <div>
+   570→                  {/* Infographic Reference Image */}
+   571→                  {currentLandmark && getLandmarkImagePath(currentLandmark.id, mode, 'infographic') ? (
+   572→                    <div className="relative w-full aspect-square bg-neutral-800">
+   573→                      <Image
+   574→                        src={getLandmarkImagePath(currentLandmark.id, mode, 'infographic')!}
+   575→                        alt={`${currentLandmark.label} infographic`}
+   576→                        fill
+   577→                        className="object-contain"
+   578→                        unoptimized
+   579→                      />
+   580→                    </div>
+   581→                  ) : (
+   582→                    <div className="w-full aspect-square bg-neutral-800 flex items-center justify-center">
+   583→                      <Info className="w-12 h-12 text-neutral-600" />
+   584→                    </div>
+   585→                  )}
+   586→                  <div className="p-3 text-center border-t border-neutral-800">
+   587→                    <p className="text-sm text-neutral-300">
+   588→                      {currentLandmark ? getLandmarkPlacementGuide(currentLandmark.id, mode) : ''}
+   589→                    </p>
+   590→                  </div>
+   591→                </div>
+   592→              )}
+   593→            </div>
+   594→          </div>
+   595→
+   596→          {/* Keyboard Shortcuts - Desktop only */}
+   597→          <div className="hidden md:flex flex-col gap-3">
+   598→            <div className="bg-neutral-900 rounded-xl border border-neutral-800 p-4">
+   599→              <p className="text-xs text-neutral-500 font-medium uppercase tracking-wide mb-3 text-center">
+   600→                Keyboard Controls
+   601→              </p>
+   602→              <div className="flex justify-center mb-4">
+   603→                <div className="flex flex-col gap-1 items-center">
+   604→                  {/* Arrow Up */}
+   605→                  <div
+   606→                    className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all duration-100 ${isKeyPressed('ArrowUp')
+   607→                      ? 'bg-[#00f3ff] text-black shadow-[0_0_15px_rgba(0,243,255,0.5)]'
+   608→                      : 'bg-neutral-800 text-neutral-400 border border-neutral-700'
+   609→                      }`}
+   610→                  >
+   611→                    <ChevronUp className="w-5 h-5" />
+   612→                  </div>
+   613→                  {/* Arrow Row */}
+   614→                  <div className="flex gap-1">
+   615→                    {[
+   616→                      { key: 'ArrowLeft', icon: ChevronLeft },
+   617→                      { key: 'ArrowDown', icon: ChevronDown },
+   618→                      { key: 'ArrowRight', icon: ChevronRight },
+   619→                    ].map(({ key, icon: Icon }) => (
+   620→                      <div
+   621→                        key={key}
+   622→                        className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all duration-100 ${isKeyPressed(key)
+   623→                          ? 'bg-[#00f3ff] text-black shadow-[0_0_15px_rgba(0,243,255,0.5)]'
+   624→                          : 'bg-neutral-800 text-neutral-400 border border-neutral-700'
+   625→                          }`}
+   626→                      >
+   627→                        <Icon className="w-5 h-5" />
+   628→                      </div>
+   629→                    ))}
+   630→                  </div>
+   631→                </div>
+   632→              </div>
+   633→
+   634→              <div className="space-y-2 text-sm">
+   635→                <div className="flex items-center justify-between">
+   636→                  <span
+   637→                    className={`px-2 py-1 rounded font-mono text-xs transition-all duration-100 ${isKeyPressed('Enter')
+   638→                      ? 'bg-[#00f3ff] text-black'
+   639→                      : 'bg-neutral-800 text-neutral-400'
+   640→                      }`}
+   641→                  >
+   642→                    Enter
+   643→                  </span>
+   644→                  <span className="text-neutral-500">Next point</span>
+   645→                </div>
+   646→                <div className="flex items-center justify-between">
+   647→                  <span
+   648→                    className={`px-2 py-1 rounded font-mono text-xs transition-all duration-100 ${isKeyPressed('Backspace')
+   649→                      ? 'bg-[#00f3ff] text-black'
+   650→                      : 'bg-neutral-800 text-neutral-400'
+   651→                      }`}
+   652→                  >
+   653→                    Backspace
+   654→                  </span>
+   655→                  <span className="text-neutral-500">Previous</span>
+   656→                </div>
+   657→                <div className="flex items-center justify-between">
+   658→                  <span
+   659→                    className={`px-2 py-1 rounded font-mono text-xs transition-all duration-100 ${isKeyPressed('r') || isKeyPressed('R')
+   660→                      ? 'bg-[#00f3ff] text-black'
+   661→                      : 'bg-neutral-800 text-neutral-400'
+   662→                      }`}
+   663→                  >
+   664→                    R
+   665→                  </span>
+   666→                  <span className="text-neutral-500">Reset zoom</span>
+   667→                </div>
+   668→              </div>
+   669→            </div>
+   670→
+   671→            {/* Zoom Controls */}
+   672→            <div className="bg-neutral-900 rounded-xl border border-neutral-800 p-4">
+   673→              <p className="text-xs text-neutral-500 font-medium uppercase tracking-wide mb-3">
+   674→                Zoom Level
+   675→              </p>
+   676→              <div className="flex gap-2">
+   677→                {/* 2x/4x/8x discrete zoom levels */}
+   678→                {[2, 4, 8].map((level) => (
+   679→                  <button
+   680→                    key={level}
+   681→                    onClick={() => {
+   682→                      if (containerSize) {
+   683→                        // Adjust pan to keep the same center point visible when zoom changes
+   684→                        // Current center in image space: imageCenter = (containerCenter - pan) / oldZoom
+   685→                        // New pan to show same center: newPan = containerCenter - imageCenter * newZoom
+   686→                        const containerCenterX = containerSize.width / 2;
+   687→                        const containerCenterY = containerSize.height / 2;
+   688→                        const imageCenterX = (containerCenterX - pan.x) / zoomLevel;
+   689→                        const imageCenterY = (containerCenterY - pan.y) / zoomLevel;
+   690→                        const newPanX = containerCenterX - imageCenterX * level;
+   691→                        const newPanY = containerCenterY - imageCenterY * level;
+   692→                        setZoomLevel(level);
+   693→                        setPan({ x: newPanX, y: newPanY });
+   694→                      } else {
+   695→                        setZoomLevel(level);
+   696→                      }
+   697→                    }}
+   698→                    className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${zoomLevel === level
+   699→                      ? 'bg-[#00f3ff] text-black'
+   700→                      : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700'
+   701→                      }`}
+   702→                  >
+   703→                    {level}x
+   704→                  </button>
+   705→                ))}
+   706→              </div>
+   707→            </div>
+   708→
+   709→            {/* Auto-Detect Button */}
+   710→            <button
+   711→              onClick={handleAutoDetect}
+   712→              disabled={isDetecting}
+   713→              className={`w-full py-3 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${hasAutoDetected
+   714→                ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+   715→                : 'bg-gradient-to-r from-[#00f3ff] to-[#00c4cc] text-black hover:shadow-[0_0_20px_rgba(0,243,255,0.3)]'
+   716→                } disabled:opacity-50 disabled:cursor-not-allowed`}
+   717→            >
+   718→              {isDetecting ? (
+   719→                <>
+   720→                  <Loader2 className="w-4 h-4 animate-spin" />
+   721→                  Detecting...
+   722→                </>
+   723→              ) : hasAutoDetected ? (
+   724→                <>
+   725→                  <Check className="w-4 h-4" />
+   726→                  Detected - Adjust if needed
+   727→                </>
+   728→              ) : (
+   729→                <>
+   730→                  <Scan className="w-4 h-4" />
+   731→                  Auto-Detect Landmarks
+   732→                </>
+   733→              )}
+   734→            </button>
+   735→
+   736→            {/* Auto-Zoom Toggle */}
+   737→            <button
+   738→              onClick={() => setAutoZoomEnabled(!autoZoomEnabled)}
+   739→              className={`w-full py-2.5 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-2 ${autoZoomEnabled
+   740→                ? 'bg-[#00f3ff] text-black'
+   741→                : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700'
+   742→                }`}
+   743→            >
+   744→              <Focus className="w-4 h-4" />
+   745→              {autoZoomEnabled ? 'Auto-Zoom: ON' : 'Auto-Zoom: OFF'}
+   746→            </button>
+   747→
+   748→          </div>
+   749→        </div>
+   750→
+   751→        {/* Main Image Area */}
+   752→        <div className="flex-1 min-h-0 relative md:order-1 flex flex-col">
+   753→          <div
+   754→            ref={containerRef}
+   755→            className="relative flex-1 bg-neutral-900 overflow-hidden rounded-xl border border-neutral-800 select-none"
+   756→            onMouseDown={handleMouseDown}
+   757→            onMouseMove={handleMouseMove}
+   758→            onMouseUp={handleMouseUp}
+   759→            onMouseLeave={handleMouseUp}
+   760→            style={{
+   761→              cursor: isDragging ? 'grabbing' : 'grab',
+   762→            }}
+   763→          >
+   764→            {/* Transformed Content - Image and placed landmarks move together */}
+   765→            <div
+   766→              className="absolute inset-0"
+   767→              style={{
+   768→                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoomLevel})`,
+   769→                transformOrigin: '0 0',
+   770→              }}
+   771→            >
+   772→              {/* User's Image */}
+   773→              <Image
+   774→                src={imageUrl}
+   775→                alt="Your photo"
+   776→                fill
+   777→                className="object-contain pointer-events-none select-none"
+   778→                unoptimized
+   779→                draggable={false}
+   780→              />
+   781→
+   782→              {/* Placed landmarks - always visible as they're placed */}
+   783→              {landmarks.filter(lm => placedLandmarks.has(lm.id) && lm.id !== currentLandmarkId).map((landmark) => {
+   784→                const lmColor = getLandmarkColor(landmark.id, categories);
+   785→                const pos = getLandmarkPixelPosition(landmark.x, landmark.y);
+   786→
+   787→                return (
+   788→                  <div
+   789→                    key={landmark.id}
+   790→                    className="absolute pointer-events-none"
+   791→                    style={{
+   792→                      left: pos.left,
+   793→                      top: pos.top,
+   794→                      transform: `translate(-50%, -50%) scale(${1 / zoomLevel})`,
+   795→                      transformOrigin: 'center center',
+   796→                    }}
+   797→                  >
+   798→                    {/* Small persistent dot - matches Harmony style */}
+   799→                    <div
+   800→                      className="absolute rounded-full"
+   801→                      style={{
+   802→                        width: 8,
+   803→                        height: 8,
+   804→                        left: -4,
+   805→                        top: -4,
+   806→                        backgroundColor: lmColor,
+   807→                        boxShadow: `0 0 4px ${lmColor}, 0 0 8px ${lmColor}60`,
+   808→                        border: '1px solid rgba(255,255,255,0.5)',
+   809→                      }}
+   810→                    />
+   811→                  </div>
+   812→                );
+   813→              })}
+   814→
+   815→              {/* Frankfort Horizontal Plane - green reference line for side profiles */}
+   816→              {mode === 'side' && frankfortPlane && (
+   817→                <svg
+   818→                  className="absolute inset-0 pointer-events-none"
+   819→                  style={{ width: '100%', height: '100%' }}
+   820→                >
+   821→                  {(() => {
+   822→                    const bounds = getImageBounds();
+   823→                    const orbitaleX = bounds.offsetX + frankfortPlane.orbitale.x * bounds.renderedWidth;
+   824→                    const orbitaleY = bounds.offsetY + frankfortPlane.orbitale.y * bounds.renderedHeight;
+   825→                    const porionX = bounds.offsetX + frankfortPlane.porion.x * bounds.renderedWidth;
+   826→                    const porionY = bounds.offsetY + frankfortPlane.porion.y * bounds.renderedHeight;
+   827→
+   828→                    // Extend the line beyond the points for visibility
+   829→                    const dx = porionX - orbitaleX;
+   830→                    const dy = porionY - orbitaleY;
+   831→                    const length = Math.sqrt(dx * dx + dy * dy);
+   832→                    const extendFactor = length > 0 ? 0.3 : 0;
+   833→                    const startX = orbitaleX - (dx / length) * bounds.renderedWidth * extendFactor;
+   834→                    const startY = orbitaleY - (dy / length) * bounds.renderedWidth * extendFactor;
+   835→                    const endX = porionX + (dx / length) * bounds.renderedWidth * extendFactor;
+   836→                    const endY = porionY + (dy / length) * bounds.renderedWidth * extendFactor;
+   837→
+   838→                    return (
+   839→                      <>
+   840→                        {/* Main Frankfort line */}
+   841→                        <line
+   842→                          x1={startX}
+   843→                          y1={startY}
+   844→                          x2={endX}
+   845→                          y2={endY}
+   846→                          stroke="#22c55e"
+   847→                          strokeWidth={2 / zoomLevel}
+   848→                          strokeDasharray={`${6 / zoomLevel} ${4 / zoomLevel}`}
+   849→                          opacity={0.8}
+   850→                        />
+   851→                        {/* Orbitale point marker */}
+   852→                        <circle
+   853→                          cx={orbitaleX}
+   854→                          cy={orbitaleY}
+   855→                          r={4 / zoomLevel}
+   856→                          fill="#22c55e"
+   857→                          stroke="white"
+   858→                          strokeWidth={1 / zoomLevel}
+   859→                        />
+   860→                        {/* Porion point marker */}
+   861→                        <circle
+   862→                          cx={porionX}
+   863→                          cy={porionY}
+   864→                          r={4 / zoomLevel}
+   865→                          fill="#22c55e"
+   866→                          stroke="white"
+   867→                          strokeWidth={1 / zoomLevel}
+   868→                        />
+   869→                        {/* Angle indicator */}
+   870→                        <text
+   871→                          x={startX}
+   872→                          y={startY - 10 / zoomLevel}
+   873→                          fill="#22c55e"
+   874→                          fontSize={12 / zoomLevel}
+   875→                          fontWeight="bold"
+   876→                        >
+   877→                          FH: {frankfortPlane.angle.toFixed(1)}°
+   878→                        </text>
+   879→                      </>
+   880→                    );
+   881→                  })()}
+   882→                </svg>
+   883→              )}
+   884→            </div>
+   885→
+   886→            {/* FIXED CENTER TARGETING DOT - small precise point for accurate placement */}
+   887→            <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-20">
+   888→              {/* Crosshair lines for precision */}
+   889→              <div
+   890→                className="absolute"
+   891→                style={{
+   892→                  width: 20,
+   893→                  height: 1,
+   894→                  backgroundColor: '#00f3ff',
+   895→                  opacity: 0.6,
+   896→                }}
+   897→              />
+   898→              <div
+   899→                className="absolute"
+   900→                style={{
+   901→                  width: 1,
+   902→                  height: 20,
+   903→                  backgroundColor: '#00f3ff',
+   904→                  opacity: 0.6,
+   905→                }}
+   906→              />
+   907→              {/* Subtle glow ring */}
+   908→              <div
+   909→                className="absolute rounded-full"
+   910→                style={{
+   911→                  width: 12,
+   912→                  height: 12,
+   913→                  background: 'radial-gradient(circle, #00f3ff33 0%, transparent 70%)',
+   914→                }}
+   915→              />
+   916→              {/* Center dot - small and precise */}
+   917→              <div
+   918→                className="relative rounded-full"
+   919→                style={{
+   920→                  width: 4,
+   921→                  height: 4,
+   922→                  backgroundColor: '#00f3ff',
+   923→                  boxShadow: '0 0 6px #00f3ff, 0 0 12px #00f3ff80',
+   924→                }}
+   925→              />
+   926→            </div>
+   927→
+   928→            {/* Loading Overlay */}
+   929→            {isDetecting && (
+   930→              <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center z-50 backdrop-blur-sm">
+   931→                <div className="relative mb-8">
+   932→                  <motion.div
+   933→                    animate={{ scale: [1, 1.2, 1], opacity: [0.5, 1, 0.5] }}
+   934→                    transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+   935→                    className="absolute inset-0 bg-[#00f3ff]/20 blur-3xl rounded-full"
+   936→                  />
+   937→                  <div className="relative w-20 h-20 rounded-2xl bg-neutral-900 border border-white/10 flex items-center justify-center shadow-[0_0_30px_rgba(0,243,255,0.15)]">
+   938→                    <Scan className="w-10 h-10 text-[#00f3ff]" />
+   939→                  </div>
+   940→                </div>
+   941→                <p className="text-white text-xl font-bold tracking-wide">Mapping Biometrics...</p>
+   942→                <div className="flex items-center gap-2 mt-3">
+   943→                  <Loader2 className="w-4 h-4 text-[#00f3ff] animate-spin" />
+   944→                  <p className="text-[#00f3ff] text-sm font-mono tracking-wider">AI ANALYSIS IN PROGRESS</p>
+   945→                </div>
+   946→              </div>
+   947→            )}
+   948→
+   949→            {/* Detection Failed Banner */}
+   950→            {detectionFailed && !isDetecting && (
+   951→              <motion.div
+   952→                initial={{ opacity: 0, y: -20 }}
+   953→                animate={{ opacity: 1, y: 0 }}
+   954→                className="absolute top-12 left-3 right-3 z-30"
+   955→              >
+   956→                <div className="bg-amber-500/20 border border-amber-500/50 rounded-lg px-3 py-2 flex items-center gap-2">
+   957→                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+   958→                  <p className="text-amber-200 text-xs flex-1">
+   959→                    {mode === 'side'
+   960→                      ? 'Auto-detection could not find profile. Please place landmarks manually for best accuracy.'
+   961→                      : 'Could not detect face. Please place landmarks manually.'}
+   962→                  </p>
+   963→                  <button
+   964→                    onClick={() => setDetectionFailed(false)}
+   965→                    className="text-amber-400 hover:text-amber-200 transition-colors"
+   966→                  >
+   967→                    <X className="w-4 h-4" />
+   968→                  </button>
+   969→                </div>
+   970→              </motion.div>
+   971→            )}
+   972→
+   973→            {/* Zoom indicator */}
+   974→            <div className="absolute top-3 left-3 px-3 py-1.5 rounded-lg bg-black/80 border border-neutral-700 text-white text-xs flex items-center gap-2">
+   975→              <Move className="w-3 h-3" />
+   976→              {zoomLevel.toFixed(1)}x - Drag to align
+   977→            </div>
+   978→
+   979→            {/* Current landmark label overlay */}
+   980→            <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black via-black/80 to-transparent p-4 pointer-events-none">
+   981→              <p className="text-center text-white text-sm font-medium">
+   982→                Drag image to align:{' '}
+   983→                <span className="font-semibold" style={{ color }}>{currentLandmark?.label}</span>
+   984→              </p>
+   985→              <p className="text-center text-neutral-400 text-xs mt-1">
+   986→                Press Enter or click Next to confirm
+   987→              </p>
+   988→            </div>
+   989→          </div>
+   990→
+   991→          {/* Navigation Bar - Fixed at bottom of image area */}
+   992→          <div className="mt-3 flex items-center justify-center gap-3">
+   993→            <button
+   994→              onClick={handlePrevious}
+   995→              className="p-2.5 rounded-xl bg-neutral-800 text-neutral-300 hover:bg-neutral-700 border border-neutral-700 transition-all"
+   996→            >
+   997→              <ChevronLeft className="w-5 h-5" />
+   998→            </button>
+   999→
+  1000→            {/* Step dots - show current position indicator */}
+  1001→            <div className="flex items-center gap-2 px-4 py-2 bg-neutral-900 rounded-xl border border-neutral-800">
+  1002→              <span className="text-xs text-neutral-400 font-mono min-w-[4ch]">
+  1003→                {currentStepIndex + 1}
+  1004→              </span>
+  1005→              <div className="w-32 h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+  1006→                <div
+  1007→                  className="h-full bg-[#00f3ff] rounded-full transition-all duration-200"
+  1008→                  style={{ width: `${((currentStepIndex + 1) / totalSteps) * 100}%` }}
+  1009→                />
+  1010→              </div>
+  1011→              <span className="text-xs text-neutral-400 font-mono min-w-[4ch] text-right">
+  1012→                {totalSteps}
+  1013→              </span>
+  1014→            </div>
+  1015→
+  1016→            <button
+  1017→              onClick={handleNext}
+  1018→              className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium text-sm transition-all ${currentStepIndex === totalSteps - 1
+  1019→                ? 'bg-green-500 text-white hover:bg-green-600'
+  1020→                : 'bg-[#00f3ff] text-black hover:shadow-[0_0_20px_rgba(0,243,255,0.4)]'
+  1021→                }`}
+  1022→            >
+  1023→              {currentStepIndex === totalSteps - 1 ? (
+  1024→                <>
+  1025→                  <Check className="w-4 h-4" />
+  1026→                  Complete
+  1027→                </>
+  1028→              ) : (
+  1029→                <>
+  1030→                  Next
+  1031→                  <ChevronRight className="w-4 h-4" />
+  1032→                </>
+  1033→              )}
+  1034→            </button>
+  1035→
+  1036→          </div>
+  1037→        </div>
+  1038→      </div>
+  1039→    </div>
+  1040→  );
+  1041→}
+  1042→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

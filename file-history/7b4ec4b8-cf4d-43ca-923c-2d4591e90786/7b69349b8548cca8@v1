@@ -1,0 +1,266 @@
+"""
+Body Analysis Service using Claude Vision
+
+Estimates body fat percentage and muscle level from physique photos.
+Uses Claude's vision capabilities to analyze body composition.
+"""
+
+import base64
+import httpx
+from typing import Optional, List
+from dataclasses import dataclass
+import anthropic
+
+from app.config import get_settings
+
+settings = get_settings()
+
+
+@dataclass
+class PhysiqueResult:
+    """Result from physique analysis"""
+    estimated_body_fat: float  # Body fat percentage (e.g., 15.0)
+    muscle_level: str  # "low", "moderate", "high", "very_high"
+    confidence: float  # 0-1 confidence score
+    notes: Optional[str] = None  # Additional observations
+
+
+# Body fat reference ranges by gender
+MALE_BF_CATEGORIES = {
+    "essential": (2, 5),      # Competition ready, unsustainable
+    "athletic": (6, 13),      # Very lean, visible abs
+    "fitness": (14, 17),      # Fit, some ab definition
+    "average": (18, 24),      # Average male
+    "above_average": (25, 35), # Above average
+}
+
+FEMALE_BF_CATEGORIES = {
+    "essential": (10, 13),    # Competition ready
+    "athletic": (14, 20),     # Very lean
+    "fitness": (21, 24),      # Fit
+    "average": (25, 31),      # Average female
+    "above_average": (32, 42), # Above average
+}
+
+
+def get_muscle_level_description(level: str) -> str:
+    """Get description for muscle level"""
+    descriptions = {
+        "low": "Below average muscle mass. Little visible muscle definition.",
+        "moderate": "Average muscle mass. Some visible muscle when flexed.",
+        "high": "Above average muscle mass. Good muscle definition.",
+        "very_high": "Significantly above average. Very developed musculature.",
+    }
+    return descriptions.get(level, "")
+
+
+async def fetch_image_as_base64(url: str) -> Optional[str]:
+    """Fetch image from URL and convert to base64"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "image/jpeg")
+            # Only get the base type (e.g., "image/jpeg" not "image/jpeg; charset=utf-8")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            base64_data = base64.standard_b64encode(response.content).decode("utf-8")
+            return f"data:{content_type};base64,{base64_data}"
+    except Exception as e:
+        print(f"[BODY_ANALYSIS] Failed to fetch image {url}: {e}")
+        return None
+
+
+def build_analysis_prompt(gender: str, num_photos: int) -> str:
+    """Build the analysis prompt for Claude Vision"""
+
+    gender_context = "male" if gender == "male" else "female"
+    bf_ranges = MALE_BF_CATEGORIES if gender == "male" else FEMALE_BF_CATEGORIES
+
+    prompt = f"""Analyze this {gender_context} physique photo(s) to estimate body composition.
+
+You are provided with {num_photos} photo(s) showing the person's physique.
+
+Your task is to estimate:
+1. Body fat percentage (as a number between 5 and 45)
+2. Muscle development level (one of: "low", "moderate", "high", "very_high")
+
+Reference ranges for {gender_context} body fat:
+- Essential/Competition: {bf_ranges['essential'][0]}-{bf_ranges['essential'][1]}%
+- Athletic: {bf_ranges['athletic'][0]}-{bf_ranges['athletic'][1]}%
+- Fitness: {bf_ranges['fitness'][0]}-{bf_ranges['fitness'][1]}%
+- Average: {bf_ranges['average'][0]}-{bf_ranges['average'][1]}%
+- Above Average: {bf_ranges['above_average'][0]}-{bf_ranges['above_average'][1]}%
+
+Key indicators to look for:
+- Visible abs/core definition (lower body fat)
+- Visible vascularity (lower body fat, higher muscle)
+- Muscle striations (very low body fat)
+- Hip bone visibility
+- Face/jaw definition
+- Shoulder-to-waist ratio
+- Arm/leg muscle definition
+
+Muscle level criteria:
+- "low": Little visible muscle, skinny or soft appearance
+- "moderate": Some muscle visible when flexed, average development
+- "high": Good muscle definition even at rest, athletic build
+- "very_high": Significant musculature, bodybuilder-level development
+
+IMPORTANT: Respond in this exact JSON format:
+{{
+    "body_fat_percent": <number between 5-45>,
+    "muscle_level": "<low|moderate|high|very_high>",
+    "confidence": <number between 0.0-1.0>,
+    "notes": "<brief observation about the physique>"
+}}
+
+Confidence should be:
+- 0.7-1.0: Clear, well-lit photos with good visibility
+- 0.4-0.7: Partial visibility or lighting issues
+- 0.0-0.4: Poor quality or obstructed views
+
+Be accurate but conservative - when uncertain, estimate toward the average range for the gender."""
+
+    return prompt
+
+
+async def analyze_physique(
+    front_url: str,
+    side_url: Optional[str] = None,
+    back_url: Optional[str] = None,
+    gender: str = "male",
+) -> PhysiqueResult:
+    """
+    Analyze physique photos to estimate body composition.
+
+    Args:
+        front_url: URL to front photo (required)
+        side_url: URL to side photo (optional)
+        back_url: URL to back photo (optional)
+        gender: "male" or "female"
+
+    Returns:
+        PhysiqueResult with estimated body fat, muscle level, and confidence
+    """
+    if not settings.anthropic_api_key:
+        # Fallback when API key not configured - return average estimate
+        print("[BODY_ANALYSIS] No Anthropic API key configured, using default estimate")
+        return PhysiqueResult(
+            estimated_body_fat=18.0 if gender == "male" else 25.0,
+            muscle_level="moderate",
+            confidence=0.3,
+            notes="Default estimate - body analysis service not configured",
+        )
+
+    # Collect available images
+    image_urls = [front_url]
+    if side_url:
+        image_urls.append(side_url)
+    if back_url:
+        image_urls.append(back_url)
+
+    # Fetch and encode images
+    image_contents: List[dict] = []
+    for url in image_urls:
+        base64_image = await fetch_image_as_base64(url)
+        if base64_image:
+            # Parse the data URL
+            media_type = base64_image.split(";")[0].split(":")[1]
+            data = base64_image.split(",")[1]
+            image_contents.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                }
+            })
+
+    if not image_contents:
+        # No images could be fetched
+        return PhysiqueResult(
+            estimated_body_fat=18.0 if gender == "male" else 25.0,
+            muscle_level="moderate",
+            confidence=0.2,
+            notes="Could not fetch images for analysis",
+        )
+
+    # Build prompt
+    prompt = build_analysis_prompt(gender, len(image_contents))
+
+    # Add prompt as text content
+    image_contents.append({
+        "type": "text",
+        "text": prompt,
+    })
+
+    try:
+        # Call Claude Vision API
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "user",
+                    "content": image_contents,
+                }
+            ],
+        )
+
+        # Parse response
+        response_text = message.content[0].text
+
+        # Extract JSON from response
+        import json
+        import re
+
+        # Try to find JSON in the response
+        json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            result_data = json.loads(json_match.group())
+
+            body_fat = float(result_data.get("body_fat_percent", 18))
+            muscle_level = result_data.get("muscle_level", "moderate")
+            confidence = float(result_data.get("confidence", 0.5))
+            notes = result_data.get("notes", "")
+
+            # Validate ranges
+            body_fat = max(5.0, min(45.0, body_fat))
+            confidence = max(0.0, min(1.0, confidence))
+            if muscle_level not in ["low", "moderate", "high", "very_high"]:
+                muscle_level = "moderate"
+
+            return PhysiqueResult(
+                estimated_body_fat=body_fat,
+                muscle_level=muscle_level,
+                confidence=confidence,
+                notes=notes if notes else None,
+            )
+
+        # Couldn't parse JSON, return default
+        return PhysiqueResult(
+            estimated_body_fat=18.0 if gender == "male" else 25.0,
+            muscle_level="moderate",
+            confidence=0.3,
+            notes="Could not parse analysis response",
+        )
+
+    except anthropic.APIError as e:
+        print(f"[BODY_ANALYSIS] Anthropic API error: {e}")
+        return PhysiqueResult(
+            estimated_body_fat=18.0 if gender == "male" else 25.0,
+            muscle_level="moderate",
+            confidence=0.2,
+            notes=f"Analysis service error: {str(e)[:100]}",
+        )
+    except Exception as e:
+        print(f"[BODY_ANALYSIS] Unexpected error: {e}")
+        return PhysiqueResult(
+            estimated_body_fat=18.0 if gender == "male" else 25.0,
+            muscle_level="moderate",
+            confidence=0.2,
+            notes="Unexpected error during analysis",
+        )

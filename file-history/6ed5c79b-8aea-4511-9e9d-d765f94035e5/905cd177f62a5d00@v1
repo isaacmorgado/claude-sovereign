@@ -1,0 +1,335 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @fileoverview Loads agent definitions from Markdown files with YAML frontmatter.
+ * This provides Claude Code-style agent definitions alongside the existing TOML format.
+ */
+
+import * as fs from 'node:fs/promises';
+import { type Dirent } from 'node:fs';
+import * as path from 'node:path';
+import { z } from 'zod';
+import type { AgentDefinition } from './types.js';
+import {
+  isValidToolName,
+  DELEGATE_TO_AGENT_TOOL_NAME,
+} from '../tools/tool-names.js';
+
+/**
+ * Error thrown when an agent definition is invalid or cannot be loaded.
+ */
+export class MarkdownAgentLoadError extends Error {
+  constructor(
+    public filePath: string,
+    message: string,
+  ) {
+    super(`Failed to load agent from ${filePath}: ${message}`);
+    this.name = 'MarkdownAgentLoadError';
+  }
+}
+
+/**
+ * Result of loading agents from a directory.
+ */
+export interface MarkdownAgentLoadResult {
+  agents: AgentDefinition[];
+  errors: MarkdownAgentLoadError[];
+}
+
+/**
+ * Schema for the YAML frontmatter in markdown agent files.
+ */
+const frontmatterSchema = z.object({
+  name: z.string().regex(/^[a-z0-9-_]+$/, 'Name must be a valid slug'),
+  description: z.string().min(1),
+  display_name: z.string().optional(),
+  tools: z.string().optional(), // Comma-separated tool names
+  model: z.string().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  max_turns: z.number().int().positive().optional(),
+  max_time_minutes: z.number().int().positive().optional(),
+  query: z.string().optional(), // Initial query template
+  inputs: z
+    .record(
+      z.object({
+        type: z.enum(['string', 'number', 'boolean', 'integer', 'string[]', 'number[]']),
+        description: z.string(),
+        required: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+});
+
+type MarkdownFrontmatter = z.infer<typeof frontmatterSchema>;
+
+/**
+ * Parses YAML frontmatter from a markdown string.
+ * Frontmatter is delimited by --- at the start and end.
+ */
+function parseFrontmatter(content: string): { meta: Record<string, unknown>; body: string } {
+  const frontmatterRegex = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/;
+  const match = content.match(frontmatterRegex);
+
+  if (!match) {
+    throw new Error('No valid YAML frontmatter found. File must start with ---');
+  }
+
+  const yamlContent = match[1];
+  const body = match[2];
+
+  // Simple YAML parser for flat key-value pairs
+  const meta: Record<string, unknown> = {};
+  const lines = yamlContent.split('\n');
+
+  let currentKey: string | null = null;
+  let currentIndent = 0;
+  let nestedObject: Record<string, unknown> = {};
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const indent = line.search(/\S/);
+    const keyValueMatch = trimmed.match(/^([a-z_]+):\s*(.*)$/);
+
+    if (keyValueMatch) {
+      const [, key, value] = keyValueMatch;
+
+      if (indent === 0) {
+        // Top-level key
+        if (currentKey && Object.keys(nestedObject).length > 0) {
+          meta[currentKey] = nestedObject;
+          nestedObject = {};
+        }
+
+        if (value === '' || value === undefined) {
+          // This is a parent key for nested values
+          currentKey = key;
+          currentIndent = indent;
+        } else {
+          // Simple key-value
+          meta[key] = parseYamlValue(value);
+          currentKey = null;
+        }
+      } else if (currentKey && indent > currentIndent) {
+        // Nested key under currentKey
+        nestedObject[key] = parseYamlValue(value);
+      }
+    }
+  }
+
+  // Don't forget the last nested object
+  if (currentKey && Object.keys(nestedObject).length > 0) {
+    meta[currentKey] = nestedObject;
+  }
+
+  return { meta, body: body.trim() };
+}
+
+/**
+ * Parses a YAML value string into the appropriate type.
+ */
+function parseYamlValue(value: string): unknown {
+  // Remove quotes if present
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+
+  // Boolean
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+
+  // Number
+  const num = Number(value);
+  if (!isNaN(num) && value !== '') return num;
+
+  // String
+  return value;
+}
+
+/**
+ * Parses and validates a markdown agent file.
+ *
+ * @param filePath Path to the markdown file.
+ * @returns The parsed and validated agent definition.
+ * @throws MarkdownAgentLoadError if parsing or validation fails.
+ */
+export async function parseMarkdownAgent(
+  filePath: string,
+): Promise<{ frontmatter: MarkdownFrontmatter; systemPrompt: string }> {
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, 'utf-8');
+  } catch (error) {
+    throw new MarkdownAgentLoadError(
+      filePath,
+      `Could not read file: ${(error as Error).message}`,
+    );
+  }
+
+  let parsed: { meta: Record<string, unknown>; body: string };
+  try {
+    parsed = parseFrontmatter(content);
+  } catch (error) {
+    throw new MarkdownAgentLoadError(
+      filePath,
+      `Frontmatter parsing failed: ${(error as Error).message}`,
+    );
+  }
+
+  const result = frontmatterSchema.safeParse(parsed.meta);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((i) => `${i.path.join('.')}: ${i.message}`)
+      .join(', ');
+    throw new MarkdownAgentLoadError(filePath, `Validation failed: ${issues}`);
+  }
+
+  const frontmatter = result.data;
+
+  // Parse and validate tools if provided
+  if (frontmatter.tools) {
+    const toolNames = frontmatter.tools.split(',').map((t) => t.trim());
+    for (const tool of toolNames) {
+      if (!isValidToolName(tool)) {
+        throw new MarkdownAgentLoadError(
+          filePath,
+          `Invalid tool name: ${tool}`,
+        );
+      }
+    }
+
+    // Prevent sub-agents from delegating to other agents
+    if (toolNames.includes(DELEGATE_TO_AGENT_TOOL_NAME)) {
+      throw new MarkdownAgentLoadError(
+        filePath,
+        `Validation failed: tools list cannot include '${DELEGATE_TO_AGENT_TOOL_NAME}'. Sub-agents cannot delegate to other agents.`,
+      );
+    }
+  }
+
+  if (!parsed.body) {
+    throw new MarkdownAgentLoadError(
+      filePath,
+      'Agent file must contain a system prompt after the frontmatter',
+    );
+  }
+
+  return { frontmatter, systemPrompt: parsed.body };
+}
+
+/**
+ * Converts a parsed markdown agent to an AgentDefinition.
+ */
+export function markdownToAgentDefinition(
+  frontmatter: MarkdownFrontmatter,
+  systemPrompt: string,
+): AgentDefinition {
+  const modelName = frontmatter.model || 'inherit';
+  const tools = frontmatter.tools
+    ? frontmatter.tools.split(',').map((t) => t.trim())
+    : undefined;
+
+  return {
+    kind: 'local',
+    name: frontmatter.name,
+    description: frontmatter.description,
+    displayName: frontmatter.display_name,
+    promptConfig: {
+      systemPrompt,
+      query: frontmatter.query,
+    },
+    modelConfig: {
+      model: modelName,
+      temp: frontmatter.temperature ?? 1,
+      top_p: 0.95,
+    },
+    runConfig: {
+      max_turns: frontmatter.max_turns,
+      max_time_minutes: frontmatter.max_time_minutes || 5,
+    },
+    toolConfig: tools
+      ? {
+          tools,
+        }
+      : undefined,
+    inputConfig: {
+      inputs: frontmatter.inputs ?? {
+        query: {
+          type: 'string',
+          description: 'The task for the agent.',
+          required: false,
+        },
+      },
+    },
+  };
+}
+
+/**
+ * Loads all markdown agents from a specific directory.
+ * Ignores non-markdown files and files starting with _.
+ *
+ * @param dir Directory path to scan.
+ * @returns Object containing successfully loaded agents and any errors.
+ */
+export async function loadMarkdownAgentsFromDirectory(
+  dir: string,
+): Promise<MarkdownAgentLoadResult> {
+  const result: MarkdownAgentLoadResult = {
+    agents: [],
+    errors: [],
+  };
+
+  let dirEntries: Dirent[];
+  try {
+    dirEntries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    // If directory doesn't exist, just return empty
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return result;
+    }
+    result.errors.push(
+      new MarkdownAgentLoadError(
+        dir,
+        `Could not list directory: ${(error as Error).message}`,
+      ),
+    );
+    return result;
+  }
+
+  const files = dirEntries
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        entry.name.endsWith('.md') &&
+        !entry.name.startsWith('_'),
+    )
+    .map((entry) => entry.name);
+
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    try {
+      const { frontmatter, systemPrompt } = await parseMarkdownAgent(filePath);
+      const agent = markdownToAgentDefinition(frontmatter, systemPrompt);
+      result.agents.push(agent);
+    } catch (error) {
+      if (error instanceof MarkdownAgentLoadError) {
+        result.errors.push(error);
+      } else {
+        result.errors.push(
+          new MarkdownAgentLoadError(
+            filePath,
+            `Unexpected error: ${(error as Error).message}`,
+          ),
+        );
+      }
+    }
+  }
+
+  return result;
+}

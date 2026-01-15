@@ -1,0 +1,407 @@
+"""
+LOOKSMAXX Side Profile Detection API
+Uses InsightFace for accurate side profile landmark detection
+"""
+
+import os
+import base64
+import io
+import math
+from typing import Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import insightface
+from insightface.app import FaceAnalysis
+
+app = FastAPI(
+    title="LOOKSMAXX Detection API",
+    description="Side profile facial landmark detection using InsightFace",
+    version="1.0.0"
+)
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update with your domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global face analyzer - initialized on startup
+face_analyzer: Optional[FaceAnalysis] = None
+
+
+class LandmarkPoint(BaseModel):
+    x: float
+    y: float
+
+
+class DetectionResponse(BaseModel):
+    success: bool
+    message: str
+    direction: Optional[str] = None  # "left" or "right"
+    rotation_angle: Optional[float] = None
+    raw_landmarks: Optional[list[LandmarkPoint]] = None
+    mapped_landmarks: Optional[dict[str, LandmarkPoint]] = None
+    face_box: Optional[dict] = None
+
+
+# Mapping from InsightFace 106 landmarks to our 28 cephalometric landmarks
+# InsightFace 106-point indices reference: https://github.com/deepinsight/insightface/tree/master/alignment/coordinate_reg
+SIDE_LANDMARK_MAPPING = {
+    # Skull/Head
+    "vertex": 0,  # Top of head (approximate)
+    "occiput": 0,  # Back of head (use top, no good equivalent)
+    "trichion": 0,  # Hairline (use top)
+
+    # Nasal landmarks
+    "pronasale": 54,  # Nose tip
+    "nasion": 51,  # Nasal bridge root
+    "rhinion": 52,  # Nose bridge middle
+    "supratip": 53,  # Above nose tip
+    "infratip": 55,  # Below nose tip
+    "columella": 55,  # Nasal septum
+    "subnasale": 56,  # Nose base
+    "subalare": 57,  # Nostril wing
+
+    # Eye/Orbital
+    "orbitale": 35,  # Lower orbital rim
+    "cornealApex": 33,  # Forward point of cornea
+
+    # Ear landmarks
+    "porion": 0,  # Ear canal (no good equivalent in 106 points)
+    "tragus": 0,  # Ear cartilage
+    "intertragicNotch": 0,  # Ear notch
+
+    # Cheek
+    "cheekbone": 46,  # Zygomatic prominence
+
+    # Forehead
+    "glabella": 51,  # Between brows
+
+    # Lips/Mouth
+    "labraleSuperius": 76,  # Upper lip
+    "cheilion": 84,  # Mouth corner
+    "labraleInferius": 82,  # Lower lip
+    "sublabiale": 83,  # Below lower lip
+
+    # Chin/Jaw
+    "pogonion": 16,  # Chin point
+    "menton": 16,  # Chin bottom
+    "cervicalPoint": 16,  # Neck point (use chin)
+    "neckPoint": 16,  # Lower neck
+    "gonionTop": 10,  # Upper jaw angle
+    "gonionBottom": 12,  # Lower jaw angle
+}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize InsightFace model on startup"""
+    global face_analyzer
+    try:
+        # Use buffalo_l for best accuracy
+        face_analyzer = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"]
+        )
+        face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        print("InsightFace model loaded successfully")
+    except Exception as e:
+        print(f"Failed to load InsightFace model: {e}")
+        # Try with simpler model
+        try:
+            face_analyzer = FaceAnalysis(
+                name="buffalo_s",
+                providers=["CPUExecutionProvider"]
+            )
+            face_analyzer.prepare(ctx_id=0, det_size=(320, 320))
+            print("InsightFace buffalo_s model loaded as fallback")
+        except Exception as e2:
+            print(f"Failed to load fallback model: {e2}")
+
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "model_loaded": face_analyzer is not None
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check for Railway"""
+    return {"status": "ok"}
+
+
+def detect_face_direction(landmarks: np.ndarray) -> str:
+    """
+    Detect if the face is facing left or right based on landmark positions.
+    Uses the relative positions of nose and jaw landmarks.
+    """
+    if landmarks is None or len(landmarks) < 60:
+        return "unknown"
+
+    # Get nose tip and jaw center
+    nose_tip = landmarks[54]  # Nose tip
+    left_jaw = landmarks[0]   # Left jaw point
+    right_jaw = landmarks[16]  # Right jaw point
+
+    # Calculate horizontal position of nose relative to jaw center
+    jaw_center_x = (left_jaw[0] + right_jaw[0]) / 2
+
+    if nose_tip[0] < jaw_center_x:
+        return "left"
+    else:
+        return "right"
+
+
+def calculate_rotation_angle(landmarks: np.ndarray) -> float:
+    """
+    Calculate the rotation angle of the face.
+    Uses the angle of the line connecting the eye corners.
+    """
+    if landmarks is None or len(landmarks) < 40:
+        return 0.0
+
+    # Use eye corners for rotation
+    left_eye_outer = landmarks[33]
+    right_eye_outer = landmarks[42]
+
+    dx = right_eye_outer[0] - left_eye_outer[0]
+    dy = right_eye_outer[1] - left_eye_outer[1]
+
+    angle = math.atan2(dy, dx) * 180 / math.pi
+    return angle
+
+
+def map_landmarks_to_cephalometric(
+    landmarks: np.ndarray,
+    img_width: int,
+    img_height: int
+) -> dict[str, LandmarkPoint]:
+    """
+    Map InsightFace 106 landmarks to our 28 cephalometric landmarks.
+    Returns normalized coordinates (0-1).
+    """
+    mapped = {}
+
+    for name, idx in SIDE_LANDMARK_MAPPING.items():
+        if idx < len(landmarks):
+            point = landmarks[idx]
+            mapped[name] = LandmarkPoint(
+                x=float(point[0]) / img_width,
+                y=float(point[1]) / img_height
+            )
+        else:
+            # Fallback to center if index out of range
+            mapped[name] = LandmarkPoint(x=0.5, y=0.5)
+
+    return mapped
+
+
+def image_to_cv2(file_bytes: bytes) -> np.ndarray:
+    """Convert uploaded file bytes to OpenCV image"""
+    nparr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image")
+    return img
+
+
+@app.post("/api/side-landmarks", response_model=DetectionResponse)
+async def detect_side_landmarks(file: UploadFile = File(...)):
+    """
+    Detect facial landmarks from a side profile image.
+
+    Returns:
+    - 106 raw landmarks from InsightFace
+    - 28 mapped cephalometric landmarks
+    - Face direction (left/right)
+    - Rotation angle
+    """
+    if face_analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Face detection model not loaded"
+        )
+
+    try:
+        # Read and decode image
+        contents = await file.read()
+        img = image_to_cv2(contents)
+        img_height, img_width = img.shape[:2]
+
+        # Convert to RGB for InsightFace
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Detect faces
+        faces = face_analyzer.get(img_rgb)
+
+        if not faces:
+            return DetectionResponse(
+                success=False,
+                message="No face detected in image"
+            )
+
+        # Use the first (most prominent) face
+        face = faces[0]
+
+        # Check if landmark_2d_106 is available
+        if not hasattr(face, 'landmark_2d_106') or face.landmark_2d_106 is None:
+            # Fall back to landmark_3d_68 or kps
+            if hasattr(face, 'kps') and face.kps is not None:
+                # Only 5 keypoints available
+                return DetectionResponse(
+                    success=False,
+                    message="Full landmarks not available, only basic keypoints detected"
+                )
+            return DetectionResponse(
+                success=False,
+                message="Landmarks not available for detected face"
+            )
+
+        landmarks_106 = face.landmark_2d_106
+
+        # Detect face direction and rotation
+        direction = detect_face_direction(landmarks_106)
+        rotation = calculate_rotation_angle(landmarks_106)
+
+        # Convert raw landmarks to response format
+        raw_landmarks = [
+            LandmarkPoint(
+                x=float(pt[0]) / img_width,
+                y=float(pt[1]) / img_height
+            )
+            for pt in landmarks_106
+        ]
+
+        # Map to cephalometric landmarks
+        mapped = map_landmarks_to_cephalometric(
+            landmarks_106, img_width, img_height
+        )
+
+        # Get bounding box
+        bbox = face.bbox
+        face_box = {
+            "x": float(bbox[0]) / img_width,
+            "y": float(bbox[1]) / img_height,
+            "width": float(bbox[2] - bbox[0]) / img_width,
+            "height": float(bbox[3] - bbox[1]) / img_height
+        }
+
+        return DetectionResponse(
+            success=True,
+            message=f"Detected {len(landmarks_106)} landmarks",
+            direction=direction,
+            rotation_angle=rotation,
+            raw_landmarks=raw_landmarks,
+            mapped_landmarks=mapped,
+            face_box=face_box
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+
+@app.post("/api/side-landmarks/base64", response_model=DetectionResponse)
+async def detect_side_landmarks_base64(data: dict):
+    """
+    Detect facial landmarks from a base64-encoded image.
+
+    Request body:
+    {
+        "image": "base64-encoded-image-string"
+    }
+    """
+    if face_analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Face detection model not loaded"
+        )
+
+    try:
+        # Decode base64 image
+        image_data = data.get("image", "")
+        if "," in image_data:
+            # Remove data URL prefix if present
+            image_data = image_data.split(",")[1]
+
+        image_bytes = base64.b64decode(image_data)
+        img = image_to_cv2(image_bytes)
+        img_height, img_width = img.shape[:2]
+
+        # Convert to RGB for InsightFace
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Detect faces
+        faces = face_analyzer.get(img_rgb)
+
+        if not faces:
+            return DetectionResponse(
+                success=False,
+                message="No face detected in image"
+            )
+
+        # Use the first face
+        face = faces[0]
+
+        if not hasattr(face, 'landmark_2d_106') or face.landmark_2d_106 is None:
+            return DetectionResponse(
+                success=False,
+                message="Full landmarks not available for detected face"
+            )
+
+        landmarks_106 = face.landmark_2d_106
+
+        direction = detect_face_direction(landmarks_106)
+        rotation = calculate_rotation_angle(landmarks_106)
+
+        raw_landmarks = [
+            LandmarkPoint(
+                x=float(pt[0]) / img_width,
+                y=float(pt[1]) / img_height
+            )
+            for pt in landmarks_106
+        ]
+
+        mapped = map_landmarks_to_cephalometric(
+            landmarks_106, img_width, img_height
+        )
+
+        bbox = face.bbox
+        face_box = {
+            "x": float(bbox[0]) / img_width,
+            "y": float(bbox[1]) / img_height,
+            "width": float(bbox[2] - bbox[0]) / img_width,
+            "height": float(bbox[3] - bbox[1]) / img_height
+        }
+
+        return DetectionResponse(
+            success=True,
+            message=f"Detected {len(landmarks_106)} landmarks",
+            direction=direction,
+            rotation_angle=rotation,
+            raw_landmarks=raw_landmarks,
+            mapped_landmarks=mapped,
+            face_box=face_box
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

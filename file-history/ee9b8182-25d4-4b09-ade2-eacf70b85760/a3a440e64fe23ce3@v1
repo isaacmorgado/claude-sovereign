@@ -1,0 +1,789 @@
+/**
+ * SPLICE Text Editor Plugin Module
+ *
+ * Provides UI for text-based video editing.
+ * Edit video by editing the transcript text.
+ * Delete text to delete video, reorder paragraphs to reorder video.
+ */
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+const textEditorState = {
+  originalTranscript: null,
+  editableTranscript: null,
+  currentText: '',
+  undoStack: [],
+  redoStack: [],
+  searchResults: [],
+  currentSearchIndex: -1,
+  isDirty: false,
+  isProcessing: false,
+  previewChanges: null
+};
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+/**
+ * Initialize text editor module
+ */
+async function initTextEditor() {
+  console.log('[SPLICE] Initializing text editor module');
+
+  // Setup event listeners
+  setupTextEditorListeners();
+
+  // Setup keyboard shortcuts
+  setupKeyboardShortcuts();
+
+  console.log('[SPLICE] Text editor module initialized');
+}
+
+/**
+ * Setup event listeners for text editor
+ */
+function setupTextEditorListeners() {
+  // Text area input
+  document.addEventListener('input', (e) => {
+    if (e.target.id === 'text-editor-content') {
+      handleTextChange(e.target.value);
+    }
+  });
+
+  // Button clicks
+  document.addEventListener('click', (e) => {
+    // Apply edits
+    if (e.target.id === 'apply-text-edits-btn') {
+      applyTextEdits();
+    }
+
+    // Preview edits
+    if (e.target.id === 'preview-text-edits-btn') {
+      previewTextEdits();
+    }
+
+    // Undo/Redo
+    if (e.target.id === 'text-editor-undo-btn') {
+      undoTextEdit();
+    }
+    if (e.target.id === 'text-editor-redo-btn') {
+      redoTextEdit();
+    }
+
+    // Search
+    if (e.target.id === 'text-search-btn') {
+      searchInTranscript();
+    }
+    if (e.target.id === 'text-search-next-btn') {
+      navigateSearchResult(1);
+    }
+    if (e.target.id === 'text-search-prev-btn') {
+      navigateSearchResult(-1);
+    }
+
+    // Replace
+    if (e.target.id === 'text-replace-btn') {
+      replaceInTranscript();
+    }
+    if (e.target.id === 'text-replace-all-btn') {
+      replaceAllInTranscript();
+    }
+
+    // Reset
+    if (e.target.id === 'text-editor-reset-btn') {
+      resetToOriginal();
+    }
+
+    // Build sequence
+    if (e.target.id === 'text-editor-build-btn') {
+      buildSequenceFromEdits();
+    }
+  });
+
+  // Search input enter key
+  document.addEventListener('keypress', (e) => {
+    if (e.target.id === 'text-search-input' && e.key === 'Enter') {
+      e.preventDefault();
+      searchInTranscript();
+    }
+  });
+}
+
+/**
+ * Setup keyboard shortcuts
+ */
+function setupKeyboardShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    // Only handle if text editor is focused
+    const editorContent = document.getElementById('text-editor-content');
+    if (!editorContent || document.activeElement !== editorContent) return;
+
+    // Ctrl/Cmd + Z = Undo
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      undoTextEdit();
+    }
+
+    // Ctrl/Cmd + Shift + Z or Ctrl/Cmd + Y = Redo
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'Z' || e.key === 'y')) {
+      e.preventDefault();
+      redoTextEdit();
+    }
+
+    // Ctrl/Cmd + F = Focus search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault();
+      const searchInput = document.getElementById('text-search-input');
+      if (searchInput) searchInput.focus();
+    }
+  });
+}
+
+// ============================================================================
+// TRANSCRIPT LOADING
+// ============================================================================
+
+/**
+ * Load transcript into text editor
+ * @param {Object} transcript - Transcript from main module
+ */
+async function loadTranscriptIntoEditor(transcript) {
+  if (!transcript) {
+    showTextEditorStatus('No transcript available', 'error');
+    return;
+  }
+
+  textEditorState.isProcessing = true;
+  updateProcessingState(true);
+  showTextEditorStatus('Preparing editable transcript...', 'info');
+
+  try {
+    const { getBackendUrl, fetchWithTimeout, getAuthHeaders } = window.spliceConfig || {};
+    const backendUrl = getBackendUrl ? getBackendUrl() : 'https://127.0.0.1:3847';
+    const headers = getAuthHeaders ? getAuthHeaders() : { 'Content-Type': 'application/json' };
+
+    const response = await (fetchWithTimeout || fetch)(`${backendUrl}/text-edit/prepare`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ transcript })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || 'Failed to prepare transcript');
+    }
+
+    const data = await response.json();
+
+    // Store original and editable transcripts
+    textEditorState.originalTranscript = transcript;
+    textEditorState.editableTranscript = data.editableTranscript;
+    textEditorState.currentText = data.editableTranscript.plainText;
+    textEditorState.isDirty = false;
+    textEditorState.undoStack = [];
+    textEditorState.redoStack = [];
+
+    // Render editor
+    renderTextEditor();
+
+    showTextEditorStatus(`Loaded ${data.editableTranscript.totalWords} words`, 'success');
+
+  } catch (err) {
+    console.error('[SPLICE] Text editor load error:', err);
+    showTextEditorStatus(err.message, 'error');
+  } finally {
+    textEditorState.isProcessing = false;
+    updateProcessingState(false);
+  }
+}
+
+// ============================================================================
+// TEXT EDITING
+// ============================================================================
+
+/**
+ * Handle text changes in editor
+ */
+function handleTextChange(newText) {
+  // Save current state to undo stack
+  if (textEditorState.currentText !== newText) {
+    textEditorState.undoStack.push(textEditorState.currentText);
+    textEditorState.redoStack = []; // Clear redo stack on new edit
+
+    // Limit undo stack size
+    if (textEditorState.undoStack.length > 50) {
+      textEditorState.undoStack.shift();
+    }
+  }
+
+  textEditorState.currentText = newText;
+  textEditorState.isDirty = true;
+  textEditorState.previewChanges = null; // Clear preview
+
+  updateEditorStatus();
+}
+
+/**
+ * Undo last text edit
+ */
+function undoTextEdit() {
+  if (textEditorState.undoStack.length === 0) {
+    showTextEditorStatus('Nothing to undo', 'info');
+    return;
+  }
+
+  // Save current to redo stack
+  textEditorState.redoStack.push(textEditorState.currentText);
+
+  // Restore from undo stack
+  textEditorState.currentText = textEditorState.undoStack.pop();
+
+  // Update editor content
+  const editor = document.getElementById('text-editor-content');
+  if (editor) {
+    editor.value = textEditorState.currentText;
+  }
+
+  updateEditorStatus();
+  showTextEditorStatus('Undo applied', 'info');
+}
+
+/**
+ * Redo last undone edit
+ */
+function redoTextEdit() {
+  if (textEditorState.redoStack.length === 0) {
+    showTextEditorStatus('Nothing to redo', 'info');
+    return;
+  }
+
+  // Save current to undo stack
+  textEditorState.undoStack.push(textEditorState.currentText);
+
+  // Restore from redo stack
+  textEditorState.currentText = textEditorState.redoStack.pop();
+
+  // Update editor content
+  const editor = document.getElementById('text-editor-content');
+  if (editor) {
+    editor.value = textEditorState.currentText;
+  }
+
+  updateEditorStatus();
+  showTextEditorStatus('Redo applied', 'info');
+}
+
+/**
+ * Reset to original transcript
+ */
+function resetToOriginal() {
+  if (!textEditorState.editableTranscript) return;
+
+  // Save current to undo
+  if (textEditorState.isDirty) {
+    textEditorState.undoStack.push(textEditorState.currentText);
+  }
+
+  textEditorState.currentText = textEditorState.editableTranscript.plainText;
+  textEditorState.isDirty = false;
+  textEditorState.previewChanges = null;
+
+  const editor = document.getElementById('text-editor-content');
+  if (editor) {
+    editor.value = textEditorState.currentText;
+  }
+
+  updateEditorStatus();
+  showTextEditorStatus('Reset to original', 'success');
+}
+
+// ============================================================================
+// PREVIEW AND APPLY
+// ============================================================================
+
+/**
+ * Preview text edits without applying
+ */
+async function previewTextEdits() {
+  if (!textEditorState.editableTranscript || !textEditorState.isDirty) {
+    showTextEditorStatus('No changes to preview', 'info');
+    return;
+  }
+
+  textEditorState.isProcessing = true;
+  updateProcessingState(true);
+  showTextEditorStatus('Generating preview...', 'info');
+
+  try {
+    const { getBackendUrl, fetchWithTimeout, getAuthHeaders } = window.spliceConfig || {};
+    const backendUrl = getBackendUrl ? getBackendUrl() : 'https://127.0.0.1:3847';
+    const headers = getAuthHeaders ? getAuthHeaders() : { 'Content-Type': 'application/json' };
+
+    const response = await (fetchWithTimeout || fetch)(`${backendUrl}/text-edit/preview`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        transcript: textEditorState.editableTranscript,
+        editedText: textEditorState.currentText
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || 'Preview failed');
+    }
+
+    const data = await response.json();
+    textEditorState.previewChanges = data;
+
+    renderPreview(data);
+    showTextEditorStatus(`Preview: ${data.changes.length} changes`, 'success');
+
+  } catch (err) {
+    console.error('[SPLICE] Text edit preview error:', err);
+    showTextEditorStatus(err.message, 'error');
+  } finally {
+    textEditorState.isProcessing = false;
+    updateProcessingState(false);
+  }
+}
+
+/**
+ * Render preview of changes
+ */
+function renderPreview(preview) {
+  const container = document.getElementById('text-editor-preview');
+  if (!container) return;
+
+  if (!preview.changes || preview.changes.length === 0) {
+    container.innerHTML = '<div class="preview-empty">No changes detected</div>';
+    return;
+  }
+
+  const html = `
+    <div class="preview-summary">
+      <span class="preview-stat">${preview.summary.deletions} deletions</span>
+      <span class="preview-stat">${preview.summary.reorderings} reorders</span>
+      <span class="preview-stat">${preview.impact.percentageRemoved}% removed</span>
+    </div>
+    <div class="preview-changes">
+      ${preview.changes.map(change => `
+        <div class="preview-change preview-change-${change.type}">
+          <span class="change-type">${change.type}</span>
+          <span class="change-desc">${change.description}</span>
+          <span class="change-time">${change.timeRange}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+
+  container.innerHTML = html;
+}
+
+/**
+ * Apply text edits and generate cut list
+ */
+async function applyTextEdits() {
+  if (!textEditorState.editableTranscript || !textEditorState.isDirty) {
+    showTextEditorStatus('No changes to apply', 'info');
+    return;
+  }
+
+  textEditorState.isProcessing = true;
+  updateProcessingState(true);
+  showTextEditorStatus('Applying edits...', 'info');
+
+  try {
+    const { getBackendUrl, fetchWithTimeout, getAuthHeaders } = window.spliceConfig || {};
+    const backendUrl = getBackendUrl ? getBackendUrl() : 'https://127.0.0.1:3847';
+    const headers = getAuthHeaders ? getAuthHeaders() : { 'Content-Type': 'application/json' };
+
+    // Apply edits
+    const applyResponse = await (fetchWithTimeout || fetch)(`${backendUrl}/text-edit/apply`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        transcript: textEditorState.editableTranscript,
+        editedText: textEditorState.currentText
+      })
+    });
+
+    if (!applyResponse.ok) {
+      const err = await applyResponse.json();
+      throw new Error(err.error || 'Apply failed');
+    }
+
+    const applyData = await applyResponse.json();
+
+    // Generate cut list from operations
+    const cutListResponse = await (fetchWithTimeout || fetch)(`${backendUrl}/text-edit/cut-list`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        operations: applyData.operations,
+        sourceInfo: {
+          sourceName: textEditorState.originalTranscript?.source?.name || 'source',
+          duration: textEditorState.editableTranscript.duration
+        }
+      })
+    });
+
+    if (!cutListResponse.ok) {
+      const err = await cutListResponse.json();
+      throw new Error(err.error || 'Cut list generation failed');
+    }
+
+    const cutListData = await cutListResponse.json();
+
+    // Store cut list for building
+    textEditorState.lastCutList = cutListData.cutList;
+
+    // Update state
+    textEditorState.isDirty = false;
+
+    showTextEditorStatus(
+      `Applied ${applyData.stats.deletions} cuts, ${cutListData.summary.segmentCount} segments`,
+      'success'
+    );
+
+    // Show build button
+    updateBuildButtonState(true);
+
+  } catch (err) {
+    console.error('[SPLICE] Text edit apply error:', err);
+    showTextEditorStatus(err.message, 'error');
+  } finally {
+    textEditorState.isProcessing = false;
+    updateProcessingState(false);
+  }
+}
+
+/**
+ * Build sequence from applied edits
+ */
+async function buildSequenceFromEdits() {
+  if (!textEditorState.lastCutList) {
+    showTextEditorStatus('No edits to build. Apply edits first.', 'error');
+    return;
+  }
+
+  showTextEditorStatus('Building sequence...', 'info');
+
+  try {
+    // Use builder to create sequence
+    if (window.spliceBuilder?.buildSequence) {
+      await window.spliceBuilder.buildSequence(textEditorState.lastCutList);
+      showTextEditorStatus('Sequence built successfully', 'success');
+    } else {
+      showTextEditorStatus('Builder not available', 'error');
+    }
+  } catch (err) {
+    console.error('[SPLICE] Build sequence error:', err);
+    showTextEditorStatus(err.message, 'error');
+  }
+}
+
+// ============================================================================
+// SEARCH AND REPLACE
+// ============================================================================
+
+/**
+ * Search in transcript
+ */
+async function searchInTranscript() {
+  const searchInput = document.getElementById('text-search-input');
+  const searchText = searchInput?.value?.trim();
+
+  if (!searchText) {
+    showTextEditorStatus('Enter search text', 'info');
+    return;
+  }
+
+  if (!textEditorState.editableTranscript) {
+    showTextEditorStatus('No transcript loaded', 'error');
+    return;
+  }
+
+  try {
+    const { getBackendUrl, fetchWithTimeout, getAuthHeaders } = window.spliceConfig || {};
+    const backendUrl = getBackendUrl ? getBackendUrl() : 'https://127.0.0.1:3847';
+    const headers = getAuthHeaders ? getAuthHeaders() : { 'Content-Type': 'application/json' };
+
+    const response = await (fetchWithTimeout || fetch)(`${backendUrl}/text-edit/search`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        transcript: textEditorState.editableTranscript,
+        searchText
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || 'Search failed');
+    }
+
+    const data = await response.json();
+    textEditorState.searchResults = data.matches || [];
+    textEditorState.currentSearchIndex = data.matches.length > 0 ? 0 : -1;
+
+    highlightSearchResults();
+    showTextEditorStatus(`Found ${data.totalMatches} matches`, 'success');
+
+  } catch (err) {
+    console.error('[SPLICE] Search error:', err);
+    showTextEditorStatus(err.message, 'error');
+  }
+}
+
+/**
+ * Navigate search results
+ */
+function navigateSearchResult(direction) {
+  if (textEditorState.searchResults.length === 0) {
+    showTextEditorStatus('No search results', 'info');
+    return;
+  }
+
+  textEditorState.currentSearchIndex += direction;
+
+  // Wrap around
+  if (textEditorState.currentSearchIndex >= textEditorState.searchResults.length) {
+    textEditorState.currentSearchIndex = 0;
+  } else if (textEditorState.currentSearchIndex < 0) {
+    textEditorState.currentSearchIndex = textEditorState.searchResults.length - 1;
+  }
+
+  highlightCurrentResult();
+  updateSearchResultsDisplay();
+}
+
+/**
+ * Highlight search results in editor
+ */
+function highlightSearchResults() {
+  // For simplicity, just update counter - full highlighting would need contenteditable
+  updateSearchResultsDisplay();
+
+  if (textEditorState.currentSearchIndex >= 0) {
+    highlightCurrentResult();
+  }
+}
+
+/**
+ * Highlight current search result
+ */
+function highlightCurrentResult() {
+  const result = textEditorState.searchResults[textEditorState.currentSearchIndex];
+  if (!result) return;
+
+  // Scroll to result position in textarea
+  const editor = document.getElementById('text-editor-content');
+  if (editor) {
+    // Simple approach: find text position and scroll
+    const text = editor.value;
+    const searchPos = text.toLowerCase().indexOf(result.text.toLowerCase());
+    if (searchPos >= 0) {
+      editor.setSelectionRange(searchPos, searchPos + result.text.length);
+      editor.focus();
+    }
+  }
+
+  // Show time info
+  showTextEditorStatus(
+    `Match ${textEditorState.currentSearchIndex + 1}/${textEditorState.searchResults.length} at ${formatTime(result.start)}`,
+    'info'
+  );
+}
+
+/**
+ * Update search results display
+ */
+function updateSearchResultsDisplay() {
+  const display = document.getElementById('text-search-results');
+  if (display) {
+    const current = textEditorState.currentSearchIndex + 1;
+    const total = textEditorState.searchResults.length;
+    display.textContent = total > 0 ? `${current}/${total}` : '0/0';
+  }
+}
+
+/**
+ * Replace in transcript
+ */
+async function replaceInTranscript() {
+  const searchText = document.getElementById('text-search-input')?.value?.trim();
+  const replaceText = document.getElementById('text-replace-input')?.value || '';
+
+  if (!searchText) {
+    showTextEditorStatus('Enter search text', 'info');
+    return;
+  }
+
+  // Replace in current text
+  const newText = textEditorState.currentText.replace(
+    new RegExp(escapeRegex(searchText), 'i'),
+    replaceText
+  );
+
+  if (newText !== textEditorState.currentText) {
+    handleTextChange(newText);
+    const editor = document.getElementById('text-editor-content');
+    if (editor) editor.value = newText;
+    showTextEditorStatus('Replaced 1 occurrence', 'success');
+  } else {
+    showTextEditorStatus('No match found', 'info');
+  }
+}
+
+/**
+ * Replace all occurrences in transcript
+ */
+async function replaceAllInTranscript() {
+  const searchText = document.getElementById('text-search-input')?.value?.trim();
+  const replaceText = document.getElementById('text-replace-input')?.value || '';
+
+  if (!searchText) {
+    showTextEditorStatus('Enter search text', 'info');
+    return;
+  }
+
+  const regex = new RegExp(escapeRegex(searchText), 'gi');
+  const matches = textEditorState.currentText.match(regex);
+  const count = matches ? matches.length : 0;
+
+  if (count > 0) {
+    const newText = textEditorState.currentText.replace(regex, replaceText);
+    handleTextChange(newText);
+    const editor = document.getElementById('text-editor-content');
+    if (editor) editor.value = newText;
+    showTextEditorStatus(`Replaced ${count} occurrences`, 'success');
+  } else {
+    showTextEditorStatus('No matches found', 'info');
+  }
+}
+
+/**
+ * Escape special regex characters
+ */
+function escapeRegex(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ============================================================================
+// UI RENDERING
+// ============================================================================
+
+/**
+ * Render text editor content
+ */
+function renderTextEditor() {
+  const container = document.getElementById('text-editor-content');
+  if (!container) return;
+
+  container.value = textEditorState.currentText;
+  updateEditorStatus();
+}
+
+/**
+ * Update editor status display
+ */
+function updateEditorStatus() {
+  const wordCount = document.getElementById('text-editor-word-count');
+  const dirtyIndicator = document.getElementById('text-editor-dirty');
+  const undoBtn = document.getElementById('text-editor-undo-btn');
+  const redoBtn = document.getElementById('text-editor-redo-btn');
+
+  if (wordCount) {
+    const words = textEditorState.currentText.split(/\s+/).filter(w => w.length > 0);
+    wordCount.textContent = `${words.length} words`;
+  }
+
+  if (dirtyIndicator) {
+    dirtyIndicator.style.display = textEditorState.isDirty ? 'inline' : 'none';
+  }
+
+  if (undoBtn) {
+    undoBtn.disabled = textEditorState.undoStack.length === 0;
+  }
+
+  if (redoBtn) {
+    redoBtn.disabled = textEditorState.redoStack.length === 0;
+  }
+}
+
+/**
+ * Update processing state UI
+ */
+function updateProcessingState(isProcessing) {
+  const buttons = document.querySelectorAll('#text-editor-panel button');
+  buttons.forEach(btn => {
+    if (!btn.classList.contains('always-enabled')) {
+      btn.disabled = isProcessing;
+    }
+  });
+
+  const editor = document.getElementById('text-editor-content');
+  if (editor) {
+    editor.disabled = isProcessing;
+  }
+}
+
+/**
+ * Update build button state
+ */
+function updateBuildButtonState(enabled) {
+  const btn = document.getElementById('text-editor-build-btn');
+  if (btn) {
+    btn.disabled = !enabled;
+    btn.classList.toggle('ready', enabled);
+  }
+}
+
+/**
+ * Show status message
+ */
+function showTextEditorStatus(message, type = 'info') {
+  const statusEl = document.getElementById('text-editor-status');
+  if (!statusEl) return;
+
+  statusEl.textContent = message;
+  statusEl.className = `text-editor-status text-editor-status-${type}`;
+
+  if (type !== 'error') {
+    setTimeout(() => {
+      statusEl.textContent = '';
+      statusEl.className = 'text-editor-status';
+    }, 5000);
+  }
+}
+
+/**
+ * Format time for display
+ */
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+// Export for global access
+window.spliceTextEditor = {
+  init: initTextEditor,
+  loadTranscript: loadTranscriptIntoEditor,
+  applyEdits: applyTextEdits,
+  previewEdits: previewTextEdits,
+  undo: undoTextEdit,
+  redo: redoTextEdit,
+  reset: resetToOriginal,
+  search: searchInTranscript,
+  buildSequence: buildSequenceFromEdits,
+  getState: () => textEditorState
+};

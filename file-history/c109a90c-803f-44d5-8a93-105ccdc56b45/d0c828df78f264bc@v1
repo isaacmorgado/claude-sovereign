@@ -1,0 +1,265 @@
+import * as cron from "node-cron"
+import { BaseTrigger, BaseTriggerOptions } from "./BaseTrigger"
+import type { CronTrigger as CronTriggerConfig } from "@multi-agent/types"
+
+export interface CronTriggerOptions extends BaseTriggerOptions {
+	trigger: CronTriggerConfig
+}
+
+/**
+ * Cron trigger implementation.
+ * Executes automations on a schedule defined by a cron expression.
+ *
+ * Cron expression format:
+ *  ┌────────────── second (optional, 0-59)
+ *  │ ┌──────────── minute (0-59)
+ *  │ │ ┌────────── hour (0-23)
+ *  │ │ │ ┌──────── day of month (1-31)
+ *  │ │ │ │ ┌────── month (1-12 or names)
+ *  │ │ │ │ │ ┌──── day of week (0-7 or names, 0 and 7 are Sunday)
+ *  │ │ │ │ │ │
+ *  * * * * * *
+ *
+ * Examples:
+ *   "0 9 * * 1-5"     - 9:00 AM, Monday through Friday
+ *   "0 0 * * *"       - Midnight every day
+ *   "*/15 * * * *"    - Every 15 minutes
+ *   "0 9,17 * * *"    - 9:00 AM and 5:00 PM daily
+ */
+export class CronTrigger extends BaseTrigger {
+	private task: cron.ScheduledTask | null = null
+	private nextRunTime?: Date
+
+	constructor(options: CronTriggerOptions) {
+		super(options)
+	}
+
+	get type(): string {
+		return "cron"
+	}
+
+	private get triggerConfig(): CronTriggerConfig {
+		return this.config as CronTriggerConfig
+	}
+
+	/**
+	 * Validate a cron expression
+	 */
+	static isValidCronExpression(expression: string): boolean {
+		return cron.validate(expression)
+	}
+
+	/**
+	 * Get a human-readable description of the schedule
+	 */
+	getScheduleDescription(): string {
+		const { schedule, timezone } = this.triggerConfig
+		return `Schedule: ${schedule} (${timezone || "UTC"})`
+	}
+
+	/**
+	 * Get the next scheduled run time
+	 */
+	getNextRunTime(): Date | undefined {
+		return this.nextRunTime
+	}
+
+	async start(): Promise<void> {
+		if (this.isRunning) {
+			return
+		}
+
+		const { schedule, timezone } = this.triggerConfig
+
+		// Validate the cron expression
+		if (!CronTrigger.isValidCronExpression(schedule)) {
+			throw new Error(`Invalid cron expression: ${schedule}`)
+		}
+
+		// Schedule the task
+		this.task = cron.schedule(
+			schedule,
+			() => {
+				this.handleCronTick()
+			},
+			{
+				scheduled: true,
+				timezone: timezone || "UTC",
+			}
+		)
+
+		// Calculate next run time
+		this.updateNextRunTime()
+
+		this.isRunning = true
+	}
+
+	async stop(): Promise<void> {
+		if (!this.isRunning) {
+			return
+		}
+
+		if (this.task) {
+			this.task.stop()
+			this.task = null
+		}
+
+		this.nextRunTime = undefined
+		this.isRunning = false
+	}
+
+	/**
+	 * Handle a cron tick (scheduled execution)
+	 */
+	private handleCronTick(): void {
+		const now = new Date()
+
+		this.emitTrigger({
+			scheduledTime: now.toISOString(),
+		})
+
+		// Update next run time after trigger
+		this.updateNextRunTime()
+	}
+
+	/**
+	 * Calculate and update the next run time based on the cron expression.
+	 * This is an approximation - for complex cron expressions, it iterates
+	 * through time to find the next matching slot.
+	 */
+	private updateNextRunTime(): void {
+		const { schedule } = this.triggerConfig
+
+		// Parse the cron expression to calculate next run
+		// node-cron doesn't expose a next() method, so we calculate manually
+		try {
+			this.nextRunTime = this.calculateNextRun(schedule)
+		} catch {
+			// If we can't calculate, leave undefined
+			this.nextRunTime = undefined
+		}
+	}
+
+	/**
+	 * Calculate the next run time for a cron expression.
+	 * Iterates minute by minute up to 1 year to find the next match.
+	 */
+	private calculateNextRun(cronExpression: string): Date | undefined {
+		const parts = cronExpression.trim().split(/\s+/)
+		if (parts.length < 5 || parts.length > 6) {
+			return undefined
+		}
+
+		const now = new Date()
+		const hasSeconds = parts.length === 6
+
+		// Parse cron fields
+		const fields = hasSeconds
+			? {
+					second: parts[0],
+					minute: parts[1],
+					hour: parts[2],
+					dayOfMonth: parts[3],
+					month: parts[4],
+					dayOfWeek: parts[5],
+				}
+			: {
+					second: "0",
+					minute: parts[0],
+					hour: parts[1],
+					dayOfMonth: parts[2],
+					month: parts[3],
+					dayOfWeek: parts[4],
+				}
+
+		// Start from the next minute
+		const candidate = new Date(now)
+		candidate.setMilliseconds(0)
+		candidate.setSeconds(hasSeconds ? 0 : 0)
+		candidate.setMinutes(candidate.getMinutes() + 1)
+
+		// Search up to 1 year ahead
+		const maxIterations = 525600 // minutes in a year
+		for (let i = 0; i < maxIterations; i++) {
+			if (this.matchesCronFields(candidate, fields)) {
+				return candidate
+			}
+			candidate.setMinutes(candidate.getMinutes() + 1)
+		}
+
+		return undefined
+	}
+
+	/**
+	 * Check if a date matches the cron fields
+	 */
+	private matchesCronFields(
+		date: Date,
+		fields: {
+			second: string
+			minute: string
+			hour: string
+			dayOfMonth: string
+			month: string
+			dayOfWeek: string
+		}
+	): boolean {
+		return (
+			this.matchesField(date.getMinutes(), fields.minute, 0, 59) &&
+			this.matchesField(date.getHours(), fields.hour, 0, 23) &&
+			this.matchesField(date.getDate(), fields.dayOfMonth, 1, 31) &&
+			this.matchesField(date.getMonth() + 1, fields.month, 1, 12) &&
+			this.matchesDayOfWeek(date.getDay(), fields.dayOfWeek)
+		)
+	}
+
+	/**
+	 * Check if a value matches a cron field expression
+	 */
+	private matchesField(value: number, field: string, min: number, max: number): boolean {
+		if (field === "*") {
+			return true
+		}
+
+		// Handle comma-separated values
+		const parts = field.split(",")
+		for (const part of parts) {
+			// Handle step values (e.g., */5)
+			if (part.includes("/")) {
+				const [range, step] = part.split("/")
+				const stepValue = parseInt(step, 10)
+				if (range === "*") {
+					if (value % stepValue === 0) return true
+				} else if (range.includes("-")) {
+					const [start, end] = range.split("-").map((s) => parseInt(s, 10))
+					if (value >= start && value <= end && (value - start) % stepValue === 0) return true
+				}
+			}
+			// Handle range values (e.g., 1-5)
+			else if (part.includes("-")) {
+				const [start, end] = part.split("-").map((s) => parseInt(s, 10))
+				if (value >= start && value <= end) return true
+			}
+			// Handle single values
+			else {
+				if (parseInt(part, 10) === value) return true
+			}
+		}
+
+		return false
+	}
+
+	/**
+	 * Check if a day of week matches the cron field
+	 * Note: Sunday can be 0 or 7 in cron
+	 */
+	private matchesDayOfWeek(dayOfWeek: number, field: string): boolean {
+		if (field === "*") {
+			return true
+		}
+
+		// Convert Sunday from 0 to 7 for consistency with some cron implementations
+		const normalizedField = field.replace(/7/g, "0")
+		return this.matchesField(dayOfWeek, normalizedField, 0, 6)
+	}
+}

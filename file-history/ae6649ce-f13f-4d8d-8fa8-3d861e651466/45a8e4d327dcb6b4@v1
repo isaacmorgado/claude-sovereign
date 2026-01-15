@@ -1,0 +1,368 @@
+import * as vscode from "vscode"
+import { BaseTrigger, BaseTriggerOptions } from "./BaseTrigger"
+import type { GitHookTrigger as GitHookTriggerConfig, GitHookType } from "@multi-agent/types"
+
+// VS Code Git extension API types
+interface GitExtension {
+	getAPI(version: 1): GitAPI
+}
+
+interface GitAPI {
+	repositories: Repository[]
+	onDidOpenRepository: vscode.Event<Repository>
+	onDidCloseRepository: vscode.Event<Repository>
+}
+
+interface Repository {
+	rootUri: vscode.Uri
+	state: RepositoryState
+	onDidChangeState: vscode.Event<void>
+}
+
+interface RepositoryState {
+	HEAD?: Branch
+	indexChanges: Change[]
+	workingTreeChanges: Change[]
+}
+
+interface Branch {
+	name?: string
+	commit?: string
+	upstream?: { name: string; remote: string }
+}
+
+interface Change {
+	uri: vscode.Uri
+	status: number
+}
+
+export interface GitHookTriggerOptions extends BaseTriggerOptions {
+	trigger: GitHookTriggerConfig
+}
+
+/**
+ * Git hook trigger implementation.
+ * Monitors git repository state changes and triggers automations based on git events.
+ *
+ * Supported hooks:
+ * - pre-commit: Triggered when files are staged (index changes)
+ * - post-commit: Triggered when HEAD commit changes
+ * - pre-push: Triggered when upstream ref changes are detected
+ * - post-checkout: Triggered when branch changes
+ * - post-merge: Triggered when HEAD changes after merge
+ * - branch-change: Triggered when current branch name changes
+ *
+ * Note: VS Code's git extension doesn't provide true pre-* hooks.
+ * We simulate them by detecting related state changes.
+ */
+export class GitHookTrigger extends BaseTrigger {
+	private gitAPI: GitAPI | null = null
+	private repository: Repository | null = null
+	private disposables: vscode.Disposable[] = []
+	private lastBranch?: string
+	private lastCommit?: string
+	private lastIndexChangeCount: number = 0
+	private debounceTimer?: NodeJS.Timeout
+	private readonly debounceMs = 300
+
+	constructor(options: GitHookTriggerOptions) {
+		super(options)
+	}
+
+	get type(): string {
+		return "git_hook"
+	}
+
+	private get triggerConfig(): GitHookTriggerConfig {
+		return this.config as GitHookTriggerConfig
+	}
+
+	async start(): Promise<void> {
+		if (this.isRunning) {
+			return
+		}
+
+		// Get the git extension
+		const gitExtension = vscode.extensions.getExtension<GitExtension>("vscode.git")
+		if (!gitExtension) {
+			throw new Error("Git extension not found. Please ensure the VS Code Git extension is installed.")
+		}
+
+		if (!gitExtension.isActive) {
+			await gitExtension.activate()
+		}
+
+		this.gitAPI = gitExtension.exports.getAPI(1)
+		if (!this.gitAPI) {
+			throw new Error("Failed to get Git API")
+		}
+
+		// Find the repository for our workspace
+		this.repository = this.findRepository()
+
+		if (this.repository) {
+			this.setupRepositoryListeners(this.repository)
+		}
+
+		// Listen for new repositories being opened
+		const openDisposable = this.gitAPI.onDidOpenRepository((repo) => {
+			if (this.isWorkspaceRepository(repo) && !this.repository) {
+				this.repository = repo
+				this.setupRepositoryListeners(repo)
+			}
+		})
+		this.disposables.push(openDisposable)
+
+		// Listen for repositories being closed
+		const closeDisposable = this.gitAPI.onDidCloseRepository((repo) => {
+			if (this.repository && repo.rootUri.fsPath === this.repository.rootUri.fsPath) {
+				this.repository = null
+			}
+		})
+		this.disposables.push(closeDisposable)
+
+		this.isRunning = true
+	}
+
+	async stop(): Promise<void> {
+		if (!this.isRunning) {
+			return
+		}
+
+		// Clear debounce timer
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer)
+			this.debounceTimer = undefined
+		}
+
+		// Dispose all listeners
+		for (const disposable of this.disposables) {
+			disposable.dispose()
+		}
+		this.disposables = []
+
+		this.gitAPI = null
+		this.repository = null
+		this.lastBranch = undefined
+		this.lastCommit = undefined
+		this.lastIndexChangeCount = 0
+
+		this.isRunning = false
+	}
+
+	/**
+	 * Find the repository that matches our workspace path
+	 */
+	private findRepository(): Repository | null {
+		if (!this.gitAPI) {
+			return null
+		}
+
+		for (const repo of this.gitAPI.repositories) {
+			if (this.isWorkspaceRepository(repo)) {
+				return repo
+			}
+		}
+
+		return null
+	}
+
+	/**
+	 * Check if a repository is within our workspace
+	 */
+	private isWorkspaceRepository(repo: Repository): boolean {
+		const repoPath = repo.rootUri.fsPath
+		return (
+			this.workspacePath.startsWith(repoPath) ||
+			repoPath.startsWith(this.workspacePath) ||
+			this.workspacePath === repoPath
+		)
+	}
+
+	/**
+	 * Set up listeners for repository state changes
+	 */
+	private setupRepositoryListeners(repo: Repository): void {
+		// Store initial state
+		this.lastBranch = repo.state.HEAD?.name
+		this.lastCommit = repo.state.HEAD?.commit
+		this.lastIndexChangeCount = repo.state.indexChanges.length
+
+		// Listen for state changes
+		const stateDisposable = repo.onDidChangeState(() => {
+			this.handleStateChange(repo)
+		})
+		this.disposables.push(stateDisposable)
+	}
+
+	/**
+	 * Handle repository state changes with debouncing
+	 */
+	private handleStateChange(repo: Repository): void {
+		// Debounce rapid state changes
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer)
+		}
+
+		this.debounceTimer = setTimeout(() => {
+			this.processStateChange(repo)
+		}, this.debounceMs)
+	}
+
+	/**
+	 * Process a repository state change
+	 */
+	private processStateChange(repo: Repository): void {
+		const state = repo.state
+		const currentBranch = state.HEAD?.name
+		const currentCommit = state.HEAD?.commit
+		const currentIndexCount = state.indexChanges.length
+
+		const hookType = this.triggerConfig.hook
+
+		// Check branch filter
+		if (!this.matchesBranchFilter(currentBranch)) {
+			// Update state even if filtered out
+			this.lastBranch = currentBranch
+			this.lastCommit = currentCommit
+			this.lastIndexChangeCount = currentIndexCount
+			return
+		}
+
+		let shouldTrigger = false
+		let eventType: GitHookType | null = null
+
+		switch (hookType) {
+			case "branch-change":
+			case "post-checkout":
+				// Branch name changed
+				if (currentBranch !== this.lastBranch) {
+					shouldTrigger = true
+					eventType = hookType
+				}
+				break
+
+			case "post-commit":
+				// Commit hash changed (new commit)
+				if (currentCommit && currentCommit !== this.lastCommit && this.lastCommit !== undefined) {
+					shouldTrigger = true
+					eventType = "post-commit"
+				}
+				break
+
+			case "post-merge":
+				// Commit changed and we're on same branch (likely a merge)
+				if (
+					currentCommit !== this.lastCommit &&
+					currentBranch === this.lastBranch &&
+					this.lastCommit !== undefined
+				) {
+					shouldTrigger = true
+					eventType = "post-merge"
+				}
+				break
+
+			case "pre-commit":
+				// Files staged (index changed) - proxy for "about to commit"
+				if (currentIndexCount > this.lastIndexChangeCount) {
+					shouldTrigger = true
+					eventType = "pre-commit"
+				}
+				break
+
+			case "pre-push":
+				// Detect when there are commits ahead of upstream
+				// This is a proxy - we trigger when we detect unpushed commits
+				if (this.hasUnpushedCommits(state)) {
+					shouldTrigger = true
+					eventType = "pre-push"
+				}
+				break
+		}
+
+		// Update state
+		this.lastBranch = currentBranch
+		this.lastCommit = currentCommit
+		this.lastIndexChangeCount = currentIndexCount
+
+		// Emit trigger if conditions met
+		if (shouldTrigger && eventType) {
+			this.emitTrigger({
+				branch: currentBranch,
+				commit: currentCommit,
+			})
+		}
+	}
+
+	/**
+	 * Check if current branch matches the branch filter (if configured)
+	 */
+	private matchesBranchFilter(branchName?: string): boolean {
+		const { branches } = this.triggerConfig
+
+		// No filter means match all branches
+		if (!branches || branches.length === 0) {
+			return true
+		}
+
+		if (!branchName) {
+			return false
+		}
+
+		// Check if branch matches any of the patterns
+		for (const pattern of branches) {
+			if (this.matchesBranchPattern(branchName, pattern)) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	/**
+	 * Match a branch name against a pattern (supports * and ** wildcards)
+	 */
+	private matchesBranchPattern(branchName: string, pattern: string): boolean {
+		// Exact match
+		if (pattern === branchName) {
+			return true
+		}
+
+		// Convert glob pattern to regex
+		const regexPattern = pattern
+			.replace(/[.+^${}()|[\]\\]/g, "\\$&") // Escape special regex chars
+			.replace(/\*\*/g, ".*") // ** matches anything
+			.replace(/\*/g, "[^/]*") // * matches anything except /
+
+		const regex = new RegExp(`^${regexPattern}$`)
+		return regex.test(branchName)
+	}
+
+	/**
+	 * Check if there are unpushed commits
+	 * This is a heuristic - we check if HEAD differs from upstream
+	 */
+	private hasUnpushedCommits(state: RepositoryState): boolean {
+		// If no upstream tracking, we can't determine
+		if (!state.HEAD?.upstream) {
+			return false
+		}
+
+		// We'd need the upstream commit hash to compare
+		// Since VS Code API doesn't expose this directly,
+		// we use the existence of an upstream as a proxy
+		return true
+	}
+
+	/**
+	 * Get a description of what this trigger watches for
+	 */
+	getDescription(): string {
+		const { hook, branches } = this.triggerConfig
+		let desc = `Git ${hook}`
+		if (branches && branches.length > 0) {
+			desc += ` on branches: ${branches.join(", ")}`
+		}
+		return desc
+	}
+}

@@ -1,0 +1,575 @@
+// Web Snatcher - Content Script
+// Handles element selection, DOM extraction, and JavaScript capture
+
+(function() {
+  'use strict';
+
+  // Prevent double initialization
+  if (window.__webSnatcherInitialized) return;
+  window.__webSnatcherInitialized = true;
+
+  // State
+  let isSelecting = false;
+  let currentSettings = {};
+  let highlightOverlay = null;
+  let infoBox = null;
+
+  // ============================================
+  // ELEMENT SELECTION UI
+  // ============================================
+
+  function createOverlay() {
+    highlightOverlay = document.createElement('div');
+    highlightOverlay.id = 'web-snatcher-overlay';
+    document.body.appendChild(highlightOverlay);
+
+    infoBox = document.createElement('div');
+    infoBox.id = 'web-snatcher-info';
+    document.body.appendChild(infoBox);
+  }
+
+  function removeOverlay() {
+    highlightOverlay?.remove();
+    infoBox?.remove();
+    highlightOverlay = null;
+    infoBox = null;
+  }
+
+  function updateHighlight(element) {
+    if (!highlightOverlay || !element) return;
+
+    const rect = element.getBoundingClientRect();
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+
+    highlightOverlay.style.cssText = `
+      position: absolute;
+      top: ${rect.top + scrollY}px;
+      left: ${rect.left + scrollX}px;
+      width: ${rect.width}px;
+      height: ${rect.height}px;
+      pointer-events: none;
+      z-index: 2147483646;
+    `;
+
+    // Update info box
+    const tagName = element.tagName.toLowerCase();
+    const id = element.id ? `#${element.id}` : '';
+    const classes = element.className && typeof element.className === 'string'
+      ? '.' + element.className.trim().split(/\s+/).slice(0, 3).join('.')
+      : '';
+
+    infoBox.textContent = `${tagName}${id}${classes}`;
+    infoBox.style.cssText = `
+      position: absolute;
+      top: ${Math.max(0, rect.top + scrollY - 28)}px;
+      left: ${rect.left + scrollX}px;
+      z-index: 2147483647;
+    `;
+  }
+
+  // ============================================
+  // EVENT HANDLERS FOR SELECTION
+  // ============================================
+
+  let hoveredElement = null;
+
+  function handleMouseMove(e) {
+    if (!isSelecting) return;
+
+    const target = e.target;
+    if (target === highlightOverlay || target === infoBox) return;
+    if (target.id?.startsWith('web-snatcher')) return;
+
+    hoveredElement = target;
+    updateHighlight(target);
+  }
+
+  function handleClick(e) {
+    if (!isSelecting) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (hoveredElement) {
+      captureElement(hoveredElement);
+    }
+
+    stopSelection();
+  }
+
+  function handleKeydown(e) {
+    if (e.key === 'Escape' && isSelecting) {
+      stopSelection();
+      showToast('Selection cancelled', 'info');
+    }
+  }
+
+  function startSelection(settings) {
+    currentSettings = settings;
+    isSelecting = true;
+
+    createOverlay();
+
+    document.addEventListener('mousemove', handleMouseMove, true);
+    document.addEventListener('click', handleClick, true);
+    document.addEventListener('keydown', handleKeydown, true);
+
+    document.body.style.cursor = 'crosshair';
+    showToast('Click an element to capture', 'info');
+  }
+
+  function stopSelection() {
+    isSelecting = false;
+    hoveredElement = null;
+
+    document.removeEventListener('mousemove', handleMouseMove, true);
+    document.removeEventListener('click', handleClick, true);
+    document.removeEventListener('keydown', handleKeydown, true);
+
+    document.body.style.cursor = '';
+    removeOverlay();
+  }
+
+  // ============================================
+  // STYLE EXTRACTION
+  // ============================================
+
+  function getComputedStylesAsString(element) {
+    const computed = window.getComputedStyle(element);
+    const styles = [];
+
+    // Important properties to capture
+    const importantProps = [
+      'display', 'position', 'top', 'right', 'bottom', 'left',
+      'width', 'height', 'min-width', 'max-width', 'min-height', 'max-height',
+      'margin', 'padding', 'border', 'border-radius',
+      'background', 'background-color', 'background-image',
+      'color', 'font-family', 'font-size', 'font-weight', 'line-height',
+      'text-align', 'text-decoration', 'letter-spacing',
+      'flex', 'flex-direction', 'justify-content', 'align-items', 'gap',
+      'grid', 'grid-template-columns', 'grid-template-rows',
+      'overflow', 'opacity', 'visibility', 'z-index',
+      'transform', 'transition', 'animation',
+      'box-shadow', 'text-shadow', 'filter',
+      'cursor', 'pointer-events'
+    ];
+
+    for (const prop of importantProps) {
+      const value = computed.getPropertyValue(prop);
+      if (value && value !== 'none' && value !== 'normal' && value !== 'auto') {
+        styles.push(`${prop}: ${value}`);
+      }
+    }
+
+    return styles.join('; ');
+  }
+
+  function extractStylesRecursive(element, depth = 0, maxDepth = 10) {
+    if (depth > maxDepth) return;
+
+    const computed = getComputedStylesAsString(element);
+    if (computed) {
+      element.setAttribute('style', computed);
+    }
+
+    for (const child of element.children) {
+      extractStylesRecursive(child, depth + 1, maxDepth);
+    }
+  }
+
+  // ============================================
+  // JAVASCRIPT EXTRACTION
+  // ============================================
+
+  function extractEventListeners(element) {
+    const listeners = [];
+
+    // Try to get event listeners via getEventListeners (Chrome DevTools only)
+    // In content script context, we can't access this directly
+    // Instead, we capture inline handlers and look for common patterns
+
+    // Capture inline event handlers
+    const attrs = element.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      if (attr.name.startsWith('on')) {
+        listeners.push({
+          type: attr.name.slice(2),
+          handler: attr.value,
+          inline: true
+        });
+      }
+    }
+
+    // Check for data attributes that might indicate JS behavior
+    const dataAttrs = [];
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      if (attr.name.startsWith('data-')) {
+        dataAttrs.push({ name: attr.name, value: attr.value });
+      }
+    }
+
+    return { listeners, dataAttrs };
+  }
+
+  function findRelatedScripts(element) {
+    const scripts = [];
+    const elementId = element.id;
+    const elementClasses = element.className?.split?.(/\s+/) || [];
+
+    // Find all script tags on the page
+    document.querySelectorAll('script').forEach(script => {
+      const content = script.textContent || '';
+
+      // Check if script references this element
+      if (elementId && content.includes(`#${elementId}`)) {
+        scripts.push({
+          type: 'inline',
+          reason: `References #${elementId}`,
+          content: content.slice(0, 500) + (content.length > 500 ? '...' : '')
+        });
+      }
+
+      for (const cls of elementClasses) {
+        if (cls && content.includes(`.${cls}`)) {
+          scripts.push({
+            type: 'inline',
+            reason: `References .${cls}`,
+            content: content.slice(0, 500) + (content.length > 500 ? '...' : '')
+          });
+          break;
+        }
+      }
+
+      // Capture script src for external scripts
+      if (script.src) {
+        scripts.push({
+          type: 'external',
+          src: script.src
+        });
+      }
+    });
+
+    return scripts;
+  }
+
+  // ============================================
+  // ASSET EXTRACTION
+  // ============================================
+
+  function extractAssets(element) {
+    const assets = {
+      images: [],
+      stylesheets: [],
+      fonts: [],
+      scripts: []
+    };
+
+    // Images
+    element.querySelectorAll('img').forEach(img => {
+      if (img.src) assets.images.push(img.src);
+    });
+
+    // Background images from computed styles
+    const walkForBackgrounds = (el) => {
+      const bg = window.getComputedStyle(el).backgroundImage;
+      if (bg && bg !== 'none') {
+        const matches = bg.match(/url\(['"]?([^'"]+)['"]?\)/g);
+        if (matches) {
+          matches.forEach(m => {
+            const url = m.replace(/url\(['"]?/, '').replace(/['"]?\)/, '');
+            if (url.startsWith('http')) assets.images.push(url);
+          });
+        }
+      }
+      for (const child of el.children) {
+        walkForBackgrounds(child);
+      }
+    };
+    walkForBackgrounds(element);
+
+    // Stylesheets
+    document.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+      if (link.href) assets.stylesheets.push(link.href);
+    });
+
+    // Fonts from stylesheets (basic detection)
+    const fontFamilies = new Set();
+    const walkForFonts = (el) => {
+      const font = window.getComputedStyle(el).fontFamily;
+      if (font) {
+        font.split(',').forEach(f => {
+          const cleaned = f.trim().replace(/['"]/g, '');
+          if (!['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui'].includes(cleaned)) {
+            fontFamilies.add(cleaned);
+          }
+        });
+      }
+      for (const child of el.children) {
+        walkForFonts(child);
+      }
+    };
+    walkForFonts(element);
+    assets.fonts = Array.from(fontFamilies);
+
+    return assets;
+  }
+
+  // ============================================
+  // ELEMENT CAPTURE
+  // ============================================
+
+  async function captureElement(element) {
+    showToast('Capturing element...', 'info');
+
+    try {
+      // Clone the element
+      const clone = element.cloneNode(true);
+
+      // Apply inline styles if requested
+      if (currentSettings.inlineStyles) {
+        extractStylesRecursive(clone);
+      }
+
+      // Get the HTML
+      const html = clone.outerHTML;
+
+      // Extract JavaScript info if requested
+      let jsInfo = null;
+      if (currentSettings.includeJs) {
+        const eventInfo = extractEventListeners(element);
+        const relatedScripts = findRelatedScripts(element);
+        jsInfo = { events: eventInfo, scripts: relatedScripts };
+      }
+
+      // Extract assets if requested
+      let assets = null;
+      if (currentSettings.downloadAssets) {
+        assets = extractAssets(element);
+      }
+
+      // Build metadata
+      const metadata = {
+        url: window.location.href,
+        title: document.title,
+        selector: generateSelector(element),
+        capturedAt: new Date().toISOString(),
+        dimensions: {
+          width: element.offsetWidth,
+          height: element.offsetHeight
+        }
+      };
+
+      // Send to background for download
+      const response = await chrome.runtime.sendMessage({
+        action: 'downloadCapture',
+        data: {
+          type: 'element',
+          html,
+          jsInfo,
+          assets,
+          metadata
+        }
+      });
+
+      if (response.success) {
+        showToast('Element captured!', 'success');
+      } else {
+        throw new Error(response.error);
+      }
+
+    } catch (error) {
+      console.error('Capture error:', error);
+      showToast('Capture failed: ' + error.message, 'error');
+    }
+  }
+
+  // ============================================
+  // FULL PAGE CAPTURE
+  // ============================================
+
+  async function captureFullPage(settings) {
+    currentSettings = settings;
+    showToast('Capturing full page...', 'info');
+
+    try {
+      // Clone the entire document
+      const clone = document.documentElement.cloneNode(true);
+
+      // Remove our extension elements
+      clone.querySelectorAll('[id^="web-snatcher"]').forEach(el => el.remove());
+
+      // Apply inline styles if requested
+      if (settings.inlineStyles) {
+        extractStylesRecursive(clone, 0, 20);
+      }
+
+      // Get all stylesheets content
+      const stylesheets = [];
+      for (const sheet of document.styleSheets) {
+        try {
+          if (sheet.cssRules) {
+            let css = '';
+            for (const rule of sheet.cssRules) {
+              css += rule.cssText + '\n';
+            }
+            stylesheets.push({
+              href: sheet.href,
+              content: css
+            });
+          }
+        } catch (e) {
+          // Cross-origin stylesheet, just save the href
+          if (sheet.href) {
+            stylesheets.push({ href: sheet.href });
+          }
+        }
+      }
+
+      // Get all scripts
+      const scripts = [];
+      if (settings.includeJs) {
+        document.querySelectorAll('script').forEach(script => {
+          scripts.push({
+            src: script.src || null,
+            content: script.textContent || null,
+            type: script.type || 'text/javascript'
+          });
+        });
+      }
+
+      // Extract assets
+      let assets = null;
+      if (settings.downloadAssets) {
+        assets = extractAssets(document.body);
+      }
+
+      // Build metadata
+      const metadata = {
+        url: window.location.href,
+        title: document.title,
+        capturedAt: new Date().toISOString(),
+        dimensions: {
+          width: document.documentElement.scrollWidth,
+          height: document.documentElement.scrollHeight
+        }
+      };
+
+      // Prepare the HTML with embedded styles
+      let fullHtml = '<!DOCTYPE html>\n' + clone.outerHTML;
+
+      // Send to background for download
+      const response = await chrome.runtime.sendMessage({
+        action: 'downloadCapture',
+        data: {
+          type: 'fullPage',
+          html: fullHtml,
+          stylesheets,
+          scripts,
+          assets,
+          metadata
+        }
+      });
+
+      if (response.success) {
+        showToast(`Page captured! ${response.fileCount || ''} files`, 'success');
+        return { success: true, fileCount: response.fileCount };
+      } else {
+        throw new Error(response.error);
+      }
+
+    } catch (error) {
+      console.error('Full page capture error:', error);
+      showToast('Capture failed: ' + error.message, 'error');
+      return { success: false, error: error.message };
+    }
+  }
+
+  // ============================================
+  // UTILITIES
+  // ============================================
+
+  function generateSelector(element) {
+    if (element.id) {
+      return `#${element.id}`;
+    }
+
+    const path = [];
+    let current = element;
+
+    while (current && current !== document.body) {
+      let selector = current.tagName.toLowerCase();
+
+      if (current.className && typeof current.className === 'string') {
+        const classes = current.className.trim().split(/\s+/).slice(0, 2);
+        if (classes.length) {
+          selector += '.' + classes.join('.');
+        }
+      }
+
+      // Add nth-child if needed
+      const parent = current.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(
+          c => c.tagName === current.tagName
+        );
+        if (siblings.length > 1) {
+          const index = siblings.indexOf(current) + 1;
+          selector += `:nth-of-type(${index})`;
+        }
+      }
+
+      path.unshift(selector);
+      current = current.parentElement;
+    }
+
+    return path.join(' > ');
+  }
+
+  function showToast(message, type = 'info') {
+    // Remove existing toast
+    document.getElementById('web-snatcher-toast')?.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'web-snatcher-toast';
+    toast.className = `web-snatcher-toast ${type}`;
+    toast.innerHTML = `
+      <span class="icon">${type === 'success' ? '&#10003;' : type === 'error' ? '&#10007;' : '&#9432;'}</span>
+      <span class="message">${message}</span>
+    `;
+
+    document.body.appendChild(toast);
+
+    // Animate in
+    requestAnimationFrame(() => {
+      toast.classList.add('show');
+    });
+
+    // Remove after delay
+    setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 300);
+    }, 3000);
+  }
+
+  // ============================================
+  // MESSAGE HANDLERS
+  // ============================================
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.action === 'startElementSelection') {
+      startSelection(message.settings);
+      sendResponse({ success: true });
+    } else if (message.action === 'captureFullPage') {
+      captureFullPage(message.settings).then(result => {
+        sendResponse(result);
+      });
+      return true; // Keep channel open for async response
+    }
+  });
+
+  console.log('Web Snatcher content script loaded');
+
+})();

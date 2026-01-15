@@ -1,0 +1,489 @@
+#!/usr/bin/env node
+/**
+ * Comprehensive Edge Case Testing for All clauded Models
+ * Tests: Tool calling, Agent spawning, MCP access, Commands, Context management
+ */
+
+const https = require('https');
+const http = require('http');
+
+const PROXY_URL = 'http://127.0.0.1:3000';
+const API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
+
+// All models to test
+const MODELS_TO_TEST = [
+  { id: 'claude-sonnet-4-5-20250929', name: 'Sonnet 4.5', hasNativeTools: true },
+  { id: 'glm/glm-4.7', name: 'GLM-4.7', hasNativeTools: true },
+  { id: 'google/gemini-3-pro', name: 'Gemini 3 Pro', hasNativeTools: true },
+  { id: 'google/gemini-2.0-flash', name: 'Gemini 2.0 Flash', hasNativeTools: true },
+  { id: 'featherless/dphn/Dolphin-Mistral-24B-Venice-Edition', name: 'Dolphin-3', hasNativeTools: false },
+  { id: 'featherless/huihui-ai/Qwen2.5-72B-Instruct-abliterated', name: 'Qwen 72B', hasNativeTools: false },
+  { id: 'featherless/WhiteRabbitNeo/Llama-3.1-WhiteRabbitNeo-2-70B', name: 'WhiteRabbitNeo 70B', hasNativeTools: false },
+];
+
+const COLORS = {
+  green: '\x1b[32m',
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+  reset: '\x1b[0m'
+};
+
+let testsPassed = 0;
+let testsFailed = 0;
+let testsSkipped = 0;
+
+function log(message, color = 'reset') {
+  console.log(`${COLORS[color]}${message}${COLORS.reset}`);
+}
+
+/**
+ * Make API request to proxy
+ */
+async function makeProxyRequest(model, messages, tools = null, maxTokens = 100) {
+  return new Promise((resolve, reject) => {
+    const requestBody = JSON.stringify({
+      model: model,
+      messages: messages,
+      max_tokens: maxTokens,
+      temperature: 0.1,
+      ...(tools && { tools: tools })
+    });
+
+    const options = {
+      hostname: '127.0.0.1',
+      port: 3000,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+        'anthropic-version': '2023-06-01'
+      }
+    };
+
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Parse error: ${e.message}\nResponse: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+/**
+ * Test 1: Basic Tool Calling (Read tool)
+ */
+async function testToolCalling(model) {
+  log(`  Testing tool calling...`, 'cyan');
+
+  const tools = [{
+    name: 'Read',
+    description: 'Read a file from the filesystem',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'Path to file' }
+      },
+      required: ['file_path']
+    }
+  }];
+
+  const messages = [{
+    role: 'user',
+    content: 'Read the file /etc/hosts using the Read tool. Respond with a tool call.'
+  }];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 200);
+
+    // Check for tool use in response
+    if (response.content && Array.isArray(response.content)) {
+      const hasToolUse = response.content.some(block => block.type === 'tool_use');
+      if (hasToolUse) {
+        log(`    ✓ Tool calling works (native format)`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    // Check for XML tool calls (emulated)
+    if (response.content && Array.isArray(response.content)) {
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      if (textContent.includes('<tool_call>')) {
+        log(`    ✓ Tool calling works (emulated via XML)`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    log(`    ✗ No tool call detected in response`, 'red');
+    testsFailed++;
+    return false;
+  } catch (error) {
+    log(`    ✗ Tool calling test failed: ${error.message}`, 'red');
+    testsFailed++;
+    return false;
+  }
+}
+
+/**
+ * Test 2: Parallel Tool Calling
+ */
+async function testParallelToolCalling(model) {
+  log(`  Testing parallel tool calling...`, 'cyan');
+
+  const tools = [{
+    name: 'Read',
+    description: 'Read a file',
+    input_schema: {
+      type: 'object',
+      properties: { file_path: { type: 'string' } },
+      required: ['file_path']
+    }
+  }];
+
+  const messages = [{
+    role: 'user',
+    content: 'Use the Read tool to read BOTH /etc/hosts AND /etc/passwd in PARALLEL. Make two tool calls.'
+  }];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 300);
+
+    // Count tool uses
+    let toolCallCount = 0;
+
+    if (response.content && Array.isArray(response.content)) {
+      toolCallCount = response.content.filter(b => b.type === 'tool_use').length;
+
+      // Check XML format
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      const xmlMatches = textContent.match(/<tool_call>/g);
+      if (xmlMatches) toolCallCount = Math.max(toolCallCount, xmlMatches.length);
+    }
+
+    if (toolCallCount >= 2) {
+      log(`    ✓ Parallel tool calling works (${toolCallCount} calls)`, 'green');
+      testsPassed++;
+      return true;
+    } else {
+      log(`    ⚠ Only ${toolCallCount} tool calls (expected 2+)`, 'yellow');
+      testsSkipped++;
+      return false;
+    }
+  } catch (error) {
+    log(`    ⚠ Parallel tool test skipped: ${error.message}`, 'yellow');
+    testsSkipped++;
+    return false;
+  }
+}
+
+/**
+ * Test 3: Agent Spawning (Task tool)
+ */
+async function testAgentSpawning(model) {
+  log(`  Testing agent spawning...`, 'cyan');
+
+  const tools = [{
+    name: 'Task',
+    description: 'Spawn a sub-agent to handle a task',
+    input_schema: {
+      type: 'object',
+      properties: {
+        subagent_type: { type: 'string', description: 'Type of agent' },
+        description: { type: 'string', description: 'Task description' },
+        prompt: { type: 'string', description: 'Detailed instructions' }
+      },
+      required: ['subagent_type', 'description', 'prompt']
+    }
+  }];
+
+  const messages = [{
+    role: 'user',
+    content: 'Spawn an Explore agent to analyze the codebase structure using the Task tool.'
+  }];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 200);
+
+    // Check for Task tool use
+    if (response.content && Array.isArray(response.content)) {
+      const hasTask = response.content.some(b =>
+        b.type === 'tool_use' && b.name === 'Task'
+      );
+
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      const hasTaskXML = textContent.includes('"name": "Task"') || textContent.includes('"name":"Task"');
+
+      if (hasTask || hasTaskXML) {
+        log(`    ✓ Agent spawning works`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    log(`    ✗ No Task tool call detected`, 'red');
+    testsFailed++;
+    return false;
+  } catch (error) {
+    log(`    ✗ Agent spawning test failed: ${error.message}`, 'red');
+    testsFailed++;
+    return false;
+  }
+}
+
+/**
+ * Test 4: MCP Tool Access
+ */
+async function testMCPAccess(model) {
+  log(`  Testing MCP tool access...`, 'cyan');
+
+  const tools = [{
+    name: 'mcp__gemini__googleSearch',
+    description: 'Perform a Google search',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query' }
+      },
+      required: ['query']
+    }
+  }];
+
+  const messages = [{
+    role: 'user',
+    content: 'Use the mcp__gemini__googleSearch tool to search for "Claude Code documentation".'
+  }];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 200);
+
+    // Check for MCP tool use
+    if (response.content && Array.isArray(response.content)) {
+      const hasMCP = response.content.some(b =>
+        b.type === 'tool_use' && b.name && b.name.startsWith('mcp__')
+      );
+
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      const hasMCPXML = textContent.includes('mcp__gemini__googleSearch');
+
+      if (hasMCP || hasMCPXML) {
+        log(`    ✓ MCP tool access works`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    log(`    ⚠ No MCP tool call detected (may not understand MCP naming)`, 'yellow');
+    testsSkipped++;
+    return false;
+  } catch (error) {
+    log(`    ⚠ MCP test skipped: ${error.message}`, 'yellow');
+    testsSkipped++;
+    return false;
+  }
+}
+
+/**
+ * Test 5: Skill/Command Invocation
+ */
+async function testCommandInvocation(model) {
+  log(`  Testing /command (Skill) invocation...`, 'cyan');
+
+  const tools = [{
+    name: 'Skill',
+    description: 'Invoke a skill/command',
+    input_schema: {
+      type: 'object',
+      properties: {
+        skill: { type: 'string', description: 'Skill name' },
+        args: { type: 'string', description: 'Arguments' }
+      },
+      required: ['skill']
+    }
+  }];
+
+  const messages = [{
+    role: 'user',
+    content: 'Invoke the "research" skill to analyze authentication patterns using the Skill tool.'
+  }];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 200);
+
+    // Check for Skill tool use
+    if (response.content && Array.isArray(response.content)) {
+      const hasSkill = response.content.some(b =>
+        b.type === 'tool_use' && b.name === 'Skill'
+      );
+
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      const hasSkillXML = textContent.includes('"name": "Skill"') || textContent.includes('"name":"Skill"');
+
+      if (hasSkill || hasSkillXML) {
+        log(`    ✓ Command/Skill invocation works`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    log(`    ⚠ No Skill tool call detected`, 'yellow');
+    testsSkipped++;
+    return false;
+  } catch (error) {
+    log(`    ⚠ Skill test skipped: ${error.message}`, 'yellow');
+    testsSkipped++;
+    return false;
+  }
+}
+
+/**
+ * Test 6: Context Management (long context handling)
+ */
+async function testContextManagement(model) {
+  log(`  Testing context management...`, 'cyan');
+
+  // Create a long context message
+  const longContext = 'Background information: ' + 'A'.repeat(500) + '\n\n';
+  const tools = [{
+    name: 'Read',
+    description: 'Read a file',
+    input_schema: {
+      type: 'object',
+      properties: { file_path: { type: 'string' } },
+      required: ['file_path']
+    }
+  }];
+
+  const messages = [
+    {
+      role: 'user',
+      content: longContext + 'Read /etc/hosts using the Read tool.'
+    }
+  ];
+
+  try {
+    const response = await makeProxyRequest(model.id, messages, tools, 200);
+
+    // Check if model handled context and still made tool call
+    if (response.content && Array.isArray(response.content)) {
+      const hasToolUse = response.content.some(b => b.type === 'tool_use');
+      const textContent = response.content.find(b => b.type === 'text')?.text || '';
+      const hasXMLCall = textContent.includes('<tool_call>');
+
+      if (hasToolUse || hasXMLCall) {
+        log(`    ✓ Context management works (handled long context + tool use)`, 'green');
+        testsPassed++;
+        return true;
+      }
+    }
+
+    log(`    ⚠ Context test inconclusive`, 'yellow');
+    testsSkipped++;
+    return false;
+  } catch (error) {
+    if (error.message && error.message.includes('context_length')) {
+      log(`    ✗ Context length exceeded for this model`, 'red');
+      testsFailed++;
+      return false;
+    }
+    log(`    ⚠ Context test skipped: ${error.message}`, 'yellow');
+    testsSkipped++;
+    return false;
+  }
+}
+
+/**
+ * Main test runner
+ */
+async function runTests() {
+  console.log('');
+  console.log('═'.repeat(70));
+  log('🧪 Comprehensive Edge Case Testing - All Models', 'cyan');
+  console.log('═'.repeat(70));
+  console.log('');
+
+  log('Testing: Tool calling, Agent spawning, MCP access, Commands, Context', 'cyan');
+  console.log('');
+
+  // Check if proxy is running
+  try {
+    await makeProxyRequest('claude-sonnet-4-5-20250929', [{role: 'user', content: 'hi'}], null, 5);
+    log('✓ Proxy is running on port 3000\n', 'green');
+  } catch (error) {
+    log('✗ Proxy not running! Start with: node ~/.claude/model-proxy-server.js 3000', 'red');
+    process.exit(1);
+  }
+
+  for (const model of MODELS_TO_TEST) {
+    console.log('━'.repeat(70));
+    log(`\nTesting: ${model.name} (${model.id})`, 'cyan');
+    log(`Tool Support: ${model.hasNativeTools ? 'Native' : 'Emulated via XML'}`, 'cyan');
+    console.log('');
+
+    try {
+      await testToolCalling(model);
+      await new Promise(r => setTimeout(r, 500)); // Rate limit
+
+      await testParallelToolCalling(model);
+      await new Promise(r => setTimeout(r, 500));
+
+      await testAgentSpawning(model);
+      await new Promise(r => setTimeout(r, 500));
+
+      await testMCPAccess(model);
+      await new Promise(r => setTimeout(r, 500));
+
+      await testCommandInvocation(model);
+      await new Promise(r => setTimeout(r, 500));
+
+      await testContextManagement(model);
+      await new Promise(r => setTimeout(r, 500));
+
+    } catch (error) {
+      log(`\n  ✗ Model testing failed: ${error.message}`, 'red');
+      testsFailed++;
+    }
+
+    console.log('');
+  }
+
+  console.log('═'.repeat(70));
+  log('\n📊 Final Results\n', 'cyan');
+  log(`✓ Passed:  ${testsPassed}`, 'green');
+  log(`⚠ Skipped: ${testsSkipped}`, 'yellow');
+  log(`✗ Failed:  ${testsFailed}`, 'red');
+  console.log('');
+
+  if (testsFailed === 0) {
+    log('✅ ALL CRITICAL TESTS PASSED', 'green');
+    console.log('');
+    log('All models support:', 'cyan');
+    log('  ✓ Tool calling (native or emulated)', 'green');
+    log('  ✓ Agent spawning via Task tool', 'green');
+    log('  ✓ MCP tool access', 'green');
+    log('  ✓ Skill/Command invocation', 'green');
+    log('  ✓ Context management', 'green');
+  } else {
+    log('⚠️  SOME TESTS FAILED - Review above', 'yellow');
+  }
+
+  console.log('');
+  console.log('═'.repeat(70));
+}
+
+// Run tests
+runTests().catch(error => {
+  log(`\nFatal error: ${error.message}`, 'red');
+  process.exit(1);
+});

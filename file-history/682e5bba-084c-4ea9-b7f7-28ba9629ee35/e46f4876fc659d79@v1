@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+
+/**
+ * Post-Processor - Beautify and deobfuscate captured JS/CSS using the reverse-engineer tools
+ */
+
+const fs = require('fs').promises;
+const path = require('path');
+const { execSync, exec } = require('child_process');
+
+class PostProcessor {
+  constructor(outputDir) {
+    this.outputDir = outputDir;
+    this.toolsDir = path.join(__dirname, '..', '..');  // Parent of website-cloner
+    this.results = {
+      beautified: [],
+      deobfuscated: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Check if a tool is available
+   */
+  async checkTool(toolPath) {
+    try {
+      await fs.access(toolPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Beautify JavaScript files using js-beautify
+   */
+  async beautifyJs(filePath) {
+    const jsBeautifyDir = path.join(this.toolsDir, 'js-beautify');
+
+    if (!(await this.checkTool(jsBeautifyDir))) {
+      console.log('js-beautify not found, skipping beautification');
+      return null;
+    }
+
+    try {
+      const outputPath = filePath.replace('.js', '.beautified.js');
+      execSync(`cd "${jsBeautifyDir}" && npx js-beautify "${filePath}" -o "${outputPath}"`, {
+        stdio: 'pipe'
+      });
+
+      this.results.beautified.push(filePath);
+      return outputPath;
+    } catch (error) {
+      this.results.errors.push({ file: filePath, error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Beautify CSS files
+   */
+  async beautifyCss(filePath) {
+    const jsBeautifyDir = path.join(this.toolsDir, 'js-beautify');
+
+    if (!(await this.checkTool(jsBeautifyDir))) {
+      return null;
+    }
+
+    try {
+      const outputPath = filePath.replace('.css', '.beautified.css');
+      execSync(`cd "${jsBeautifyDir}" && npx css-beautify "${filePath}" -o "${outputPath}"`, {
+        stdio: 'pipe'
+      });
+
+      this.results.beautified.push(filePath);
+      return outputPath;
+    } catch (error) {
+      this.results.errors.push({ file: filePath, error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Unpack webpack bundles using wakaru
+   */
+  async unpackBundle(filePath) {
+    const wakaruDir = path.join(this.toolsDir, 'wakaru');
+
+    if (!(await this.checkTool(wakaruDir))) {
+      console.log('wakaru not found, skipping bundle unpacking');
+      return null;
+    }
+
+    try {
+      const outputDir = filePath.replace('.js', '_unpacked');
+      await fs.mkdir(outputDir, { recursive: true });
+
+      execSync(`cd "${wakaruDir}" && npx wakaru "${filePath}" -o "${outputDir}"`, {
+        stdio: 'pipe',
+        timeout: 60000  // 60 second timeout
+      });
+
+      this.results.deobfuscated.push(filePath);
+      return outputDir;
+    } catch (error) {
+      this.results.errors.push({ file: filePath, error: error.message });
+      return null;
+    }
+  }
+
+  /**
+   * Detect if a JS file is a webpack bundle
+   */
+  async isWebpackBundle(filePath) {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      return (
+        content.includes('webpackJsonp') ||
+        content.includes('__webpack_require__') ||
+        content.includes('__webpack_modules__') ||
+        /\(function\s*\(\w+\)\s*\{[^}]*\[\d+\]/.test(content)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Detect if a JS file is obfuscated
+   */
+  async isObfuscated(filePath) {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+
+      // Common obfuscation patterns
+      const obfuscationIndicators = [
+        // Obfuscator.io patterns
+        /var _0x[a-f0-9]+=/,
+        /_0x[a-f0-9]+\[['"]push['"]\]/,
+        /\['\\x/,  // Hex encoded strings
+
+        // Base64 encoded strings
+        /atob\s*\(/,
+        /btoa\s*\(/,
+
+        // Heavy string array usage
+        /\[['"][^'"]{0,20}['"],\s*['"][^'"]{0,20}['"],\s*['"][^'"]{0,20}['"]/,
+
+        // Control flow flattening
+        /switch\s*\(\w+\[[\w\[\]]+\+\+\]\)/,
+      ];
+
+      let score = 0;
+      for (const pattern of obfuscationIndicators) {
+        if (pattern.test(content)) {
+          score++;
+        }
+      }
+
+      // Also check for high entropy (lots of random-looking characters)
+      const chars = content.replace(/\s/g, '');
+      const uniqueChars = new Set(chars).size;
+      const ratio = uniqueChars / chars.length;
+      if (ratio < 0.1) score++;  // Very repetitive = likely obfuscated
+
+      return score >= 2;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Process all JS files in the output directory
+   */
+  async processJsFiles() {
+    const jsDir = path.join(this.outputDir, 'js');
+
+    try {
+      const files = await fs.readdir(jsDir);
+      const jsFiles = files.filter(f => f.endsWith('.js') && !f.includes('.beautified') && !f.includes('_unpacked'));
+
+      console.log(`\nProcessing ${jsFiles.length} JavaScript files...`);
+
+      for (const file of jsFiles) {
+        const filePath = path.join(jsDir, file);
+        const stats = await fs.stat(filePath);
+
+        console.log(`\n  ${file} (${(stats.size / 1024).toFixed(1)} KB)`);
+
+        // Beautify all JS files
+        const beautified = await this.beautifyJs(filePath);
+        if (beautified) {
+          console.log(`    ✓ Beautified`);
+        }
+
+        // Check if it's a webpack bundle
+        if (await this.isWebpackBundle(filePath)) {
+          console.log(`    → Detected webpack bundle`);
+          const unpacked = await this.unpackBundle(beautified || filePath);
+          if (unpacked) {
+            console.log(`    ✓ Unpacked to ${path.basename(unpacked)}`);
+          }
+        }
+
+        // Check if it's obfuscated
+        if (await this.isObfuscated(filePath)) {
+          console.log(`    ⚠ Obfuscated - consider using webcrack`);
+        }
+      }
+    } catch (error) {
+      console.error(`Error processing JS files: ${error.message}`);
+    }
+  }
+
+  /**
+   * Process all CSS files
+   */
+  async processCssFiles() {
+    const cssDir = path.join(this.outputDir, 'css');
+
+    try {
+      const files = await fs.readdir(cssDir);
+      const cssFiles = files.filter(f => f.endsWith('.css') && !f.includes('.beautified'));
+
+      console.log(`\nProcessing ${cssFiles.length} CSS files...`);
+
+      for (const file of cssFiles) {
+        const filePath = path.join(cssDir, file);
+        const beautified = await this.beautifyCss(filePath);
+        if (beautified) {
+          console.log(`  ✓ ${file} beautified`);
+        }
+      }
+    } catch (error) {
+      console.error(`Error processing CSS files: ${error.message}`);
+    }
+  }
+
+  /**
+   * Generate a summary report
+   */
+  async generateReport() {
+    const report = {
+      processedAt: new Date().toISOString(),
+      outputDir: this.outputDir,
+      results: this.results,
+      recommendations: [],
+    };
+
+    // Add recommendations
+    if (this.results.errors.length > 0) {
+      report.recommendations.push('Some files failed to process - check errors array for details');
+    }
+
+    if (this.results.deobfuscated.length > 0) {
+      report.recommendations.push('Check _unpacked directories for unpacked webpack modules');
+    }
+
+    // Look for large bundles that might need manual inspection
+    const jsDir = path.join(this.outputDir, 'js');
+    try {
+      const files = await fs.readdir(jsDir);
+      for (const file of files) {
+        const stats = await fs.stat(path.join(jsDir, file));
+        if (stats.size > 500000) {  // > 500KB
+          report.recommendations.push(`Large bundle detected: ${file} - consider using webcrack for deeper analysis`);
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+
+    // Save report
+    const reportPath = path.join(this.outputDir, 'processing-report.json');
+    await fs.writeFile(reportPath, JSON.stringify(report, null, 2));
+
+    return report;
+  }
+
+  /**
+   * Run all post-processing
+   */
+  async run() {
+    console.log('\n========================================');
+    console.log('  Post-Processing Captured Assets');
+    console.log('========================================');
+
+    await this.processJsFiles();
+    await this.processCssFiles();
+
+    const report = await this.generateReport();
+
+    console.log('\n========================================');
+    console.log('  Post-Processing Complete');
+    console.log('========================================');
+    console.log(`  Beautified: ${this.results.beautified.length} files`);
+    console.log(`  Unpacked:   ${this.results.deobfuscated.length} bundles`);
+    console.log(`  Errors:     ${this.results.errors.length}`);
+
+    if (report.recommendations.length > 0) {
+      console.log('\nRecommendations:');
+      report.recommendations.forEach(r => console.log(`  • ${r}`));
+    }
+
+    return report;
+  }
+}
+
+// CLI
+if (require.main === module) {
+  const outputDir = process.argv[2] || './site-clone';
+
+  const processor = new PostProcessor(outputDir);
+  processor.run().catch(error => {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = PostProcessor;

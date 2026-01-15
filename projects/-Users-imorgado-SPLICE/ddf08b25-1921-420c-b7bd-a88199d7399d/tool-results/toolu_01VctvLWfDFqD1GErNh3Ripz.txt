@@ -1,0 +1,445 @@
+     1→/**
+     2→ * SPLICE CEP Credits Display Module
+     3→ *
+     4→ * Fetches and displays user's remaining hours from the billing backend.
+     5→ * Port of UXP credits.js for CEP compatibility.
+     6→ */
+     7→
+     8→// Track fetch error state for retry UI
+     9→let lastCreditsError = null;
+    10→let creditsRetryCount = 0;
+    11→const MAX_CREDITS_RETRIES = 3;
+    12→
+    13→// Store current credits globally for access checks
+    14→let currentCredits = null;
+    15→
+    16→// Store interval reference for cleanup
+    17→let creditsRefreshInterval = null;
+    18→
+    19→// FIX: CEP-CRIT-016 - Token refresh race condition prevention
+    20→let tokenRefreshPromise = null;  // Deduplicate concurrent refresh attempts
+    21→
+    22→/**
+    23→ * Fetch user's credit balance from backend
+    24→ * @returns {Promise<Object | null>} Credit data including isolation hours, or error object
+    25→ */
+    26→async function fetchCredits() {
+    27→    const settings = getSettings();
+    28→    const customerId = settings.customerId;
+    29→
+    30→    if (!customerId) {
+    31→        console.log('[SPLICE] No customerId configured - credits display disabled');
+    32→        lastCreditsError = null;
+    33→        return null;
+    34→    }
+    35→
+    36→    try {
+    37→        // Ensure we have a valid token before making the request
+    38→        if (typeof ensureValidToken === 'function') {
+    39→            const hasValidToken = await ensureValidToken();
+    40→            if (!hasValidToken && !settings.accessToken) {
+    41→                // No JWT token - will fall back to legacy auth in getAuthHeaders()
+    42→                debugLog('[Credits] No JWT token, using legacy auth');
+    43→            }
+    44→        }
+    45→
+    46→        const response = await fetchWithTimeout(`${getBackendUrl()}/credits`, {
+    47→            method: 'GET',
+    48→            headers: getAuthHeaders()
+    49→        }, SPLICE_CONFIG.FETCH_TIMEOUT);
+    50→
+    51→        if (!response.ok) {
+    52→            const errorMsg = await parseErrorResponse(response);
+    53→
+    54→            // If unauthorized, try refreshing token and retry once
+    55→            if (response.status === 401 && typeof refreshAccessToken === 'function') {
+    56→                debugLog('[Credits] Got 401, attempting token refresh...');
+    57→
+    58→                // FIX: CEP-CRIT-016 - Deduplicate concurrent token refresh attempts
+    59→                if (!tokenRefreshPromise) {
+    60→                    tokenRefreshPromise = refreshAccessToken().finally(() => {
+    61→                        tokenRefreshPromise = null;
+    62→                    });
+    63→                }
+    64→                const refreshed = await tokenRefreshPromise;
+    65→
+    66→                if (refreshed) {
+    67→                    // FIX: CEP-CRIT-017 - Retry uses 30s timeout (not full 120s)
+    68→                    // Retry with new token
+    69→                    const retryResponse = await fetchWithTimeout(`${getBackendUrl()}/credits`, {
+    70→                        method: 'GET',
+    71→                        headers: getAuthHeaders()
+    72→                    }, 30000);
+    73→
+    74→                    if (retryResponse.ok) {
+    75→                        const data = await retryResponse.json();
+    76→                        lastCreditsError = null;
+    77→                        creditsRetryCount = 0;
+    78→                        return {
+    79→                            hoursRemaining: data.hoursRemaining || 0,
+    80→                            hoursTotal: data.hoursTotal || 0,
+    81→                            tierName: data.tierName || 'Free',
+    82→                            tier: data.tier || 'starter',
+    83→                            isolationHoursRemaining: data.isolationHoursRemaining || 0,
+    84→                            isolationHoursTotal: data.isolationHoursTotal || 0,
+    85→                            hasIsolationAccess: data.hasIsolationAccess || false,
+    86→                            isolationOverageRate: data.isolationOverageRate || 0.08,
+    87→                            featureAccess: data.featureAccess || [],
+    88→                            trialDaysRemaining: data.trialDaysRemaining || null,
+    89→                            isOnTrial: data.isOnTrial || false
+    90→                        };
+    91→                    }
+    92→                }
+    93→
+    94→                // Token refresh failed - user needs to re-login
+    95→                console.warn('[SPLICE] Token refresh failed, user needs to re-login');
+    96→                if (typeof clearAuthTokens === 'function') {
+    97→                    clearAuthTokens();
+    98→                }
+    99→                return { _error: true, message: 'Session expired. Please log in again.' };
+   100→            }
+   101→
+   102→            console.error('[SPLICE] Credits fetch failed:', errorMsg);
+   103→            lastCreditsError = errorMsg;
+   104→            return { _error: true, message: errorMsg };
+   105→        }
+   106→
+   107→        const data = await response.json();
+   108→        lastCreditsError = null;
+   109→        creditsRetryCount = 0;
+   110→        return {
+   111→            hoursRemaining: data.hoursRemaining || 0,
+   112→            hoursTotal: data.hoursTotal || 0,
+   113→            tierName: data.tierName || 'Free',
+   114→            tier: data.tier || 'starter',
+   115→            // Isolation hours
+   116→            isolationHoursRemaining: data.isolationHoursRemaining || 0,
+   117→            isolationHoursTotal: data.isolationHoursTotal || 0,
+   118→            hasIsolationAccess: data.hasIsolationAccess || false,
+   119→            isolationOverageRate: data.isolationOverageRate || 0.08,
+   120→            // Feature access
+   121→            featureAccess: data.featureAccess || [],
+   122→            // Trial info
+   123→            trialDaysRemaining: data.trialDaysRemaining || null,
+   124→            isOnTrial: data.isOnTrial || false
+   125→        };
+   126→    } catch (err) {
+   127→        console.error('[SPLICE] Credits fetch error:', err);
+   128→        lastCreditsError = err.message || 'Connection failed';
+   129→        return { _error: true, message: lastCreditsError };
+   130→    }
+   131→}
+   132→
+   133→/**
+   134→ * Clear the credits cache (call on logout)
+   135→ */
+   136→function clearCreditsCache() {
+   137→    currentCredits = null;
+   138→    lastCreditsError = null;
+   139→    creditsRetryCount = 0;
+   140→    console.log('[SPLICE] Credits cache cleared');
+   141→}
+   142→
+   143→/**
+   144→ * Update the credit display in the UI
+   145→ * @param {Object|null} credits - Credit data, error object, or null if unavailable
+   146→ */
+   147→function updateCreditDisplay(credits) {
+   148→    const creditBadge = document.getElementById('creditBadge');
+   149→    if (!creditBadge) return;
+   150→
+   151→    // Handle no customer ID configured
+   152→    if (!credits) {
+   153→        currentCredits = null;
+   154→        creditBadge.style.display = 'flex';
+   155→        creditBadge.textContent = 'Login';
+   156→        creditBadge.title = 'Click to enter license key';
+   157→        creditBadge.classList.remove('ok', 'low');
+   158→        creditBadge.classList.add('login');
+   159→        return;
+   160→    }
+   161→
+   162→    // Handle error state - show error badge with retry
+   163→    if (credits._error) {
+   164→        currentCredits = null;
+   165→        creditBadge.style.display = 'flex';
+   166→        creditBadge.textContent = 'Retry';
+   167→        creditBadge.title = `Error: ${credits.message}\nClick to retry`;
+   168→        creditBadge.classList.remove('ok', 'low', 'login');
+   169→        creditBadge.classList.add('error');
+   170→        return;
+   171→    }
+   172→
+   173→    // Normal credit display
+   174→    currentCredits = credits;
+   175→    creditBadge.style.display = 'flex';
+   176→
+   177→    // Show referral promo when logged in
+   178→    const referralPromo = document.getElementById('referralPromo');
+   179→    if (referralPromo) {
+   180→        referralPromo.classList.remove('hidden');
+   181→    }
+   182→
+   183→    // Show trial status if on trial
+   184→    if (credits.isOnTrial && credits.trialDaysRemaining) {
+   185→        creditBadge.textContent = `Trial: ${credits.trialDaysRemaining}d`;
+   186→        creditBadge.classList.remove('error', 'login', 'ok', 'low');
+   187→        creditBadge.classList.add('trial');
+   188→    } else {
+   189→        creditBadge.textContent = `${credits.hoursRemaining.toFixed(1)} hrs`;
+   190→        creditBadge.classList.remove('error', 'login', 'trial');
+   191→    }
+   192→
+   193→    // Build tooltip with isolation info if available
+   194→    let tooltip = `${credits.tierName}: ${credits.hoursRemaining.toFixed(1)} / ${credits.hoursTotal} hours`;
+   195→    if (credits.isOnTrial && credits.trialDaysRemaining) {
+   196→        tooltip = `Trial: ${credits.trialDaysRemaining} days remaining\n` + tooltip;
+   197→    }
+   198→    if (credits.hasIsolationAccess) {
+   199→        tooltip += `\nIsolation: ${(credits.isolationHoursRemaining * 60).toFixed(0)} / ${(credits.isolationHoursTotal * 60).toFixed(0)} min`;
+   200→    }
+   201→    creditBadge.title = tooltip;
+   202→
+   203→    // Color based on remaining hours
+   204→    if (credits.hoursRemaining <= 1) {
+   205→        creditBadge.classList.add('low');
+   206→        creditBadge.classList.remove('ok');
+   207→    } else {
+   208→        creditBadge.classList.add('ok');
+   209→        creditBadge.classList.remove('low');
+   210→    }
+   211→
+   212→    // Update isolation checkbox state based on tier access
+   213→    updateIsolationCheckboxState(credits);
+   214→}
+   215→
+   216→/**
+   217→ * Update the isolation checkbox based on tier access
+   218→ */
+   219→function updateIsolationCheckboxState(credits) {
+   220→    const isolatedCheckbox = document.getElementById('sourceIsolated');
+   221→    const tierBadge = isolatedCheckbox?.parentElement?.querySelector('.tier-badge');
+   222→
+   223→    if (!isolatedCheckbox) return;
+   224→
+   225→    if (!credits || !credits.hasIsolationAccess) {
+   226→        // Disable isolation for non-Pro/Team users
+   227→        isolatedCheckbox.disabled = true;
+   228→        isolatedCheckbox.checked = false;
+   229→        if (tierBadge) {
+   230→            tierBadge.textContent = 'Pro+';
+   231→            tierBadge.style.opacity = '1';
+   232→        }
+   233→    } else {
+   234→        // Enable isolation for Pro/Team users
+   235→        isolatedCheckbox.disabled = false;
+   236→        if (tierBadge) {
+   237→            // Show remaining isolation time
+   238→            const minsRemaining = (credits.isolationHoursRemaining * 60).toFixed(0);
+   239→            tierBadge.textContent = `${minsRemaining} min`;
+   240→            tierBadge.style.opacity = credits.isolationHoursRemaining > 0 ? '1' : '0.6';
+   241→        }
+   242→    }
+   243→}
+   244→
+   245→/**
+   246→ * Check if user can use isolation and get cost estimate
+   247→ * @param {number} estimatedMinutes - Estimated audio duration in minutes
+   248→ * @returns {Object} Access info with allowed, message, overageCost
+   249→ */
+   250→function checkIsolationAccess(estimatedMinutes = 0) {
+   251→    if (!currentCredits) {
+   252→        return { allowed: false, message: 'Credits not loaded', overageCost: 0 };
+   253→    }
+   254→
+   255→    if (!currentCredits.hasIsolationAccess) {
+   256→        return {
+   257→            allowed: false,
+   258→            message: 'Vocal isolation requires Pro or Team tier',
+   259→            upgradeRequired: true,
+   260→            overageCost: 0
+   261→        };
+   262→    }
+   263→
+   264→    const estimatedHours = estimatedMinutes / 60;
+   265→    const remaining = currentCredits.isolationHoursRemaining;
+   266→
+   267→    if (remaining >= estimatedHours) {
+   268→        return {
+   269→            allowed: true,
+   270→            message: `Using ${estimatedMinutes.toFixed(1)} min of included isolation time`,
+   271→            overageCost: 0
+   272→        };
+   273→    }
+   274→
+   275→    // Calculate overage
+   276→    const overageMinutes = estimatedMinutes - (remaining * 60);
+   277→    const overageCost = overageMinutes * currentCredits.isolationOverageRate;
+   278→
+   279→    return {
+   280→        allowed: true,
+   281→        message: `${remaining > 0 ? `${(remaining * 60).toFixed(0)} included + ` : ''}${overageMinutes.toFixed(0)} min overage ($${overageCost.toFixed(2)})`,
+   282→        overageCost,
+   283→        overageMinutes
+   284→    };
+   285→}
+   286→
+   287→/**
+   288→ * Get current credits (for access checks)
+   289→ */
+   290→function getCurrentCredits() {
+   291→    return currentCredits;
+   292→}
+   293→
+   294→/**
+   295→ * Check if user has access to a specific feature based on their tier
+   296→ * @param {string} featureName - The feature to check (e.g., 'social_reframe', 'text_editing', 'multitrack')
+   297→ * @returns {boolean} - True if user has access
+   298→ */
+   299→function hasFeatureAccess(featureName) {
+   300→    if (!currentCredits || !currentCredits.featureAccess) {
+   301→        return false; // Not logged in = no premium features
+   302→    }
+   303→    return currentCredits.featureAccess.includes(featureName);
+   304→}
+   305→
+   306→/**
+   307→ * Get the required tier for a feature
+   308→ * @param {string} featureName - The feature name
+   309→ * @returns {string} - Required tier name
+   310→ */
+   311→function getRequiredTier(featureName) {
+   312→    const teamOnlyFeatures = ['multitrack', 'music_to_cut', 'mood_timeline', 'youtube_metadata', 'profanity_bleeping'];
+   313→    const proFeatures = ['vocal_isolation', 'social_reframe', 'text_editing', 'all_captions', 'profanity_detection', 'chapter_detection'];
+   314→
+   315→    if (teamOnlyFeatures.includes(featureName)) {
+   316→        return 'Team';
+   317→    } else if (proFeatures.includes(featureName)) {
+   318→        return 'Pro';
+   319→    }
+   320→    return 'Starter';
+   321→}
+   322→
+   323→/**
+   324→ * Initialize credits display
+   325→ * Fetches credits on load and sets up periodic refresh
+   326→ */
+   327→async function initCredits() {
+   328→    // Clear any existing interval to prevent duplicates
+   329→    if (creditsRefreshInterval) {
+   330→        clearInterval(creditsRefreshInterval);
+   331→    }
+   332→
+   333→    // Initial fetch
+   334→    const credits = await fetchCredits();
+   335→    updateCreditDisplay(credits);
+   336→
+   337→    // Refresh credits every 5 minutes
+   338→    creditsRefreshInterval = setInterval(async () => {
+   339→        const refreshedCredits = await fetchCredits();
+   340→        updateCreditDisplay(refreshedCredits);
+   341→    }, 5 * 60 * 1000);
+   342→}
+   343→
+   344→/**
+   345→ * Cleanup credits module - call on plugin unload
+   346→ */
+   347→function cleanupCredits() {
+   348→    if (creditsRefreshInterval) {
+   349→        clearInterval(creditsRefreshInterval);
+   350→        creditsRefreshInterval = null;
+   351→    }
+   352→}
+   353→
+   354→/**
+   355→ * Manually refresh credits (e.g., after a processing operation)
+   356→ */
+   357→async function refreshCredits() {
+   358→    const credits = await fetchCredits();
+   359→    updateCreditDisplay(credits);
+   360→    return credits;
+   361→}
+   362→
+   363→/**
+   364→ * Retry fetching credits with exponential backoff
+   365→ * Called when user clicks the "Retry" badge
+   366→ */
+   367→async function retryFetchCredits() {
+   368→    if (creditsRetryCount >= MAX_CREDITS_RETRIES) {
+   369→        console.warn('[SPLICE] Max retry attempts reached for credits fetch');
+   370→        updateCreditDisplay({
+   371→            _error: true,
+   372→            message: 'Max retries exceeded. Check your connection and try again later.'
+   373→        });
+   374→        creditsRetryCount = 0; // Reset for next attempt
+   375→        return null;
+   376→    }
+   377→
+   378→    creditsRetryCount++;
+   379→    console.log(`[SPLICE] Retrying credits fetch (attempt ${creditsRetryCount}/${MAX_CREDITS_RETRIES})`);
+   380→
+   381→    // Exponential backoff: 1s, 2s, 4s
+   382→    const delay = Math.pow(2, creditsRetryCount - 1) * 1000;
+   383→
+   384→    // Show retrying state
+   385→    const creditBadge = document.getElementById('creditBadge');
+   386→    if (creditBadge) {
+   387→        creditBadge.textContent = `Retry ${creditsRetryCount}...`;
+   388→        creditBadge.classList.add('retrying');
+   389→    }
+   390→
+   391→    await new Promise(resolve => setTimeout(resolve, delay));
+   392→
+   393→    const credits = await fetchCredits();
+   394→
+   395→    if (creditBadge) {
+   396→        creditBadge.classList.remove('retrying');
+   397→    }
+   398→
+   399→    updateCreditDisplay(credits);
+   400→    return credits;
+   401→}
+   402→
+   403→/**
+   404→ * Handle click on credit badge
+   405→ * - If error state: retry fetching
+   406→ * - If login state: open login modal
+   407→ * - Otherwise: refresh credits
+   408→ */
+   409→function handleCreditBadgeClick() {
+   410→    const creditBadge = document.getElementById('creditBadge');
+   411→    if (!creditBadge) return;
+   412→
+   413→    if (creditBadge.classList.contains('error')) {
+   414→        retryFetchCredits();
+   415→    } else if (creditBadge.classList.contains('login')) {
+   416→        // Open login modal (handled in main.js)
+   417→        const loginModal = document.getElementById('loginModal');
+   418→        if (loginModal) {
+   419→            loginModal.classList.remove('hidden');
+   420→        }
+   421→    } else {
+   422→        // Normal state - just refresh
+   423→        refreshCredits();
+   424→    }
+   425→}
+   426→
+   427→// Export for window access
+   428→window.fetchCredits = fetchCredits;
+   429→window.clearCreditsCache = clearCreditsCache;
+   430→window.updateCreditDisplay = updateCreditDisplay;
+   431→window.checkIsolationAccess = checkIsolationAccess;
+   432→window.getCurrentCredits = getCurrentCredits;
+   433→window.hasFeatureAccess = hasFeatureAccess;
+   434→window.getRequiredTier = getRequiredTier;
+   435→window.initCredits = initCredits;
+   436→window.cleanupCredits = cleanupCredits;
+   437→window.refreshCredits = refreshCredits;
+   438→window.retryFetchCredits = retryFetchCredits;
+   439→window.handleCreditBadgeClick = handleCreditBadgeClick;
+   440→
+   441→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

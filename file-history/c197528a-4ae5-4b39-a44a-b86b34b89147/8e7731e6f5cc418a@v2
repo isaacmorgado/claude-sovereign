@@ -1,0 +1,214 @@
+/**
+ * Slice 4: Whisper Transcription Service
+ *
+ * Handles audio transcription using OpenAI's Whisper model.
+ * Returns timestamped segments required for take detection.
+ * Includes caching to avoid repeated API calls.
+ */
+
+const fs = require('fs');
+const OpenAI = require('openai');
+
+// Initialize OpenAI client
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// In-memory cache: { wavPath: { mtime, result } }
+const transcriptCache = new Map();
+
+// Cache configuration
+const MAX_CACHE_SIZE = 50;
+
+/**
+ * Retry function with exponential backoff
+ * @param {Function} fn - Async function to retry
+ * @param {number} retries - Number of retry attempts (default: 3)
+ * @param {number} baseDelay - Base delay in ms (default: 1000)
+ * @returns {Promise<any>} Result of the function
+ */
+async function withRetry(fn, retries = 3, baseDelay = 1000) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      // Don't retry on quota exceeded - fail immediately
+      if (err.code === 'insufficient_quota' || err.message?.includes('quota')) {
+        throw new Error('OpenAI API quota exceeded. Please check your billing at https://platform.openai.com/account/billing');
+      }
+
+      // Don't retry on the last attempt
+      if (attempt === retries) {
+        break;
+      }
+
+      // Calculate delay with exponential backoff + jitter
+      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 500;
+
+      // Only retry on retryable errors
+      const isRetryable =
+        err.status === 429 ||                          // Rate limit
+        err.status === 500 ||                          // Server error
+        err.status === 502 ||                          // Bad gateway
+        err.status === 503 ||                          // Service unavailable
+        err.code === 'ECONNRESET' ||                   // Connection reset
+        err.code === 'ETIMEDOUT' ||                    // Timeout
+        err.message?.includes('Connection error') ||   // Connection error
+        err.message?.includes('network');              // Network error
+
+      if (!isRetryable) {
+        throw err;
+      }
+
+      console.log(`[SPLICE] Retry ${attempt + 1}/${retries} after ${Math.round(delay)}ms: ${err.message}`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * LRU cache set with size limit
+ * Evicts oldest entries when cache exceeds MAX_CACHE_SIZE
+ * @param {string} key - Cache key
+ * @param {any} value - Value to cache
+ */
+function cacheSet(key, value) {
+  // Evict oldest entries if at capacity
+  while (transcriptCache.size >= MAX_CACHE_SIZE) {
+    const oldestKey = transcriptCache.keys().next().value;
+    transcriptCache.delete(oldestKey);
+    console.log(`[SPLICE] Cache eviction: removed ${oldestKey}`);
+  }
+
+  transcriptCache.set(key, value);
+}
+
+/**
+ * Transcribe audio file using Whisper with segment timestamps (with caching)
+ * @param {string} wavPath - Path to the WAV file
+ * @returns {Promise<{text: string, segments: Array, language: string, duration: number}>}
+ */
+async function transcribeAudio(wavPath) {
+  // Check cache based on file modification time
+  const stats = fs.statSync(wavPath);
+  const mtime = stats.mtimeMs;
+
+  const cached = transcriptCache.get(wavPath);
+  if (cached && cached.mtime === mtime) {
+    console.log('[SPLICE] Using cached transcription (file unchanged)');
+    return cached.result;
+  }
+
+  console.log('[SPLICE] Starting Whisper transcription...');
+
+  // Use Whisper with verbose_json for segment timestamps (required for take detection)
+  const transcription = await withRetry(async () => {
+    return await openai.audio.transcriptions.create({
+      file: fs.createReadStream(wavPath),
+      model: 'whisper-1',
+      response_format: 'verbose_json',
+      language: 'en',
+    });
+  });
+
+  console.log(`[SPLICE] Transcription complete: ${transcription.text.slice(0, 100)}...`);
+
+  // Extract segments with timestamps for take detection
+  const result = {
+    text: transcription.text,
+    segments: (transcription.segments || []).map(s => ({
+      id: s.id,
+      start: s.start,
+      end: s.end,
+      text: s.text
+    })),
+    language: transcription.language || 'en',
+    duration: transcription.duration || 0
+  };
+
+  // Cache the result (with LRU eviction)
+  cacheSet(wavPath, { mtime, result });
+  console.log(`[SPLICE] Transcription cached (${result.segments.length} segments)`);
+
+  return result;
+}
+
+/**
+ * Transcribe audio with word-level timestamps using Whisper
+ * Required for profanity, repetition, and stutter detection endpoints.
+ *
+ * @param {string} wavPath - Path to the WAV file
+ * @returns {Promise<{text: string, words: Array<{word: string, start: number, end: number}>}>}
+ */
+async function transcribeWithWords(wavPath) {
+  // Check cache based on file modification time
+  const stats = fs.statSync(wavPath);
+  const mtime = stats.mtimeMs;
+  const cacheKey = `words:${wavPath}`;
+
+  const cached = transcriptCache.get(cacheKey);
+  if (cached && cached.mtime === mtime) {
+    console.log('[SPLICE] Using cached word-level transcription (file unchanged)');
+    return cached.result;
+  }
+
+  console.log('[SPLICE] Starting Whisper transcription with word timestamps...');
+
+  // Use whisper-1 with word-level timestamp granularity (with retry)
+  const transcription = await withRetry(async () => {
+    return await openai.audio.transcriptions.create({
+      file: fs.createReadStream(wavPath),
+      model: 'whisper-1',
+      response_format: 'verbose_json',
+      timestamp_granularities: ['word'],
+      language: 'en',
+    });
+  });
+
+  console.log(`[SPLICE] Word transcription complete: ${transcription.words?.length || 0} words`);
+
+  // Map to consistent format
+  const result = {
+    text: transcription.text,
+    words: (transcription.words || []).map(w => ({
+      word: w.word,
+      start: w.start,
+      end: w.end
+    })),
+    language: transcription.language || 'en',
+    duration: transcription.duration || 0
+  };
+
+  // Cache the result (with LRU eviction)
+  cacheSet(cacheKey, { mtime, result });
+  console.log(`[SPLICE] Word transcription cached (${result.words.length} words)`);
+
+  return result;
+}
+
+/**
+ * Clear transcription cache
+ * Useful for testing or memory management
+ */
+function clearCache() {
+  const size = transcriptCache.size;
+  transcriptCache.clear();
+  console.log(`[SPLICE] Cleared ${size} cached transcription(s)`);
+  return size;
+}
+
+/**
+ * Get cache statistics
+ */
+function getCacheStats() {
+  return {
+    entries: transcriptCache.size,
+    keys: Array.from(transcriptCache.keys())
+  };
+}
+
+module.exports = { transcribeAudio, transcribeWithWords, clearCache, getCacheStats };

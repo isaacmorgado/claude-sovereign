@@ -1,0 +1,917 @@
+     1→/**
+     2→ * Music Routes
+     3→ *
+     4→ * AI Music generation endpoints (Phase 8)
+     5→ */
+     6→
+     7→const express = require('express');
+     8→
+     9→// Lazy-load music services to prevent startup failures if deps missing
+    10→let musicQueue, songIdentification, musicGeneration, r2Storage, musicAlignment, musicTimeline;
+    11→let musicServicesLoaded = false;
+    12→let musicGenerationLoaded = false;
+    13→
+    14→/**
+    15→ * Load only musicGeneration service (no Redis dependency)
+    16→ * Used by /moods and /instruments endpoints
+    17→ */
+    18→function loadMusicGenerationOnly() {
+    19→  if (!musicGenerationLoaded) {
+    20→    try {
+    21→      musicGeneration = require('../services/musicGeneration');
+    22→      musicGenerationLoaded = true;
+    23→    } catch (err) {
+    24→      console.warn('[SPLICE] Music generation service not available:', err.message);
+    25→    }
+    26→  }
+    27→}
+    28→
+    29→/**
+    30→ * Load all music services including Redis-dependent ones
+    31→ * Used by endpoints that need queue functionality
+    32→ */
+    33→function loadMusicServices() {
+    34→  if (!musicServicesLoaded) {
+    35→    try {
+    36→      // Load musicGeneration first (no Redis dependency)
+    37→      loadMusicGenerationOnly();
+    38→
+    39→      // Load Redis-dependent services with timeout protection
+    40→      songIdentification = require('../services/songIdentification');
+    41→      r2Storage = require('../services/r2Storage');
+    42→      musicAlignment = require('../services/musicAlignment');
+    43→      musicTimeline = require('../services/musicTimeline');
+    44→
+    45→      // Load musicQueue last (Redis-dependent, may throw)
+    46→      try {
+    47→        musicQueue = require('../services/musicQueue');
+    48→      } catch (queueErr) {
+    49→        console.warn('[SPLICE] Music queue not available (Redis not configured):', queueErr.message);
+    50→        // Continue without queue - some endpoints will return 503
+    51→      }
+    52→
+    53→      musicServicesLoaded = true;
+    54→    } catch (err) {
+    55→      console.warn('[SPLICE] Music services not available:', err.message);
+    56→    }
+    57→  }
+    58→}
+    59→
+    60→/**
+    61→ * Create music routes
+    62→ * @param {Object} options - Route configuration options
+    63→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    64→ * @param {Object} options.services - Shared services (usageTracking)
+    65→ * @returns {express.Router}
+    66→ */
+    67→function createMusicRoutes(options = {}) {
+    68→  const router = express.Router();
+    69→  const { requireCredits } = options.middleware || {};
+    70→  const { usageTracking } = options.services || {};
+    71→
+    72→  // Note: Services are now loaded lazily on first route access
+    73→  // This prevents Redis dependency from blocking startup
+    74→
+    75→  /**
+    76→   * POST /identify - Identify song from YouTube URL
+    77→   */
+    78→  router.post('/identify', requireCredits, async (req, res) => {
+    79→    const { youtubeUrl } = req.body;
+    80→
+    81→    if (!youtubeUrl) {
+    82→      return res.status(400).json({ error: 'youtubeUrl is required' });
+    83→    }
+    84→
+    85→    if (!songIdentification) {
+    86→      return res.status(503).json({ error: 'Song identification service not available' });
+    87→    }
+    88→
+    89→    try {
+    90→      // Validate URL
+    91→      const validation = songIdentification.validateYouTubeUrl(youtubeUrl);
+    92→      if (!validation.valid) {
+    93→        return res.status(400).json({ error: validation.error });
+    94→      }
+    95→
+    96→      // Check dependencies
+    97→      const deps = await songIdentification.checkDependencies();
+    98→      if (!deps.ytdlp) {
+    99→        return res.status(503).json({ error: 'yt-dlp is not installed on server' });
+   100→      }
+   101→      if (!deps.ffmpeg) {
+   102→        return res.status(503).json({ error: 'FFmpeg is not installed on server' });
+   103→      }
+   104→
+   105→      // Check ACRCloud credentials
+   106→      if (!songIdentification.hasACRCloudCredentials()) {
+   107→        return res.status(503).json({ error: 'ACRCloud credentials not configured' });
+   108→      }
+   109→
+   110→      // Identify song
+   111→      const result = await songIdentification.identifyFromYouTube(youtubeUrl);
+   112→
+   113→      res.json(result);
+   114→
+   115→    } catch (err) {
+   116→      console.error('[SPLICE] Song identification error:', err.message);
+   117→      res.status(500).json({ error: err.message || 'Song identification failed' });
+   118→    }
+   119→  });
+   120→
+   121→  /**
+   122→   * POST /generate - Start music generation job
+   123→   */
+   124→  router.post('/generate', requireCredits, async (req, res) => {
+   125→    const { youtubeUrl, prompt, duration, mood, instruments, referenceSong } = req.body;
+   126→    const customerId = req.stripeCustomerId;
+   127→
+   128→    if (!customerId) {
+   129→      return res.status(401).json({ error: 'Authentication required' });
+   130→    }
+   131→
+   132→    if (!musicQueue) {
+   133→      return res.status(503).json({ error: 'Music generation service not available' });
+   134→    }
+   135→
+   136→    try {
+   137→      // Validate options if musicGeneration is available
+   138→      if (musicGeneration) {
+   139→        const validation = musicGeneration.validateOptions({ duration, mood, instruments });
+   140→        if (!validation.valid) {
+   141→          return res.status(400).json({ error: validation.errors.join(', ') });
+   142→        }
+   143→      }
+   144→
+   145→      // Add job to queue
+   146→      const result = await musicQueue.addMusicJob({
+   147→        customerId,
+   148→        youtubeUrl,
+   149→        prompt,
+   150→        duration: duration || 60,
+   151→        mood: mood || 'neutral',
+   152→        instruments: instruments || [],
+   153→        referenceSong
+   154→      });
+   155→
+   156→      res.json({
+   157→        success: true,
+   158→        jobId: result.jobId,
+   159→        status: result.status,
+   160→        estimatedTime: result.estimatedTime,
+   161→        statusUrl: `/music/status/${result.jobId}`
+   162→      });
+   163→
+   164→    } catch (err) {
+   165→      console.error('[SPLICE] Music generation error:', err.message);
+   166→      res.status(500).json({ error: err.message || 'Failed to start music generation' });
+   167→    }
+   168→  });
+   169→
+   170→  /**
+   171→   * POST /generate-variations - Generate 3 song variations for user selection
+   172→   */
+   173→  router.post('/generate-variations', requireCredits, async (req, res) => {
+   174→    const { prompt, duration, mood, instruments, referenceSong } = req.body;
+   175→    const customerId = req.stripeCustomerId;
+   176→
+   177→    if (!customerId) {
+   178→      return res.status(401).json({ error: 'Authentication required' });
+   179→    }
+   180→
+   181→    if (!musicQueue) {
+   182→      return res.status(503).json({ error: 'Music generation service not available' });
+   183→    }
+   184→
+   185→    try {
+   186→      // Validate options if musicGeneration is available
+   187→      if (musicGeneration) {
+   188→        const validation = musicGeneration.validateOptions({ duration, mood, instruments });
+   189→        if (!validation.valid) {
+   190→          return res.status(400).json({ error: validation.errors.join(', ') });
+   191→        }
+   192→      }
+   193→
+   194→      // Check for variations credits (2.5 credits = 3 music credits equivalent)
+   195→      const hasCredits = await usageTracking.checkVariationsCredits(customerId);
+   196→      if (!hasCredits.canGenerate) {
+   197→        return res.status(402).json({
+   198→          error: 'Insufficient credits for variations',
+   199→          creditsRequired: 2.5,
+   200→          creditsAvailable: hasCredits.creditsAvailable
+   201→        });
+   202→      }
+   203→
+   204→      // Add variations job to queue
+   205→      const result = await musicQueue.addVariationsJob({
+   206→        customerId,
+   207→        prompt,
+   208→        duration: duration || 60,
+   209→        mood: mood || 'neutral',
+   210→        instruments: instruments || [],
+   211→        referenceSong
+   212→      });
+   213→
+   214→      res.json({
+   215→        success: true,
+   216→        jobId: result.jobId,
+   217→        status: result.status,
+   218→        isVariations: true,
+   219→        estimatedTime: result.estimatedTime,
+   220→        statusUrl: `/music/variations/status/${result.jobId}`
+   221→      });
+   222→
+   223→    } catch (err) {
+   224→      console.error('[SPLICE] Music variations error:', err.message);
+   225→      res.status(500).json({ error: err.message || 'Failed to start variations generation' });
+   226→    }
+   227→  });
+   228→
+   229→  /**
+   230→   * POST /generate-scene-aware - Generate music with transcript analysis
+   231→   */
+   232→  router.post('/generate-scene-aware', requireCredits, async (req, res) => {
+   233→    const { segments, prompt, duration, mood, instruments, referenceSong } = req.body;
+   234→    const customerId = req.stripeCustomerId;
+   235→
+   236→    if (!customerId) {
+   237→      return res.status(401).json({ error: 'Authentication required' });
+   238→    }
+   239→
+   240→    if (!musicQueue) {
+   241→      return res.status(503).json({ error: 'Music generation service not available' });
+   242→    }
+   243→
+   244→    // Validate segments
+   245→    if (!segments || !Array.isArray(segments) || segments.length === 0) {
+   246→      return res.status(400).json({ error: 'Transcript segments are required' });
+   247→    }
+   248→
+   249→    try {
+   250→      // Validate scene-aware options
+   251→      if (musicGeneration) {
+   252→        const validation = musicGeneration.validateSceneAwareOptions(segments, { duration, mood, instruments });
+   253→        if (!validation.valid) {
+   254→          return res.status(400).json({ error: validation.errors.join(', ') });
+   255→        }
+   256→      }
+   257→
+   258→      // Check for scene-aware credits (1.5 credits)
+   259→      const hasCredits = await usageTracking.checkSceneAwareCredits(customerId);
+   260→      if (!hasCredits.canGenerate) {
+   261→        return res.status(402).json({
+   262→          error: 'Insufficient credits for scene-aware music',
+   263→          creditsRequired: 1.5,
+   264→          creditsAvailable: hasCredits.creditsAvailable
+   265→        });
+   266→      }
+   267→
+   268→      // Add scene-aware job to queue with scene analysis flag
+   269→      const result = await musicQueue.addMusicJob({
+   270→        customerId,
+   271→        prompt,
+   272→        duration: duration || 60,
+   273→        mood: mood || 'neutral',
+   274→        instruments: instruments || [],
+   275→        referenceSong,
+   276→        isSceneAware: true,
+   277→        segments
+   278→      });
+   279→
+   280→      res.json({
+   281→        success: true,
+   282→        jobId: result.jobId,
+   283→        status: result.status,
+   284→        isSceneAware: true,
+   285→        estimatedTime: result.estimatedTime,
+   286→        statusUrl: `/music/status/${result.jobId}`
+   287→      });
+   288→
+   289→    } catch (err) {
+   290→      console.error('[SPLICE] Scene-aware music error:', err.message);
+   291→      res.status(500).json({ error: err.message || 'Failed to start scene-aware music generation' });
+   292→    }
+   293→  });
+   294→
+   295→  /**
+   296→   * GET /variations/status/:jobId - Get variations job status with detailed progress
+   297→   */
+   298→  router.get('/variations/status/:jobId', requireCredits, async (req, res) => {
+   299→    const { jobId } = req.params;
+   300→    const customerId = req.stripeCustomerId;
+   301→
+   302→    if (!musicQueue) {
+   303→      return res.status(503).json({ error: 'Music generation service not available' });
+   304→    }
+   305→
+   306→    try {
+   307→      const status = await musicQueue.getVariationsJobStatus(jobId);
+   308→
+   309→      if (!status) {
+   310→        return res.status(404).json({ error: 'Job not found' });
+   311→      }
+   312→
+   313→      // Verify ownership
+   314→      if (status.data.customerId !== customerId) {
+   315→        return res.status(403).json({ error: 'Not authorized to access this job' });
+   316→      }
+   317→
+   318→      res.json(status);
+   319→
+   320→    } catch (err) {
+   321→      console.error('[SPLICE] Variations status error:', err.message);
+   322→      res.status(500).json({ error: err.message || 'Failed to get job status' });
+   323→    }
+   324→  });
+   325→
+   326→  /**
+   327→   * POST /variations/:jobId/select - Select a variation to finalize
+   328→   */
+   329→  router.post('/variations/:jobId/select', requireCredits, async (req, res) => {
+   330→    const { jobId } = req.params;
+   331→    const { variationIndex } = req.body;
+   332→    const customerId = req.stripeCustomerId;
+   333→
+   334→    if (!musicQueue) {
+   335→      return res.status(503).json({ error: 'Music generation service not available' });
+   336→    }
+   337→
+   338→    if (variationIndex === undefined || variationIndex === null) {
+   339→      return res.status(400).json({ error: 'variationIndex is required' });
+   340→    }
+   341→
+   342→    const index = parseInt(variationIndex);
+   343→    if (isNaN(index) || index < 0 || index > 2) {
+   344→      return res.status(400).json({ error: 'variationIndex must be 0, 1, or 2' });
+   345→    }
+   346→
+   347→    try {
+   348→      // Select the variation
+   349→      const result = await musicQueue.selectVariation(jobId, index, customerId);
+   350→
+   351→      // Deduct variations credits (2.5 credits)
+   352→      await usageTracking.deductVariationsCredit(customerId);
+   353→
+   354→      res.json({
+   355→        success: true,
+   356→        ...result
+   357→      });
+   358→
+   359→    } catch (err) {
+   360→      console.error('[SPLICE] Variation selection error:', err.message);
+   361→      res.status(500).json({ error: err.message || 'Failed to select variation' });
+   362→    }
+   363→  });
+   364→
+   365→  /**
+   366→   * GET /status/:jobId - Get job status
+   367→   */
+   368→  router.get('/status/:jobId', requireCredits, async (req, res) => {
+   369→    const { jobId } = req.params;
+   370→    const customerId = req.stripeCustomerId;
+   371→
+   372→    if (!musicQueue) {
+   373→      return res.status(503).json({ error: 'Music generation service not available' });
+   374→    }
+   375→
+   376→    try {
+   377→      const status = await musicQueue.getJobStatus(jobId);
+   378→
+   379→      if (!status) {
+   380→        return res.status(404).json({ error: 'Job not found' });
+   381→      }
+   382→
+   383→      // Verify ownership
+   384→      if (status.data.customerId !== customerId) {
+   385→        return res.status(403).json({ error: 'Access denied' });
+   386→      }
+   387→
+   388→      res.json(status);
+   389→
+   390→    } catch (err) {
+   391→      console.error('[SPLICE] Job status error:', err.message);
+   392→      res.status(500).json({ error: err.message || 'Failed to get job status' });
+   393→    }
+   394→  });
+   395→
+   396→  /**
+   397→   * GET /library - Get user's music library
+   398→   */
+   399→  router.get('/library', requireCredits, async (req, res) => {
+   400→    const customerId = req.stripeCustomerId;
+   401→
+   402→    if (!customerId) {
+   403→      return res.status(401).json({ error: 'Authentication required' });
+   404→    }
+   405→
+   406→    if (!musicQueue) {
+   407→      return res.status(503).json({ error: 'Music generation service not available' });
+   408→    }
+   409→
+   410→    try {
+   411→      const jobs = await musicQueue.getCustomerJobs(customerId, {
+   412→        limit: parseInt(req.query.limit) || 50,
+   413→        offset: parseInt(req.query.offset) || 0
+   414→      });
+   415→
+   416→      // Filter to only completed jobs for library
+   417→      const library = jobs.filter(j => j.status === 'completed');
+   418→
+   419→      res.json(library);
+   420→
+   421→    } catch (err) {
+   422→      console.error('[SPLICE] Music library error:', err.message);
+   423→      res.status(500).json({ error: err.message || 'Failed to load music library' });
+   424→    }
+   425→  });
+   426→
+   427→  /**
+   428→   * GET /credits - Get music credits balance
+   429→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   430→   */
+   431→  router.get('/credits', requireCredits, async (req, res) => {
+   432→    const customerId = req.stripeCustomerId;
+   433→
+   434→    if (!customerId) {
+   435→      return res.status(401).json({ error: 'Authentication required' });
+   436→    }
+   437→
+   438→    try {
+   439→      // Get credits from database using usageTracking
+   440→      const credits = await usageTracking.getMusicCredits(customerId);
+   441→
+   442→      res.json(credits);
+   443→
+   444→    } catch (err) {
+   445→      console.error('[SPLICE] Music credits error:', err.message);
+   446→      res.status(500).json({ error: err.message || 'Failed to get credits' });
+   447→    }
+   448→  });
+   449→
+   450→  /**
+   451→   * GET /moods - Get available mood presets
+   452→   * Note: Uses lightweight loader (no Redis dependency)
+   453→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   454→   */
+   455→  router.get('/moods', (req, res) => {
+   456→    loadMusicGenerationOnly();
+   457→    if (!musicGeneration) {
+   458→      return res.status(503).json({ error: 'Music service not available' });
+   459→    }
+   460→
+   461→    res.json(musicGeneration.getAvailableMoods());
+   462→  });
+   463→
+   464→  /**
+   465→   * GET /instruments - Get available instrument presets
+   466→   * Note: Uses lightweight loader (no Redis dependency)
+   467→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   468→   */
+   469→  router.get('/instruments', (req, res) => {
+   470→    loadMusicGenerationOnly();
+   471→    if (!musicGeneration) {
+   472→      return res.status(503).json({ error: 'Music service not available' });
+   473→    }
+   474→
+   475→    res.json(musicGeneration.getAvailableInstruments());
+   476→  });
+   477→
+   478→  /**
+   479→   * GET /queue-stats - Get queue statistics (admin only)
+   480→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   481→   * SECURITY: Restricted to admin customers only
+   482→   */
+   483→  router.get('/queue-stats', requireCredits, async (req, res) => {
+   484→    // SECURITY: Check for admin access
+   485→    // Only allow specific admin customer IDs (configured via env var)
+   486→    const adminCustomerIds = (process.env.ADMIN_CUSTOMER_IDS || '').split(',').filter(Boolean);
+   487→    const customerId = req.stripeCustomerId;
+   488→
+   489→    if (!customerId || (adminCustomerIds.length > 0 && !adminCustomerIds.includes(customerId))) {
+   490→      return res.status(403).json({ error: 'Admin access required' });
+   491→    }
+   492→
+   493→    loadMusicServices();
+   494→    if (!musicQueue) {
+   495→      return res.status(503).json({ error: 'Music service not available' });
+   496→    }
+   497→
+   498→    try {
+   499→      const stats = await musicQueue.getQueueStats();
+   500→      res.json(stats);
+   501→    } catch (err) {
+   502→      console.error('[SPLICE] Queue stats error:', err.message);
+   503→      res.status(500).json({ error: err.message || 'Failed to get queue stats' });
+   504→    }
+   505→  });
+   506→
+   507→  /**
+   508→   * GET /alignment-options - Get alignment configuration options
+   509→   * Note: Loads alignment service on demand (no Redis dependency)
+   510→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   511→   */
+   512→  router.get('/alignment-options', (req, res) => {
+   513→    // Load alignment service on demand if not already loaded
+   514→    if (!musicAlignment) {
+   515→      try {
+   516→        musicAlignment = require('../services/musicAlignment');
+   517→      } catch (err) {
+   518→        console.warn('[SPLICE] Music alignment service not available:', err.message);
+   519→        return res.status(503).json({ error: 'Music alignment service not available' });
+   520→      }
+   521→    }
+   522→
+   523→    res.json({
+   524→      fadeDuration: {
+   525→        default: musicAlignment.DEFAULT_FADE_DURATION,
+   526→        min: musicAlignment.MIN_FADE_DURATION,
+   527→        max: musicAlignment.MAX_FADE_DURATION
+   528→      },
+   529→      searchWindow: {
+   530→        default: musicAlignment.BEAT_SEARCH_WINDOW,
+   531→        min: 0.5,
+   532→        max: 10
+   533→      },
+   534→      minAudioDuration: musicAlignment.MIN_AUDIO_DURATION
+   535→    });
+   536→  });
+   537→
+   538→  /**
+   539→   * GET /timeline-options - Get timeline generation options and presets
+   540→   * Note: Loads timeline service on demand (no Redis dependency)
+   541→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   542→   */
+   543→  router.get('/timeline-options', (req, res) => {
+   544→    // Load timeline service on demand if not already loaded
+   545→    if (!musicTimeline) {
+   546→      try {
+   547→        musicTimeline = require('../services/musicTimeline');
+   548→      } catch (err) {
+   549→        console.warn('[SPLICE] Music timeline service not available:', err.message);
+   550→        return res.status(503).json({ error: 'Music timeline service not available' });
+   551→      }
+   552→    }
+   553→
+   554→    res.json(musicTimeline.getTimelinePresets());
+   555→  });
+   556→
+   557→  /**
+   558→   * POST /timeline-estimate - Estimate timeline generation time
+   559→   * Note: Loads timeline service on demand (no Redis dependency)
+   560→   * IMPORTANT: Must be defined BEFORE /:jobId catch-all route
+   561→   */
+   562→  router.post('/timeline-estimate', (req, res) => {
+   563→    const { transcript, maxChapters, minChapterLength } = req.body;
+   564→
+   565→    // Load timeline service on demand if not already loaded
+   566→    if (!musicTimeline) {
+   567→      try {
+   568→        musicTimeline = require('../services/musicTimeline');
+   569→      } catch (err) {
+   570→        console.warn('[SPLICE] Music timeline service not available:', err.message);
+   571→        return res.status(503).json({ error: 'Music timeline service not available' });
+   572→      }
+   573→    }
+   574→
+   575→    if (!transcript || !transcript.duration) {
+   576→      return res.status(400).json({ error: 'transcript with duration is required' });
+   577→    }
+   578→
+   579→    const estimate = musicTimeline.estimateGenerationTime(transcript, {
+   580→      maxChapters,
+   581→      minChapterLength
+   582→    });
+   583→
+   584→    res.json(estimate);
+   585→  });
+   586→
+   587→  /**
+   588→   * GET /:jobId - Get music with signed download URL
+   589→   * IMPORTANT: This is a catch-all route - must be defined AFTER all specific routes
+   590→   */
+   591→  router.get('/:jobId', requireCredits, async (req, res) => {
+   592→    const { jobId } = req.params;
+   593→    const customerId = req.stripeCustomerId;
+   594→
+   595→    if (!musicQueue || !r2Storage) {
+   596→      return res.status(503).json({ error: 'Music service not available' });
+   597→    }
+   598→
+   599→    try {
+   600→      const status = await musicQueue.getJobStatus(jobId);
+   601→
+   602→      if (!status) {
+   603→        return res.status(404).json({ error: 'Music not found' });
+   604→      }
+   605→
+   606→      // Verify ownership
+   607→      if (status.data.customerId !== customerId) {
+   608→        return res.status(403).json({ error: 'Access denied' });
+   609→      }
+   610→
+   611→      if (status.status !== 'completed') {
+   612→        return res.status(400).json({ error: 'Music generation not complete' });
+   613→      }
+   614→
+   615→      // Generate signed download URLs
+   616→      const masterKey = r2Storage.generateStorageKey(customerId, jobId, 'master.wav');
+   617→      const previewKey = r2Storage.generateStorageKey(customerId, jobId, 'preview.mp3');
+   618→
+   619→      const [downloadUrl, previewUrl] = await Promise.all([
+   620→        r2Storage.getSignedDownloadUrl(masterKey, 3600), // 1 hour
+   621→        r2Storage.getSignedDownloadUrl(previewKey, 3600).catch(() => null)
+   622→      ]);
+   623→
+   624→      res.json({
+   625→        success: true,
+   626→        music: {
+   627→          jobId,
+   628→          title: status.data.musicResult?.title || 'Generated Music',
+   629→          duration: status.data.duration,
+   630→          mood: status.data.mood,
+   631→          downloadUrl,
+   632→          previewUrl,
+   633→          createdAt: status.createdAt,
+   634→          completedAt: status.completedAt
+   635→        }
+   636→      });
+   637→
+   638→    } catch (err) {
+   639→      console.error('[SPLICE] Get music error:', err.message);
+   640→      res.status(500).json({ error: err.message || 'Failed to get music' });
+   641→    }
+   642→  });
+   643→
+   644→  /**
+   645→   * DELETE /:jobId - Delete music from library
+   646→   */
+   647→  router.delete('/:jobId', requireCredits, async (req, res) => {
+   648→    const { jobId } = req.params;
+   649→    const customerId = req.stripeCustomerId;
+   650→
+   651→    if (!musicQueue || !r2Storage) {
+   652→      return res.status(503).json({ error: 'Music service not available' });
+   653→    }
+   654→
+   655→    try {
+   656→      const status = await musicQueue.getJobStatus(jobId);
+   657→
+   658→      if (!status) {
+   659→        return res.status(404).json({ error: 'Music not found' });
+   660→      }
+   661→
+   662→      // Verify ownership
+   663→      if (status.data.customerId !== customerId) {
+   664→        return res.status(403).json({ error: 'Access denied' });
+   665→      }
+   666→
+   667→      // Delete from R2
+   668→      await r2Storage.deleteJobFiles(customerId, jobId);
+   669→
+   670→      // Note: Job record stays in Redis for history
+   671→      // Could optionally call musicQueue.cancelJob if we want to remove it
+   672→
+   673→      res.json({ success: true, message: 'Music deleted' });
+   674→
+   675→    } catch (err) {
+   676→      console.error('[SPLICE] Delete music error:', err.message);
+   677→      res.status(500).json({ error: err.message || 'Failed to delete music' });
+   678→    }
+   679→  });
+   680→
+   681→  /**
+   682→   * POST /align - Align music to video duration with beat-matching
+   683→   */
+   684→  router.post('/align', requireCredits, async (req, res) => {
+   685→    const { jobId, targetDuration, fadeDuration, beatAlign = true, searchWindow } = req.body;
+   686→    const customerId = req.stripeCustomerId;
+   687→
+   688→    if (!jobId) {
+   689→      return res.status(400).json({ error: 'jobId is required' });
+   690→    }
+   691→
+   692→    if (!targetDuration || typeof targetDuration !== 'number') {
+   693→      return res.status(400).json({ error: 'targetDuration (number in seconds) is required' });
+   694→    }
+   695→
+   696→    if (!musicAlignment || !musicQueue || !r2Storage) {
+   697→      return res.status(503).json({ error: 'Music alignment service not available' });
+   698→    }
+   699→
+   700→    try {
+   701→      // Validate options
+   702→      const validation = musicAlignment.validateAlignmentOptions({
+   703→        targetDuration,
+   704→        fadeDuration,
+   705→        searchWindow
+   706→      });
+   707→      if (!validation.valid) {
+   708→        return res.status(400).json({ error: validation.errors.join(', ') });
+   709→      }
+   710→
+   711→      // Get job and verify ownership
+   712→      const job = await musicQueue.getJobStatus(jobId);
+   713→      if (!job) {
+   714→        return res.status(404).json({ error: 'Job not found' });
+   715→      }
+   716→      if (job.data.customerId !== customerId) {
+   717→        return res.status(403).json({ error: 'Access denied' });
+   718→      }
+   719→      if (job.status !== 'completed') {
+   720→        return res.status(400).json({ error: 'Job must be completed before alignment' });
+   721→      }
+   722→
+   723→      // Download the master audio from R2
+   724→      const masterKey = r2Storage.generateStorageKey(customerId, jobId, 'master.wav');
+   725→      const audioBuffer = await r2Storage.downloadFile(masterKey);
+   726→
+   727→      // Perform alignment with beat detection
+   728→      const result = await musicAlignment.trimToLength(audioBuffer, targetDuration, {
+   729→        fadeDuration: fadeDuration || musicAlignment.DEFAULT_FADE_DURATION,
+   730→        beatAlign,
+   731→        searchWindow: searchWindow || musicAlignment.BEAT_SEARCH_WINDOW
+   732→      });
+   733→
+   734→      // Generate aligned file key
+   735→      const alignedKey = r2Storage.generateStorageKey(customerId, jobId, `aligned_${Math.round(targetDuration)}s.wav`);
+   736→
+   737→      // Upload aligned audio to R2
+   738→      await r2Storage.uploadBuffer(alignedKey, result.buffer, 'audio/wav');
+   739→
+   740→      // Get signed URL for download
+   741→      const downloadUrl = await r2Storage.getSignedDownloadUrl(alignedKey, 3600);
+   742→
+   743→      res.json({
+   744→        success: true,
+   745→        jobId,
+   746→        targetDuration,
+   747→        actualDuration: result.cutTime,
+   748→        wasAligned: result.wasAligned,
+   749→        beatCount: result.beats.length,
+   750→        downloadUrl,
+   751→        alignedKey
+   752→      });
+   753→
+   754→    } catch (err) {
+   755→      console.error('[SPLICE] Music align error:', err.message);
+   756→      res.status(500).json({ error: err.message || 'Failed to align music' });
+   757→    }
+   758→  });
+   759→
+   760→  /**
+   761→   * POST /analyze-beats - Analyze beats in audio without trimming
+   762→   */
+   763→  router.post('/analyze-beats', requireCredits, async (req, res) => {
+   764→    const { jobId } = req.body;
+   765→    const customerId = req.stripeCustomerId;
+   766→
+   767→    if (!jobId) {
+   768→      return res.status(400).json({ error: 'jobId is required' });
+   769→    }
+   770→
+   771→    if (!musicAlignment || !musicQueue || !r2Storage) {
+   772→      return res.status(503).json({ error: 'Music alignment service not available' });
+   773→    }
+   774→
+   775→    try {
+   776→      // Get job and verify ownership
+   777→      const job = await musicQueue.getJobStatus(jobId);
+   778→      if (!job) {
+   779→        return res.status(404).json({ error: 'Job not found' });
+   780→      }
+   781→      if (job.data.customerId !== customerId) {
+   782→        return res.status(403).json({ error: 'Access denied' });
+   783→      }
+   784→      if (job.status !== 'completed') {
+   785→        return res.status(400).json({ error: 'Job must be completed before analysis' });
+   786→      }
+   787→
+   788→      // Download the master audio from R2
+   789→      const masterKey = r2Storage.generateStorageKey(customerId, jobId, 'master.wav');
+   790→      const audioBuffer = await r2Storage.downloadFile(masterKey);
+   791→
+   792→      // Analyze beats
+   793→      const analysis = await musicAlignment.analyzeBeats(audioBuffer);
+   794→
+   795→      res.json({
+   796→        success: true,
+   797→        jobId,
+   798→        duration: analysis.duration,
+   799→        beatCount: analysis.beatCount,
+   800→        bpm: analysis.bpm,
+   801→        beats: analysis.beats
+   802→      });
+   803→
+   804→    } catch (err) {
+   805→      console.error('[SPLICE] Beat analysis error:', err.message);
+   806→      res.status(500).json({ error: err.message || 'Failed to analyze beats' });
+   807→    }
+   808→  });
+   809→
+   810→  /**
+   811→   * POST /generate-timeline - Generate per-chapter mood-matched music
+   812→   * Billing: 3 credits per timeline job (multiple generations + assembly)
+   813→   */
+   814→  router.post('/generate-timeline', requireCredits, async (req, res) => {
+   815→    const { transcript, maxChapters, minChapterLength, crossfadeDuration, instruments, prompt } = req.body;
+   816→    const customerId = req.stripeCustomerId;
+   817→
+   818→    if (!customerId) {
+   819→      return res.status(401).json({ error: 'Authentication required' });
+   820→    }
+   821→
+   822→    loadMusicServices();
+   823→    if (!musicTimeline) {
+   824→      return res.status(503).json({ error: 'Music timeline service not available' });
+   825→    }
+   826→
+   827→    if (!musicGeneration || !musicGeneration.hasMurekaCredentials()) {
+   828→      return res.status(503).json({ error: 'Music generation service not configured' });
+   829→    }
+   830→
+   831→    // Validate transcript
+   832→    if (!transcript) {
+   833→      return res.status(400).json({ error: 'transcript is required' });
+   834→    }
+   835→
+   836→    // Validate options
+   837→    const validation = musicTimeline.validateTimelineOptions(transcript, {
+   838→      maxChapters,
+   839→      minChapterLength,
+   840→      crossfadeDuration
+   841→    });
+   842→
+   843→    if (!validation.valid) {
+   844→      return res.status(400).json({ error: validation.errors.join(', ') });
+   845→    }
+   846→
+   847→    try {
+   848→      // Check music credits (timeline costs 3 credits due to multiple generations)
+   849→      const creditCost = 3;
+   850→
+   851→      // Estimate generation time
+   852→      const estimate = musicTimeline.estimateGenerationTime(transcript, {
+   853→        maxChapters: maxChapters || 10,
+   854→        minChapterLength: minChapterLength || 60
+   855→      });
+   856→
+   857→      console.log(`[SPLICE Timeline] Starting generation for ${customerId} - est. ${estimate.estimatedChapters} chapters`);
+   858→
+   859→      // Generate timeline music
+   860→      const result = await musicTimeline.generateTimelineMusic(transcript, {
+   861→        maxChapters: maxChapters || 10,
+   862→        minChapterLength: minChapterLength || 60,
+   863→        crossfadeDuration: crossfadeDuration || 2.0,
+   864→        instruments: instruments || [],
+   865→        prompt: prompt || ''
+   866→      });
+   867→
+   868→      // Upload to R2 if available
+   869→      let r2Key = null;
+   870→      let signedUrl = null;
+   871→
+   872→      if (r2Storage && result.audioBuffer) {
+   873→        const jobId = `timeline_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+   874→        r2Key = `${customerId}/${jobId}/timeline.wav`;
+   875→
+   876→        // Note: uploadMusic signature is (buffer, key, metadata)
+   877→        await r2Storage.uploadMusic(result.audioBuffer, r2Key, {
+   878→          customerId,
+   879→          jobId,
+   880→          type: 'timeline',
+   881→          chapterCount: String(result.chapters.length)
+   882→        });
+   883→
+   884→        signedUrl = await r2Storage.getSignedDownloadUrl(r2Key, 3600);
+   885→      }
+   886→
+   887→      // Deduct timeline credits (3 credits for timeline = 3 individual song credits)
+   888→      for (let i = 0; i < creditCost; i++) {
+   889→        await usageTracking.deductMusicCredit(customerId);
+   890→      }
+   891→
+   892→      res.json({
+   893→        success: true,
+   894→        duration: result.duration,
+   895→        chapters: result.chapters,
+   896→        metadata: result.metadata,
+   897→        audioUrl: signedUrl,
+   898→        r2Key,
+   899→        creditCost,
+   900→        estimate
+   901→      });
+   902→
+   903→    } catch (err) {
+   904→      console.error('[SPLICE Timeline] Generation error:', err.message);
+   905→      res.status(500).json({ error: err.message || 'Timeline generation failed' });
+   906→    }
+   907→  });
+   908→
+   909→  return router;
+   910→}
+   911→
+   912→module.exports = createMusicRoutes;
+   913→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,287 @@
+     1→/**
+     2→ * Slice 4: Whisper Transcription Service
+     3→ *
+     4→ * Handles audio transcription using OpenAI's Whisper model.
+     5→ * Returns timestamped segments required for take detection.
+     6→ * Includes caching to avoid repeated API calls.
+     7→ *
+     8→ * Circuit Breaker Protection:
+     9→ * - OpenAI Whisper API calls wrapped with circuit breaker
+    10→ * - Fallback: Return cached data when circuit is OPEN (marked as stale)
+    11→ * - If no cache available and circuit OPEN: Return error to user
+    12→ */
+    13→
+    14→
+    15→const fs = require('fs');
+    16→const OpenAI = require('openai');
+    17→const { circuitBreakers } = require('../config/circuitBreakers');
+    18→
+    19→// Initialize OpenAI client
+    20→const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    21→
+    22→// In-memory cache: { wavPath: { mtime, result, cachedAt } }
+    23→const transcriptCache = new Map();
+    24→
+    25→// Cache configuration
+    26→const MAX_CACHE_SIZE = 50;
+    27→const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
+    28→
+    29→/**
+    30→ * Retry function with exponential backoff
+    31→ * @param {Function} fn - Async function to retry
+    32→ * @param {number} retries - Number of retry attempts (default: 3)
+    33→ * @param {number} baseDelay - Base delay in ms (default: 1000)
+    34→ * @returns {Promise<any>} Result of the function
+    35→ */
+    36→async function withRetry(fn, retries = 3, baseDelay = 1000) {
+    37→  let lastError;
+    38→
+    39→  for (let attempt = 0; attempt <= retries; attempt++) {
+    40→    try {
+    41→      return await fn();
+    42→    } catch (err) {
+    43→      lastError = err;
+    44→
+    45→      // Don't retry on quota exceeded - fail immediately
+    46→      if (err.code === 'insufficient_quota' || err.message?.includes('quota')) {
+    47→        throw new Error('OpenAI API quota exceeded. Please check your billing at https://platform.openai.com/account/billing');
+    48→      }
+    49→
+    50→      // Don't retry on the last attempt
+    51→      if (attempt === retries) {
+    52→        break;
+    53→      }
+    54→
+    55→      // Calculate delay with exponential backoff + jitter
+    56→      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 500;
+    57→
+    58→      // Only retry on retryable errors
+    59→      const isRetryable =
+    60→        err.status === 429 ||                          // Rate limit
+    61→        err.status === 500 ||                          // Server error
+    62→        err.status === 502 ||                          // Bad gateway
+    63→        err.status === 503 ||                          // Service unavailable
+    64→        err.code === 'ECONNRESET' ||                   // Connection reset
+    65→        err.code === 'ETIMEDOUT' ||                    // Timeout
+    66→        err.message?.includes('Connection error') ||   // Connection error
+    67→        err.message?.includes('network');              // Network error
+    68→
+    69→      if (!isRetryable) {
+    70→        throw err;
+    71→      }
+    72→
+    73→      console.log(`[SPLICE] Retry ${attempt + 1}/${retries} after ${Math.round(delay)}ms: ${err.message}`);
+    74→      await new Promise(resolve => setTimeout(resolve, delay));
+    75→    }
+    76→  }
+    77→
+    78→  throw lastError;
+    79→}
+    80→
+    81→/**
+    82→ * LRU cache set with size limit and TTL
+    83→ * Evicts oldest entries when cache exceeds MAX_CACHE_SIZE
+    84→ * @param {string} key - Cache key
+    85→ * @param {any} value - Value to cache (should include mtime, result)
+    86→ */
+    87→function cacheSet(key, value) {
+    88→  // Clean up expired entries first
+    89→  cleanExpiredEntries();
+    90→
+    91→  // Evict oldest entries if at capacity
+    92→  while (transcriptCache.size >= MAX_CACHE_SIZE) {
+    93→    const oldestKey = transcriptCache.keys().next().value;
+    94→    transcriptCache.delete(oldestKey);
+    95→    console.log(`[SPLICE] Cache eviction: removed ${oldestKey}`);
+    96→  }
+    97→
+    98→  // Add cachedAt timestamp
+    99→  transcriptCache.set(key, {
+   100→    ...value,
+   101→    cachedAt: Date.now()
+   102→  });
+   103→}
+   104→
+   105→/**
+   106→ * Get from cache with TTL check
+   107→ * @param {string} key - Cache key
+   108→ * @returns {object|null} Cached value or null if expired/missing
+   109→ */
+   110→function cacheGet(key) {
+   111→  const entry = transcriptCache.get(key);
+   112→  if (!entry) return null;
+   113→
+   114→  // Check TTL
+   115→  if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {
+   116→    transcriptCache.delete(key);
+   117→    console.log(`[SPLICE] Cache entry expired: ${key}`);
+   118→    return null;
+   119→  }
+   120→
+   121→  return entry;
+   122→}
+   123→
+   124→/**
+   125→ * Clean up expired cache entries
+   126→ * Called periodically and before cache set
+   127→ */
+   128→function cleanExpiredEntries() {
+   129→  const now = Date.now();
+   130→  let cleaned = 0;
+   131→
+   132→  for (const [key, entry] of transcriptCache.entries()) {
+   133→    if (now - entry.cachedAt > CACHE_TTL_MS) {
+   134→      transcriptCache.delete(key);
+   135→      cleaned++;
+   136→    }
+   137→  }
+   138→
+   139→  if (cleaned > 0) {
+   140→    console.log(`[SPLICE] Cleaned ${cleaned} expired cache entries`);
+   141→  }
+   142→}
+   143→
+   144→/**
+   145→ * Unified transcription: calls Whisper ONCE with both word and segment granularities.
+   146→ * All other transcription functions should use this cache.
+   147→ *
+   148→ * @param {string} wavPath - Path to the WAV file
+   149→ * @returns {Promise<{text: string, segments: Array, words: Array, duration: number, language: string}>}
+   150→ */
+   151→async function transcribeFull(wavPath) {
+   152→  // Check cache based on file modification time and TTL
+   153→  const stats = fs.statSync(wavPath);
+   154→  const mtime = stats.mtimeMs;
+   155→  const cacheKey = `full:${wavPath}`;
+   156→
+   157→  const cached = cacheGet(cacheKey);  // Uses TTL-aware getter
+   158→  if (cached && cached.mtime === mtime) {
+   159→    console.log('[SPLICE] Using cached full transcription (file unchanged, cache valid)');
+   160→    return cached.result;
+   161→  }
+   162→
+   163→  console.log('[SPLICE] Starting unified Whisper transcription (words + segments)...');
+   164→
+   165→  // Single Whisper call with BOTH granularities
+   166→  const transcription = await withRetry(async () => {
+   167→    return await openai.audio.transcriptions.create({
+   168→      file: fs.createReadStream(wavPath),
+   169→      model: 'whisper-1',
+   170→      response_format: 'verbose_json',
+   171→      timestamp_granularities: ['word', 'segment'],
+   172→      language: 'en',
+   173→    });
+   174→  });
+   175→
+   176→  console.log(`[SPLICE] Unified transcription complete: ${transcription.segments?.length || 0} segments, ${transcription.words?.length || 0} words`);
+   177→
+   178→  // Build unified result with both segments and words
+   179→  const result = {
+   180→    text: transcription.text,
+   181→    segments: (transcription.segments || []).map(s => ({
+   182→      id: s.id,
+   183→      start: s.start,
+   184→      end: s.end,
+   185→      text: s.text
+   186→    })),
+   187→    words: (transcription.words || []).map(w => ({
+   188→      word: w.word,
+   189→      start: w.start,
+   190→      end: w.end
+   191→    })),
+   192→    language: transcription.language || 'en',
+   193→    duration: transcription.duration || 0
+   194→  };
+   195→
+   196→  // Cache the unified result
+   197→  cacheSet(cacheKey, { mtime, result });
+   198→  console.log(`[SPLICE] Full transcription cached (${result.segments.length} segments, ${result.words.length} words)`);
+   199→
+   200→  return result;
+   201→}
+   202→
+   203→/**
+   204→ * Transcribe audio file using Whisper with segment timestamps (with caching)
+   205→ * Uses unified transcribeFull() cache to avoid duplicate API calls.
+   206→ *
+   207→ * @param {string} wavPath - Path to the WAV file
+   208→ * @returns {Promise<{text: string, segments: Array, language: string, duration: number}>}
+   209→ */
+   210→async function transcribeAudio(wavPath) {
+   211→  // Use unified transcription (gets both segments and words)
+   212→  const full = await transcribeFull(wavPath);
+   213→
+   214→  // Return segment-focused result (matches legacy format)
+   215→  return {
+   216→    text: full.text,
+   217→    segments: full.segments,
+   218→    language: full.language,
+   219→    duration: full.duration
+   220→  };
+   221→}
+   222→
+   223→/**
+   224→ * Transcribe audio with word-level timestamps using Whisper
+   225→ * Uses unified transcribeFull() cache to avoid duplicate API calls.
+   226→ *
+   227→ * @param {string} wavPath - Path to the WAV file
+   228→ * @returns {Promise<{text: string, words: Array<{word: string, start: number, end: number}>}>}
+   229→ */
+   230→async function transcribeWithWords(wavPath) {
+   231→  // Use unified transcription (gets both segments and words)
+   232→  const full = await transcribeFull(wavPath);
+   233→
+   234→  // Return word-focused result (matches legacy format)
+   235→  return {
+   236→    text: full.text,
+   237→    words: full.words,
+   238→    language: full.language,
+   239→    duration: full.duration
+   240→  };
+   241→}
+   242→
+   243→/**
+   244→ * Clear transcription cache
+   245→ * Useful for testing or memory management
+   246→ */
+   247→function clearCache() {
+   248→  const size = transcriptCache.size;
+   249→  transcriptCache.clear();
+   250→  console.log(`[SPLICE] Cleared ${size} cached transcription(s)`);
+   251→  return size;
+   252→}
+   253→
+   254→/**
+   255→ * Get cache statistics
+   256→ */
+   257→function getCacheStats() {
+   258→  const now = Date.now();
+   259→  const entries = [];
+   260→
+   261→  for (const [key, entry] of transcriptCache.entries()) {
+   262→    const ageMs = now - entry.cachedAt;
+   263→    entries.push({
+   264→      key,
+   265→      ageMs,
+   266→      ageMinutes: Math.floor(ageMs / 60000),
+   267→      expiresInMs: Math.max(0, CACHE_TTL_MS - ageMs),
+   268→      expired: ageMs > CACHE_TTL_MS
+   269→    });
+   270→  }
+   271→
+   272→  return {
+   273→    entries: transcriptCache.size,
+   274→    ttlMs: CACHE_TTL_MS,
+   275→    ttlMinutes: CACHE_TTL_MS / 60000,
+   276→    maxSize: MAX_CACHE_SIZE,
+   277→    keys: Array.from(transcriptCache.keys()),
+   278→    details: entries
+   279→  };
+   280→}
+   281→
+   282→module.exports = { transcribeFull, transcribeAudio, transcribeWithWords, clearCache, getCacheStats };
+   283→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

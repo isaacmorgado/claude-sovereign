@@ -1,0 +1,967 @@
+#!/usr/bin/env node
+
+/**
+ * Website Cloner - All-in-One Tool
+ *
+ * Single command that:
+ * 1. Clones the website (Playwright for SPAs, or fast static download)
+ * 2. Beautifies all JS/CSS automatically
+ * 3. Unpacks webpack bundles
+ * 4. Analyzes and reports findings
+ *
+ * Usage: node cloner.js --url="https://example.com"
+ */
+
+const { chromium } = require('playwright');
+const { program } = require('commander');
+const chalk = require('chalk');
+const ora = require('ora');
+const fs = require('fs').promises;
+const path = require('path');
+const { URL } = require('url');
+const robotsParser = require('robots-parser');
+const mime = require('mime-types');
+const crypto = require('crypto');
+const { execSync, spawn } = require('child_process');
+
+// Paths to reverse-engineer tools
+const TOOLS_DIR = path.join(__dirname, '..');
+const JS_BEAUTIFY_DIR = path.join(TOOLS_DIR, 'js-beautify');
+const WAKARU_DIR = path.join(TOOLS_DIR, 'wakaru');
+const PYTHON_DOWNLOADER = path.join(__dirname, '..', '..', 'WEBSITE_DOWNLOADER', 'website-downloader.py');
+
+// Custom deobfuscator (pure JS, no native deps)
+const Deobfuscator = require('./lib/deobfuscator');
+
+class WebsiteCloner {
+  constructor(options) {
+    this.options = {
+      url: options.url,
+      urlList: options.urlList || [options.url],
+      depth: parseInt(options.depth) || 3,
+      delay: parseInt(options.delay) || 500,
+      output: options.output || './site-clone',
+      maxPages: parseInt(options.maxPages) || 500,
+      timeout: parseInt(options.timeout) || 30000,
+      exclude: options.exclude ? options.exclude.split(',') : ['/logout', '/admin', '/signout', '/api/auth'],
+      login: options.login || null,
+      headed: options.headed || false,
+      interactive: options.interactive || false,
+      multiDomain: options.multiDomain || false,
+      screenshots: options.screenshots || false,
+      manualLogin: options.manualLogin || false,
+      loginUrl: options.loginUrl || null,
+      saveCookies: options.saveCookies || false,
+      loadCookies: options.loadCookies || false,
+      pauseEach: options.pauseEach || false,
+    };
+
+    this.baseUrl = null;
+    this.baseDomain = null;
+    this.allowedDomains = new Set(); // For multi-domain support
+    this.visited = new Set();
+    this.queue = [];
+    this.assets = new Map();
+    this.hashes = new Set();
+    this.urlMap = new Map();
+    this.harEntries = [];
+    this.harStartTime = new Date();
+
+    this.stats = {
+      pagesVisited: 0,
+      assetsDownloaded: 0,
+      apiCallsCaptured: 0,
+      jsFilesBeautified: 0,
+      bundlesUnpacked: 0,
+      jsFilesDeobfuscated: 0,
+      errors: [],
+      startTime: null,
+      endTime: null,
+    };
+
+    this.report = {
+      siteInfo: {},
+      pages: [],
+      assets: { js: [], css: [], images: [], fonts: [], api: [] },
+      frameworks: [],
+      apiEndpoints: [],
+      recommendations: [],
+    };
+  }
+
+  log(message, type = 'info') {
+    const prefix = {
+      info: chalk.blue('[INFO]'),
+      success: chalk.green('[OK]'),
+      warn: chalk.yellow('[WARN]'),
+      error: chalk.red('[ERROR]'),
+      step: chalk.cyan('[STEP]'),
+    };
+    console.log(`${prefix[type] || prefix.info} ${message}`);
+  }
+
+  // ============================================
+  // INITIALIZATION
+  // ============================================
+
+  async initialize() {
+    this.baseUrl = new URL(this.options.url);
+    this.baseDomain = this.baseUrl.hostname;
+
+    // Build allowed domains from all URLs
+    for (const url of this.options.urlList) {
+      const parsed = new URL(url);
+      this.allowedDomains.add(parsed.hostname);
+
+      // If multi-domain, also allow the root domain
+      if (this.options.multiDomain) {
+        const parts = parsed.hostname.split('.');
+        if (parts.length >= 2) {
+          const rootDomain = parts.slice(-2).join('.');
+          this.allowedDomains.add(rootDomain);
+        }
+      }
+    }
+
+    const dirs = ['html', 'css', 'js', 'js-beautified', 'js-deobfuscated', 'js-unpacked', 'images', 'fonts', 'api', 'har', 'screenshots'];
+    for (const dir of dirs) {
+      await fs.mkdir(path.join(this.options.output, dir), { recursive: true });
+    }
+
+    this.report.siteInfo = {
+      url: this.options.url,
+      urls: this.options.urlList,
+      domains: Array.from(this.allowedDomains),
+      clonedAt: new Date().toISOString(),
+    };
+
+    this.log(`Target URLs: ${this.options.urlList.length}`, 'info');
+    this.log(`Domains: ${Array.from(this.allowedDomains).join(', ')}`, 'info');
+    this.log(`Output: ${path.resolve(this.options.output)}`, 'info');
+  }
+
+  // ============================================
+  // URL HELPERS
+  // ============================================
+
+  isInternalUrl(url) {
+    try {
+      const parsed = new URL(url, this.baseUrl);
+      // Check if hostname is in allowed domains
+      if (this.allowedDomains.has(parsed.hostname)) return true;
+
+      // Check if it's a subdomain of any allowed domain
+      if (this.options.multiDomain) {
+        for (const domain of this.allowedDomains) {
+          if (parsed.hostname.endsWith('.' + domain) || domain.endsWith('.' + parsed.hostname)) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    } catch { return false; }
+  }
+
+  shouldExclude(url) {
+    const pathname = new URL(url, this.baseUrl).pathname;
+    return this.options.exclude.some(p => pathname.startsWith(p));
+  }
+
+  normalizeUrl(url) {
+    try {
+      const parsed = new URL(url, this.baseUrl);
+      parsed.hash = '';
+      return parsed.href;
+    } catch { return null; }
+  }
+
+  // ============================================
+  // ASSET MANAGEMENT
+  // ============================================
+
+  hashContent(content) {
+    const data = typeof content === 'string' ? content : Buffer.from(content);
+    return crypto.createHash('md5').update(data).digest('hex');
+  }
+
+  generateFilename(url, extension) {
+    try {
+      const parsed = new URL(url);
+      let filename = parsed.pathname.split('/').pop() || 'index';
+      filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (extension && !filename.endsWith(extension)) {
+        filename = filename.replace(/\.[^.]+$/, '') + extension;
+      }
+      const hash = this.hashContent(url).substring(0, 8);
+      if (filename.length > 100) {
+        filename = filename.substring(0, 90) + '_' + hash + (extension || '');
+      }
+      return filename;
+    } catch {
+      return 'asset_' + this.hashContent(url).substring(0, 12) + (extension || '');
+    }
+  }
+
+  async saveAsset(url, content, type, extension) {
+    const hash = this.hashContent(content);
+    if (this.hashes.has(hash)) return null;
+
+    let filename = this.generateFilename(url, extension);
+    const dir = path.join(this.options.output, type);
+
+    // Ensure unique filename
+    let finalName = filename;
+    let counter = 1;
+    while (true) {
+      try {
+        await fs.access(path.join(dir, finalName));
+        const ext = path.extname(filename);
+        const base = path.basename(filename, ext);
+        finalName = `${base}_${counter}${ext}`;
+        counter++;
+      } catch { break; }
+    }
+
+    const fullPath = path.join(dir, finalName);
+
+    if (typeof content === 'string') {
+      await fs.writeFile(fullPath, content, 'utf-8');
+    } else {
+      await fs.writeFile(fullPath, content);
+    }
+
+    this.hashes.add(hash);
+    this.urlMap.set(url, path.join(type, finalName));
+    this.assets.set(url, { hash, path: fullPath, type, filename: finalName });
+
+    return fullPath;
+  }
+
+  // ============================================
+  // NETWORK INTERCEPTION
+  // ============================================
+
+  async setupNetworkInterception(page) {
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        const status = response.status();
+        const headers = response.headers();
+        const contentType = headers['content-type'] || '';
+
+        // Add to HAR
+        this.addHarEntry(response);
+
+        if (status < 200 || status >= 400) return;
+        if (this.assets.has(url)) return;
+
+        let resourceType = 'other';
+        let extension = '';
+
+        if (contentType.includes('text/css') || url.endsWith('.css')) {
+          resourceType = 'css'; extension = '.css';
+        } else if (contentType.includes('javascript') || url.endsWith('.js')) {
+          resourceType = 'js'; extension = '.js';
+        } else if (contentType.includes('image/') || /\.(png|jpg|jpeg|gif|svg|webp|ico)(\?|$)/i.test(url)) {
+          resourceType = 'images';
+          extension = url.match(/\.(png|jpg|jpeg|gif|svg|webp|ico)/i)?.[0] || '.png';
+        } else if (contentType.includes('font/') || /\.(woff2?|ttf|eot|otf)(\?|$)/i.test(url)) {
+          resourceType = 'fonts';
+          extension = url.match(/\.(woff2?|ttf|eot|otf)/i)?.[0] || '.woff2';
+        } else if (contentType.includes('application/json') || url.includes('/api/')) {
+          resourceType = 'api'; extension = '.json';
+          this.stats.apiCallsCaptured++;
+
+          // Track API endpoint
+          try {
+            const apiUrl = new URL(url);
+            this.report.apiEndpoints.push({
+              method: response.request().method(),
+              path: apiUrl.pathname,
+              status: status,
+            });
+          } catch {}
+        } else {
+          return; // Skip other types
+        }
+
+        let body;
+        try {
+          if (resourceType === 'api' || contentType.includes('json')) {
+            body = JSON.stringify(await response.json(), null, 2);
+          } else if (['css', 'js'].includes(resourceType) || contentType.includes('text')) {
+            body = await response.text();
+          } else {
+            body = await response.body();
+          }
+        } catch { return; }
+
+        const savedPath = await this.saveAsset(url, body, resourceType, extension);
+        if (savedPath) {
+          this.stats.assetsDownloaded++;
+          this.report.assets[resourceType]?.push({ url, localPath: savedPath });
+        }
+      } catch {}
+    });
+  }
+
+  addHarEntry(response) {
+    try {
+      const request = response.request();
+      this.harEntries.push({
+        startedDateTime: new Date().toISOString(),
+        request: {
+          method: request.method(),
+          url: request.url(),
+          headers: [],
+        },
+        response: {
+          status: response.status(),
+          statusText: response.statusText(),
+          headers: [],
+        },
+      });
+    } catch {}
+  }
+
+  // ============================================
+  // SMART FEATURES
+  // ============================================
+
+  async detectFrameworks(page) {
+    const frameworks = await page.evaluate(() => {
+      const detected = [];
+      if (window.React || window.__REACT_DEVTOOLS_GLOBAL_HOOK__) detected.push('React');
+      if (window.Vue || window.__VUE__) detected.push('Vue');
+      if (window.angular || window.ng) detected.push('Angular');
+      if (window.__NEXT_DATA__) detected.push('Next.js');
+      if (window.__NUXT__) detected.push('Nuxt.js');
+      if (window.Svelte) detected.push('Svelte');
+      if (window.jQuery || window.$?.fn?.jquery) detected.push('jQuery');
+      return detected;
+    });
+    this.report.frameworks = frameworks;
+    if (frameworks.length > 0) {
+      this.log(`Detected: ${frameworks.join(', ')}`, 'info');
+    }
+    return frameworks;
+  }
+
+  async handleCookieConsent(page) {
+    const selectors = [
+      '#onetrust-accept-btn-handler', '.cc-accept', '.gdpr-accept',
+      'button:has-text("Accept All")', 'button:has-text("Accept Cookies")',
+      'button:has-text("I Agree")', 'button:has-text("Got it")',
+      '[class*="cookie"] button[class*="accept"]',
+    ];
+    for (const sel of selectors) {
+      try {
+        const btn = await page.$(sel);
+        if (btn && await btn.isVisible()) {
+          await btn.click();
+          await page.waitForTimeout(500);
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  async handleInfiniteScroll(page) {
+    let prevHeight = 0;
+    let currHeight = await page.evaluate(() => document.body.scrollHeight);
+    let scrolls = 0;
+
+    while (scrolls < 5 && currHeight > prevHeight) {
+      prevHeight = currHeight;
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1000);
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      currHeight = await page.evaluate(() => document.body.scrollHeight);
+      scrolls++;
+    }
+  }
+
+  async handleInteractiveElements(page) {
+    // Dropdowns
+    const dropdowns = await page.$$('.dropdown-toggle, [data-toggle="dropdown"], [aria-haspopup="true"]');
+    for (const dd of dropdowns.slice(0, 5)) {
+      try {
+        await dd.hover();
+        await page.waitForTimeout(300);
+        await dd.click();
+        await page.waitForTimeout(300);
+        await page.keyboard.press('Escape');
+      } catch {}
+    }
+
+    // Tabs
+    const tabs = await page.$$('[role="tab"], .nav-tabs .nav-link');
+    for (const tab of tabs.slice(0, 5)) {
+      try {
+        await tab.click();
+        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+      } catch {}
+    }
+  }
+
+  async extractLinks(page) {
+    const links = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('a[href]')).map(a => a.href);
+    });
+    return links.filter(link => {
+      const normalized = this.normalizeUrl(link);
+      return normalized && this.isInternalUrl(normalized) &&
+             !this.visited.has(normalized) && !this.shouldExclude(normalized);
+    });
+  }
+
+  // ============================================
+  // CRAWLING
+  // ============================================
+
+  async crawlPage(page, url, depth) {
+    if (this.visited.has(url) || depth > this.options.depth || this.stats.pagesVisited >= this.options.maxPages) {
+      return [];
+    }
+
+    this.visited.add(url);
+    const spinner = ora(`[${this.stats.pagesVisited + 1}] ${url}`).start();
+
+    try {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: this.options.timeout });
+      await page.waitForTimeout(this.options.delay);
+
+      // First page setup
+      if (this.stats.pagesVisited === 0) {
+        await this.detectFrameworks(page);
+        await this.handleCookieConsent(page);
+      }
+
+      // Handle dynamic content
+      await this.handleInfiniteScroll(page);
+      await this.handleInteractiveElements(page);
+
+      // Pause mode - let user interact (upload images, adjust points, etc.)
+      if (this.options.pauseEach) {
+        console.log(chalk.bold.cyan('\n╔══════════════════════════════════════════╗'));
+        console.log(chalk.bold.cyan('║            INTERACTIVE PAUSE             ║'));
+        console.log(chalk.bold.cyan('╠══════════════════════════════════════════╣'));
+        console.log(chalk.bold.cyan('║  Page loaded. You can now:               ║'));
+        console.log(chalk.bold.cyan('║  • Upload images                         ║'));
+        console.log(chalk.bold.cyan('║  • Adjust landmarks/points               ║'));
+        console.log(chalk.bold.cyan('║  • Navigate within the page              ║'));
+        console.log(chalk.bold.cyan('║  • Trigger calculations                  ║'));
+        console.log(chalk.bold.cyan('║                                          ║'));
+        console.log(chalk.bold.cyan('║  Press ENTER when ready to capture       ║'));
+        console.log(chalk.bold.cyan('╚══════════════════════════════════════════╝\n'));
+        console.log(chalk.gray(`  Current URL: ${url}`));
+
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        await new Promise(resolve => rl.question(chalk.yellow('  Press ENTER to capture this page... '), resolve));
+        rl.close();
+
+        // Wait a moment for any final renders
+        await page.waitForTimeout(500);
+        this.log('Capturing page state...', 'info');
+      }
+
+      // Save HTML with proper filename (including query params)
+      const html = await page.content();
+      const parsedUrl = new URL(url);
+      const urlPath = parsedUrl.pathname || '/index';
+      let htmlFilename = urlPath === '/' ? 'index' : urlPath.replace(/\//g, '_').replace(/^_/, '');
+
+      // Include query params in filename (e.g., tab=overview -> _tab-overview)
+      if (parsedUrl.search) {
+        const queryPart = parsedUrl.search.slice(1).replace(/[=&]/g, '-').replace(/[^a-zA-Z0-9_-]/g, '');
+        htmlFilename += '_' + queryPart;
+      }
+
+      // Include subdomain if multi-domain
+      if (this.options.multiDomain || this.allowedDomains.size > 1) {
+        htmlFilename = parsedUrl.hostname.replace(/\./g, '_') + '_' + htmlFilename;
+      }
+
+      htmlFilename += '.html';
+      await fs.writeFile(path.join(this.options.output, 'html', htmlFilename), html);
+
+      // Take screenshot if enabled
+      if (this.options.screenshots) {
+        const screenshotName = htmlFilename.replace('.html', '.png');
+        await page.screenshot({
+          path: path.join(this.options.output, 'screenshots', screenshotName),
+          fullPage: true
+        });
+      }
+
+      // Extract links
+      const links = await this.extractLinks(page);
+
+      this.stats.pagesVisited++;
+      this.report.pages.push({ url, linksFound: links.length });
+
+      spinner.succeed(`[${this.stats.pagesVisited}] ${url} (${links.length} links)`);
+
+      return links.map(l => ({ url: this.normalizeUrl(l), depth: depth + 1 })).filter(l => l.url);
+    } catch (error) {
+      spinner.fail(`[${this.stats.pagesVisited + 1}] ${url} - ${error.message}`);
+      this.stats.errors.push({ url, error: error.message });
+      return [];
+    }
+  }
+
+  // ============================================
+  // POST-PROCESSING
+  // ============================================
+
+  async beautifyJsFiles() {
+    this.log('Beautifying JavaScript files...', 'step');
+    const jsDir = path.join(this.options.output, 'js');
+    const outDir = path.join(this.options.output, 'js-beautified');
+
+    try {
+      const files = await fs.readdir(jsDir);
+      const jsFiles = files.filter(f => f.endsWith('.js'));
+
+      for (const file of jsFiles) {
+        try {
+          const content = await fs.readFile(path.join(jsDir, file), 'utf-8');
+
+          // Simple beautification (indent and line breaks)
+          let beautified = content;
+          try {
+            // Try using js-beautify if available
+            await fs.access(JS_BEAUTIFY_DIR);
+            execSync(`cd "${JS_BEAUTIFY_DIR}" && npx js-beautify "${path.join(jsDir, file)}" -o "${path.join(outDir, file)}"`, {
+              stdio: 'pipe', timeout: 30000
+            });
+            this.stats.jsFilesBeautified++;
+          } catch {
+            // Fallback: basic formatting
+            beautified = content
+              .replace(/;/g, ';\n')
+              .replace(/\{/g, '{\n')
+              .replace(/\}/g, '\n}\n');
+            await fs.writeFile(path.join(outDir, file), beautified);
+            this.stats.jsFilesBeautified++;
+          }
+        } catch (e) {
+          this.stats.errors.push({ file, error: e.message });
+        }
+      }
+      this.log(`Beautified ${this.stats.jsFilesBeautified} JS files`, 'success');
+    } catch {}
+  }
+
+  async unpackBundles() {
+    this.log('Checking for webpack bundles...', 'step');
+    const jsDir = path.join(this.options.output, 'js');
+    const outDir = path.join(this.options.output, 'js-unpacked');
+
+    try {
+      await fs.access(WAKARU_DIR);
+    } catch {
+      this.log('wakaru not found, skipping bundle unpacking', 'warn');
+      return;
+    }
+
+    try {
+      const files = await fs.readdir(jsDir);
+
+      for (const file of files.filter(f => f.endsWith('.js'))) {
+        const content = await fs.readFile(path.join(jsDir, file), 'utf-8');
+
+        // Check if it's a webpack bundle
+        if (content.includes('webpackJsonp') || content.includes('__webpack_require__') || content.includes('__webpack_modules__')) {
+          this.log(`Unpacking bundle: ${file}`, 'info');
+          try {
+            const bundleOutDir = path.join(outDir, file.replace('.js', ''));
+            await fs.mkdir(bundleOutDir, { recursive: true });
+            execSync(`cd "${WAKARU_DIR}" && npx wakaru "${path.join(jsDir, file)}" -o "${bundleOutDir}"`, {
+              stdio: 'pipe', timeout: 120000
+            });
+            this.stats.bundlesUnpacked++;
+          } catch (e) {
+            this.stats.errors.push({ file, error: `Bundle unpack failed: ${e.message}` });
+          }
+        }
+      }
+
+      if (this.stats.bundlesUnpacked > 0) {
+        this.log(`Unpacked ${this.stats.bundlesUnpacked} webpack bundles`, 'success');
+      }
+    } catch {}
+  }
+
+  async deobfuscateJsFiles() {
+    this.log('Deobfuscating JavaScript files...', 'step');
+    const jsDir = path.join(this.options.output, 'js');
+    const outDir = path.join(this.options.output, 'js-deobfuscated');
+    await fs.mkdir(outDir, { recursive: true });
+
+    try {
+      const files = await fs.readdir(jsDir);
+
+      for (const file of files.filter(f => f.endsWith('.js'))) {
+        const content = await fs.readFile(path.join(jsDir, file), 'utf-8');
+
+        // Check if file is obfuscated
+        if (Deobfuscator.isObfuscated(content)) {
+          this.log(`  Deobfuscating: ${file}`, 'info');
+          try {
+            const deobfuscator = new Deobfuscator();
+            const result = deobfuscator.deobfuscate(content);
+
+            // Save deobfuscated version
+            await fs.writeFile(path.join(outDir, file), result.code);
+            this.stats.jsFilesDeobfuscated++;
+
+            // Log stats
+            if (result.stats.stringsDecoded > 0 || result.stats.expressionsSimplified > 0) {
+              this.log(`    Decoded ${result.stats.stringsDecoded} strings, simplified ${result.stats.expressionsSimplified} expressions`, 'success');
+            }
+          } catch (e) {
+            this.stats.errors.push({ file, error: `Deobfuscation failed: ${e.message}` });
+          }
+        }
+
+        // Detect bundler type
+        const bundler = Deobfuscator.detectBundler(content);
+        if (bundler) {
+          this.report.recommendations.push(`${file} is a ${bundler} bundle - check js-unpacked folder`);
+        }
+      }
+
+      if (this.stats.jsFilesDeobfuscated > 0) {
+        this.log(`Deobfuscated ${this.stats.jsFilesDeobfuscated} JS files`, 'success');
+      } else {
+        this.log('No obfuscated files detected', 'info');
+      }
+    } catch (e) {
+      this.stats.errors.push({ step: 'deobfuscation', error: e.message });
+    }
+  }
+
+  // ============================================
+  // HAR & REPORTING
+  // ============================================
+
+  async saveHar() {
+    const har = {
+      log: {
+        version: '1.2',
+        creator: { name: 'Website Cloner', version: '1.0.0' },
+        entries: this.harEntries,
+      }
+    };
+    await fs.writeFile(
+      path.join(this.options.output, 'har', 'capture.har'),
+      JSON.stringify(har, null, 2)
+    );
+  }
+
+  async generateReport() {
+    this.report.stats = this.stats;
+    this.report.urlMapping = Object.fromEntries(this.urlMap);
+
+    // Add recommendations
+    if (this.report.frameworks.includes('React') || this.report.frameworks.includes('Vue')) {
+      this.report.recommendations.push('SPA detected - check js-unpacked folder for component modules');
+    }
+    if (this.stats.apiCallsCaptured > 0) {
+      this.report.recommendations.push(`${this.stats.apiCallsCaptured} API endpoints captured in /api folder`);
+    }
+
+    await fs.writeFile(
+      path.join(this.options.output, 'report.json'),
+      JSON.stringify(this.report, null, 2)
+    );
+
+    // Generate summary
+    const summary = `
+# Website Clone Report
+
+**URL:** ${this.report.siteInfo.url}
+**Domain:** ${this.report.siteInfo.domain}
+**Cloned:** ${this.report.siteInfo.clonedAt}
+
+## Statistics
+- Pages crawled: ${this.stats.pagesVisited}
+- Assets downloaded: ${this.stats.assetsDownloaded}
+- API calls captured: ${this.stats.apiCallsCaptured}
+- JS files beautified: ${this.stats.jsFilesBeautified}
+- JS files deobfuscated: ${this.stats.jsFilesDeobfuscated}
+- Bundles unpacked: ${this.stats.bundlesUnpacked}
+- Errors: ${this.stats.errors.length}
+
+## Detected Frameworks
+${this.report.frameworks.length > 0 ? this.report.frameworks.map(f => `- ${f}`).join('\n') : '- None detected'}
+
+## API Endpoints
+${this.report.apiEndpoints.slice(0, 20).map(e => `- ${e.method} ${e.path} (${e.status})`).join('\n') || '- None captured'}
+
+## Recommendations
+${this.report.recommendations.map(r => `- ${r}`).join('\n') || '- None'}
+
+## Output Structure
+\`\`\`
+${this.options.output}/
+├── html/           # ${this.stats.pagesVisited} HTML pages
+├── css/            # Stylesheets
+├── js/             # Original JavaScript
+├── js-beautified/  # Beautified JavaScript
+├── js-deobfuscated/# Deobfuscated JavaScript
+├── js-unpacked/    # Unpacked webpack modules
+├── images/         # Images
+├── fonts/          # Fonts
+├── api/            # API responses (JSON)
+├── har/            # Network traffic (HAR)
+└── report.json     # Full analysis report
+\`\`\`
+`;
+
+    await fs.writeFile(path.join(this.options.output, 'REPORT.md'), summary);
+    return summary;
+  }
+
+  // ============================================
+  // MAIN
+  // ============================================
+
+  async run() {
+    console.log(chalk.bold.cyan('\n╔══════════════════════════════════════════╗'));
+    console.log(chalk.bold.cyan('║     Website Cloner - All-in-One Tool     ║'));
+    console.log(chalk.bold.cyan('╚══════════════════════════════════════════╝\n'));
+
+    this.stats.startTime = new Date();
+    await this.initialize();
+
+    // Step 1: Clone
+    console.log(chalk.bold.yellow('\n▸ STEP 1: Cloning website...\n'));
+
+    // Always use headed mode for manual login or pause mode
+    const useHeaded = this.options.headed || this.options.manualLogin || this.options.pauseEach;
+
+    // Use persistent browser profile for Google OAuth compatibility
+    const userDataDir = path.join(this.options.output, '.browser-profile');
+    await fs.mkdir(userDataDir, { recursive: true });
+
+    let browser, context, page;
+
+    if (this.options.manualLogin || this.options.loadCookies) {
+      // Use persistent context (looks like real Chrome, Google allows OAuth)
+      this.log('Using persistent browser profile for OAuth compatibility...', 'info');
+      context = await chromium.launchPersistentContext(userDataDir, {
+        headless: !useHeaded,
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=IsolateOrigins,site-per-process',
+        ],
+        ignoreDefaultArgs: ['--enable-automation'],
+      });
+      page = context.pages()[0] || await context.newPage();
+      browser = null; // No separate browser object with persistent context
+    } else {
+      // Standard browser launch
+      browser = await chromium.launch({ headless: !useHeaded });
+
+      // Try to load saved cookies
+      let storageState = null;
+      const cookiesFile = path.join(this.options.output, '.cookies.json');
+      if (this.options.loadCookies) {
+        try {
+          await fs.access(cookiesFile);
+          storageState = cookiesFile;
+          this.log('Loading saved session cookies...', 'info');
+        } catch {
+          this.log('No saved cookies found', 'warn');
+        }
+      }
+
+      context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        storageState: storageState,
+      });
+      page = await context.newPage();
+    }
+
+    await this.setupNetworkInterception(page);
+
+    // Manual login mode - open browser and wait for user to log in
+    if (this.options.manualLogin) {
+      const loginUrl = this.options.loginUrl || this.options.url;
+      this.log(`Opening browser for manual login...`, 'info');
+      this.log(`Login URL: ${loginUrl}`, 'info');
+
+      await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 60000 });
+
+      console.log(chalk.bold.magenta('\n╔══════════════════════════════════════════╗'));
+      console.log(chalk.bold.magenta('║          MANUAL LOGIN REQUIRED           ║'));
+      console.log(chalk.bold.magenta('╠══════════════════════════════════════════╣'));
+      console.log(chalk.bold.magenta('║  1. Log in using Google or credentials   ║'));
+      console.log(chalk.bold.magenta('║  2. Navigate to a logged-in page         ║'));
+      console.log(chalk.bold.magenta('║  3. Press ENTER here when ready          ║'));
+      console.log(chalk.bold.magenta('╚══════════════════════════════════════════╝\n'));
+
+      // Wait for user to press Enter
+      const readline = require('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      await new Promise(resolve => rl.question(chalk.yellow('Press ENTER when logged in... '), resolve));
+      rl.close();
+
+      // Save cookies for future use
+      if (this.options.saveCookies) {
+        await context.storageState({ path: cookiesFile });
+        this.log(`Session cookies saved to ${cookiesFile}`, 'success');
+      }
+
+      this.log('Login complete, starting crawl...', 'success');
+    }
+
+    // Handle automated login if provided (username:password)
+    if (this.options.login && !this.options.manualLogin) {
+      const [user, pass] = this.options.login.split(':');
+      await page.goto(this.options.url);
+      const userInput = await page.$('input[type="email"], input[name="email"], input[name="username"]');
+      const passInput = await page.$('input[type="password"]');
+      const submitBtn = await page.$('button[type="submit"]');
+      if (userInput && passInput && submitBtn) {
+        await userInput.fill(user);
+        await passInput.fill(pass);
+        await submitBtn.click();
+        await page.waitForLoadState('networkidle').catch(() => {});
+        this.log('Login attempted', 'info');
+      }
+    }
+
+    // Queue all starting URLs
+    for (const startUrl of this.options.urlList) {
+      const normalized = this.normalizeUrl(startUrl);
+      if (normalized && !this.visited.has(normalized)) {
+        this.queue.push({ url: normalized, depth: 0 });
+        this.log(`Queued: ${normalized}`, 'info');
+      }
+    }
+
+    while (this.queue.length > 0 && this.stats.pagesVisited < this.options.maxPages) {
+      const { url, depth } = this.queue.shift();
+      if (this.visited.has(url) || depth > this.options.depth) continue;
+
+      const newLinks = await this.crawlPage(page, url, depth);
+      this.queue.push(...newLinks);
+
+      if (this.options.delay > 0) {
+        await page.waitForTimeout(this.options.delay);
+      }
+    }
+
+    // Close browser/context
+    if (browser) {
+      await browser.close();
+    } else {
+      await context.close();
+    }
+
+    // Step 2: Post-process
+    console.log(chalk.bold.yellow('\n▸ STEP 2: Post-processing assets...\n'));
+    await this.beautifyJsFiles();
+    await this.deobfuscateJsFiles();
+    await this.unpackBundles();
+
+    // Step 3: Generate reports
+    console.log(chalk.bold.yellow('\n▸ STEP 3: Generating reports...\n'));
+    await this.saveHar();
+    const summary = await this.generateReport();
+
+    this.stats.endTime = new Date();
+    const duration = (this.stats.endTime - this.stats.startTime) / 1000;
+
+    // Final output
+    console.log(chalk.bold.green('\n╔══════════════════════════════════════════╗'));
+    console.log(chalk.bold.green('║            CLONE COMPLETE!               ║'));
+    console.log(chalk.bold.green('╚══════════════════════════════════════════╝'));
+    console.log(summary);
+    console.log(chalk.bold.white(`\nCompleted in ${duration.toFixed(1)} seconds`));
+    console.log(chalk.bold.white(`Output: ${path.resolve(this.options.output)}\n`));
+
+    return this.report;
+  }
+}
+
+// CLI
+program
+  .name('cloner')
+  .description('All-in-one website cloner with automatic post-processing')
+  .version('1.0.0')
+  .option('-u, --url <url>', 'Single URL to clone')
+  .option('-U, --urls <file>', 'File containing URLs to clone (one per line)')
+  .option('-d, --depth <n>', 'Max crawl depth', '3')
+  .option('-D, --delay <ms>', 'Delay between requests', '500')
+  .option('-o, --output <dir>', 'Output directory', './site-clone')
+  .option('-m, --max-pages <n>', 'Max pages to crawl', '500')
+  .option('-t, --timeout <ms>', 'Page timeout', '30000')
+  .option('-e, --exclude <patterns>', 'URL patterns to exclude (comma-separated)')
+  .option('-l, --login <user:pass>', 'Login credentials')
+  .option('-H, --headed', 'Show browser window')
+  .option('-i, --interactive', 'Interactive mode')
+  .option('-M, --multi-domain', 'Allow crawling across subdomains (e.g., www + beta)')
+  .option('-S, --screenshots', 'Take screenshots of each page')
+  .option('-L, --manual-login', 'Open browser for manual login (Google OAuth, etc.)')
+  .option('--login-url <url>', 'URL to open for login (default: first URL)')
+  .option('--save-cookies', 'Save session cookies after login for reuse')
+  .option('--load-cookies', 'Load previously saved cookies')
+  .option('-P, --pause-each', 'Pause at each page for manual interaction (upload, adjust points)')
+  .parse();
+
+const opts = program.opts();
+
+// Handle URL input - single URL or file with multiple URLs
+async function loadUrls() {
+  const urls = [];
+
+  if (opts.urls) {
+    // Load from file
+    try {
+      const content = await fs.readFile(opts.urls, 'utf-8');
+      const lines = content.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+      urls.push(...lines);
+    } catch (e) {
+      console.error(chalk.red(`Failed to read URLs file: ${e.message}`));
+      process.exit(1);
+    }
+  }
+
+  if (opts.url) {
+    urls.push(opts.url);
+  }
+
+  if (urls.length === 0) {
+    console.error(chalk.red('Error: Provide --url or --urls <file>'));
+    process.exit(1);
+  }
+
+  // Validate URLs
+  for (const url of urls) {
+    try { new URL(url); }
+    catch { console.error(chalk.red(`Invalid URL: ${url}`)); process.exit(1); }
+  }
+
+  return urls;
+}
+
+loadUrls().then(urls => {
+  opts.urlList = urls;
+  opts.url = urls[0]; // Primary URL for domain detection
+
+  const cloner = new WebsiteCloner(opts);
+  return cloner.run();
+}).catch(err => {
+  console.error(chalk.red(`Fatal: ${err.message}`));
+  process.exit(1);
+});

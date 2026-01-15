@@ -1,0 +1,400 @@
+/**
+ * Side Profile Normalization Utilities
+ *
+ * Normalizes side profile images and landmarks using rotation-based alignment.
+ * Uses landmark indices 10, 26, 75 as rotation reference points for consistent
+ * orientation across all side profile measurements.
+ *
+ * Rotation Algorithm:
+ * - Uses landmark indices 10, 26, 75 for rotation calculation
+ * - Left profile: rotate based on landmarks[75] → landmarks[26]
+ * - Right profile: rotate based on landmarks[10] → landmarks[26]
+ * - Pivot point: landmarks[10] for right, landmarks[26] for left
+ * - Crops to 1024×1024 with 1.12 scale factor and 0.65 height ratio
+ */
+
+export interface Point2D {
+    x: number;
+    y: number;
+}
+
+export interface FaceIQNormalizationResult {
+    /** Rotation angle applied (in radians) */
+    rotationAngle: number;
+    /** Rotation angle in degrees */
+    rotationAngleDeg: number;
+    /** Direction the face is pointing */
+    direction: 'left' | 'right';
+    /** Pivot point used for rotation */
+    pivot: Point2D;
+    /** Rotated landmarks */
+    rotatedLandmarks: Array<{ id: string; x: number; y: number }>;
+    /** Rotated image as data URL (if image provided) */
+    rotatedImageUrl?: string;
+    /** Crop info */
+    cropInfo: {
+        x: number;
+        y: number;
+        size: number;
+        scale: number;
+    };
+}
+
+/**
+ * FaceIQ's landmark indices for rotation calculation
+ * 
+ * These correspond to face contour positions in their model:
+ * - Index 10: Upper face contour (forehead/temple area) - right anchor
+ * - Index 26: Mid-face contour (jaw level) - common reference
+ * - Index 75: Upper face contour (mirrored) - left anchor
+ * 
+ * Our InsightFace 106 mapping:
+ * - Index 10 → InsightFace contour point ~9-10 (right side)
+ * - Index 26 → InsightFace contour point ~25-26 (mid contour)
+ * - Index 75 → InsightFace right eye area ~71-75
+ */
+
+/**
+ * FaceIQ to our raw landmark array index mapping (documentation only)
+ * These indices map to the raw landmarks array returned by the API
+ *
+ * @internal Used for reference - actual implementation uses direct indices
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _FACEIQ_INDEX_REFERENCE = {
+    10: 'faceContour_10',  // Right anchor for rotation
+    26: 'faceContour_26',  // Common reference point
+    75: 'rightEyeLowerInner',  // Left anchor (near eye for left-facing)
+} as const;
+
+/**
+ * Calculate rotation angle using FaceIQ's exact algorithm
+ * 
+ * @param landmarks - Raw landmarks array from API
+ * @param direction - Face direction ("left" or "right")
+ * @returns Rotation angle in radians
+ */
+export function calculateRotationAngle(
+    landmarks: Array<{ x: number; y: number }>,
+    direction: 'left' | 'right'
+): number {
+    // FaceIQ algorithm:
+    // anchor = (direction === "left") ? landmarks[75] : landmarks[10];
+    // reference = landmarks[26];
+    // angle = Math.atan2(reference.y - anchor.y, reference.x - anchor.x);
+
+    const anchor = direction === 'left' ? landmarks[75] : landmarks[10];
+    const reference = landmarks[26];
+
+    if (!anchor || !reference) {
+        console.warn('[FaceIQ Normalization] Missing landmark indices 10, 26, or 75');
+        return 0;
+    }
+
+    const angle = Math.atan2(reference.y - anchor.y, reference.x - anchor.x);
+    return angle;
+}
+
+/**
+ * Get the rotation pivot point using FaceIQ's logic
+ * 
+ * @param landmarks - Raw landmarks array
+ * @param direction - Face direction
+ * @returns Pivot point coordinates
+ */
+export function getRotationPivot(
+    landmarks: Array<{ x: number; y: number }>,
+    direction: 'left' | 'right'
+): Point2D {
+    // FaceIQ: pivot = (direction === "right") ? landmarks[10] : landmarks[26]
+    const pivotLandmark = direction === 'right' ? landmarks[10] : landmarks[26];
+
+    if (!pivotLandmark) {
+        return { x: 0.5, y: 0.5 };
+    }
+
+    return { x: pivotLandmark.x, y: pivotLandmark.y };
+}
+
+/**
+ * Rotate a point around a pivot using FaceIQ's formula
+ * 
+ * FaceIQ's rotation function:
+ * ```
+ * let j = e => {
+ *   let t = Math.sin(-g), i = Math.cos(-g), a = e.x - f, s = e.y - b;
+ *   return { x: f + a * i - s * t, y: b + a * t + s * i };
+ * };
+ * ```
+ */
+export function rotatePoint(
+    point: Point2D,
+    pivot: Point2D,
+    angleRad: number
+): Point2D {
+    // FaceIQ rotates by NEGATIVE angle
+    const negAngle = -angleRad;
+    const sin = Math.sin(negAngle);
+    const cos = Math.cos(negAngle);
+
+    const dx = point.x - pivot.x;
+    const dy = point.y - pivot.y;
+
+    return {
+        x: pivot.x + dx * cos - dy * sin,
+        y: pivot.y + dx * sin + dy * cos,
+    };
+}
+
+/**
+ * Calculate crop dimensions using FaceIQ's formula
+ * 
+ * FaceIQ algorithm:
+ * - croppedHeight = bboxHeight * 1.12
+ * - cropSize = croppedHeight / 0.65
+ * - Constrained between 32 and 2 * max(width, height)
+ */
+export function calculateCropSize(
+    bboxHeight: number,
+    imageWidth: number,
+    imageHeight: number
+): number {
+    const scaledHeight = bboxHeight * 1.12;
+    const cropSize = scaledHeight / 0.65;
+
+    // FaceIQ constraints
+    const minSize = 32;
+    const maxSize = 2 * Math.max(imageWidth, imageHeight);
+
+    return Math.min(Math.max(minSize, cropSize), maxSize);
+}
+
+/**
+ * Apply FaceIQ-exact normalization to named landmarks
+ * 
+ * This function works with our named landmark format and applies
+ * the FaceIQ rotation algorithm.
+ * 
+ * @param namedLandmarks - Landmarks as { id: string; x: number; y: number }[]
+ * @param rawLandmarks - Raw landmark array (for indices 10, 26, 75)
+ * @param direction - Face direction
+ * @param bbox - Bounding box for crop calculation
+ */
+export function applySideProfileNormalization(
+    namedLandmarks: Array<{ id: string; x: number; y: number }>,
+    rawLandmarks: Array<{ x: number; y: number }>,
+    direction: 'left' | 'right',
+    bbox?: { x: number; y: number; width: number; height: number }
+): FaceIQNormalizationResult {
+    // Calculate rotation angle using FaceIQ's algorithm
+    const rotationAngle = calculateRotationAngle(rawLandmarks, direction);
+    const rotationAngleDeg = rotationAngle * (180 / Math.PI);
+
+    // Get pivot point
+    const pivot = getRotationPivot(rawLandmarks, direction);
+
+    // Skip rotation if angle is very small (< 2 degrees)
+    if (Math.abs(rotationAngleDeg) < 2) {
+        return {
+            rotationAngle: 0,
+            rotationAngleDeg: 0,
+            direction,
+            pivot,
+            rotatedLandmarks: namedLandmarks,
+            cropInfo: {
+                x: 0,
+                y: 0,
+                size: 1024,
+                scale: 1,
+            },
+        };
+    }
+
+    // Rotate all named landmarks
+    const rotatedLandmarks = namedLandmarks.map(landmark => {
+        const rotated = rotatePoint(
+            { x: landmark.x, y: landmark.y },
+            pivot,
+            rotationAngle
+        );
+        return {
+            id: landmark.id,
+            x: rotated.x,
+            y: rotated.y,
+        };
+    });
+
+    // Calculate crop info
+    const cropSize = bbox
+        ? calculateCropSize(bbox.height, 1, 1)  // Normalized
+        : 1024;
+
+    console.log(`[FaceIQ Normalization] Direction: ${direction}, Rotation: ${rotationAngleDeg.toFixed(1)}°`);
+
+    return {
+        rotationAngle,
+        rotationAngleDeg,
+        direction,
+        pivot,
+        rotatedLandmarks,
+        cropInfo: {
+            x: pivot.x - cropSize / 2,
+            y: pivot.y - cropSize / 2,
+            size: cropSize,
+            scale: 1024 / cropSize,
+        },
+    };
+}
+
+/**
+ * Apply FaceIQ normalization (REQUIRED for 100% parity)
+ *
+ * FaceIQ PARITY FIX #3: This function REQUIRES raw landmarks and direction.
+ * No fallback to Frankfort-based normalization - FaceIQ algorithm only.
+ *
+ * @param landmarks - Named landmarks from detection (in pixel coordinates)
+ * @param rawLandmarks - Raw landmark array (REQUIRED - must have 106 landmarks)
+ * @param direction - Face direction (REQUIRED - 'left' or 'right')
+ * @returns Normalized landmarks (still in pixel coordinates)
+ * @throws Error if raw landmarks or direction missing
+ */
+export function applySideProfileRotation(
+    landmarks: Array<{ id: string; x: number; y: number }>,
+    rawLandmarks?: Array<{ x: number; y: number }>,
+    direction?: 'left' | 'right'
+): Array<{ id: string; x: number; y: number }> {
+    // FaceIQ PARITY: No fallback - raw landmarks REQUIRED
+    if (!rawLandmarks || rawLandmarks.length < 76 || !direction) {
+        console.error('[FaceIQ Normalization] CRITICAL: Missing raw landmarks or direction');
+        console.error('[FaceIQ Normalization] rawLandmarks length:', rawLandmarks?.length);
+        console.error('[FaceIQ Normalization] direction:', direction);
+        throw new Error(
+            'FaceIQ normalization requires raw landmarks (106) and direction. ' +
+            'Ensure InsightFace detection returned rawLandmarks array.'
+        );
+    }
+
+    const result = applySideProfileNormalization(landmarks, rawLandmarks, direction);
+    return result.rotatedLandmarks;
+}
+
+/**
+ * Fallback to our original Frankfort-based correction
+ * when FaceIQ indices are not available
+ */
+function applyFrankfortCorrectionFallback(
+    landmarks: Array<{ id: string; x: number; y: number }>
+): Array<{ id: string; x: number; y: number }> {
+    const orbitale = landmarks.find(l => l.id === 'orbitale');
+    const porion = landmarks.find(l => l.id === 'porion');
+
+    if (!orbitale || !porion) {
+        return landmarks;
+    }
+
+    // Calculate Frankfort angle
+    const dx = porion.x - orbitale.x;
+    const dy = porion.y - orbitale.y;
+    const angle = Math.atan2(dy, dx);
+
+    if (Math.abs(angle) < 0.035) { // ~2 degrees
+        return landmarks;
+    }
+
+    const pivot: Point2D = {
+        x: (orbitale.x + porion.x) / 2,
+        y: (orbitale.y + porion.y) / 2,
+    };
+
+    return landmarks.map(landmark => {
+        const cos = Math.cos(-angle);
+        const sin = Math.sin(-angle);
+        const dx = landmark.x - pivot.x;
+        const dy = landmark.y - pivot.y;
+
+        return {
+            id: landmark.id,
+            x: pivot.x + dx * cos - dy * sin,
+            y: pivot.y + dx * sin + dy * cos,
+        };
+    });
+}
+
+/**
+ * Rotate image to match FaceIQ's 1024×1024 standardized output
+ */
+export async function rotateSideProfileImage(
+    imageUrl: string,
+    rawLandmarks: Array<{ x: number; y: number }>,
+    direction: 'left' | 'right',
+    bbox: { x: number; y: number; width: number; height: number }
+): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+
+            if (!ctx) {
+                reject(new Error('Canvas context unavailable'));
+                return;
+            }
+
+            // FaceIQ uses 1024×1024 output
+            const OUTPUT_SIZE = 1024;
+            canvas.width = OUTPUT_SIZE;
+            canvas.height = OUTPUT_SIZE;
+
+            // Calculate rotation
+            const rotationAngle = calculateRotationAngle(rawLandmarks, direction);
+            const pivot = getRotationPivot(rawLandmarks, direction);
+
+            // Calculate crop size using FaceIQ formula
+            const cropSize = calculateCropSize(
+                bbox.height * img.height,
+                img.width,
+                img.height
+            );
+
+            const scale = OUTPUT_SIZE / cropSize;
+
+            // Transform canvas
+            ctx.translate(OUTPUT_SIZE / 2, OUTPUT_SIZE / 2);
+            ctx.rotate(-rotationAngle);
+            ctx.scale(scale, scale);
+            ctx.translate(
+                -pivot.x * img.width,
+                -pivot.y * img.height
+            );
+
+            // Draw image
+            ctx.drawImage(img, 0, 0);
+
+            resolve(canvas.toDataURL('image/jpeg', 0.9));
+        };
+
+        img.onerror = () => reject(new Error('Failed to load image'));
+        img.src = imageUrl;
+    });
+}
+
+// ============================================
+// LEGACY EXPORTS FOR BACKWARD COMPATIBILITY
+// ============================================
+
+// Keep the old function name as an alias
+export { applyFrankfortCorrectionFallback as applyFrankfortCorrection };
+
+// Re-export with old names for compatibility
+export function normalizeLandmarksToFrankfort(
+    landmarks: Array<{ id: string; x: number; y: number }>
+) {
+    return {
+        rotationAngle: 0,
+        originalFrankfortAngle: 0,
+        rotatedLandmarks: applyFrankfortCorrectionFallback(landmarks),
+        rotationCenter: { x: 0.5, y: 0.5 },
+    };
+}

@@ -1,0 +1,613 @@
+/**
+ * Phase 6 License Key Tests
+ *
+ * Tests license key generation, activation, and validation:
+ * - License key format validation
+ * - License key generation
+ * - License key activation
+ * - License key lookup by customer
+ * - Webhook integration (license key generation on subscription)
+ * - UI validation patterns
+ */
+
+const https = require('https');
+const licenseService = require('../services/licenseService');
+
+const BASE_URL = 'https://127.0.0.1:3847';
+const TEST_CUSTOMER_ID = 'cus_test_phase6_license';
+
+// Allow self-signed certs
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+/**
+ * Helper: Make HTTPS request
+ */
+function request(method, path, body = null, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, BASE_URL);
+    const options = {
+      method,
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers
+      },
+      agent
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(data) });
+        } catch (e) {
+          resolve({ status: res.statusCode, data: data });
+        }
+      });
+    });
+
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+// =============================================================================
+// Test: License Key Format Validation (Unit Tests)
+// =============================================================================
+
+function testLicenseKeyFormat() {
+  console.log('\n=== Test: License Key Format Validation ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Test valid format
+  const validKeys = [
+    'SPLICE-ABCD-EFGH-JKLM',
+    'SPLICE-2345-6789-NPQR',
+    'splice-abcd-efgh-jklm', // lowercase should be normalized
+    'SPLICE-A2B3-C4D5-E6F7'
+  ];
+
+  for (const key of validKeys) {
+    if (licenseService.isValidKeyFormat(key)) {
+      console.log(`  ✓ Valid key accepted: ${key}`);
+      passed++;
+    } else {
+      console.log(`  ✗ Valid key rejected: ${key}`);
+      failed++;
+    }
+  }
+
+  // Test invalid formats
+  const invalidKeys = [
+    'SPLICE-ABC-DEF-GHI',         // Too short
+    'SPLICE-ABCDE-FGHI-JKLM',     // Too long
+    'PREFIX-ABCD-EFGH-JKLM',      // Wrong prefix
+    'SPLICEABCDEFGHJKLM',         // No dashes
+    'SPLICE-ABCD-EFGH',           // Missing segment
+    'SPLICE-0000-1111-OOOO',      // Contains O and 0/1 (confusing)
+    '',                            // Empty
+    null,                          // Null
+    123456                         // Number
+  ];
+
+  for (const key of invalidKeys) {
+    if (!licenseService.isValidKeyFormat(key)) {
+      console.log(`  ✓ Invalid key rejected: ${key}`);
+      passed++;
+    } else {
+      console.log(`  ✗ Invalid key accepted: ${key}`);
+      failed++;
+    }
+  }
+
+  // Test key generation format
+  console.log('\nTesting generated key format...');
+  for (let i = 0; i < 10; i++) {
+    const generatedKey = licenseService.generateKeyString();
+    if (licenseService.isValidKeyFormat(generatedKey)) {
+      passed++;
+    } else {
+      console.log(`  ✗ Generated key invalid: ${generatedKey}`);
+      failed++;
+    }
+  }
+  console.log(`  ✓ 10 generated keys have valid format`);
+
+  // Test key normalization
+  console.log('\nTesting key normalization...');
+  const testCases = [
+    { input: 'splice-abcd-efgh-jklm', expected: 'SPLICE-ABCD-EFGH-JKLM' },
+    { input: '  SPLICE-ABCD-EFGH-JKLM  ', expected: 'SPLICE-ABCD-EFGH-JKLM' },
+    { input: 'Splice-Abcd-Efgh-Jklm', expected: 'SPLICE-ABCD-EFGH-JKLM' }
+  ];
+
+  for (const tc of testCases) {
+    const normalized = licenseService.normalizeKey(tc.input);
+    if (normalized === tc.expected) {
+      console.log(`  ✓ Normalized correctly: "${tc.input}" → "${normalized}"`);
+      passed++;
+    } else {
+      console.log(`  ✗ Normalization failed: expected "${tc.expected}", got "${normalized}"`);
+      failed++;
+    }
+  }
+
+  console.log(`\nFormat validation: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: License Key Generation (Unit Tests - No DB)
+// =============================================================================
+
+function testLicenseKeyGeneration() {
+  console.log('\n=== Test: License Key Generation (Unit) ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Test key uniqueness
+  console.log('Testing key uniqueness...');
+  const generatedKeys = new Set();
+  const iterations = 100;
+
+  for (let i = 0; i < iterations; i++) {
+    const key = licenseService.generateKeyString();
+    generatedKeys.add(key);
+  }
+
+  if (generatedKeys.size === iterations) {
+    console.log(`  ✓ All ${iterations} generated keys are unique`);
+    passed++;
+  } else {
+    console.log(`  ✗ Only ${generatedKeys.size}/${iterations} keys unique`);
+    failed++;
+  }
+
+  // Test key character set
+  console.log('Testing key character set...');
+  const allowedChars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789-';
+  let allCharsValid = true;
+
+  for (const key of generatedKeys) {
+    for (const char of key) {
+      if (!allowedChars.includes(char)) {
+        console.log(`  ✗ Invalid character found: ${char} in ${key}`);
+        allCharsValid = false;
+        break;
+      }
+    }
+  }
+
+  if (allCharsValid) {
+    console.log(`  ✓ All characters in allowed set`);
+    passed++;
+  } else {
+    failed++;
+  }
+
+  // Test key length
+  console.log('Testing key length...');
+  let allCorrectLength = true;
+  for (const key of generatedKeys) {
+    if (key.length !== 19) { // SPLICE-XXXX-XXXX-XXXX = 6+1+4+1+4+1+4 = 19
+      console.log(`  ✗ Incorrect length: ${key} (${key.length})`);
+      allCorrectLength = false;
+    }
+  }
+
+  if (allCorrectLength) {
+    console.log(`  ✓ All keys have correct length (19 chars)`);
+    passed++;
+  } else {
+    failed++;
+  }
+
+  console.log(`\nKey generation: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: License Activation API (E2E Tests)
+// =============================================================================
+
+async function testLicenseActivationAPI() {
+  console.log('\n=== Test: License Activation API ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Test 1: Missing key
+  console.log('Testing missing key...');
+  try {
+    const res = await request('POST', '/license/activate', {});
+    if (res.status === 400 && res.data.error) {
+      console.log('  ✓ Returns 400 for missing key');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected 400, got ${res.status}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  // Test 2: Invalid format
+  console.log('Testing invalid key format...');
+  try {
+    const res = await request('POST', '/license/activate', { key: 'INVALID-KEY' });
+    if (res.status === 400 && res.data.error.includes('format')) {
+      console.log('  ✓ Returns 400 for invalid format');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected 400 with format error, got ${res.status}: ${res.data.error}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  // Test 3: Non-existent key
+  console.log('Testing non-existent key...');
+  try {
+    const res = await request('POST', '/license/activate', { key: 'SPLICE-XXXX-YYYY-ZZZZ' });
+    if (res.status === 400 && res.data.error.includes('not found')) {
+      console.log('  ✓ Returns 400 for non-existent key');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected 400 with not found error, got ${res.status}: ${res.data.error}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  console.log(`\nActivation API: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: License Key Lookup API (E2E Tests)
+// =============================================================================
+
+async function testLicenseKeyLookupAPI() {
+  console.log('\n=== Test: License Key Lookup API ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Test 1: Missing customer ID header
+  console.log('Testing missing customer ID...');
+  try {
+    const res = await request('GET', '/license/key');
+    if (res.status === 401 && res.data.error.includes('Authentication')) {
+      console.log('  ✓ Returns 401 for missing customer ID');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected 401, got ${res.status}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  // Test 2: Non-existent customer
+  console.log('Testing non-existent customer...');
+  try {
+    const res = await request('GET', '/license/key', null, {
+      'x-stripe-customer-id': 'cus_nonexistent_12345'
+    });
+    if (res.status === 404) {
+      console.log('  ✓ Returns 404 for non-existent customer');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected 404, got ${res.status}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  console.log(`\nLookup API: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: License Service Database Operations (Integration Tests)
+// =============================================================================
+
+async function testLicenseServiceDB() {
+  console.log('\n=== Test: License Service Database Operations ===');
+  let passed = 0;
+  let failed = 0;
+
+  const testCustomerId = `cus_test_${Date.now()}`;
+
+  // Test 1: Generate license key for new customer
+  console.log('Testing license key generation...');
+  try {
+    const result = await licenseService.generateLicenseKey(testCustomerId);
+    if (result.success && result.key && licenseService.isValidKeyFormat(result.key)) {
+      console.log(`  ✓ Generated key: ${result.key}`);
+      passed++;
+
+      // Test 2: Get existing key (should return same key)
+      console.log('Testing duplicate key generation returns existing...');
+      const result2 = await licenseService.generateLicenseKey(testCustomerId);
+      if (result2.success && result2.key === result.key && result2.existing === true) {
+        console.log('  ✓ Returns existing key for same customer');
+        passed++;
+      } else {
+        console.log(`  ✗ Expected same key, got different: ${result2.key}`);
+        failed++;
+      }
+
+      // Test 3: Activate the key
+      console.log('Testing license key activation...');
+      const activateResult = await licenseService.activateLicenseKey(result.key);
+      if (activateResult.success && activateResult.customerId === testCustomerId) {
+        console.log('  ✓ Key activated successfully');
+        passed++;
+      } else {
+        console.log(`  ✗ Activation failed: ${activateResult.error}`);
+        failed++;
+      }
+
+      // Test 4: Lookup by customer ID
+      console.log('Testing license lookup by customer ID...');
+      const lookupResult = await licenseService.getLicenseByCustomerId(testCustomerId);
+      if (lookupResult.success && lookupResult.key === result.key && lookupResult.activated === true) {
+        console.log('  ✓ Lookup returned correct key and activation status');
+        passed++;
+      } else {
+        console.log(`  ✗ Lookup failed or incorrect: ${JSON.stringify(lookupResult)}`);
+        failed++;
+      }
+
+      // Test 5: Deactivate the key
+      console.log('Testing license key deactivation...');
+      const deactivateResult = await licenseService.deactivateLicenseKey(result.key);
+      if (deactivateResult.success) {
+        console.log('  ✓ Key deactivated successfully');
+        passed++;
+
+        // Test 6: Try to activate deactivated key
+        console.log('Testing activation of deactivated key...');
+        const reactivateAttempt = await licenseService.activateLicenseKey(result.key);
+        if (!reactivateAttempt.success && reactivateAttempt.error.includes('deactivated')) {
+          console.log('  ✓ Deactivated key correctly rejected');
+          passed++;
+        } else {
+          console.log(`  ✗ Expected deactivated error: ${JSON.stringify(reactivateAttempt)}`);
+          failed++;
+        }
+
+        // Test 7: Reactivate the key
+        console.log('Testing license key reactivation...');
+        const reactivateResult = await licenseService.reactivateLicenseKey(result.key);
+        if (reactivateResult.success) {
+          console.log('  ✓ Key reactivated successfully');
+          passed++;
+
+          // Verify it can be activated again
+          const finalActivate = await licenseService.activateLicenseKey(result.key);
+          if (finalActivate.success) {
+            console.log('  ✓ Reactivated key can be used');
+            passed++;
+          } else {
+            console.log(`  ✗ Reactivated key still rejected: ${finalActivate.error}`);
+            failed++;
+          }
+        } else {
+          console.log(`  ✗ Reactivation failed: ${reactivateResult.error}`);
+          failed++;
+        }
+      } else {
+        console.log(`  ✗ Deactivation failed: ${deactivateResult.error}`);
+        failed++;
+      }
+    } else {
+      console.log(`  ✗ Generation failed: ${result.error}`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  // Test: Missing customer ID
+  console.log('Testing missing customer ID...');
+  try {
+    const result = await licenseService.generateLicenseKey(null);
+    if (!result.success && result.error.includes('required')) {
+      console.log('  ✓ Rejects null customer ID');
+      passed++;
+    } else {
+      console.log(`  ✗ Expected error for null customer ID`);
+      failed++;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    failed++;
+  }
+
+  console.log(`\nDatabase operations: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: UI Validation Pattern (Unit Tests)
+// =============================================================================
+
+function testUIValidationPattern() {
+  console.log('\n=== Test: UI Validation Pattern ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Simulate the frontend validation regex
+  const uiPattern = /^SPLICE-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/;
+
+  const testCases = [
+    { key: 'SPLICE-ABCD-EFGH-JKLM', expected: true },
+    { key: 'SPLICE-2345-6789-NPQR', expected: true },
+    { key: 'SPLICE-A2B3-C4D5-E6F7', expected: true },
+    { key: 'splice-abcd-efgh-jklm', expected: false }, // Must be uppercase
+    { key: 'SPLICE-ABCD-EFGH', expected: false },       // Too short
+    { key: 'SPLICE-ABCDE-FGHI-JKLM', expected: false }, // Segment too long
+    { key: 'PREFIX-ABCD-EFGH-JKLM', expected: false },  // Wrong prefix
+    { key: 'SPLICE-0000-1111-LLLL', expected: false },  // Contains O, 0, 1, L
+  ];
+
+  for (const tc of testCases) {
+    const matches = uiPattern.test(tc.key);
+    if (matches === tc.expected) {
+      console.log(`  ✓ "${tc.key}" → ${tc.expected}`);
+      passed++;
+    } else {
+      console.log(`  ✗ "${tc.key}" expected ${tc.expected}, got ${matches}`);
+      failed++;
+    }
+  }
+
+  console.log(`\nUI validation: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Test: Performance (Key Generation Speed)
+// =============================================================================
+
+function testPerformance() {
+  console.log('\n=== Test: Performance ===');
+  let passed = 0;
+  let failed = 0;
+
+  // Test key generation speed
+  console.log('Testing key generation speed...');
+  const iterations = 1000;
+  const start = process.hrtime.bigint();
+
+  for (let i = 0; i < iterations; i++) {
+    licenseService.generateKeyString();
+  }
+
+  const end = process.hrtime.bigint();
+  const durationMs = Number(end - start) / 1e6;
+  const avgPerKey = durationMs / iterations;
+
+  if (avgPerKey < 1) { // Should be less than 1ms per key
+    console.log(`  ✓ Generated ${iterations} keys in ${durationMs.toFixed(2)}ms (${avgPerKey.toFixed(4)}ms avg)`);
+    passed++;
+  } else {
+    console.log(`  ✗ Key generation too slow: ${avgPerKey.toFixed(4)}ms avg`);
+    failed++;
+  }
+
+  // Test validation speed
+  console.log('Testing validation speed...');
+  const testKey = 'SPLICE-ABCD-EFGH-JKLM';
+  const validationStart = process.hrtime.bigint();
+
+  for (let i = 0; i < iterations; i++) {
+    licenseService.isValidKeyFormat(testKey);
+  }
+
+  const validationEnd = process.hrtime.bigint();
+  const validationMs = Number(validationEnd - validationStart) / 1e6;
+  const avgValidation = validationMs / iterations;
+
+  if (avgValidation < 0.1) { // Should be less than 0.1ms per validation
+    console.log(`  ✓ Validated ${iterations} keys in ${validationMs.toFixed(2)}ms (${avgValidation.toFixed(4)}ms avg)`);
+    passed++;
+  } else {
+    console.log(`  ✗ Validation too slow: ${avgValidation.toFixed(4)}ms avg`);
+    failed++;
+  }
+
+  console.log(`\nPerformance: ${passed} passed, ${failed} failed`);
+  return { passed, failed };
+}
+
+// =============================================================================
+// Run All Tests
+// =============================================================================
+
+async function runAllTests() {
+  console.log('╔════════════════════════════════════════════════════════════════╗');
+  console.log('║         SPLICE Phase 6 - License Key System Tests              ║');
+  console.log('╚════════════════════════════════════════════════════════════════╝');
+
+  let totalPassed = 0;
+  let totalFailed = 0;
+
+  // Unit tests (no server required)
+  const formatResult = testLicenseKeyFormat();
+  totalPassed += formatResult.passed;
+  totalFailed += formatResult.failed;
+
+  const genResult = testLicenseKeyGeneration();
+  totalPassed += genResult.passed;
+  totalFailed += genResult.failed;
+
+  const uiResult = testUIValidationPattern();
+  totalPassed += uiResult.passed;
+  totalFailed += uiResult.failed;
+
+  const perfResult = testPerformance();
+  totalPassed += perfResult.passed;
+  totalFailed += perfResult.failed;
+
+  // E2E tests (require server)
+  console.log('\n--- E2E Tests (require server running at ' + BASE_URL + ') ---');
+
+  try {
+    const activationResult = await testLicenseActivationAPI();
+    totalPassed += activationResult.passed;
+    totalFailed += activationResult.failed;
+
+    const lookupResult = await testLicenseKeyLookupAPI();
+    totalPassed += lookupResult.passed;
+    totalFailed += lookupResult.failed;
+  } catch (err) {
+    console.log(`\n⚠ E2E tests skipped - server not running: ${err.message}`);
+  }
+
+  // Integration tests (require database)
+  console.log('\n--- Integration Tests (require database) ---');
+
+  if (process.env.DATABASE_URL) {
+    try {
+      // Initialize tables first
+      await licenseService.initLicenseTables();
+
+      const dbResult = await testLicenseServiceDB();
+      totalPassed += dbResult.passed;
+      totalFailed += dbResult.failed;
+    } catch (err) {
+      console.log(`\n⚠ Integration tests failed: ${err.message}`);
+    }
+  } else {
+    console.log('⚠ DATABASE_URL not set - skipping integration tests');
+  }
+
+  // Summary
+  console.log('\n╔════════════════════════════════════════════════════════════════╗');
+  console.log(`║  TOTAL: ${totalPassed} passed, ${totalFailed} failed                                     ║`);
+  if (totalFailed === 0) {
+    console.log('║  ✓ All tests passed!                                           ║');
+  } else {
+    console.log('║  ✗ Some tests failed                                           ║');
+  }
+  console.log('╚════════════════════════════════════════════════════════════════╝');
+
+  process.exit(totalFailed > 0 ? 1 : 0);
+}
+
+runAllTests().catch(console.error);

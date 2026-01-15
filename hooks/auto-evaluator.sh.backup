@@ -1,0 +1,470 @@
+#!/bin/bash
+# LLM-as-Judge Auto-Evaluator - Real-time quality assessment
+# Based on: LlamaStack llm_as_judge, OpenAI cookbook judge patterns, Comet Opik evaluators
+# Provides automated evaluation with chain-of-thought reasoning
+
+set -eo pipefail
+
+CLAUDE_DIR="${HOME}/.claude"
+MEMORY_MANAGER="${CLAUDE_DIR}/hooks/memory-manager.sh"
+LOG_FILE="${CLAUDE_DIR}/auto-evaluator.log"
+EVAL_HISTORY="${CLAUDE_DIR}/.evaluator/history.jsonl"
+
+mkdir -p "$(dirname "$EVAL_HISTORY")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# =============================================================================
+# EVALUATION CRITERIA (from OpenAI/Anthropic best practices)
+# =============================================================================
+
+# Core evaluation dimensions
+get_evaluation_criteria() {
+    local eval_type="${1:-code}"
+
+    case "$eval_type" in
+        code)
+            cat << 'EOF'
+{
+    "criteria": {
+        "correctness": {
+            "description": "Does the code solve the intended problem correctly?",
+            "weight": 0.30
+        },
+        "quality": {
+            "description": "Is the code well-written, readable, and maintainable?",
+            "weight": 0.25
+        },
+        "safety": {
+            "description": "Does it avoid security vulnerabilities and handle errors?",
+            "weight": 0.20
+        },
+        "efficiency": {
+            "description": "Is it performant and resource-efficient?",
+            "weight": 0.15
+        },
+        "completeness": {
+            "description": "Does it handle edge cases and meet all requirements?",
+            "weight": 0.10
+        }
+    },
+    "scale": "1-10",
+    "pass_threshold": 7.0
+}
+EOF
+            ;;
+        documentation)
+            cat << 'EOF'
+{
+    "criteria": {
+        "clarity": {
+            "description": "Is it clear, concise, and easy to understand?",
+            "weight": 0.35
+        },
+        "accuracy": {
+            "description": "Is the information correct and up-to-date?",
+            "weight": 0.30
+        },
+        "completeness": {
+            "description": "Does it cover all necessary information?",
+            "weight": 0.20
+        },
+        "usefulness": {
+            "description": "Will it help the intended audience?",
+            "weight": 0.15
+        }
+    },
+    "scale": "1-10",
+    "pass_threshold": 7.0
+}
+EOF
+            ;;
+        test)
+            cat << 'EOF'
+{
+    "criteria": {
+        "coverage": {
+            "description": "Does it test all important scenarios?",
+            "weight": 0.35
+        },
+        "correctness": {
+            "description": "Are the assertions and expectations correct?",
+            "weight": 0.30
+        },
+        "maintainability": {
+            "description": "Is the test code clear and maintainable?",
+            "weight": 0.20
+        },
+        "isolation": {
+            "description": "Is it properly isolated and deterministic?",
+            "weight": 0.15
+        }
+    },
+    "scale": "1-10",
+    "pass_threshold": 7.0
+}
+EOF
+            ;;
+        *)
+            cat << 'EOF'
+{
+    "criteria": {
+        "quality": {
+            "description": "Overall quality of the output",
+            "weight": 0.50
+        },
+        "correctness": {
+            "description": "Does it meet the requirements?",
+            "weight": 0.30
+        },
+        "completeness": {
+            "description": "Is it complete and thorough?",
+            "weight": 0.20
+        }
+    },
+    "scale": "1-10",
+    "pass_threshold": 7.0
+}
+EOF
+            ;;
+    esac
+}
+
+# =============================================================================
+# CHAIN-OF-THOUGHT EVALUATION PROMPT (improves reliability by 10-15%)
+# =============================================================================
+
+generate_evaluation_prompt() {
+    local task="$1"
+    local output="$2"
+    local eval_type="${3:-code}"
+    local context="${4:-}"
+
+    local criteria_json
+    criteria_json=$(get_evaluation_criteria "$eval_type")
+
+    local criteria_text
+    criteria_text=$(echo "$criteria_json" | jq -r '.criteria | to_entries[] | "**\(.key|ascii_upcase)** (\(.value.weight*100|floor)%): \(.value.description)"' | sed 's/^/    /')
+
+    cat << EOF
+{
+    "evaluation_prompt": "You are an expert evaluator using chain-of-thought reasoning to assess quality.
+
+**TASK:**
+$task
+
+**OUTPUT TO EVALUATE:**
+\`\`\`
+$output
+\`\`\`
+
+**CONTEXT:**
+$context
+
+**EVALUATION INSTRUCTIONS:**
+
+Please evaluate this output using chain-of-thought reasoning across these dimensions:
+
+$criteria_text
+
+**CHAIN-OF-THOUGHT EVALUATION PROCESS:**
+
+For each criterion:
+1. Analyze the specific evidence (quote examples)
+2. Identify strengths and weaknesses
+3. Assign a score (1-10) with justification
+4. Provide specific improvement suggestions
+
+**FORMAT YOUR RESPONSE AS JSON:**
+
+\`\`\`json
+{
+    \"reasoning\": {
+        \"criterion_name\": {
+            \"analysis\": \"Detailed analysis with evidence...\",
+            \"strengths\": [\"Strength 1\", \"Strength 2\"],
+            \"weaknesses\": [\"Weakness 1\", \"Weakness 2\"],
+            \"score\": 8,
+            \"justification\": \"Why this score...\"
+        }
+    },
+    \"scores\": {
+        \"criterion_name\": 8.0
+    },
+    \"weighted_score\": 7.5,
+    \"pass\": true,
+    \"overall_assessment\": \"Summary of quality...\",
+    \"critical_issues\": [\"Issue 1\", \"Issue 2\"],
+    \"improvement_suggestions\": [\"Suggestion 1\", \"Suggestion 2\"],
+    \"revision_required\": false
+}
+\`\`\`
+
+Begin your evaluation:",
+    "criteria": $(echo "$criteria_json" | jq -c '.'),
+    "eval_type": "$eval_type"
+}
+EOF
+}
+
+# =============================================================================
+# EVALUATION EXECUTION
+# =============================================================================
+
+# Evaluate output quality (requires Claude API call - returns prompt for now)
+evaluate_output() {
+    local task="$1"
+    local output="$2"
+    local eval_type="${3:-code}"
+    local context="${4:-}"
+
+    log "Evaluating output for task: $task (type: $eval_type)"
+
+    # Generate evaluation prompt
+    local eval_prompt
+    eval_prompt=$(generate_evaluation_prompt "$task" "$output" "$eval_type" "$context")
+
+    # Return prompt for Claude to process
+    echo "$eval_prompt" | jq -c '.'
+}
+
+# Process evaluation result and determine if revision needed
+process_evaluation_result() {
+    local eval_result="$1"
+    local task="$2"
+
+    log "Processing evaluation result"
+
+    # Extract key metrics
+    local weighted_score
+    local pass_status
+    local revision_required
+    local critical_issues
+
+    weighted_score=$(echo "$eval_result" | jq -r '.weighted_score // 5' 2>/dev/null)
+    pass_status=$(echo "$eval_result" | jq -r '.pass // false' 2>/dev/null)
+    revision_required=$(echo "$eval_result" | jq -r '.revision_required // false' 2>/dev/null)
+    critical_issues=$(echo "$eval_result" | jq -r '.critical_issues // [] | length' 2>/dev/null)
+
+    # Record to history
+    record_evaluation_history "$task" "$weighted_score" "$pass_status" "$eval_result"
+
+    # Store evaluation insights in memory
+    if [[ -x "$MEMORY_MANAGER" && "$pass_status" == "true" ]]; then
+        local assessment
+        assessment=$(echo "$eval_result" | jq -r '.overall_assessment // empty' 2>/dev/null)
+        "$MEMORY_MANAGER" add-context "Quality evaluation: $task scored $weighted_score/10. $assessment" "$weighted_score" 2>/dev/null || true
+    fi
+
+    # Generate action recommendation
+    local action="continue"
+    local reason="Output meets quality threshold"
+
+    if [[ "$pass_status" == "false" ]] || [[ "$revision_required" == "true" ]] || (( $(echo "$weighted_score < 7" | bc -l 2>/dev/null || echo 0) )); then
+        action="revise"
+        reason="Quality score ($weighted_score) below threshold or critical issues found ($critical_issues issues)"
+    fi
+
+    cat << EOF
+{
+    "action": "$action",
+    "reason": "$reason",
+    "score": $weighted_score,
+    "pass": $pass_status,
+    "revision_required": $revision_required,
+    "critical_issues": $critical_issues,
+    "evaluation": $(echo "$eval_result" | jq -c '.')
+}
+EOF
+}
+
+# =============================================================================
+# EVALUATION HISTORY AND ANALYTICS
+# =============================================================================
+
+# Record evaluation to history
+record_evaluation_history() {
+    local task="$1"
+    local score="$2"
+    local pass="$3"
+    local full_result="$4"
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local record
+    record=$(jq -n \
+        --arg task "$task" \
+        --arg score "$score" \
+        --arg pass "$pass" \
+        --arg ts "$timestamp" \
+        --argjson result "$full_result" \
+        '{
+            timestamp: $ts,
+            task: $task,
+            score: ($score | tonumber),
+            pass: ($pass == "true"),
+            result: $result
+        }')
+
+    echo "$record" >> "$EVAL_HISTORY"
+
+    log "Recorded evaluation: task=$task, score=$score, pass=$pass"
+}
+
+# Get evaluation statistics
+get_evaluation_stats() {
+    local limit="${1:-20}"
+
+    if [[ ! -f "$EVAL_HISTORY" ]]; then
+        echo '{"total":0,"avg_score":0,"pass_rate":0,"recent":[]}'
+        return
+    fi
+
+    local recent
+    recent=$(tail -n "$limit" "$EVAL_HISTORY" | jq -s '.')
+
+    local stats
+    stats=$(echo "$recent" | jq '{
+        total: length,
+        avg_score: (map(.score) | add / length),
+        pass_rate: (map(select(.pass) | 1) | add // 0) / length * 100,
+        recent: .[-5:]
+    }')
+
+    echo "$stats"
+}
+
+# Get evaluation trend (improving/declining)
+get_evaluation_trend() {
+    local window="${1:-10}"
+
+    if [[ ! -f "$EVAL_HISTORY" ]]; then
+        echo '{"trend":"unknown","confidence":0}'
+        return
+    fi
+
+    local recent
+    recent=$(tail -n "$((window * 2))" "$EVAL_HISTORY" | jq -s '.')
+
+    local trend
+    trend=$(echo "$recent" | jq --argjson window "$window" '{
+        first_half: .[:$window] | map(.score) | add / length,
+        second_half: .[$window:] | map(.score) | add / length
+    } | if .second_half > .first_half + 0.5 then
+        {trend: "improving", confidence: ((.second_half - .first_half) * 10 | floor / 10)}
+    elif .first_half > .second_half + 0.5 then
+        {trend: "declining", confidence: ((.first_half - .second_half) * 10 | floor / 10)}
+    else
+        {trend: "stable", confidence: 0.5}
+    end')
+
+    echo "$trend"
+}
+
+# =============================================================================
+# MULTI-AGENT EVALUATION (debate between evaluators)
+# =============================================================================
+
+# Generate multiple evaluation perspectives
+generate_multi_evaluator_prompt() {
+    local task="$1"
+    local output="$2"
+    local eval_type="${3:-code}"
+
+    cat << EOF
+{
+    "evaluation_approach": "multi_agent_debate",
+    "evaluators": [
+        {
+            "role": "optimist",
+            "perspective": "Focus on strengths, what works well, and positive aspects",
+            "bias_awareness": "May overlook critical flaws"
+        },
+        {
+            "role": "critic",
+            "perspective": "Focus on weaknesses, potential issues, and areas for improvement",
+            "bias_awareness": "May be overly harsh and miss good aspects"
+        },
+        {
+            "role": "pragmatist",
+            "perspective": "Balance trade-offs, real-world constraints, and practical value",
+            "bias_awareness": "May accept suboptimal solutions too easily"
+        }
+    ],
+    "process": "Each evaluator assesses independently, then debate to reach consensus",
+    "task": "$task",
+    "output": "$output",
+    "eval_type": "$eval_type"
+}
+EOF
+}
+
+# =============================================================================
+# COMMAND INTERFACE
+# =============================================================================
+
+case "${1:-help}" in
+    evaluate)
+        # Evaluate an output
+        evaluate_output "${2:-task}" "${3:-output}" "${4:-code}" "${5:-}"
+        ;;
+    process)
+        # Process evaluation result
+        process_evaluation_result "${2:-{}}" "${3:-task}"
+        ;;
+    criteria)
+        # Get evaluation criteria
+        get_evaluation_criteria "${2:-code}"
+        ;;
+    stats)
+        # Get evaluation statistics
+        get_evaluation_stats "${2:-20}"
+        ;;
+    trend)
+        # Get evaluation trend
+        get_evaluation_trend "${2:-10}"
+        ;;
+    multi)
+        # Generate multi-evaluator prompt
+        generate_multi_evaluator_prompt "${2:-task}" "${3:-output}" "${4:-code}"
+        ;;
+    clear-history)
+        # Clear evaluation history
+        > "$EVAL_HISTORY"
+        echo '{"status":"history_cleared"}'
+        ;;
+    help|*)
+        echo "LLM-as-Judge Auto-Evaluator - Real-time Quality Assessment"
+        echo ""
+        echo "Usage: $0 <command> [args]"
+        echo ""
+        echo "Evaluation:"
+        echo "  evaluate <task> <output> [type] [context]"
+        echo "                                     - Generate evaluation prompt"
+        echo "  process <eval_result> <task>       - Process evaluation and decide action"
+        echo "  criteria [type]                    - Get evaluation criteria"
+        echo "                                       Types: code, documentation, test, general"
+        echo ""
+        echo "Analytics:"
+        echo "  stats [limit]                      - Get evaluation statistics"
+        echo "  trend [window]                     - Get evaluation trend"
+        echo ""
+        echo "Advanced:"
+        echo "  multi <task> <output> [type]       - Multi-agent debate evaluation"
+        echo "  clear-history                      - Clear evaluation history"
+        echo ""
+        echo "Example workflow:"
+        echo "  1. eval_prompt=\$($0 evaluate 'fix bug' 'code...' 'code' 'auth module')"
+        echo "  2. [Send eval_prompt to Claude, get result]"
+        echo "  3. action=\$($0 process \"\$result\" 'fix bug')"
+        echo "  4. [If action=revise, retry with improvements]"
+        echo ""
+        echo "Quality Thresholds:"
+        echo "  - Score >= 7.0: Pass (continue)"
+        echo "  - Score < 7.0: Revise (improve and retry)"
+        echo "  - Critical issues: Always revise"
+        ;;
+esac

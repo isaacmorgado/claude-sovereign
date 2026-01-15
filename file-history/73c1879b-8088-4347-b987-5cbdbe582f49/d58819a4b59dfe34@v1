@@ -1,0 +1,379 @@
+/**
+ * Music Generation Background Worker
+ * Processes music generation jobs from the BullMQ queue
+ */
+
+const { Worker, UnrecoverableError } = require('bullmq');
+const { getRedisConnection, JOB_STATUS, PROGRESS_MAP } = require('../services/musicQueue');
+
+// Lazy import services (will be implemented in later phases)
+let songIdentification = null;
+let musicGeneration = null;
+let r2Storage = null;
+let db = null;
+
+/**
+ * Initialize worker dependencies
+ */
+async function initDependencies() {
+  try {
+    r2Storage = require('../services/r2Storage');
+  } catch (e) {
+    console.warn('r2Storage not available:', e.message);
+  }
+
+  try {
+    songIdentification = require('../services/songIdentification');
+  } catch (e) {
+    console.warn('songIdentification not available:', e.message);
+  }
+
+  try {
+    musicGeneration = require('../services/musicGeneration');
+  } catch (e) {
+    console.warn('musicGeneration not available:', e.message);
+  }
+}
+
+/**
+ * Update job step and progress
+ */
+async function updateJobStep(job, step) {
+  await job.updateData({
+    ...job.data,
+    step
+  });
+  await job.updateProgress(PROGRESS_MAP[step] || 0);
+  console.log(`[Job ${job.id}] Step: ${step} (${PROGRESS_MAP[step]}%)`);
+}
+
+/**
+ * Update database record
+ */
+async function updateDatabaseRecord(jobId, updates) {
+  // This will be connected to the actual database in Phase 4
+  console.log(`[DB Update] Job ${jobId}:`, JSON.stringify(updates).substring(0, 100));
+}
+
+/**
+ * Process a music generation job
+ * @param {Object} job - BullMQ job
+ * @returns {Promise<Object>} Job result
+ */
+async function processJob(job) {
+  const startTime = Date.now();
+  console.log(`[Job ${job.id}] Starting music generation`);
+  console.log(`[Job ${job.id}] Data:`, JSON.stringify({
+    customerId: job.data.customerId,
+    youtubeUrl: job.data.youtubeUrl?.substring(0, 50),
+    prompt: job.data.prompt?.substring(0, 50),
+    duration: job.data.duration,
+    mood: job.data.mood
+  }));
+
+  try {
+    // Step 1: Extract audio fingerprint (if YouTube URL provided)
+    if (job.data.youtubeUrl) {
+      await updateJobStep(job, JOB_STATUS.EXTRACTING);
+
+      if (!songIdentification) {
+        console.log(`[Job ${job.id}] Skipping extraction (service not available)`);
+      } else {
+        // Extract 15-second audio fingerprint
+        const audioPath = await songIdentification.extractAudioFingerprint(job.data.youtubeUrl);
+        await job.updateData({
+          ...job.data,
+          audioPath
+        });
+      }
+    }
+
+    // Step 2: Identify reference song
+    if (job.data.youtubeUrl) {
+      await updateJobStep(job, JOB_STATUS.IDENTIFYING);
+
+      if (!songIdentification) {
+        console.log(`[Job ${job.id}] Skipping identification (service not available)`);
+      } else {
+        const identification = await songIdentification.identifySong(job.data.audioPath);
+        await job.updateData({
+          ...job.data,
+          referenceSong: identification
+        });
+
+        // Update database with reference info
+        await updateDatabaseRecord(job.id, {
+          reference_song_title: identification?.title,
+          reference_artist: identification?.artist,
+          reference_bpm: identification?.bpm,
+          reference_key: identification?.key,
+          reference_mood: identification?.mood,
+          reference_confidence: identification?.confidence
+        });
+      }
+    }
+
+    // Step 3: Generate music via Mureka API
+    await updateJobStep(job, JOB_STATUS.GENERATING);
+
+    let musicResult;
+    if (!musicGeneration) {
+      console.log(`[Job ${job.id}] Skipping generation (service not available)`);
+      // Placeholder result for testing
+      musicResult = {
+        title: `Generated ${job.data.mood} Music`,
+        duration: job.data.duration,
+        audioBuffer: Buffer.from('placeholder'),
+        previewBuffer: Buffer.from('placeholder')
+      };
+    } else {
+      // Build generation prompt from reference + user input
+      const prompt = buildGenerationPrompt(job.data);
+      musicResult = await musicGeneration.generateMusic({
+        prompt,
+        duration: job.data.duration,
+        mood: job.data.mood,
+        instruments: job.data.instruments,
+        referenceSong: job.data.referenceSong
+      });
+    }
+
+    await job.updateData({
+      ...job.data,
+      musicResult: {
+        title: musicResult.title,
+        duration: musicResult.duration
+      }
+    });
+
+    // Step 4: Upload to R2
+    await updateJobStep(job, JOB_STATUS.UPLOADING);
+
+    if (!r2Storage) {
+      console.log(`[Job ${job.id}] Skipping upload (service not available)`);
+    } else {
+      // Upload master WAV
+      const masterKey = r2Storage.generateStorageKey(
+        job.data.customerId,
+        job.id,
+        'master.wav'
+      );
+      await r2Storage.uploadMusic(musicResult.audioBuffer, masterKey);
+
+      // Upload preview MP3
+      const previewKey = r2Storage.generateStorageKey(
+        job.data.customerId,
+        job.id,
+        'preview.mp3'
+      );
+      await r2Storage.uploadMusic(musicResult.previewBuffer, previewKey);
+
+      // Upload metadata
+      const metadataKey = r2Storage.generateStorageKey(
+        job.data.customerId,
+        job.id,
+        'metadata.json'
+      );
+      await r2Storage.uploadMetadata(metadataKey, {
+        title: musicResult.title,
+        duration: musicResult.duration,
+        mood: job.data.mood,
+        instruments: job.data.instruments,
+        referenceSong: job.data.referenceSong,
+        createdAt: new Date().toISOString()
+      });
+
+      // Update database with storage info
+      await updateDatabaseRecord(job.id, {
+        r2_key: masterKey,
+        r2_preview_key: previewKey,
+        file_size_bytes: musicResult.audioBuffer.length,
+        audio_duration_seconds: musicResult.duration,
+        title: musicResult.title
+      });
+    }
+
+    // Step 5: Complete
+    await updateJobStep(job, JOB_STATUS.COMPLETED);
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Job ${job.id}] Completed in ${elapsed}s`);
+
+    // Update database with completion
+    await updateDatabaseRecord(job.id, {
+      status: 'completed',
+      completed_at: new Date().toISOString()
+    });
+
+    return {
+      success: true,
+      jobId: job.id,
+      title: musicResult.title,
+      duration: musicResult.duration,
+      elapsed: parseFloat(elapsed)
+    };
+
+  } catch (error) {
+    console.error(`[Job ${job.id}] Error:`, error.message);
+
+    // Check for unrecoverable errors
+    if (isUnrecoverableError(error)) {
+      // Update database with failure
+      await updateDatabaseRecord(job.id, {
+        status: 'failed',
+        error_message: error.message
+      });
+
+      throw new UnrecoverableError(error.message);
+    }
+
+    // Update step to indicate failure point
+    await job.updateData({
+      ...job.data,
+      lastError: error.message,
+      lastErrorStep: job.data.step
+    });
+
+    throw error; // Will trigger retry
+  }
+}
+
+/**
+ * Build generation prompt from job data
+ */
+function buildGenerationPrompt(data) {
+  const parts = [];
+
+  // Add user prompt if provided
+  if (data.prompt) {
+    parts.push(data.prompt);
+  }
+
+  // Add reference song style
+  if (data.referenceSong) {
+    parts.push(`Style similar to "${data.referenceSong.title}" by ${data.referenceSong.artist}`);
+    if (data.referenceSong.bpm) {
+      parts.push(`Tempo: around ${data.referenceSong.bpm} BPM`);
+    }
+    if (data.referenceSong.key) {
+      parts.push(`Key: ${data.referenceSong.key}`);
+    }
+  }
+
+  // Add mood
+  if (data.mood) {
+    parts.push(`Mood: ${data.mood}`);
+  }
+
+  // Add instruments
+  if (data.instruments && data.instruments.length > 0) {
+    parts.push(`Instruments: ${data.instruments.join(', ')}`);
+  }
+
+  // Add duration
+  parts.push(`Duration: ${data.duration} seconds`);
+
+  // Add generic quality markers
+  parts.push('Instrumental only, no vocals');
+  parts.push('Suitable for video background music');
+
+  return parts.join('. ');
+}
+
+/**
+ * Check if error is unrecoverable
+ */
+function isUnrecoverableError(error) {
+  const unrecoverablePatterns = [
+    /quota exceeded/i,
+    /invalid api key/i,
+    /authentication failed/i,
+    /insufficient credits/i,
+    /account suspended/i,
+    /content policy violation/i
+  ];
+
+  return unrecoverablePatterns.some(pattern => pattern.test(error.message));
+}
+
+/**
+ * Create and start the music worker
+ */
+function createMusicWorker(options = {}) {
+  const worker = new Worker(
+    'music-generation',
+    async (job) => {
+      await initDependencies();
+      return processJob(job);
+    },
+    {
+      connection: getRedisConnection(),
+      concurrency: options.concurrency || 3,
+      settings: {
+        backoffStrategy: (attemptsMade) => {
+          // Exponential backoff: 5s, 10s, 20s
+          return Math.min(5000 * Math.pow(2, attemptsMade - 1), 300000);
+        }
+      }
+    }
+  );
+
+  // Event handlers
+  worker.on('completed', (job, result) => {
+    console.log(`[Worker] Job ${job.id} completed:`, result?.title || 'Unknown');
+  });
+
+  worker.on('failed', (job, error) => {
+    console.error(`[Worker] Job ${job?.id} failed after ${job?.attemptsMade} attempts:`, error.message);
+  });
+
+  worker.on('progress', (job, progress) => {
+    console.log(`[Worker] Job ${job.id} progress: ${progress}%`);
+  });
+
+  worker.on('error', (error) => {
+    console.error('[Worker] Error:', error.message);
+  });
+
+  worker.on('stalled', (jobId) => {
+    console.warn(`[Worker] Job ${jobId} stalled`);
+  });
+
+  console.log('[Worker] Music generation worker started');
+  console.log(`[Worker] Concurrency: ${options.concurrency || 3}`);
+
+  return worker;
+}
+
+/**
+ * Graceful shutdown
+ */
+async function shutdownWorker(worker) {
+  console.log('[Worker] Shutting down...');
+  await worker.close();
+  console.log('[Worker] Shutdown complete');
+}
+
+// Export for use in server.js or standalone
+module.exports = {
+  createMusicWorker,
+  shutdownWorker,
+  processJob,
+  buildGenerationPrompt,
+  isUnrecoverableError
+};
+
+// Run standalone if executed directly
+if (require.main === module) {
+  const worker = createMusicWorker();
+
+  process.on('SIGTERM', async () => {
+    await shutdownWorker(worker);
+    process.exit(0);
+  });
+
+  process.on('SIGINT', async () => {
+    await shutdownWorker(worker);
+    process.exit(0);
+  });
+}

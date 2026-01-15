@@ -1,0 +1,543 @@
+     1→/**
+     2→ * SPLICE Cut List Generator (v3.5)
+     3→ *
+     4→ * Generates JSON cut lists for direct DOM sequence building.
+     5→ * Replaces XML processing for v3.5 architecture.
+     6→ *
+     7→ * Cut list format:
+     8→ * {
+     9→ *   version: '3.5',
+    10→ *   source: { name, path, duration },
+    11→ *   segments: [{ type, sourceName, sourcePath, inPoint, outPoint }],
+    12→ *   metadata: { silencesRemoved, takesDetected, generatedAt }
+    13→ * }
+    14→ *
+    15→ * Frame Alignment:
+    16→ * When frameRate is provided, all cut points are aligned to frame boundaries.
+    17→ * This prevents sub-frame edits that can cause playback issues.
+    18→ */
+    19→
+    20→/**
+    21→ * Align a time value to the nearest frame boundary
+    22→ * @param {number} time - Time in seconds
+    23→ * @param {number} frameRate - Frames per second (e.g., 23.976, 24, 29.97, 30, 60)
+    24→ * @returns {number} Time aligned to frame boundary
+    25→ */
+    26→function alignToFrame(time, frameRate) {
+    27→  if (!frameRate || frameRate <= 0) return time;
+    28→  const frameDuration = 1 / frameRate;
+    29→  return Math.round(time / frameDuration) * frameDuration;
+    30→}
+    31→
+    32→/**
+    33→ * Align to frame boundary, rounding down (for in-points)
+    34→ */
+    35→function alignToFrameFloor(time, frameRate) {
+    36→  if (!frameRate || frameRate <= 0) return time;
+    37→  const frameDuration = 1 / frameRate;
+    38→  return Math.floor(time / frameDuration) * frameDuration;
+    39→}
+    40→
+    41→/**
+    42→ * Align to frame boundary, rounding up (for out-points)
+    43→ */
+    44→function alignToFrameCeil(time, frameRate) {
+    45→  if (!frameRate || frameRate <= 0) return time;
+    46→  const frameDuration = 1 / frameRate;
+    47→  return Math.ceil(time / frameDuration) * frameDuration;
+    48→}
+    49→
+    50→/**
+    51→ * Generate a cut list from detected silences
+    52→ * Creates segments that represent speech (non-silence) portions
+    53→ *
+    54→ * @param {Object} options - Generation options
+    55→ * @param {string} options.sourceName - Name of the source clip
+    56→ * @param {string} options.sourcePath - Full path to the source file
+    57→ * @param {number} options.duration - Total duration of source in seconds
+    58→ * @param {Array} options.silences - Array of silence segments [{start, end, duration}]
+    59→ * @param {Array} [options.takes] - Optional array of detected takes
+    60→ * @param {Object} [options.settings] - Optional generation settings
+    61→ * @returns {Object} The generated cut list
+    62→ */
+    63→function generateCutList(options) {
+    64→  const {
+    65→    sourceName,
+    66→    sourcePath,
+    67→    duration,
+    68→    silences = [],
+    69→    takes = [],
+    70→    settings = {}
+    71→  } = options;
+    72→
+    73→  // Settings with defaults
+    74→  const {
+    75→    minSegmentDuration = 0.1,  // Minimum segment length to include
+    76→    padding = 0,               // Padding around speech (extend into silence)
+    77→    markBestTakes = true,      // Color-code best takes differently
+    78→    frameRate = 0,             // Frame rate for alignment (0 = no alignment)
+    79→    jCutOffset = 0,            // J-cut: audio starts before video (negative value)
+    80→    lCutOffset = 0,            // L-cut: audio extends after video (positive value)
+    81→    labelTakes = true,         // Add take numbering and labels
+    82→    colorCode = true           // Apply color coding to segments
+    83→  } = settings;
+    84→
+    85→  // Take numbering counter
+    86→  let takeNumber = 1;
+    87→
+    88→  // Sort silences by start time
+    89→  const sortedSilences = [...silences].sort((a, b) => a.start - b.start);
+    90→
+    91→  // Build segments from gaps between silences (speech segments)
+    92→  const segments = [];
+    93→  let lastEnd = 0;
+    94→  let silencesRemoved = 0;
+    95→
+    96→  for (const silence of sortedSilences) {
+    97→    // Calculate segment boundaries with padding and frame alignment
+    98→    let segmentStart = Math.max(0, lastEnd - padding);
+    99→    let segmentEnd = Math.min(duration, silence.start + padding);
+   100→
+   101→    // Align to frame boundaries if frameRate is specified
+   102→    if (frameRate > 0) {
+   103→      segmentStart = alignToFrameFloor(segmentStart, frameRate);
+   104→      segmentEnd = alignToFrameCeil(segmentEnd, frameRate);
+   105→    }
+   106→
+   107→    // Only add if segment meets minimum duration
+   108→    if (segmentEnd - segmentStart >= minSegmentDuration) {
+   109→      const segment = {
+   110→        type: 'speech',
+   111→        sourceName,
+   112→        sourcePath,
+   113→        inPoint: parseFloat(segmentStart.toFixed(6)),
+   114→        outPoint: parseFloat(segmentEnd.toFixed(6))
+   115→      };
+   116→
+   117→      // Add J-cut/L-cut audio offsets if specified
+   118→      if (jCutOffset !== 0 || lCutOffset !== 0) {
+   119→        // Audio in/out points differ from video
+   120→        segment.audioInOffset = jCutOffset;  // Negative = audio starts earlier (J-cut)
+   121→        segment.audioOutOffset = lCutOffset; // Positive = audio ends later (L-cut)
+   122→
+   123→        // Calculate actual audio in/out points
+   124→        segment.audioInPoint = parseFloat(Math.max(0, segmentStart + jCutOffset).toFixed(6));
+   125→        segment.audioOutPoint = parseFloat(Math.min(duration, segmentEnd + lCutOffset).toFixed(6));
+   126→      }
+   127→
+   128→      // Check if this segment contains a take
+   129→      const containingTake = findContainingTake(segmentStart, segmentEnd, takes);
+   130→      if (containingTake) {
+   131→        segment.take = {
+   132→          text: containingTake.text?.substring(0, 100),
+   133→          isBest: containingTake.isBest || false
+   134→        };
+   135→        if (containingTake.isBest && markBestTakes) {
+   136→          segment.type = 'best_take';
+   137→        }
+   138→
+   139→        // Add take labeling (Phase 1 feature)
+   140→        if (labelTakes) {
+   141→          const shortLabel = generateShortLabel(containingTake.text);
+   142→          segment.takeNumber = takeNumber;
+   143→          segment.takeLabel = `Take ${takeNumber}${shortLabel ? `: ${shortLabel}` : ''}`;
+   144→          takeNumber++;
+   145→        }
+   146→      }
+   147→
+   148→      // Add color code hint for builder
+   149→      if (colorCode) {
+   150→        segment.colorHint = getColorHintForType(segment.type);
+   151→      }
+   152→
+   153→      segments.push(segment);
+   154→    }
+   155→
+   156→    silencesRemoved++;
+   157→    lastEnd = silence.end;
+   158→  }
+   159→
+   160→  // Add final segment after last silence
+   161→  if (lastEnd < duration) {
+   162→    let segmentStart = Math.max(0, lastEnd - padding);
+   163→    let segmentEnd = duration;
+   164→
+   165→    // Align to frame boundaries if frameRate is specified
+   166→    if (frameRate > 0) {
+   167→      segmentStart = alignToFrameFloor(segmentStart, frameRate);
+   168→      segmentEnd = alignToFrameCeil(segmentEnd, frameRate);
+   169→    }
+   170→
+   171→    if (segmentEnd - segmentStart >= minSegmentDuration) {
+   172→      const segment = {
+   173→        type: 'speech',
+   174→        sourceName,
+   175→        sourcePath,
+   176→        inPoint: parseFloat(segmentStart.toFixed(6)),
+   177→        outPoint: parseFloat(segmentEnd.toFixed(6))
+   178→      };
+   179→
+   180→      // Add J-cut/L-cut audio offsets if specified
+   181→      if (jCutOffset !== 0 || lCutOffset !== 0) {
+   182→        segment.audioInOffset = jCutOffset;
+   183→        segment.audioOutOffset = lCutOffset;
+   184→        segment.audioInPoint = parseFloat(Math.max(0, segmentStart + jCutOffset).toFixed(6));
+   185→        segment.audioOutPoint = parseFloat(Math.min(duration, segmentEnd + lCutOffset).toFixed(6));
+   186→      }
+   187→
+   188→      // Check if this segment contains a take
+   189→      const containingTake = findContainingTake(segmentStart, segmentEnd, takes);
+   190→      if (containingTake) {
+   191→        segment.take = {
+   192→          text: containingTake.text?.substring(0, 100),
+   193→          isBest: containingTake.isBest || false
+   194→        };
+   195→        if (containingTake.isBest && markBestTakes) {
+   196→          segment.type = 'best_take';
+   197→        }
+   198→
+   199→        // Add take labeling (Phase 1 feature)
+   200→        if (labelTakes) {
+   201→          const shortLabel = generateShortLabel(containingTake.text);
+   202→          segment.takeNumber = takeNumber;
+   203→          segment.takeLabel = `Take ${takeNumber}${shortLabel ? `: ${shortLabel}` : ''}`;
+   204→          takeNumber++;
+   205→        }
+   206→      }
+   207→
+   208→      // Add color code hint for builder
+   209→      if (colorCode) {
+   210→        segment.colorHint = getColorHintForType(segment.type);
+   211→      }
+   212→
+   213→      segments.push(segment);
+   214→    }
+   215→  }
+   216→
+   217→  // Calculate stats
+   218→  const totalKeptDuration = segments.reduce(
+   219→    (sum, seg) => sum + (seg.outPoint - seg.inPoint),
+   220→    0
+   221→  );
+   222→  const totalRemovedDuration = duration - totalKeptDuration;
+   223→
+   224→  const cutList = {
+   225→    version: '3.5',
+   226→    source: {
+   227→      name: sourceName,
+   228→      path: sourcePath,
+   229→      duration
+   230→    },
+   231→    segments,
+   232→    metadata: {
+   233→      silencesRemoved,
+   234→      takesDetected: takes.length,
+   235→      takesLabeled: labelTakes && takeNumber > 1,
+   236→      colorCoded: colorCode,
+   237→      totalKeptDuration: parseFloat(totalKeptDuration.toFixed(3)),
+   238→      totalRemovedDuration: parseFloat(totalRemovedDuration.toFixed(3)),
+   239→      segmentCount: segments.length,
+   240→      frameRate: frameRate > 0 ? frameRate : null,
+   241→      frameAligned: frameRate > 0,
+   242→      jCutOffset: jCutOffset !== 0 ? jCutOffset : null,
+   243→      lCutOffset: lCutOffset !== 0 ? lCutOffset : null,
+   244→      hasAudioOffsets: jCutOffset !== 0 || lCutOffset !== 0,
+   245→      generatedAt: new Date().toISOString()
+   246→    }
+   247→  };
+   248→
+   249→  console.log(`[SPLICE] Generated cut list: ${segments.length} segments, ${silencesRemoved} silences removed`);
+   250→
+   251→  return cutList;
+   252→}
+   253→
+   254→/**
+   255→ * Find a take that overlaps with a given time range
+   256→ * @param {number} start - Start time in seconds
+   257→ * @param {number} end - End time in seconds
+   258→ * @param {Array} takes - Array of takes
+   259→ * @returns {Object|null} The overlapping take or null
+   260→ */
+   261→function findContainingTake(start, end, takes) {
+   262→  if (!takes || takes.length === 0) return null;
+   263→
+   264→  for (const take of takes) {
+   265→    const takeStart = take.startTime || take.start;
+   266→    const takeEnd = take.endTime || take.end;
+   267→
+   268→    // Check for overlap
+   269→    if (start < takeEnd && end > takeStart) {
+   270→      return take;
+   271→    }
+   272→  }
+   273→
+   274→  return null;
+   275→}
+   276→
+   277→/**
+   278→ * Generate a short label from take text (first 3-5 words)
+   279→ * @param {string} text - Full take text
+   280→ * @returns {string} Short label (max 30 chars)
+   281→ */
+   282→function generateShortLabel(text) {
+   283→  if (!text || typeof text !== 'string') return '';
+   284→
+   285→  // Clean and split into words
+   286→  const words = text.trim().split(/\s+/);
+   287→
+   288→  // Take first 5 words max
+   289→  const shortWords = words.slice(0, 5);
+   290→
+   291→  // Join and truncate to 30 chars
+   292→  let label = shortWords.join(' ');
+   293→  if (label.length > 30) {
+   294→    label = label.substring(0, 27) + '...';
+   295→  }
+   296→
+   297→  return label;
+   298→}
+   299→
+   300→/**
+   301→ * Get color hint for segment type
+   302→ * Color hints are used by the builder to apply appropriate colors
+   303→ *
+   304→ * Color mapping:
+   305→ * - speech: green (keeps attention, standard content)
+   306→ * - best_take: cerulean/light blue (highlight best content)
+   307→ * - take: lavender (regular take)
+   308→ * - silence: violet (rarely used, mostly removed)
+   309→ * - wide_shot: yellow (visual variety)
+   310→ * - speaker_a: mango/orange (speaker differentiation)
+   311→ * - speaker_b: caribbean/teal (speaker differentiation)
+   312→ *
+   313→ * @param {string} type - Segment type
+   314→ * @returns {string} Color hint name
+   315→ */
+   316→function getColorHintForType(type) {
+   317→  switch (type) {
+   318→    case 'best_take':
+   319→      return 'cerulean';  // Light blue - best content
+   320→    case 'take':
+   321→      return 'lavender';  // Light purple - regular take
+   322→    case 'speech':
+   323→      return 'green';     // Green - speech segments
+   324→    case 'silence':
+   325→      return 'violet';    // Purple - silence (if kept)
+   326→    case 'wide_shot':
+   327→      return 'yellow';    // Yellow - visual variety
+   328→    case 'speaker_a':
+   329→      return 'mango';     // Orange - first speaker
+   330→    case 'speaker_b':
+   331→      return 'caribbean'; // Teal - second speaker
+   332→    default:
+   333→      return 'none';
+   334→  }
+   335→}
+   336→
+   337→/**
+   338→ * Generate a cut list that keeps only specific takes
+   339→ * Useful for "keep best takes only" workflow
+   340→ *
+   341→ * @param {Object} options - Generation options
+   342→ * @param {string} options.sourceName - Name of the source clip
+   343→ * @param {string} options.sourcePath - Full path to the source file
+   344→ * @param {number} options.duration - Total duration of source in seconds
+   345→ * @param {Array} options.takes - Array of takes to keep
+   346→ * @param {Object} [options.settings] - Optional generation settings
+   347→ * @returns {Object} The generated cut list
+   348→ */
+   349→function generateTakesCutList(options) {
+   350→  const {
+   351→    sourceName,
+   352→    sourcePath,
+   353→    duration,
+   354→    takes = [],
+   355→    settings = {}
+   356→  } = options;
+   357→
+   358→  const {
+   359→    padding = 0.2,          // Small padding around takes
+   360→    onlyBestTakes = false   // If true, only include takes marked as best
+   361→  } = settings;
+   362→
+   363→  // Filter to best takes if requested
+   364→  const takesToKeep = onlyBestTakes
+   365→    ? takes.filter(t => t.isBest)
+   366→    : takes;
+   367→
+   368→  // Sort by start time
+   369→  const sortedTakes = [...takesToKeep].sort((a, b) => {
+   370→    const aStart = a.startTime || a.start;
+   371→    const bStart = b.startTime || b.start;
+   372→    return aStart - bStart;
+   373→  });
+   374→
+   375→  // Build segments from takes
+   376→  const segments = sortedTakes.map(take => {
+   377→    const takeStart = take.startTime || take.start;
+   378→    const takeEnd = take.endTime || take.end;
+   379→
+   380→    return {
+   381→      type: take.isBest ? 'best_take' : 'take',
+   382→      sourceName,
+   383→      sourcePath,
+   384→      inPoint: Math.max(0, takeStart - padding),
+   385→      outPoint: Math.min(duration, takeEnd + padding),
+   386→      take: {
+   387→        text: take.text?.substring(0, 100),
+   388→        isBest: take.isBest || false
+   389→      }
+   390→    };
+   391→  });
+   392→
+   393→  const totalKeptDuration = segments.reduce(
+   394→    (sum, seg) => sum + (seg.outPoint - seg.inPoint),
+   395→    0
+   396→  );
+   397→
+   398→  const cutList = {
+   399→    version: '3.5',
+   400→    source: {
+   401→      name: sourceName,
+   402→      path: sourcePath,
+   403→      duration
+   404→    },
+   405→    segments,
+   406→    metadata: {
+   407→      takesKept: segments.length,
+   408→      takesTotal: takes.length,
+   409→      totalKeptDuration: parseFloat(totalKeptDuration.toFixed(3)),
+   410→      totalRemovedDuration: parseFloat((duration - totalKeptDuration).toFixed(3)),
+   411→      generatedAt: new Date().toISOString()
+   412→    }
+   413→  };
+   414→
+   415→  console.log(`[SPLICE] Generated takes cut list: ${segments.length} takes kept`);
+   416→
+   417→  return cutList;
+   418→}
+   419→
+   420→/**
+   421→ * Merge overlapping segments in a cut list
+   422→ * Useful when silences and takes create overlapping regions
+   423→ *
+   424→ * @param {Object} cutList - The cut list to merge
+   425→ * @returns {Object} Cut list with merged segments
+   426→ */
+   427→function mergeOverlappingSegments(cutList) {
+   428→  if (!cutList.segments || cutList.segments.length < 2) {
+   429→    return cutList;
+   430→  }
+   431→
+   432→  // Sort by start time
+   433→  const sorted = [...cutList.segments].sort((a, b) => a.inPoint - b.inPoint);
+   434→
+   435→  const merged = [];
+   436→  let current = { ...sorted[0] };
+   437→
+   438→  for (let i = 1; i < sorted.length; i++) {
+   439→    const next = sorted[i];
+   440→
+   441→    // Check for overlap
+   442→    if (next.inPoint <= current.outPoint) {
+   443→      // Merge: extend current segment
+   444→      current.outPoint = Math.max(current.outPoint, next.outPoint);
+   445→      // Keep the more specific type (best_take > take > speech)
+   446→      if (next.type === 'best_take' || (next.type === 'take' && current.type === 'speech')) {
+   447→        current.type = next.type;
+   448→        current.take = next.take;
+   449→      }
+   450→    } else {
+   451→      // No overlap: save current and start new
+   452→      merged.push(current);
+   453→      current = { ...next };
+   454→    }
+   455→  }
+   456→
+   457→  // Don't forget the last segment
+   458→  merged.push(current);
+   459→
+   460→  // Update metadata
+   461→  const newCutList = {
+   462→    ...cutList,
+   463→    segments: merged,
+   464→    metadata: {
+   465→      ...cutList.metadata,
+   466→      segmentCount: merged.length,
+   467→      mergedFrom: cutList.segments.length
+   468→    }
+   469→  };
+   470→
+   471→  console.log(`[SPLICE] Merged ${cutList.segments.length} segments into ${merged.length}`);
+   472→
+   473→  return newCutList;
+   474→}
+   475→
+   476→/**
+   477→ * Validate a cut list structure
+   478→ * @param {Object} cutList - The cut list to validate
+   479→ * @returns {{valid: boolean, errors: string[]}}
+   480→ */
+   481→function validateCutList(cutList) {
+   482→  const errors = [];
+   483→
+   484→  if (!cutList) {
+   485→    errors.push('Cut list is null or undefined');
+   486→    return { valid: false, errors };
+   487→  }
+   488→
+   489→  if (!cutList.version) {
+   490→    errors.push('Missing version field');
+   491→  }
+   492→
+   493→  if (!cutList.source) {
+   494→    errors.push('Missing source field');
+   495→  } else {
+   496→    if (!cutList.source.name && !cutList.source.path) {
+   497→      errors.push('Source must have name or path');
+   498→    }
+   499→    if (typeof cutList.source.duration !== 'number' || cutList.source.duration <= 0) {
+   500→      errors.push('Source duration must be a positive number');
+   501→    }
+   502→  }
+   503→
+   504→  if (!Array.isArray(cutList.segments)) {
+   505→    errors.push('Segments must be an array');
+   506→  } else {
+   507→    cutList.segments.forEach((seg, i) => {
+   508→      if (typeof seg.inPoint !== 'number') {
+   509→        errors.push(`Segment ${i}: inPoint must be a number`);
+   510→      }
+   511→      if (typeof seg.outPoint !== 'number') {
+   512→        errors.push(`Segment ${i}: outPoint must be a number`);
+   513→      }
+   514→      if (seg.inPoint >= seg.outPoint) {
+   515→        errors.push(`Segment ${i}: inPoint must be less than outPoint`);
+   516→      }
+   517→      if (!seg.sourceName && !seg.sourcePath) {
+   518→        errors.push(`Segment ${i}: must have sourceName or sourcePath`);
+   519→      }
+   520→    });
+   521→  }
+   522→
+   523→  return {
+   524→    valid: errors.length === 0,
+   525→    errors
+   526→  };
+   527→}
+   528→
+   529→module.exports = {
+   530→  generateCutList,
+   531→  generateTakesCutList,
+   532→  mergeOverlappingSegments,
+   533→  validateCutList,
+   534→  // Frame alignment utilities
+   535→  alignToFrame,
+   536→  alignToFrameFloor,
+   537→  alignToFrameCeil
+   538→};
+   539→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

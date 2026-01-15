@@ -1,0 +1,365 @@
+/**
+ * Settings Management
+ *
+ * Persists user preferences to localStorage
+ * v3.5: Added Persistent Token support for media folder access
+ */
+
+const uxpFs = require('uxp').storage.localFileSystem;
+
+const DEFAULT_SETTINGS = {
+  sensitivity: 50,
+  audioSource: 'original',
+  autoMarkBest: true,
+  enableTakesDetection: true,
+  rememberOptions: false,
+  optionsExpanded: false,
+  customerId: null,          // Stripe customer ID for billing
+  mediaFolderToken: null,    // Persistent token for media folder access
+  mediaFolderPath: null      // Path to the media folder (for display)
+};
+
+let currentSettings = { ...DEFAULT_SETTINGS };
+
+/**
+ * Load settings from localStorage
+ */
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem('spliceSettings');
+    if (saved) {
+      currentSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+    }
+  } catch (e) {
+    console.warn('[SPLICE] Could not load settings:', e);
+    currentSettings = { ...DEFAULT_SETTINGS };
+  }
+  return currentSettings;
+}
+
+/**
+ * Save settings to localStorage
+ */
+function saveSettings(settings) {
+  try {
+    currentSettings = { ...currentSettings, ...settings };
+    localStorage.setItem('spliceSettings', JSON.stringify(currentSettings));
+  } catch (e) {
+    console.warn('[SPLICE] Could not save settings:', e);
+  }
+}
+
+/**
+ * Get current settings
+ */
+function getSettings() {
+  return { ...currentSettings };
+}
+
+/**
+ * Reset settings to defaults
+ */
+function resetSettings() {
+  currentSettings = { ...DEFAULT_SETTINGS };
+  try {
+    localStorage.removeItem('spliceSettings');
+  } catch (e) {
+    console.warn('[SPLICE] Could not clear settings:', e);
+  }
+}
+
+/**
+ * Initialize settings UI components
+ */
+function initSettingsUI() {
+  const settings = loadSettings();
+
+  // Apply saved sensitivity to slider
+  const sensitivitySlider = document.getElementById('sensitivitySlider');
+  if (sensitivitySlider) {
+    sensitivitySlider.value = settings.sensitivity;
+  }
+
+  // Apply saved audio source
+  const sourceOriginal = document.getElementById('sourceOriginal');
+  const sourceIsolated = document.getElementById('sourceIsolated');
+  if (sourceOriginal && sourceIsolated) {
+    sourceOriginal.checked = settings.audioSource === 'original' || settings.audioSource === 'both';
+    sourceIsolated.checked = settings.audioSource === 'isolated' || settings.audioSource === 'both';
+  }
+
+  // Apply auto-mark best setting
+  const autoMarkBest = document.getElementById('autoMarkBest');
+  if (autoMarkBest) {
+    autoMarkBest.checked = settings.autoMarkBest;
+  }
+
+  // Apply takes detection setting
+  const enableTakesDetection = document.getElementById('enableTakesDetection');
+  if (enableTakesDetection) {
+    enableTakesDetection.checked = settings.enableTakesDetection;
+  }
+
+  // Apply remember options setting
+  const rememberOptions = document.getElementById('rememberOptions');
+  if (rememberOptions) {
+    rememberOptions.checked = settings.rememberOptions;
+  }
+
+  // Restore expanded state if remember is enabled
+  if (settings.rememberOptions && settings.optionsExpanded) {
+    toggleOptionsPanel(true);
+  }
+}
+
+/**
+ * Toggle options panel visibility (unified panel)
+ */
+function toggleOptionsPanel(forceState) {
+  const toggle = document.getElementById('optionsToggle');
+  const panel = document.getElementById('optionsPanel');
+
+  if (!toggle || !panel) return;
+
+  const shouldExpand = forceState !== undefined ? forceState : panel.classList.contains('collapsed');
+
+  if (shouldExpand) {
+    panel.classList.remove('collapsed');
+    toggle.classList.add('expanded');
+  } else {
+    panel.classList.add('collapsed');
+    toggle.classList.remove('expanded');
+  }
+
+  // Save state if remember is enabled
+  const settings = getSettings();
+  if (settings.rememberOptions) {
+    saveSettings({ optionsExpanded: shouldExpand });
+  }
+}
+
+/**
+ * Initialize settings modal
+ */
+function initSettingsModal() {
+  const settingsBtn = document.getElementById('settingsBtn');
+  const modal = document.getElementById('settingsModal');
+  const closeBtn = document.getElementById('closeSettingsBtn');
+  const defaultSensitivity = document.getElementById('defaultSensitivity');
+  const rememberOptions = document.getElementById('rememberOptions');
+
+  if (settingsBtn && modal) {
+    settingsBtn.addEventListener('click', () => {
+      modal.classList.remove('hidden');
+      // Sync modal values with current settings
+      const settings = getSettings();
+      if (defaultSensitivity) defaultSensitivity.value = settings.sensitivity;
+      if (rememberOptions) rememberOptions.checked = settings.rememberOptions;
+    });
+  }
+
+  if (closeBtn && modal) {
+    closeBtn.addEventListener('click', () => {
+      modal.classList.add('hidden');
+    });
+  }
+
+  // Close on backdrop click
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        modal.classList.add('hidden');
+      }
+    });
+  }
+
+  // Save default sensitivity when changed
+  if (defaultSensitivity) {
+    defaultSensitivity.addEventListener('change', () => {
+      saveSettings({ sensitivity: parseInt(defaultSensitivity.value) });
+      // Also update the main slider
+      const mainSlider = document.getElementById('sensitivitySlider');
+      if (mainSlider) mainSlider.value = defaultSensitivity.value;
+    });
+  }
+
+  // Save remember options when changed
+  if (rememberOptions) {
+    rememberOptions.addEventListener('change', () => {
+      saveSettings({ rememberOptions: rememberOptions.checked });
+    });
+  }
+}
+
+/**
+ * Initialize options toggle (unified panel)
+ */
+function initOptionsToggles() {
+  const toggle = document.getElementById('optionsToggle');
+
+  if (toggle) {
+    toggle.addEventListener('click', () => toggleOptionsPanel());
+  }
+}
+
+/**
+ * Initialize help button
+ */
+function initHelpButton() {
+  const helpBtn = document.getElementById('helpBtn');
+  if (helpBtn) {
+    helpBtn.addEventListener('click', () => {
+      setStatus('Silence: removes quiet gaps | Takes: detects repeated content');
+    });
+  }
+}
+
+// =============================================================================
+// PERSISTENT TOKEN MANAGEMENT (v3.5)
+// =============================================================================
+
+/**
+ * Media folder entry (cached after selection)
+ * @type {Object|null}
+ */
+let mediaFolderEntry = null;
+
+/**
+ * Prompt user to select a media folder and create a persistent token.
+ * This allows silent file access without repeated permission prompts.
+ *
+ * @returns {Promise<{success: boolean, path?: string, error?: string}>}
+ */
+async function setupMediaFolder() {
+  try {
+    // Open folder picker dialog
+    const folder = await uxpFs.getFolder();
+
+    if (!folder) {
+      return { success: false, error: 'No folder selected' };
+    }
+
+    // Create a persistent token for this folder
+    const token = await uxpFs.createPersistentToken(folder);
+
+    if (!token) {
+      return { success: false, error: 'Failed to create persistent token' };
+    }
+
+    // Get the folder path for display
+    const folderPath = folder.nativePath || folder.name;
+
+    // Save to settings
+    saveSettings({
+      mediaFolderToken: token,
+      mediaFolderPath: folderPath
+    });
+
+    // Cache the folder entry
+    mediaFolderEntry = folder;
+
+    console.log(`[SPLICE] Media folder set: ${folderPath}`);
+
+    return {
+      success: true,
+      path: folderPath,
+      token
+    };
+  } catch (err) {
+    console.error('[SPLICE] Error setting up media folder:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Get the media folder entry using the stored persistent token.
+ * Falls back to prompting if token is invalid.
+ *
+ * @returns {Promise<Object|null>} The folder entry or null
+ */
+async function getMediaFolder() {
+  // Return cached entry if available
+  if (mediaFolderEntry) {
+    return mediaFolderEntry;
+  }
+
+  const settings = getSettings();
+
+  // Try to restore from persistent token
+  if (settings.mediaFolderToken) {
+    try {
+      const folder = await uxpFs.getEntryForPersistentToken(settings.mediaFolderToken);
+      if (folder) {
+        mediaFolderEntry = folder;
+        console.log(`[SPLICE] Restored media folder from token: ${settings.mediaFolderPath}`);
+        return folder;
+      }
+    } catch (err) {
+      console.warn('[SPLICE] Could not restore media folder from token:', err.message);
+      // Clear invalid token
+      saveSettings({ mediaFolderToken: null, mediaFolderPath: null });
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Check if a media folder is configured
+ * @returns {boolean}
+ */
+function hasMediaFolder() {
+  const settings = getSettings();
+  return !!settings.mediaFolderToken;
+}
+
+/**
+ * Get the configured media folder path (for display)
+ * @returns {string|null}
+ */
+function getMediaFolderPath() {
+  const settings = getSettings();
+  return settings.mediaFolderPath;
+}
+
+/**
+ * Clear the media folder configuration
+ */
+function clearMediaFolder() {
+  mediaFolderEntry = null;
+  saveSettings({
+    mediaFolderToken: null,
+    mediaFolderPath: null
+  });
+  console.log('[SPLICE] Media folder cleared');
+}
+
+/**
+ * Read a file from the media folder
+ * @param {string} filename - Name of the file to read
+ * @returns {Promise<ArrayBuffer|null>} File contents or null
+ */
+async function readMediaFile(filename) {
+  const folder = await getMediaFolder();
+  if (!folder) {
+    console.warn('[SPLICE] No media folder configured');
+    return null;
+  }
+
+  try {
+    const file = await folder.getEntry(filename);
+    if (!file) {
+      console.warn(`[SPLICE] File not found in media folder: ${filename}`);
+      return null;
+    }
+
+    const contents = await file.read({ format: uxpFs.formats.binary });
+    return contents;
+  } catch (err) {
+    console.error(`[SPLICE] Error reading file ${filename}:`, err);
+    return null;
+  }
+}
+
+// Load settings on script load
+loadSettings();

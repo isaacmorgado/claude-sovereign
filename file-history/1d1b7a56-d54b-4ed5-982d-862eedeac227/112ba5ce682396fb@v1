@@ -1,0 +1,172 @@
+import { Queue } from 'bullmq'
+import { z } from 'zod'
+import { redis } from '../config/redis.js'
+import * as audioRepository from '../db/repositories/audio-repository.js'
+import * as userRepository from '../db/repositories/user-repository.js'
+import { recordUsage } from '../middleware/usage-limit.js'
+import type { AudioJobPublic, AudioJobQueueData, AudioJobType } from '../types/audio.js'
+import type { UserPublic } from '../types/user.js'
+import { TIER_LIMITS } from '../types/user.js'
+
+const QUEUE_NAMES = {
+  transcription: 'transcription-jobs',
+  vocal_isolation: 'vocal-isolation-jobs',
+} as const
+
+const transcriptionQueue = new Queue<AudioJobQueueData>(QUEUE_NAMES.transcription, {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
+    removeOnComplete: 100,
+    removeOnFail: 50,
+  },
+})
+
+const vocalIsolationQueue = new Queue<AudioJobQueueData>(QUEUE_NAMES.vocal_isolation, {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
+    removeOnComplete: 100,
+    removeOnFail: 50,
+  },
+})
+
+export const submitJobSchema = z.object({
+  audioUrl: z.string().url(),
+  audioDurationMinutes: z.number().positive().max(60),
+})
+
+export class AudioServiceError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number = 400
+  ) {
+    super(message)
+    this.name = 'AudioServiceError'
+  }
+}
+
+export async function canSubmitJob(user: UserPublic, durationMinutes: number): Promise<boolean> {
+  const limit = TIER_LIMITS[user.subscription_tier]
+  const remaining = limit - user.usage_minutes_used
+
+  if (durationMinutes > remaining) {
+    return false
+  }
+
+  const pendingJobs = await audioRepository.countPendingByUser(user.id)
+  const maxPendingJobs = user.subscription_tier === 'enterprise' ? 10 : 5
+
+  if (pendingJobs >= maxPendingJobs) {
+    return false
+  }
+
+  return true
+}
+
+export async function submitTranscriptionJob(
+  user: UserPublic,
+  audioUrl: string,
+  audioDurationMinutes: number
+): Promise<AudioJobPublic> {
+  return submitJob(user, 'transcription', audioUrl, audioDurationMinutes)
+}
+
+export async function submitVocalIsolationJob(
+  user: UserPublic,
+  audioUrl: string,
+  audioDurationMinutes: number
+): Promise<AudioJobPublic> {
+  return submitJob(user, 'vocal_isolation', audioUrl, audioDurationMinutes)
+}
+
+async function submitJob(
+  user: UserPublic,
+  jobType: AudioJobType,
+  audioUrl: string,
+  audioDurationMinutes: number
+): Promise<AudioJobPublic> {
+  const canSubmit = await canSubmitJob(user, audioDurationMinutes)
+  if (!canSubmit) {
+    throw new AudioServiceError(
+      'Cannot submit job. Either usage limit exceeded or too many pending jobs.',
+      402
+    )
+  }
+
+  const job = await audioRepository.create({
+    userId: user.id,
+    jobType,
+    audioUrl,
+    audioDurationMinutes,
+  })
+
+  const queueData: AudioJobQueueData = {
+    jobId: job.id,
+    userId: user.id,
+    audioUrl,
+    audioDurationMinutes,
+  }
+
+  const queue = jobType === 'transcription' ? transcriptionQueue : vocalIsolationQueue
+
+  await queue.add(job.id, queueData, {
+    jobId: job.id,
+  })
+
+  return audioRepository.toPublicJob(job)
+}
+
+export async function getJobStatus(user: UserPublic, jobId: string): Promise<AudioJobPublic> {
+  const job = await audioRepository.findByIdAndUser(jobId, user.id)
+  if (!job) {
+    throw new AudioServiceError('Job not found', 404)
+  }
+  return audioRepository.toPublicJob(job)
+}
+
+export async function getUserJobs(
+  user: UserPublic,
+  limit: number = 20,
+  offset: number = 0
+): Promise<AudioJobPublic[]> {
+  const jobs = await audioRepository.findByUser(user.id, limit, offset)
+  return jobs.map(audioRepository.toPublicJob)
+}
+
+export async function markJobCompleted(
+  jobId: string,
+  resultUrl: string | null,
+  resultData: Record<string, unknown> | null
+): Promise<void> {
+  const job = await audioRepository.findById(jobId)
+  if (!job) {
+    throw new AudioServiceError('Job not found', 404)
+  }
+
+  await audioRepository.updateResult(jobId, resultUrl, resultData)
+
+  await recordUsage(job.user_id, job.audio_duration_minutes)
+}
+
+export async function markJobFailed(jobId: string, errorMessage: string): Promise<void> {
+  await audioRepository.updateStatus(jobId, 'failed', errorMessage)
+}
+
+export async function markJobProcessing(jobId: string): Promise<void> {
+  await audioRepository.updateStatus(jobId, 'processing')
+}
+
+export async function resetUserUsage(userId: string): Promise<void> {
+  await userRepository.resetUsageIfNeeded(userId)
+}
+
+export { QUEUE_NAMES }

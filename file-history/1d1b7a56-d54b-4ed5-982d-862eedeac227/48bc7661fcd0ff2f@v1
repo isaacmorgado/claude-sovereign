@@ -1,0 +1,178 @@
+import { Worker, Job } from 'bullmq'
+import { redis } from '../config/redis.js'
+import { env } from '../config/env.js'
+import * as audioService from '../services/audio-service.js'
+import type { AudioJobQueueData, VocalIsolationResult } from '../types/audio.js'
+
+const QUEUE_NAME = audioService.QUEUE_NAMES.vocal_isolation
+
+async function processVocalIsolationJob(job: Job<AudioJobQueueData>): Promise<void> {
+  const { jobId, audioUrl } = job.data
+
+  console.log(`Processing vocal isolation job ${jobId}`)
+
+  await audioService.markJobProcessing(jobId)
+
+  try {
+    const result = await isolateVocals(audioUrl)
+
+    await audioService.markJobCompleted(
+      jobId,
+      result.vocalsUrl,
+      result as unknown as Record<string, unknown>
+    )
+
+    console.log(`Vocal isolation job ${jobId} completed successfully`)
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    console.error(`Vocal isolation job ${jobId} failed:`, errorMessage)
+    throw error
+  }
+}
+
+async function isolateVocals(audioUrl: string): Promise<VocalIsolationResult> {
+  if (env.DOLBY_API_KEY) {
+    return isolateWithDolby(audioUrl)
+  }
+
+  if (env.DEMUCS_API_URL) {
+    return isolateWithDemucs(audioUrl)
+  }
+
+  throw new Error('No vocal isolation service configured. Set DOLBY_API_KEY or DEMUCS_API_URL.')
+}
+
+async function isolateWithDolby(audioUrl: string): Promise<VocalIsolationResult> {
+  const startResponse = await fetch('https://api.dolby.com/media/enhance', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.DOLBY_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      input: audioUrl,
+      output: 'dlb://out/vocals.wav',
+      content: {
+        type: 'voice_recording',
+      },
+    }),
+  })
+
+  if (!startResponse.ok) {
+    const errorText = await startResponse.text()
+    throw new Error(`Dolby API error: ${startResponse.status} - ${errorText}`)
+  }
+
+  const startData = await startResponse.json() as DolbyStartResponse
+  const jobId = startData.job_id
+
+  let result: DolbyStatusResponse | null = null
+  const maxAttempts = 60
+  let attempts = 0
+
+  while (attempts < maxAttempts) {
+    await sleep(5000)
+
+    const statusResponse = await fetch(`https://api.dolby.com/media/enhance?job_id=${jobId}`, {
+      headers: {
+        Authorization: `Bearer ${env.DOLBY_API_KEY}`,
+      },
+    })
+
+    if (!statusResponse.ok) {
+      const errorText = await statusResponse.text()
+      throw new Error(`Dolby status check error: ${statusResponse.status} - ${errorText}`)
+    }
+
+    result = await statusResponse.json() as DolbyStatusResponse
+
+    if (result.status === 'Success') {
+      break
+    }
+
+    if (result.status === 'Failed') {
+      throw new Error(`Dolby processing failed: ${result.error?.message || 'Unknown error'}`)
+    }
+
+    attempts++
+  }
+
+  if (!result || result.status !== 'Success') {
+    throw new Error('Dolby processing timed out')
+  }
+
+  return {
+    vocalsUrl: result.output || '',
+    instrumentalUrl: '',
+  }
+}
+
+async function isolateWithDemucs(audioUrl: string): Promise<VocalIsolationResult> {
+  const response = await fetch(env.DEMUCS_API_URL!, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ audio_url: audioUrl }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Demucs API error: ${response.status} - ${errorText}`)
+  }
+
+  const data = await response.json() as DemucsResponse
+
+  return {
+    vocalsUrl: data.vocals_url,
+    instrumentalUrl: data.instrumental_url || data.accompaniment_url || '',
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+interface DolbyStartResponse {
+  job_id: string
+}
+
+interface DolbyStatusResponse {
+  status: 'Pending' | 'Running' | 'Success' | 'Failed'
+  output?: string
+  error?: {
+    message: string
+  }
+}
+
+interface DemucsResponse {
+  vocals_url: string
+  instrumental_url?: string
+  accompaniment_url?: string
+}
+
+export function startVocalIsolationWorker(): Worker<AudioJobQueueData> {
+  const worker = new Worker<AudioJobQueueData>(QUEUE_NAME, processVocalIsolationJob, {
+    connection: redis,
+    concurrency: 2,
+  })
+
+  worker.on('completed', (job) => {
+    console.log(`Job ${job.id} completed`)
+  })
+
+  worker.on('failed', async (job, err) => {
+    if (job) {
+      console.error(`Job ${job.id} failed with error: ${err.message}`)
+      await audioService.markJobFailed(job.data.jobId, err.message)
+    }
+  })
+
+  worker.on('error', (err) => {
+    console.error('Worker error:', err)
+  })
+
+  console.log(`Vocal isolation worker started, listening on queue: ${QUEUE_NAME}`)
+
+  return worker
+}

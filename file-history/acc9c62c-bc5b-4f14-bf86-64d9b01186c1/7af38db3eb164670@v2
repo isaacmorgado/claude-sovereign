@@ -1,0 +1,241 @@
+/**
+ * Production test for ReflexionAgent with real LLM integration
+ *
+ * Tests the agent in a realistic scenario using actual LLM routing
+ * to validate think() method integration and multi-iteration performance.
+ *
+ * Scenario: Build a simple calculator module with real LLM reasoning
+ * Expected: Agent completes successfully with actual LLM-generated thoughts
+ */
+
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { ReflexionAgent } from '../../src/core/agents/reflexion';
+import { LLMRouter } from '../../src/core/llm/Router';
+import { createDefaultRegistry } from '../../src/core/llm/providers/ProviderFactory';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+
+// Test workspace
+const TEST_WORKSPACE = path.join(process.cwd(), 'test-workspace-reflexion-production');
+
+// Setup/teardown
+async function setupWorkspace() {
+  try {
+    await fs.rm(TEST_WORKSPACE, { recursive: true, force: true });
+  } catch (error) {
+    // Ignore if doesn't exist
+  }
+  await fs.mkdir(TEST_WORKSPACE, { recursive: true });
+  process.chdir(TEST_WORKSPACE);
+}
+
+async function cleanupWorkspace() {
+  try {
+    process.chdir(path.dirname(TEST_WORKSPACE));
+    await fs.rm(TEST_WORKSPACE, { recursive: true, force: true });
+  } catch (error) {
+    console.error('Cleanup error:', error);
+  }
+}
+
+describe('ReflexionAgent Production Test (Real LLM)', () => {
+  beforeEach(async () => {
+    await setupWorkspace();
+  });
+
+  afterEach(async () => {
+    await cleanupWorkspace();
+  });
+
+  test('REAL LLM: Complete calculator module with actual reasoning (10-15 iterations)', async () => {
+    const goal = 'Create a TypeScript calculator module with add, subtract, multiply, divide functions in calculator.ts';
+
+    // Initialize real LLM router with provider registry
+    const registry = await createDefaultRegistry();
+    const router = new LLMRouter(registry);
+    const agent = new ReflexionAgent(goal, router);
+
+    let cycles = 0;
+    let lastInput = 'Start building the calculator module';
+    const maxCycles = 15;
+    let completedSuccessfully = false;
+
+    console.log('\n🤖 Starting production test with real LLM...');
+    console.log(`Goal: ${goal}\n`);
+
+    try {
+      while (cycles < maxCycles) {
+        console.log(`\n--- Cycle ${cycles + 1} ---`);
+
+        const result = await agent.cycle(lastInput);
+        cycles++;
+
+        console.log(`Thought: ${result.thought.substring(0, 100)}...`);
+        console.log(`Action: ${result.action.substring(0, 100)}...`);
+        console.log(`Observation: ${result.observation}`);
+        console.log(`Reflection: ${result.reflection}`);
+
+        // Check for completion signals
+        if (
+          result.thought.toLowerCase().includes('complete') ||
+          result.thought.toLowerCase().includes('finished') ||
+          result.observation.includes('calculator.ts')
+        ) {
+          // Verify calculator.ts was created
+          try {
+            const calculatorContent = await fs.readFile('calculator.ts', 'utf-8');
+            if (
+              calculatorContent.includes('add') &&
+              calculatorContent.includes('subtract') &&
+              calculatorContent.includes('multiply') &&
+              calculatorContent.includes('divide')
+            ) {
+              completedSuccessfully = true;
+              console.log('\n✅ Calculator module created successfully!');
+              break;
+            }
+          } catch (error) {
+            // File doesn't exist yet, continue
+          }
+        }
+
+        lastInput = result.observation;
+      }
+    } catch (error: any) {
+      console.error(`\n❌ Error after ${cycles} cycles:`, error.message);
+      throw error;
+    }
+
+    const metrics = agent.getMetrics();
+    const history = agent.getHistory();
+
+    console.log('\n📊 Final Metrics:');
+    console.log(`  Cycles: ${cycles}`);
+    console.log(`  Files Created: ${metrics.filesCreated}`);
+    console.log(`  Files Modified: ${metrics.filesModified}`);
+    console.log(`  Lines Changed: ${metrics.linesChanged}`);
+
+    // Validate results
+    expect(cycles).toBeGreaterThan(0);
+    expect(cycles).toBeLessThanOrEqual(maxCycles);
+    expect(completedSuccessfully).toBe(true);
+    expect(metrics.filesCreated).toBeGreaterThan(0);
+
+    // Verify calculator.ts exists and has all functions
+    const calculatorContent = await fs.readFile('calculator.ts', 'utf-8');
+    expect(calculatorContent).toContain('add');
+    expect(calculatorContent).toContain('subtract');
+    expect(calculatorContent).toContain('multiply');
+    expect(calculatorContent).toContain('divide');
+
+    // Validate that thoughts were LLM-generated (not template fallback)
+    const llmGeneratedThoughts = history.filter(cycle =>
+      !cycle.thought.includes('Reasoning about:') // Template fallback pattern
+    );
+    expect(llmGeneratedThoughts.length).toBeGreaterThan(0);
+
+    console.log(`\n✅ Production test completed in ${cycles} iterations with ${llmGeneratedThoughts.length} LLM-generated thoughts`);
+  }, 120000); // 2 minute timeout for real LLM calls
+
+  test('REAL LLM: Stagnation detection with actual reasoning', async () => {
+    const goal = 'Analyze the codebase structure'; // Goal that encourages thinking but not action
+
+    const registry = await createDefaultRegistry();
+    const router = new LLMRouter(registry);
+    const agent = new ReflexionAgent(goal, router);
+
+    let cycles = 0;
+    let caughtError: Error | null = null;
+    const maxCycles = 10;
+
+    console.log('\n🤖 Testing stagnation detection with real LLM...');
+
+    try {
+      let lastInput = 'Start analyzing';
+      while (cycles < maxCycles) {
+        const result = await agent.cycle(lastInput);
+        cycles++;
+
+        console.log(`Cycle ${cycles}: ${result.thought.substring(0, 60)}...`);
+
+        lastInput = result.observation;
+      }
+    } catch (error: any) {
+      caughtError = error;
+      console.log(`\n✅ Stagnation detected after ${cycles} cycles`);
+      console.log(`Error: ${error.message}`);
+    }
+
+    // Should throw stagnation error after 5+ iterations with no file changes
+    expect(caughtError).toBeDefined();
+    expect(caughtError?.message).toContain('stuck');
+    expect(cycles).toBeGreaterThanOrEqual(5);
+
+    const metrics = agent.getMetrics();
+    expect(metrics.filesCreated).toBe(0);
+
+    console.log(`\n✅ Stagnation detection validated (${cycles} cycles, 0 files)`);
+  }, 60000);
+
+  test('REAL LLM: Multi-iteration stress test (20-30 cycles)', async () => {
+    const goal = 'Create a TypeScript project with: calculator.ts (math functions), utils.ts (helper functions), and tests/calculator.test.ts (unit tests)';
+
+    const registry = await createDefaultRegistry();
+    const router = new LLMRouter(registry);
+    const agent = new ReflexionAgent(goal, router);
+
+    let cycles = 0;
+    const maxCycles = 30;
+    let completedSuccessfully = false;
+
+    console.log('\n🤖 Starting multi-iteration stress test...');
+    console.log(`Goal: ${goal}\n`);
+
+    try {
+      let lastInput = 'Start building the project';
+      while (cycles < maxCycles) {
+        const result = await agent.cycle(lastInput);
+        cycles++;
+
+        if (cycles % 5 === 0) {
+          const metrics = agent.getMetrics();
+          console.log(`\nProgress at cycle ${cycles}: ${metrics.filesCreated} files, ${metrics.linesChanged} lines`);
+        }
+
+        // Check if all files are created
+        try {
+          const hasCalculator = await fs.access('calculator.ts').then(() => true).catch(() => false);
+          const hasUtils = await fs.access('utils.ts').then(() => true).catch(() => false);
+          const hasTests = await fs.access('tests/calculator.test.ts').then(() => true).catch(() => false);
+
+          if (hasCalculator && hasUtils && hasTests) {
+            completedSuccessfully = true;
+            console.log(`\n✅ All files created after ${cycles} cycles`);
+            break;
+          }
+        } catch (error) {
+          // Files don't exist yet
+        }
+
+        lastInput = result.observation;
+      }
+    } catch (error: any) {
+      console.error(`\n❌ Error after ${cycles} cycles:`, error.message);
+      throw error;
+    }
+
+    const metrics = agent.getMetrics();
+
+    console.log('\n📊 Stress Test Results:');
+    console.log(`  Total Cycles: ${cycles}`);
+    console.log(`  Files Created: ${metrics.filesCreated}`);
+    console.log(`  Files Modified: ${metrics.filesModified}`);
+    console.log(`  Lines Changed: ${metrics.linesChanged}`);
+
+    expect(completedSuccessfully).toBe(true);
+    expect(metrics.filesCreated).toBeGreaterThanOrEqual(3);
+    expect(cycles).toBeLessThanOrEqual(maxCycles);
+
+    console.log(`\n✅ Stress test completed successfully`);
+  }, 180000); // 3 minute timeout for stress test
+});

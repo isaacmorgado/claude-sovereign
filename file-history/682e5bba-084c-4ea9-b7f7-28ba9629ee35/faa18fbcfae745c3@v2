@@ -1,0 +1,732 @@
+#!/usr/bin/env node
+
+/**
+ * Website Cloner - Comprehensive website capture tool using Playwright
+ *
+ * Captures HTML, CSS, JS, images, fonts, API responses, and generates HAR files
+ * Supports SPA navigation, infinite scroll, modals, and interactive elements
+ */
+
+const { chromium } = require('playwright');
+const { program } = require('commander');
+const chalk = require('chalk');
+const ora = require('ora');
+const fs = require('fs').promises;
+const path = require('path');
+const { URL } = require('url');
+const robotsParser = require('robots-parser');
+const mime = require('mime-types');
+
+// Import local modules
+const AssetManager = require('./lib/asset-manager');
+const InteractionHandler = require('./lib/interaction-handler');
+const HarCapture = require('./lib/har-capture');
+const SmartFeatures = require('./lib/smart-features');
+
+class WebsiteCloner {
+  constructor(options) {
+    this.options = {
+      url: options.url,
+      depth: parseInt(options.depth) || 3,
+      delay: parseInt(options.delay) || 500,
+      output: options.output || './site-clone',
+      interactive: options.interactive || false,
+      ignoreRobots: options.ignoreRobots || false,
+      maxPages: parseInt(options.maxPages) || 1000,
+      timeout: parseInt(options.timeout) || 30000,
+      exclude: options.exclude ? options.exclude.split(',') : ['/logout', '/admin', '/signout', '/api/auth'],
+      include: options.include ? options.include.split(',') : null,
+      login: options.login || null,
+      userAgent: options.userAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+      headless: !options.headed,
+      screenshots: options.screenshots || false,
+      beautify: options.beautify || false,
+    };
+
+    this.baseUrl = null;
+    this.baseDomain = null;
+    this.visited = new Set();
+    this.queue = [];
+    this.discovered = new Map(); // URL -> { depth, parent, type }
+    this.assets = new AssetManager(this.options.output);
+    this.har = new HarCapture();
+    this.smart = new SmartFeatures();
+    this.interactions = new InteractionHandler();
+    this.robots = null;
+    this.stats = {
+      pagesVisited: 0,
+      assetsDownloaded: 0,
+      apiCallsCaptured: 0,
+      errorsEncountered: 0,
+      startTime: null,
+      endTime: null,
+    };
+  }
+
+  log(message, type = 'info') {
+    const prefix = {
+      info: chalk.blue('[INFO]'),
+      success: chalk.green('[OK]'),
+      warn: chalk.yellow('[WARN]'),
+      error: chalk.red('[ERROR]'),
+      debug: chalk.gray('[DEBUG]'),
+      interactive: chalk.magenta('[INTERACTIVE]'),
+    };
+    console.log(`${prefix[type] || prefix.info} ${message}`);
+  }
+
+  async initialize() {
+    this.baseUrl = new URL(this.options.url);
+    this.baseDomain = this.baseUrl.hostname;
+
+    // Create output directories
+    const dirs = ['html', 'css', 'js', 'images', 'fonts', 'api', 'har', 'screenshots', 'other'];
+    for (const dir of dirs) {
+      await fs.mkdir(path.join(this.options.output, dir), { recursive: true });
+    }
+
+    // Fetch and parse robots.txt
+    if (!this.options.ignoreRobots) {
+      await this.fetchRobotsTxt();
+    }
+
+    this.log(`Initialized cloner for ${this.baseDomain}`, 'success');
+    this.log(`Output directory: ${path.resolve(this.options.output)}`, 'info');
+    this.log(`Max depth: ${this.options.depth}, Max pages: ${this.options.maxPages}`, 'info');
+  }
+
+  async fetchRobotsTxt() {
+    try {
+      const robotsUrl = `${this.baseUrl.protocol}//${this.baseDomain}/robots.txt`;
+      const response = await fetch(robotsUrl);
+      if (response.ok) {
+        const robotsTxt = await response.text();
+        this.robots = robotsParser(robotsUrl, robotsTxt);
+        this.log('Loaded robots.txt', 'success');
+
+        // Save robots.txt
+        await fs.writeFile(
+          path.join(this.options.output, 'robots.txt'),
+          robotsTxt
+        );
+      }
+    } catch (error) {
+      this.log('Could not fetch robots.txt', 'warn');
+    }
+  }
+
+  isAllowedByRobots(url) {
+    if (this.options.ignoreRobots || !this.robots) return true;
+    return this.robots.isAllowed(url, this.options.userAgent);
+  }
+
+  isInternalUrl(url) {
+    try {
+      const parsed = new URL(url, this.baseUrl);
+      return parsed.hostname === this.baseDomain ||
+             parsed.hostname.endsWith('.' + this.baseDomain);
+    } catch {
+      return false;
+    }
+  }
+
+  shouldExclude(url) {
+    const pathname = new URL(url, this.baseUrl).pathname;
+    return this.options.exclude.some(pattern => {
+      if (pattern.includes('*')) {
+        const regex = new RegExp(pattern.replace(/\*/g, '.*'));
+        return regex.test(pathname);
+      }
+      return pathname.startsWith(pattern);
+    });
+  }
+
+  normalizeUrl(url) {
+    try {
+      const parsed = new URL(url, this.baseUrl);
+      // Remove hash and normalize
+      parsed.hash = '';
+      // Sort query parameters for consistency
+      parsed.searchParams.sort();
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  async setupNetworkInterception(page) {
+    const capturedResources = [];
+
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        const status = response.status();
+        const headers = response.headers();
+        const contentType = headers['content-type'] || '';
+
+        // Add to HAR
+        this.har.addEntry(response);
+
+        // Skip non-successful responses
+        if (status < 200 || status >= 400) return;
+
+        // Determine resource type and save
+        let resourceType = 'other';
+        let extension = '';
+
+        if (contentType.includes('text/html')) {
+          resourceType = 'html';
+          extension = '.html';
+        } else if (contentType.includes('text/css') || url.endsWith('.css')) {
+          resourceType = 'css';
+          extension = '.css';
+        } else if (contentType.includes('javascript') || url.endsWith('.js')) {
+          resourceType = 'js';
+          extension = '.js';
+        } else if (contentType.includes('image/') || /\.(png|jpg|jpeg|gif|svg|webp|ico)(\?|$)/i.test(url)) {
+          resourceType = 'images';
+          extension = this.getExtensionFromUrl(url) || mime.extension(contentType) || '.png';
+        } else if (contentType.includes('font/') || /\.(woff2?|ttf|eot|otf)(\?|$)/i.test(url)) {
+          resourceType = 'fonts';
+          extension = this.getExtensionFromUrl(url) || '.woff2';
+        } else if (contentType.includes('application/json') || url.includes('/api/')) {
+          resourceType = 'api';
+          extension = '.json';
+          this.stats.apiCallsCaptured++;
+        }
+
+        // Check if we already have this asset
+        if (await this.assets.has(url)) {
+          return;
+        }
+
+        // Get response body
+        let body;
+        try {
+          if (resourceType === 'api' || contentType.includes('json')) {
+            body = await response.json();
+            body = JSON.stringify(body, null, 2);
+          } else if (contentType.includes('text') || resourceType === 'html' || resourceType === 'css' || resourceType === 'js') {
+            body = await response.text();
+          } else {
+            body = await response.body();
+          }
+        } catch (e) {
+          // Response body may not be available
+          return;
+        }
+
+        // Save the asset
+        await this.assets.save(url, body, resourceType, extension);
+        this.stats.assetsDownloaded++;
+
+        capturedResources.push({ url, type: resourceType });
+      } catch (error) {
+        // Silently handle response errors
+      }
+    });
+
+    return capturedResources;
+  }
+
+  getExtensionFromUrl(url) {
+    try {
+      const pathname = new URL(url).pathname;
+      const match = pathname.match(/\.([a-z0-9]+)$/i);
+      return match ? '.' + match[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async extractLinks(page) {
+    const links = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      return anchors.map(a => ({
+        href: a.href,
+        text: a.textContent?.trim().substring(0, 100),
+        isNavigation: !!(a.closest('nav, header, [role="navigation"]')),
+      }));
+    });
+
+    return links.filter(link => {
+      const normalized = this.normalizeUrl(link.href);
+      return normalized &&
+             this.isInternalUrl(normalized) &&
+             !this.visited.has(normalized) &&
+             !this.shouldExclude(normalized) &&
+             this.isAllowedByRobots(normalized);
+    });
+  }
+
+  async handleInteractiveElements(page) {
+    const discovered = [];
+
+    // Handle navigation dropdowns and menus
+    const menuButtons = await page.$$('button[aria-haspopup], [role="menubutton"], .dropdown-toggle, [data-toggle="dropdown"]');
+    for (const button of menuButtons) {
+      try {
+        await button.hover();
+        await page.waitForTimeout(300);
+
+        // Check for revealed links
+        const newLinks = await this.extractLinks(page);
+        discovered.push(...newLinks);
+
+        // Click to expand
+        await button.click();
+        await page.waitForTimeout(500);
+
+        const moreLinks = await this.extractLinks(page);
+        discovered.push(...moreLinks);
+
+        // Close by pressing Escape
+        await page.keyboard.press('Escape');
+      } catch (e) {
+        // Element may have been removed or not interactable
+      }
+    }
+
+    // Handle accordion/expandable sections
+    const expandables = await page.$$('[aria-expanded="false"], .accordion-header, .collapsible-header, details:not([open])');
+    for (const elem of expandables) {
+      try {
+        await elem.click();
+        await page.waitForTimeout(300);
+        const newLinks = await this.extractLinks(page);
+        discovered.push(...newLinks);
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    // Handle tabs
+    const tabs = await page.$$('[role="tab"], .tab-button, .nav-tab');
+    for (const tab of tabs) {
+      try {
+        await tab.click();
+        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+        const newLinks = await this.extractLinks(page);
+        discovered.push(...newLinks);
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    return discovered;
+  }
+
+  async handleModals(page) {
+    const discovered = [];
+
+    // Look for modal triggers
+    const modalTriggers = await page.$$('[data-toggle="modal"], [data-bs-toggle="modal"], [onclick*="modal"], button:has-text("More"), button:has-text("Details"), button:has-text("View")');
+
+    for (const trigger of modalTriggers.slice(0, 10)) { // Limit to avoid too many interactions
+      try {
+        await trigger.click();
+        await page.waitForTimeout(500);
+
+        // Capture modal content
+        const modalContent = await page.$('.modal.show, [role="dialog"][aria-hidden="false"], .modal-content');
+        if (modalContent) {
+          const modalHtml = await modalContent.innerHTML();
+          const modalLinks = await this.extractLinks(page);
+          discovered.push(...modalLinks);
+
+          // Close modal
+          const closeBtn = await page.$('.modal .close, [data-dismiss="modal"], [data-bs-dismiss="modal"], .modal-close');
+          if (closeBtn) {
+            await closeBtn.click();
+          } else {
+            await page.keyboard.press('Escape');
+          }
+          await page.waitForTimeout(300);
+        }
+      } catch (e) {
+        // Ignore modal errors
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+    }
+
+    return discovered;
+  }
+
+  async handleInfiniteScroll(page) {
+    let previousHeight = 0;
+    let currentHeight = await page.evaluate(() => document.body.scrollHeight);
+    let scrollAttempts = 0;
+    const maxScrolls = 10;
+
+    while (scrollAttempts < maxScrolls && currentHeight > previousHeight) {
+      previousHeight = currentHeight;
+
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1000);
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+      currentHeight = await page.evaluate(() => document.body.scrollHeight);
+      scrollAttempts++;
+
+      if (this.options.interactive) {
+        this.log(`Scroll ${scrollAttempts}/${maxScrolls} - Height: ${currentHeight}px`, 'debug');
+      }
+    }
+  }
+
+  async handleCookieConsent(page) {
+    const consentSelectors = [
+      '#cookie-consent button',
+      '.cookie-banner button',
+      '[class*="cookie"] button[class*="accept"]',
+      '[class*="consent"] button[class*="accept"]',
+      'button:has-text("Accept All")',
+      'button:has-text("Accept Cookies")',
+      'button:has-text("I Agree")',
+      'button:has-text("Got it")',
+      '#onetrust-accept-btn-handler',
+      '.cc-accept',
+      '.gdpr-accept',
+    ];
+
+    for (const selector of consentSelectors) {
+      try {
+        const button = await page.$(selector);
+        if (button && await button.isVisible()) {
+          await button.click();
+          this.log('Dismissed cookie consent banner', 'info');
+          await page.waitForTimeout(500);
+          break;
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+  }
+
+  async handleLogin(page) {
+    if (!this.options.login) return;
+
+    const [username, password] = this.options.login.split(':');
+    if (!username || !password) {
+      this.log('Login format should be username:password', 'warn');
+      return;
+    }
+
+    // Look for login form
+    const usernameSelectors = ['input[type="email"]', 'input[name="email"]', 'input[name="username"]', 'input[id*="email"]', 'input[id*="user"]'];
+    const passwordSelectors = ['input[type="password"]'];
+    const submitSelectors = ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("Sign in")'];
+
+    let usernameInput, passwordInput, submitButton;
+
+    for (const sel of usernameSelectors) {
+      usernameInput = await page.$(sel);
+      if (usernameInput) break;
+    }
+
+    for (const sel of passwordSelectors) {
+      passwordInput = await page.$(sel);
+      if (passwordInput) break;
+    }
+
+    for (const sel of submitSelectors) {
+      submitButton = await page.$(sel);
+      if (submitButton) break;
+    }
+
+    if (usernameInput && passwordInput && submitButton) {
+      await usernameInput.fill(username);
+      await passwordInput.fill(password);
+      await submitButton.click();
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      this.log('Login attempted', 'info');
+    } else {
+      this.log('Could not find login form', 'warn');
+    }
+  }
+
+  async crawlPage(page, url, depth) {
+    if (this.visited.has(url) || depth > this.options.depth || this.stats.pagesVisited >= this.options.maxPages) {
+      return [];
+    }
+
+    this.visited.add(url);
+    const spinner = ora(`Crawling: ${url}`).start();
+
+    try {
+      // Navigate to page
+      await page.goto(url, {
+        waitUntil: 'networkidle',
+        timeout: this.options.timeout
+      });
+
+      // Wait for dynamic content
+      await page.waitForTimeout(this.options.delay);
+
+      // Handle cookie consent on first page
+      if (this.stats.pagesVisited === 0) {
+        await this.handleCookieConsent(page);
+      }
+
+      // Handle infinite scroll if page seems to have it
+      const hasInfiniteScroll = await page.evaluate(() => {
+        return document.querySelector('[data-infinite], .infinite-scroll, [class*="load-more"]') !== null ||
+               document.body.scrollHeight > window.innerHeight * 2;
+      });
+
+      if (hasInfiniteScroll) {
+        await this.handleInfiniteScroll(page);
+      }
+
+      // Capture full rendered HTML
+      const html = await page.content();
+      const urlPath = new URL(url).pathname || '/index';
+      const htmlFilename = urlPath === '/' ? 'index.html' : urlPath.replace(/\//g, '_').replace(/^_/, '') + '.html';
+      await fs.writeFile(
+        path.join(this.options.output, 'html', htmlFilename),
+        html
+      );
+
+      // Take screenshot if enabled
+      if (this.options.screenshots) {
+        const screenshotName = htmlFilename.replace('.html', '.png');
+        await page.screenshot({
+          path: path.join(this.options.output, 'screenshots', screenshotName),
+          fullPage: true
+        });
+      }
+
+      // Extract all links
+      let discovered = await this.extractLinks(page);
+
+      // Handle interactive elements
+      if (this.options.interactive) {
+        spinner.text = `Exploring interactive elements on: ${url}`;
+      }
+      const interactiveLinks = await this.handleInteractiveElements(page);
+      discovered.push(...interactiveLinks);
+
+      // Handle modals
+      const modalLinks = await this.handleModals(page);
+      discovered.push(...modalLinks);
+
+      this.stats.pagesVisited++;
+      spinner.succeed(`Crawled: ${url} (${discovered.length} links found)`);
+
+      // Add discovered links to queue
+      const newLinks = [];
+      for (const link of discovered) {
+        const normalized = this.normalizeUrl(link.href);
+        if (normalized && !this.discovered.has(normalized)) {
+          this.discovered.set(normalized, {
+            depth: depth + 1,
+            parent: url,
+            text: link.text,
+            type: link.isNavigation ? 'navigation' : 'content'
+          });
+          newLinks.push({ url: normalized, depth: depth + 1 });
+        }
+      }
+
+      // Interactive mode pause
+      if (this.options.interactive && newLinks.length > 0) {
+        await this.interactivePause(page, url, newLinks);
+      }
+
+      return newLinks;
+
+    } catch (error) {
+      spinner.fail(`Error crawling ${url}: ${error.message}`);
+      this.stats.errorsEncountered++;
+      return [];
+    }
+  }
+
+  async interactivePause(page, currentUrl, discoveredLinks) {
+    const inquirer = require('inquirer');
+
+    console.log(chalk.cyan('\n=== Interactive Mode ==='));
+    console.log(chalk.white(`Current page: ${currentUrl}`));
+    console.log(chalk.white(`Discovered ${discoveredLinks.length} new links\n`));
+
+    // Show discovered links
+    discoveredLinks.slice(0, 10).forEach((link, i) => {
+      const info = this.discovered.get(link.url);
+      console.log(chalk.gray(`  ${i + 1}. ${link.url}`));
+      if (info?.text) console.log(chalk.gray(`     "${info.text}"`));
+    });
+
+    if (discoveredLinks.length > 10) {
+      console.log(chalk.gray(`  ... and ${discoveredLinks.length - 10} more`));
+    }
+
+    const { action } = await inquirer.prompt([{
+      type: 'list',
+      name: 'action',
+      message: 'What would you like to do?',
+      choices: [
+        { name: 'Continue crawling', value: 'continue' },
+        { name: 'Skip to next page', value: 'skip' },
+        { name: 'Open browser DevTools (5 sec)', value: 'devtools' },
+        { name: 'Stop crawling', value: 'stop' }
+      ]
+    }]);
+
+    if (action === 'stop') {
+      this.log('Stopping crawl by user request', 'warn');
+      process.exit(0);
+    } else if (action === 'devtools') {
+      this.log('Opening DevTools for 5 seconds...', 'info');
+      await page.pause();
+    }
+  }
+
+  async generateSitemap() {
+    const sitemap = {
+      baseUrl: this.options.url,
+      crawledAt: new Date().toISOString(),
+      totalPages: this.visited.size,
+      totalAssets: this.stats.assetsDownloaded,
+      pages: {},
+    };
+
+    for (const [url, info] of this.discovered) {
+      sitemap.pages[url] = {
+        ...info,
+        visited: this.visited.has(url),
+      };
+    }
+
+    await fs.writeFile(
+      path.join(this.options.output, 'sitemap.json'),
+      JSON.stringify(sitemap, null, 2)
+    );
+
+    this.log(`Sitemap saved with ${Object.keys(sitemap.pages).length} URLs`, 'success');
+  }
+
+  async saveHar() {
+    const harFile = this.har.generate(this.options.url);
+    await fs.writeFile(
+      path.join(this.options.output, 'har', 'capture.har'),
+      JSON.stringify(harFile, null, 2)
+    );
+    this.log(`HAR file saved with ${harFile.log.entries.length} entries`, 'success');
+  }
+
+  async clone() {
+    this.stats.startTime = new Date();
+
+    console.log(chalk.bold.cyan('\n========================================'));
+    console.log(chalk.bold.cyan('  Website Cloner v1.0'));
+    console.log(chalk.bold.cyan('========================================\n'));
+
+    await this.initialize();
+
+    // Launch browser
+    const browser = await chromium.launch({
+      headless: this.options.headless,
+    });
+
+    const context = await browser.newContext({
+      userAgent: this.options.userAgent,
+      viewport: this.options.viewport,
+      ignoreHTTPSErrors: true,
+    });
+
+    const page = await context.newPage();
+
+    // Setup network interception
+    await this.setupNetworkInterception(page);
+
+    // Handle login if credentials provided
+    if (this.options.login) {
+      await page.goto(this.options.url);
+      await this.handleLogin(page);
+    }
+
+    // Start crawling from initial URL
+    this.queue.push({ url: this.normalizeUrl(this.options.url), depth: 0 });
+    this.discovered.set(this.normalizeUrl(this.options.url), { depth: 0, parent: null, type: 'entry' });
+
+    while (this.queue.length > 0 && this.stats.pagesVisited < this.options.maxPages) {
+      const { url, depth } = this.queue.shift();
+
+      if (this.visited.has(url) || depth > this.options.depth) {
+        continue;
+      }
+
+      const newLinks = await this.crawlPage(page, url, depth);
+      this.queue.push(...newLinks);
+
+      // Delay between requests
+      if (this.options.delay > 0) {
+        await page.waitForTimeout(this.options.delay);
+      }
+    }
+
+    // Generate outputs
+    await this.generateSitemap();
+    await this.saveHar();
+    await this.assets.generateIndex();
+
+    // Close browser
+    await browser.close();
+
+    this.stats.endTime = new Date();
+    const duration = (this.stats.endTime - this.stats.startTime) / 1000;
+
+    // Print summary
+    console.log(chalk.bold.green('\n========================================'));
+    console.log(chalk.bold.green('  Crawl Complete!'));
+    console.log(chalk.bold.green('========================================\n'));
+    console.log(chalk.white(`  Pages visited:    ${this.stats.pagesVisited}`));
+    console.log(chalk.white(`  Assets captured:  ${this.stats.assetsDownloaded}`));
+    console.log(chalk.white(`  API calls:        ${this.stats.apiCallsCaptured}`));
+    console.log(chalk.white(`  Errors:           ${this.stats.errorsEncountered}`));
+    console.log(chalk.white(`  Duration:         ${duration.toFixed(1)}s`));
+    console.log(chalk.white(`  Output:           ${path.resolve(this.options.output)}\n`));
+  }
+}
+
+// CLI Setup
+program
+  .name('website-cloner')
+  .description('Comprehensive website cloning tool using Playwright')
+  .version('1.0.0')
+  .requiredOption('-u, --url <url>', 'Starting URL to clone')
+  .option('-d, --depth <number>', 'Maximum crawl depth', '3')
+  .option('-D, --delay <ms>', 'Delay between requests in milliseconds', '500')
+  .option('-o, --output <dir>', 'Output directory', './site-clone')
+  .option('-i, --interactive', 'Interactive mode - pause before major actions')
+  .option('-I, --ignore-robots', 'Ignore robots.txt restrictions')
+  .option('-m, --max-pages <number>', 'Maximum number of pages to crawl', '1000')
+  .option('-t, --timeout <ms>', 'Page load timeout in milliseconds', '30000')
+  .option('-e, --exclude <patterns>', 'Comma-separated URL patterns to exclude')
+  .option('-n, --include <patterns>', 'Comma-separated URL patterns to include (whitelist)')
+  .option('-l, --login <credentials>', 'Login credentials as username:password')
+  .option('-a, --user-agent <ua>', 'Custom user agent string')
+  .option('-H, --headed', 'Run in headed mode (show browser)')
+  .option('-s, --screenshots', 'Take screenshots of each page')
+  .option('-b, --beautify', 'Beautify JS/CSS files using js-beautify')
+  .parse();
+
+const options = program.opts();
+
+// Validate URL
+try {
+  new URL(options.url);
+} catch (e) {
+  console.error(chalk.red('Error: Invalid URL provided'));
+  process.exit(1);
+}
+
+// Run cloner
+const cloner = new WebsiteCloner(options);
+cloner.clone().catch(error => {
+  console.error(chalk.red(`Fatal error: ${error.message}`));
+  console.error(error.stack);
+  process.exit(1);
+});

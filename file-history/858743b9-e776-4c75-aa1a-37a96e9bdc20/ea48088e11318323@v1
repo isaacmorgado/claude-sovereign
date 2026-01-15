@@ -1,0 +1,841 @@
+/**
+ * MultiAgent Browser Bridge - Background Service Worker
+ *
+ * Manages WebSocket connection to VS Code extension and coordinates
+ * communication between browser tabs and the development environment.
+ */
+
+const DEFAULT_SERVER_URL = "ws://127.0.0.1:9876"
+const RECONNECT_DELAY = 5000
+const MAX_RECONNECT_ATTEMPTS = 10
+
+class BrowserBridge {
+	constructor() {
+		this.ws = null
+		this.connectionState = "disconnected"
+		this.serverUrl = DEFAULT_SERVER_URL
+		this.reconnectAttempts = 0
+		this.reconnectTimer = null
+		this.networkMonitoringEnabled = false
+		this.consoleMonitoringEnabled = false
+		this.networkRequests = new Map()
+		this.pendingResponses = new Map()
+
+		// Load saved settings
+		this.loadSettings()
+
+		// Set up chrome event listeners
+		this.setupEventListeners()
+	}
+
+	async loadSettings() {
+		try {
+			const result = await chrome.storage.local.get(["serverUrl", "autoConnect"])
+			if (result.serverUrl) {
+				this.serverUrl = result.serverUrl
+			}
+			if (result.autoConnect) {
+				this.connect()
+			}
+		} catch (error) {
+			console.error("[BrowserBridge] Failed to load settings:", error)
+		}
+	}
+
+	async saveSettings() {
+		try {
+			await chrome.storage.local.set({
+				serverUrl: this.serverUrl,
+			})
+		} catch (error) {
+			console.error("[BrowserBridge] Failed to save settings:", error)
+		}
+	}
+
+	setupEventListeners() {
+		// Handle messages from content scripts
+		chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+			this.handleContentMessage(message, sender).then(sendResponse)
+			return true // Keep channel open for async response
+		})
+
+		// Network request monitoring via webRequest API
+		chrome.webRequest.onBeforeRequest.addListener(
+			(details) => this.handleNetworkRequest(details),
+			{ urls: ["<all_urls>"] },
+			["requestBody"],
+		)
+
+		chrome.webRequest.onCompleted.addListener(
+			(details) => this.handleNetworkResponse(details),
+			{ urls: ["<all_urls>"] },
+			["responseHeaders"],
+		)
+
+		chrome.webRequest.onErrorOccurred.addListener((details) => this.handleNetworkError(details), {
+			urls: ["<all_urls>"],
+		})
+
+		// Tab events
+		chrome.tabs.onActivated.addListener((activeInfo) => {
+			this.sendMessage({
+				type: "tab_activated",
+				payload: { tabId: activeInfo.tabId },
+			})
+		})
+
+		chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+			if (changeInfo.status === "complete") {
+				this.sendMessage({
+					type: "tab_updated",
+					payload: this.formatTabInfo(tab),
+				})
+			}
+		})
+
+		chrome.tabs.onRemoved.addListener((tabId) => {
+			this.sendMessage({
+				type: "tab_removed",
+				payload: { tabId },
+			})
+		})
+	}
+
+	connect(url) {
+		if (url) {
+			this.serverUrl = url
+			this.saveSettings()
+		}
+
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			console.log("[BrowserBridge] Already connected")
+			return
+		}
+
+		this.setConnectionState("connecting")
+		console.log(`[BrowserBridge] Connecting to ${this.serverUrl}`)
+
+		try {
+			this.ws = new WebSocket(this.serverUrl)
+
+			this.ws.onopen = () => {
+				console.log("[BrowserBridge] Connected to VS Code")
+				this.reconnectAttempts = 0
+				this.setConnectionState("connected")
+				this.sendHandshake()
+			}
+
+			this.ws.onmessage = (event) => {
+				try {
+					const message = JSON.parse(event.data)
+					this.handleServerMessage(message)
+				} catch (error) {
+					console.error("[BrowserBridge] Failed to parse message:", error)
+				}
+			}
+
+			this.ws.onclose = (event) => {
+				console.log(`[BrowserBridge] Disconnected: ${event.code} - ${event.reason}`)
+				this.setConnectionState("disconnected")
+				this.ws = null
+				this.scheduleReconnect()
+			}
+
+			this.ws.onerror = (error) => {
+				console.error("[BrowserBridge] WebSocket error:", error)
+				this.setConnectionState("error")
+			}
+		} catch (error) {
+			console.error("[BrowserBridge] Connection failed:", error)
+			this.setConnectionState("error")
+			this.scheduleReconnect()
+		}
+	}
+
+	disconnect() {
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer)
+			this.reconnectTimer = null
+		}
+		this.reconnectAttempts = MAX_RECONNECT_ATTEMPTS // Prevent auto-reconnect
+
+		if (this.ws) {
+			this.ws.close(1000, "User disconnected")
+			this.ws = null
+		}
+		this.setConnectionState("disconnected")
+	}
+
+	scheduleReconnect() {
+		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			console.log("[BrowserBridge] Max reconnection attempts reached")
+			return
+		}
+
+		const delay = RECONNECT_DELAY * Math.pow(1.5, this.reconnectAttempts)
+		console.log(`[BrowserBridge] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`)
+
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectAttempts++
+			this.connect()
+		}, delay)
+	}
+
+	setConnectionState(state) {
+		this.connectionState = state
+		// Notify popup about state change
+		chrome.runtime.sendMessage({ type: "connection_state", state }).catch(() => {
+			// Popup might not be open
+		})
+	}
+
+	sendHandshake() {
+		this.sendMessage({
+			type: "handshake",
+			payload: {
+				extensionId: chrome.runtime.id,
+				extensionVersion: chrome.runtime.getManifest().version,
+				browserName: "Chrome",
+				browserVersion: navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || "unknown",
+				userAgent: navigator.userAgent,
+			},
+		})
+	}
+
+	sendMessage(message) {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			return false
+		}
+
+		const fullMessage = {
+			id: message.id || crypto.randomUUID(),
+			timestamp: Date.now(),
+			...message,
+		}
+
+		try {
+			this.ws.send(JSON.stringify(fullMessage))
+			return true
+		} catch (error) {
+			console.error("[BrowserBridge] Send error:", error)
+			return false
+		}
+	}
+
+	async handleServerMessage(message) {
+		const { id, type, tabId, payload } = message
+
+		try {
+			let response = null
+
+			switch (type) {
+				case "handshake_ack":
+					console.log("[BrowserBridge] Handshake acknowledged by VS Code")
+					break
+
+				case "ping":
+					this.sendMessage({ id, type: "pong" })
+					break
+
+				case "network_enable":
+					this.networkMonitoringEnabled = true
+					break
+
+				case "network_disable":
+					this.networkMonitoringEnabled = false
+					break
+
+				case "console_enable":
+					this.consoleMonitoringEnabled = true
+					this.enableConsoleMonitoring()
+					break
+
+				case "console_disable":
+					this.consoleMonitoringEnabled = false
+					this.disableConsoleMonitoring()
+					break
+
+				case "dom_inspect_request":
+					response = await this.inspectElement(tabId, payload.x, payload.y)
+					break
+
+				case "dom_query_selector":
+					response = await this.querySelectorAll(tabId, payload.selector, payload.includeChildren)
+					break
+
+				case "dom_get_computed_styles":
+					response = await this.getComputedStyles(tabId, payload.selector)
+					break
+
+				case "dom_highlight_element":
+					await this.highlightElement(tabId, payload.selector, payload.color)
+					break
+
+				case "dom_highlight_clear":
+					await this.clearHighlights(tabId)
+					break
+
+				case "page_screenshot":
+					response = await this.takeScreenshot(tabId, payload)
+					break
+
+				case "page_navigate":
+					await this.navigateTo(tabId, payload.url)
+					break
+
+				case "page_reload":
+					await this.reloadPage(tabId, payload.ignoreCache)
+					break
+
+				case "page_execute_script":
+					response = await this.executeScript(tabId, payload.script)
+					break
+
+				case "page_get_info":
+					response = await this.getPageInfo(tabId)
+					break
+
+				case "tabs_list":
+					response = await this.listTabs()
+					break
+
+				case "tabs_activate":
+					await this.activateTab(payload.tabId)
+					break
+
+				case "tabs_close":
+					await this.closeTab(payload.tabId)
+					break
+
+				case "tabs_create":
+					response = await this.createTab(payload.url)
+					break
+
+				default:
+					console.warn(`[BrowserBridge] Unknown message type: ${type}`)
+			}
+
+			// Send response if there's one
+			if (response !== null && id) {
+				this.sendMessage({
+					id,
+					type: `${type}_response`,
+					tabId,
+					payload: response,
+				})
+			}
+		} catch (error) {
+			console.error(`[BrowserBridge] Error handling ${type}:`, error)
+			if (id) {
+				this.sendMessage({
+					id,
+					type: "error",
+					payload: { error: error.message },
+				})
+			}
+		}
+	}
+
+	async handleContentMessage(message, sender) {
+		const { type, payload } = message
+
+		switch (type) {
+			case "console_message":
+				if (this.consoleMonitoringEnabled) {
+					this.sendMessage({
+						type: "console_message",
+						tabId: sender.tab?.id,
+						payload: {
+							id: crypto.randomUUID(),
+							...payload,
+							timestamp: Date.now(),
+						},
+					})
+				}
+				break
+
+			case "dom_event":
+				this.sendMessage({
+					type: "dom_event",
+					tabId: sender.tab?.id,
+					payload,
+				})
+				break
+		}
+
+		return { success: true }
+	}
+
+	handleNetworkRequest(details) {
+		if (!this.networkMonitoringEnabled) return
+
+		const request = {
+			requestId: details.requestId,
+			url: details.url,
+			method: details.method,
+			type: details.type,
+			timestamp: details.timeStamp,
+			tabId: details.tabId,
+			initiator: details.initiator,
+		}
+
+		this.networkRequests.set(details.requestId, request)
+
+		this.sendMessage({
+			type: "network_request",
+			tabId: details.tabId,
+			payload: request,
+		})
+	}
+
+	handleNetworkResponse(details) {
+		if (!this.networkMonitoringEnabled) return
+
+		const request = this.networkRequests.get(details.requestId)
+		if (!request) return
+
+		const response = {
+			...request,
+			status: details.statusCode,
+			statusText: details.statusLine,
+			responseHeaders: this.headersToObject(details.responseHeaders),
+			responseTimestamp: details.timeStamp,
+			duration: details.timeStamp - request.timestamp,
+		}
+
+		this.networkRequests.delete(details.requestId)
+
+		this.sendMessage({
+			type: "network_response",
+			tabId: details.tabId,
+			payload: response,
+		})
+	}
+
+	handleNetworkError(details) {
+		if (!this.networkMonitoringEnabled) return
+
+		const request = this.networkRequests.get(details.requestId)
+		if (!request) return
+
+		const response = {
+			...request,
+			error: details.error,
+			responseTimestamp: details.timeStamp,
+			duration: details.timeStamp - request.timestamp,
+		}
+
+		this.networkRequests.delete(details.requestId)
+
+		this.sendMessage({
+			type: "network_response",
+			tabId: details.tabId,
+			payload: response,
+		})
+	}
+
+	headersToObject(headers) {
+		if (!headers) return {}
+		return headers.reduce((acc, { name, value }) => {
+			acc[name] = value
+			return acc
+		}, {})
+	}
+
+	// DOM Inspection
+	async inspectElement(tabId, x, y) {
+		return this.executeInTab(tabId, { func: inspectElementAt, args: [x, y] })
+	}
+
+	async querySelectorAll(tabId, selector, includeChildren) {
+		return this.executeInTab(tabId, { func: queryElements, args: [selector, includeChildren] })
+	}
+
+	async getComputedStyles(tabId, selector) {
+		return this.executeInTab(tabId, { func: getElementStyles, args: [selector] })
+	}
+
+	async highlightElement(tabId, selector, color) {
+		return this.executeInTab(tabId, { func: highlightEl, args: [selector, color] })
+	}
+
+	async clearHighlights(tabId) {
+		return this.executeInTab(tabId, { func: clearHighlights })
+	}
+
+	// Page Interaction
+	async takeScreenshot(tabId, options = {}) {
+		const format = options.format || "png"
+		const quality = options.quality || 100
+
+		if (options.fullPage) {
+			// For full page, we need to scroll and stitch
+			return this.executeInTab(tabId, { func: captureFullPage, args: [format, quality] })
+		}
+
+		// Capture visible area
+		const dataUrl = await chrome.tabs.captureVisibleTab(null, {
+			format: format === "jpeg" ? "jpeg" : "png",
+			quality: format === "jpeg" ? quality : undefined,
+		})
+		return dataUrl
+	}
+
+	async navigateTo(tabId, url) {
+		await chrome.tabs.update(tabId, { url })
+	}
+
+	async reloadPage(tabId, ignoreCache) {
+		await chrome.tabs.reload(tabId, { bypassCache: ignoreCache })
+	}
+
+	async executeScript(tabId, script) {
+		const results = await chrome.scripting.executeScript({
+			target: { tabId },
+			func: (code) => {
+				try {
+					return eval(code)
+				} catch (error) {
+					return { error: error.message }
+				}
+			},
+			args: [script],
+			world: "MAIN",
+		})
+		return results[0]?.result
+	}
+
+	async getPageInfo(tabId) {
+		return this.executeInTab(tabId, { func: getPageDetails })
+	}
+
+	// Tab Management
+	async listTabs() {
+		const tabs = await chrome.tabs.query({})
+		return tabs.map(this.formatTabInfo)
+	}
+
+	async activateTab(tabId) {
+		const tab = await chrome.tabs.get(tabId)
+		await chrome.tabs.update(tabId, { active: true })
+		await chrome.windows.update(tab.windowId, { focused: true })
+	}
+
+	async closeTab(tabId) {
+		await chrome.tabs.remove(tabId)
+	}
+
+	async createTab(url) {
+		const tab = await chrome.tabs.create({ url: url || "about:blank" })
+		return this.formatTabInfo(tab)
+	}
+
+	formatTabInfo(tab) {
+		return {
+			id: tab.id,
+			url: tab.url,
+			title: tab.title,
+			favicon: tab.favIconUrl,
+			active: tab.active,
+			pinned: tab.pinned,
+			windowId: tab.windowId,
+		}
+	}
+
+	// Console Monitoring
+	enableConsoleMonitoring() {
+		chrome.tabs.query({}, (tabs) => {
+			tabs.forEach((tab) => {
+				if (tab.id) {
+					chrome.scripting
+						.executeScript({
+							target: { tabId: tab.id },
+							func: setupConsoleCapture,
+							world: "MAIN",
+						})
+						.catch(() => {
+							// Some tabs can't be scripted
+						})
+				}
+			})
+		})
+	}
+
+	disableConsoleMonitoring() {
+		chrome.tabs.query({}, (tabs) => {
+			tabs.forEach((tab) => {
+				if (tab.id) {
+					chrome.scripting
+						.executeScript({
+							target: { tabId: tab.id },
+							func: removeConsoleCapture,
+							world: "MAIN",
+						})
+						.catch(() => {})
+				}
+			})
+		})
+	}
+
+	async executeInTab(tabId, options) {
+		try {
+			const results = await chrome.scripting.executeScript({
+				target: { tabId },
+				...options,
+				world: "MAIN",
+			})
+			return results[0]?.result
+		} catch (error) {
+			console.error(`[BrowserBridge] Execute in tab ${tabId} failed:`, error)
+			throw error
+		}
+	}
+
+	getState() {
+		return {
+			connectionState: this.connectionState,
+			serverUrl: this.serverUrl,
+			networkMonitoringEnabled: this.networkMonitoringEnabled,
+			consoleMonitoringEnabled: this.consoleMonitoringEnabled,
+		}
+	}
+}
+
+// ============== Injected Functions ==============
+
+function inspectElementAt(x, y) {
+	const element = document.elementFromPoint(x, y)
+	if (!element) return null
+
+	return getElementInfo(element)
+}
+
+function getElementInfo(element, maxDepth = 3, currentDepth = 0) {
+	if (!element || currentDepth > maxDepth) return null
+
+	const rect = element.getBoundingClientRect()
+
+	const info = {
+		tagName: element.tagName.toLowerCase(),
+		id: element.id || undefined,
+		className: element.className || undefined,
+		attributes: {},
+		textContent: element.textContent?.slice(0, 200),
+		rect: {
+			x: rect.x,
+			y: rect.y,
+			width: rect.width,
+			height: rect.height,
+			top: rect.top,
+			left: rect.left,
+			bottom: rect.bottom,
+			right: rect.right,
+		},
+		xpath: getXPath(element),
+		cssSelector: getCssSelector(element),
+	}
+
+	for (const attr of element.attributes) {
+		info.attributes[attr.name] = attr.value
+	}
+
+	if (currentDepth < maxDepth && element.children.length > 0 && element.children.length <= 10) {
+		info.children = Array.from(element.children).map((child) => getElementInfo(child, maxDepth, currentDepth + 1))
+	}
+
+	return info
+}
+
+function getXPath(element) {
+	if (!element) return ""
+	if (element.id) return `//*[@id="${element.id}"]`
+
+	const parts = []
+	let current = element
+
+	while (current && current.nodeType === Node.ELEMENT_NODE) {
+		let index = 1
+		let sibling = current.previousSibling
+
+		while (sibling) {
+			if (sibling.nodeType === Node.ELEMENT_NODE && sibling.tagName === current.tagName) {
+				index++
+			}
+			sibling = sibling.previousSibling
+		}
+
+		const tagName = current.tagName.toLowerCase()
+		parts.unshift(`${tagName}[${index}]`)
+		current = current.parentNode
+	}
+
+	return "/" + parts.join("/")
+}
+
+function getCssSelector(element) {
+	if (!element) return ""
+	if (element.id) return `#${element.id}`
+
+	const parts = []
+	let current = element
+
+	while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
+		let selector = current.tagName.toLowerCase()
+
+		if (current.id) {
+			selector = `#${current.id}`
+			parts.unshift(selector)
+			break
+		}
+
+		if (current.className) {
+			const classes = current.className.trim().split(/\s+/).slice(0, 2)
+			if (classes.length) {
+				selector += "." + classes.join(".")
+			}
+		}
+
+		const siblings = current.parentNode?.children
+		if (siblings && siblings.length > 1) {
+			const index = Array.from(siblings).indexOf(current) + 1
+			selector += `:nth-child(${index})`
+		}
+
+		parts.unshift(selector)
+		current = current.parentNode
+	}
+
+	return parts.join(" > ")
+}
+
+function queryElements(selector, includeChildren) {
+	const elements = document.querySelectorAll(selector)
+	return Array.from(elements).map((el) => getElementInfo(el, includeChildren ? 2 : 0))
+}
+
+function getElementStyles(selector) {
+	const element = document.querySelector(selector)
+	if (!element) return null
+
+	const computed = window.getComputedStyle(element)
+	const styles = {}
+
+	for (const prop of computed) {
+		styles[prop] = computed.getPropertyValue(prop)
+	}
+
+	return styles
+}
+
+function highlightEl(selector, color) {
+	const element = document.querySelector(selector)
+	if (!element) return
+
+	const overlay = document.createElement("div")
+	overlay.className = "multiagent-highlight"
+	const rect = element.getBoundingClientRect()
+
+	Object.assign(overlay.style, {
+		position: "fixed",
+		top: rect.top + "px",
+		left: rect.left + "px",
+		width: rect.width + "px",
+		height: rect.height + "px",
+		backgroundColor: color,
+		pointerEvents: "none",
+		zIndex: "999999",
+		transition: "opacity 0.3s",
+	})
+
+	document.body.appendChild(overlay)
+}
+
+function clearHighlights() {
+	document.querySelectorAll(".multiagent-highlight").forEach((el) => el.remove())
+}
+
+function getPageDetails() {
+	return {
+		url: window.location.href,
+		title: document.title,
+		readyState: document.readyState,
+		viewport: {
+			width: window.innerWidth,
+			height: window.innerHeight,
+			devicePixelRatio: window.devicePixelRatio,
+		},
+		scrollPosition: {
+			x: window.scrollX,
+			y: window.scrollY,
+		},
+	}
+}
+
+function captureFullPage(format, quality) {
+	// For full page capture, return scroll dimensions
+	// Actual stitching would require more complex implementation
+	return {
+		scrollWidth: document.documentElement.scrollWidth,
+		scrollHeight: document.documentElement.scrollHeight,
+		viewportWidth: window.innerWidth,
+		viewportHeight: window.innerHeight,
+		note: "Full page capture requires visible tab capture with scrolling",
+	}
+}
+
+function setupConsoleCapture() {
+	if (window.__multiagentConsoleCapture) return
+
+	window.__multiagentConsoleCapture = true
+	const originalConsole = {}
+
+	;["log", "warn", "error", "info", "debug"].forEach((level) => {
+		originalConsole[level] = console[level]
+		console[level] = function (...args) {
+			originalConsole[level].apply(console, args)
+
+			try {
+				chrome.runtime.sendMessage({
+					type: "console_message",
+					payload: {
+						level,
+						message: args.map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : String(arg))).join(" "),
+						args: args.map((arg) => {
+							try {
+								return JSON.parse(JSON.stringify(arg))
+							} catch {
+								return String(arg)
+							}
+						}),
+					},
+				})
+			} catch {
+				// Ignore send errors
+			}
+		}
+	})
+
+	window.__multiagentOriginalConsole = originalConsole
+}
+
+function removeConsoleCapture() {
+	if (!window.__multiagentConsoleCapture) return
+
+	const originalConsole = window.__multiagentOriginalConsole
+	if (originalConsole) {
+		;["log", "warn", "error", "info", "debug"].forEach((level) => {
+			if (originalConsole[level]) {
+				console[level] = originalConsole[level]
+			}
+		})
+	}
+
+	delete window.__multiagentConsoleCapture
+	delete window.__multiagentOriginalConsole
+}
+
+// Create singleton instance
+const bridge = new BrowserBridge()
+
+// Export for popup access
+self.getBridge = () => bridge

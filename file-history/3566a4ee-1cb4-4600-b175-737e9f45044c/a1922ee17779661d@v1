@@ -1,0 +1,433 @@
+/**
+ * SPLICE Plugin Main Entry Point
+ *
+ * Initializes all functionality when the plugin loads.
+ * New unified 1-click workflow.
+ */
+
+// Initialize Premiere Pro API
+const ppro = require('premierepro');
+
+// Initialize all components when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+  // Settings & UI
+  initSettingsUI();
+  initSettingsModal();
+  initOptionsToggles();
+  initHelpButton();
+
+  // Credits display
+  initCredits();
+
+  // Main workflows
+  initSilenceWorkflow();
+  initTakesWorkflow();
+
+  // Undo handlers
+  initUndoHandlers();
+
+  // Advanced features (Razor)
+  initSlice9();
+
+  console.log('[SPLICE] Plugin initialized v3.0');
+});
+
+/**
+ * Initialize one-click silence removal workflow
+ */
+function initSilenceWorkflow() {
+  const goBtn = document.getElementById('silenceGoBtn');
+  if (!goBtn) return;
+
+  goBtn.addEventListener('click', async () => {
+    goBtn.disabled = true;
+
+    try {
+      // Show progress
+      showProgress('Preparing audio...');
+
+      // Step 1: Export audio (invisible to user)
+      const exportSuccess = await exportAudioInternal();
+      if (!exportSuccess) {
+        throw new Error('Audio export failed');
+      }
+
+      // Step 2: Get settings
+      const sensitivity = parseInt(document.getElementById('sensitivitySlider')?.value || 50);
+      const useOriginal = document.getElementById('sourceOriginal')?.checked ?? true;
+      const useIsolated = document.getElementById('sourceIsolated')?.checked ?? false;
+
+      // Step 3: Vocal isolation if needed
+      let audioPath = WAV_PATH;
+      if (useIsolated) {
+        showProgress('Isolating vocals (this may take a few minutes)...');
+        const isolateResult = await isolateVocals();
+        if (isolateResult.success) {
+          audioPath = isolateResult.outputPath;
+        } else {
+          throw new Error(isolateResult.error || 'Vocal isolation failed');
+        }
+      }
+
+      // Step 4: Detect silences
+      showProgress('Detecting silences...');
+      const params = mapSensitivity(sensitivity);
+      const silences = await detectSilences(audioPath, params);
+
+      if (silences.length === 0) {
+        showEmptyState();
+        setStatus('No silences detected. Try increasing sensitivity.');
+        goBtn.disabled = false;
+        return;
+      }
+
+      // Step 5: Apply to timeline
+      showProgress('Applying changes...');
+      const result = await removeSilencesFromTimeline();
+
+      // Step 6: Show results
+      showSilenceResults({
+        count: silences.length,
+        timeSaved: silences.reduce((sum, s) => sum + (s.end - s.start), 0),
+        clipsModified: result
+      });
+
+      // Show advanced section for power users
+      document.getElementById('advancedSection')?.classList.remove('hidden');
+
+      setStatus(`Removed ${silences.length} silence(s) - ${result} clip(s) modified`);
+
+    } catch (err) {
+      showEmptyState();
+      setStatus('Error: ' + err.message);
+      console.error('[SPLICE] Silence workflow error:', err);
+    }
+
+    goBtn.disabled = false;
+  });
+}
+
+/**
+ * Initialize one-click takes detection workflow
+ */
+function initTakesWorkflow() {
+  const goBtn = document.getElementById('takesGoBtn');
+  if (!goBtn) return;
+
+  goBtn.addEventListener('click', async () => {
+    goBtn.disabled = true;
+
+    try {
+      // Show progress
+      showProgress('Preparing audio...');
+
+      // Step 1: Export audio (invisible to user)
+      const exportSuccess = await exportAudioInternal();
+      if (!exportSuccess) {
+        throw new Error('Audio export failed');
+      }
+
+      // Step 2: Transcribe and analyze (combined endpoint)
+      showProgress('Transcribing and analyzing...');
+      const result = await transcribeAudio();
+
+      if (!result.success) {
+        throw new Error(result.error || 'Transcription failed');
+      }
+
+      // Extract takes from result
+      let takes = [];
+      if (result.takes && result.takes.takes) {
+        takes = result.takes.takes;
+      } else if (result.takes && Array.isArray(result.takes)) {
+        takes = result.takes;
+      }
+
+      if (takes.length === 0) {
+        showEmptyState();
+        setStatus('No takes detected in this audio');
+        goBtn.disabled = false;
+        return;
+      }
+
+      // Store for later use
+      window.currentTakes = takes;
+
+      // Step 3: Auto-mark best takes if enabled
+      const autoMark = document.getElementById('autoMarkBest')?.checked ?? true;
+      if (autoMark) {
+        // Mark AI-suggested takes as best
+        takes.forEach(take => {
+          if (take.isBest) {
+            take.userMarkedBest = true;
+          }
+        });
+      }
+
+      // Step 4: Show results
+      showTakesResults(takes, result.transcript);
+
+      setStatus(`Found ${takes.length} take(s)`);
+
+    } catch (err) {
+      showEmptyState();
+      setStatus('Error: ' + err.message);
+      console.error('[SPLICE] Takes workflow error:', err);
+    }
+
+    goBtn.disabled = false;
+  });
+}
+
+/**
+ * Initialize undo handlers
+ */
+function initUndoHandlers() {
+  const undoBtn = document.getElementById('undoBtn');
+  const undoTakesBtn = document.getElementById('undoTakesBtn');
+
+  if (undoBtn) {
+    undoBtn.addEventListener('click', () => {
+      // Use Premiere Pro's native undo
+      try {
+        ppro.app.executeCommand('Edit.Undo');
+        showEmptyState();
+        setStatus('Changes undone');
+      } catch (e) {
+        setStatus('Undo failed - use Cmd+Z');
+      }
+    });
+  }
+
+  if (undoTakesBtn) {
+    undoTakesBtn.addEventListener('click', () => {
+      try {
+        ppro.app.executeCommand('Edit.Undo');
+        showEmptyState();
+        setStatus('Changes undone');
+      } catch (e) {
+        setStatus('Undo failed - use Cmd+Z');
+      }
+    });
+  }
+
+  // Keep Best button
+  const keepBestBtn = document.getElementById('keepBestBtn');
+  if (keepBestBtn) {
+    keepBestBtn.addEventListener('click', async () => {
+      try {
+        await applyBestTakes();
+        setStatus('Kept best takes only');
+      } catch (e) {
+        setStatus('Error applying takes: ' + e.message);
+      }
+    });
+  }
+
+  // Label All button
+  const labelAllBtn = document.getElementById('labelAllBtn');
+  if (labelAllBtn) {
+    labelAllBtn.addEventListener('click', async () => {
+      try {
+        await labelTakesOnTimeline();
+        setStatus('Takes labeled on timeline');
+      } catch (e) {
+        setStatus('Error labeling takes: ' + e.message);
+      }
+    });
+  }
+}
+
+/**
+ * Show progress indicator
+ */
+function showProgress(message) {
+  document.getElementById('resultsEmpty').style.display = 'none';
+  document.getElementById('silenceResults').style.display = 'none';
+  document.getElementById('takesResults').style.display = 'none';
+
+  const progressContainer = document.getElementById('progressContainer');
+  const progressText = document.getElementById('progressText');
+
+  if (progressContainer) progressContainer.style.display = 'block';
+  if (progressText) progressText.textContent = message;
+}
+
+/**
+ * Show empty state
+ */
+function showEmptyState() {
+  document.getElementById('progressContainer').style.display = 'none';
+  document.getElementById('silenceResults').style.display = 'none';
+  document.getElementById('takesResults').style.display = 'none';
+  document.getElementById('resultsEmpty').style.display = 'block';
+  document.getElementById('advancedSection')?.classList.add('hidden');
+}
+
+/**
+ * Show silence removal results
+ */
+function showSilenceResults({ count, timeSaved, clipsModified }) {
+  document.getElementById('progressContainer').style.display = 'none';
+  document.getElementById('resultsEmpty').style.display = 'none';
+  document.getElementById('takesResults').style.display = 'none';
+
+  document.getElementById('silenceCount').textContent = count;
+  document.getElementById('timeSaved').textContent = timeSaved.toFixed(1) + 's';
+  document.getElementById('clipsModified').textContent = clipsModified;
+
+  document.getElementById('silenceResults').style.display = 'block';
+}
+
+/**
+ * Show takes detection results
+ */
+function showTakesResults(takes, transcript) {
+  document.getElementById('progressContainer').style.display = 'none';
+  document.getElementById('resultsEmpty').style.display = 'none';
+  document.getElementById('silenceResults').style.display = 'none';
+
+  const takesList = document.getElementById('takesList');
+  if (!takesList) return;
+
+  // Store takes globally for later use
+  window.currentTakes = takes;
+
+  takesList.innerHTML = takes.map((take, index) => `
+    <div class="take-item ${take.userMarkedBest || take.isBest ? 'best' : ''}" data-index="${index}">
+      <div class="take-header">
+        <span class="take-label">Take ${index + 1}</span>
+        <span class="take-star">${take.userMarkedBest || take.isBest ? '*' : 'o'}</span>
+      </div>
+      <div class="take-time">${formatTime(take.startTime)} - ${formatTime(take.endTime)}</div>
+      <div class="take-text">${take.text?.substring(0, 80) || ''}${take.text?.length > 80 ? '...' : ''}</div>
+    </div>
+  `).join('');
+
+  // Add click handlers to toggle best
+  takesList.querySelectorAll('.take-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const index = parseInt(item.dataset.index);
+      const take = takes[index];
+      take.userMarkedBest = !take.userMarkedBest;
+      item.classList.toggle('best');
+      item.querySelector('.take-star').textContent = take.userMarkedBest ? '*' : 'o';
+    });
+  });
+
+  document.getElementById('takesResults').style.display = 'block';
+}
+
+/**
+ * Format time in seconds to MM:SS
+ */
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Internal audio export (not user-facing)
+ */
+async function exportAudioInternal() {
+  try {
+    const context = await getActiveSequence();
+    if (!context) {
+      throw new Error('No project or sequence open');
+    }
+
+    const { sequence } = context;
+    const encoderManager = ppro.EncoderManager.getManager();
+    if (!encoderManager) {
+      throw new Error('EncoderManager not available');
+    }
+
+    const result = await encoderManager.exportSequence(
+      sequence,
+      ppro.EncoderManager.EXPORT_IMMEDIATELY,
+      WAV_PATH,
+      WAV_PRESET_PATH,
+      true
+    );
+
+    return result;
+  } catch (err) {
+    console.error('[SPLICE] Export error:', err);
+    return false;
+  }
+}
+
+/**
+ * Isolate vocals using backend
+ */
+async function isolateVocals() {
+  const response = await fetch(`${BACKEND_URL}/isolate-vocals`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audioPath: WAV_PATH })
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    return { success: false, error: err.error || 'Isolation request failed' };
+  }
+
+  return await response.json();
+}
+
+/**
+ * Detect silences using backend
+ */
+async function detectSilences(audioPath, params) {
+  const response = await fetch(`${BACKEND_URL}/silences-audio`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      wavPath: audioPath,
+      threshold: params.dbThreshold,
+      minDuration: params.minDuration,
+      padding: params.padding
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error || 'Silence detection failed');
+  }
+
+  const data = await response.json();
+  if (!data.success) {
+    throw new Error(data.error || 'Silence detection failed');
+  }
+
+  // Store silences globally for razor workflow
+  currentSilences = data.silences;
+
+  return data.silences;
+}
+
+/**
+ * Transcribe audio using backend
+ */
+async function transcribeAudio() {
+  const response = await fetch(`${BACKEND_URL}/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ wavPath: WAV_PATH })
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    return { success: false, error: err.error || 'Transcription failed' };
+  }
+
+  const data = await response.json();
+  return {
+    success: data.success,
+    transcript: data.transcript,
+    takes: data.takes,
+    error: data.error
+  };
+}
+

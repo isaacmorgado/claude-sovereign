@@ -1,0 +1,214 @@
+     1→/**
+     2→ * CSRF Protection Middleware
+     3→ *
+     4→ * Implements double-submit cookie pattern for CSRF protection.
+     5→ * Works with stateless JWT authentication.
+     6→ *
+     7→ * How it works:
+     8→ * 1. Client requests a CSRF token via GET /auth/csrf-token
+     9→ * 2. Server generates a cryptographically random token
+    10→ * 3. Server sends token in both:
+    11→ *    - Response body (for JavaScript to read)
+    12→ *    - HttpOnly cookie (for automatic submission)
+    13→ * 4. Client includes token in X-CSRF-Token header on state-changing requests
+    14→ * 5. Server validates header token matches cookie token
+    15→ */
+    16→
+    17→const crypto = require('crypto');
+    18→
+    19→// CSRF Configuration
+    20→const CSRF_TOKEN_LENGTH = 32; // 256 bits
+    21→const CSRF_COOKIE_NAME = 'splice_csrf';
+    22→const CSRF_HEADER_NAME = 'x-csrf-token';
+    23→const CSRF_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+    24→
+    25→// Check if running in production
+    26→const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+    27→
+    28→/**
+    29→ * Generate a cryptographically secure CSRF token
+    30→ * @returns {string} Hex-encoded random token
+    31→ */
+    32→function generateCsrfToken() {
+    33→  return crypto.randomBytes(CSRF_TOKEN_LENGTH).toString('hex');
+    34→}
+    35→
+    36→/**
+    37→ * Constant-time comparison to prevent timing attacks
+    38→ * @param {string} a - First string
+    39→ * @param {string} b - Second string
+    40→ * @returns {boolean} True if strings are equal
+    41→ */
+    42→function safeCompare(a, b) {
+    43→  if (!a || !b || typeof a !== 'string' || typeof b !== 'string') {
+    44→    return false;
+    45→  }
+    46→
+    47→  // Use crypto.timingSafeEqual for constant-time comparison
+    48→  const bufA = Buffer.from(a);
+    49→  const bufB = Buffer.from(b);
+    50→
+    51→  if (bufA.length !== bufB.length) {
+    52→    return false;
+    53→  }
+    54→
+    55→  return crypto.timingSafeEqual(bufA, bufB);
+    56→}
+    57→
+    58→/**
+    59→ * Get cookie options for CSRF token
+    60→ * @returns {Object} Cookie configuration
+    61→ */
+    62→function getCsrfCookieOptions() {
+    63→  return {
+    64→    httpOnly: true,
+    65→    secure: isProduction, // Only secure in production (HTTPS)
+    66→    sameSite: 'strict', // Strict same-site policy for CSRF protection
+    67→    maxAge: CSRF_TOKEN_EXPIRY,
+    68→    path: '/',
+    69→    // Domain is omitted to default to the current domain
+    70→  };
+    71→}
+    72→
+    73→/**
+    74→ * Handler to generate and return a CSRF token
+    75→ * Should be mounted as GET /auth/csrf-token
+    76→ *
+    77→ * @param {Request} req - Express request
+    78→ * @param {Response} res - Express response
+    79→ */
+    80→function csrfTokenHandler(req, res) {
+    81→  const token = generateCsrfToken();
+    82→
+    83→  // Set the token in an HttpOnly cookie
+    84→  res.cookie(CSRF_COOKIE_NAME, token, getCsrfCookieOptions());
+    85→
+    86→  // Also return token in response body for JavaScript to use
+    87→  // The client will send this in the X-CSRF-Token header
+    88→  res.json({
+    89→    success: true,
+    90→    csrfToken: token,
+    91→    expiresIn: CSRF_TOKEN_EXPIRY / 1000 // seconds
+    92→  });
+    93→
+    94→  console.log('[CSRF] Token generated for request');
+    95→}
+    96→
+    97→/**
+    98→ * Middleware to validate CSRF token on state-changing requests
+    99→ * Checks that the X-CSRF-Token header matches the cookie value
+   100→ *
+   101→ * @param {Request} req - Express request
+   102→ * @param {Response} res - Express response
+   103→ * @param {Function} next - Next middleware
+   104→ */
+   105→function validateCsrfToken(req, res, next) {
+   106→  // Skip CSRF validation for safe methods (GET, HEAD, OPTIONS)
+   107→  const safeMethods = ['GET', 'HEAD', 'OPTIONS'];
+   108→  if (safeMethods.includes(req.method)) {
+   109→    return next();
+   110→  }
+   111→
+   112→  // Get token from header
+   113→  const headerToken = req.headers[CSRF_HEADER_NAME];
+   114→
+   115→  // Get token from cookie
+   116→  const cookieToken = req.cookies?.[CSRF_COOKIE_NAME];
+   117→
+   118→  // Validate both tokens exist
+   119→  if (!headerToken) {
+   120→    console.warn('[CSRF] Missing CSRF token in header');
+   121→    return res.status(403).json({
+   122→      error: 'CSRF token missing',
+   123→      message: 'Please refresh the page and try again'
+   124→    });
+   125→  }
+   126→
+   127→  if (!cookieToken) {
+   128→    console.warn('[CSRF] Missing CSRF cookie');
+   129→    return res.status(403).json({
+   130→      error: 'CSRF validation failed',
+   131→      message: 'Session expired. Please refresh the page and try again'
+   132→    });
+   133→  }
+   134→
+   135→  // Use constant-time comparison to prevent timing attacks
+   136→  if (!safeCompare(headerToken, cookieToken)) {
+   137→    console.warn('[CSRF] Token mismatch - possible CSRF attack');
+   138→    return res.status(403).json({
+   139→      error: 'CSRF validation failed',
+   140→      message: 'Security validation failed. Please refresh the page and try again'
+   141→    });
+   142→  }
+   143→
+   144→  // Token is valid
+   145→  next();
+   146→}
+   147→
+   148→/**
+   149→ * Conditional CSRF validation middleware
+   150→ * Skips validation for certain routes (e.g., webhooks, public endpoints)
+   151→ *
+   152→ * @param {Object} options - Configuration options
+   153→ * @param {string[]} options.skipRoutes - Array of route patterns to skip
+   154→ * @returns {Function} Middleware function
+   155→ */
+   156→function csrfProtection(options = {}) {
+   157→  const { skipRoutes = [] } = options;
+   158→
+   159→  // Default routes to skip CSRF validation
+   160→  const defaultSkipRoutes = [
+   161→    '/webhooks/', // Stripe webhooks use their own signature verification
+   162→    '/health', // Health checks are public
+   163→    '/api-info', // API info is public
+   164→  ];
+   165→
+   166→  const allSkipRoutes = [...defaultSkipRoutes, ...skipRoutes];
+   167→
+   168→  return (req, res, next) => {
+   169→    // Check if this route should skip CSRF validation
+   170→    const shouldSkip = allSkipRoutes.some(route => req.path.startsWith(route));
+   171→
+   172→    if (shouldSkip) {
+   173→      return next();
+   174→    }
+   175→
+   176→    // Apply CSRF validation
+   177→    return validateCsrfToken(req, res, next);
+   178→  };
+   179→}
+   180→
+   181→/**
+   182→ * Middleware to ensure CSRF cookie exists
+   183→ * Sets a new cookie if one doesn't exist
+   184→ * Useful for ensuring cookie is set before any form is shown
+   185→ *
+   186→ * @param {Request} req - Express request
+   187→ * @param {Response} res - Express response
+   188→ * @param {Function} next - Next middleware
+   189→ */
+   190→function ensureCsrfCookie(req, res, next) {
+   191→  // Check if cookie already exists
+   192→  if (!req.cookies?.[CSRF_COOKIE_NAME]) {
+   193→    const token = generateCsrfToken();
+   194→    res.cookie(CSRF_COOKIE_NAME, token, getCsrfCookieOptions());
+   195→  }
+   196→  next();
+   197→}
+   198→
+   199→module.exports = {
+   200→  generateCsrfToken,
+   201→  csrfTokenHandler,
+   202→  validateCsrfToken,
+   203→  csrfProtection,
+   204→  ensureCsrfCookie,
+   205→  // Constants for external use
+   206→  CSRF_COOKIE_NAME,
+   207→  CSRF_HEADER_NAME,
+   208→  CSRF_TOKEN_EXPIRY
+   209→};
+   210→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

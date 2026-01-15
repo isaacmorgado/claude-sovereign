@@ -1,0 +1,453 @@
+#!/bin/bash
+# Self-Healing System - Based on patterns from:
+# - Roo-Code: recoverFromError, state management
+# - claude-flow: circuit breaker, health checks
+# - medusa: checkpointing with rollback
+# - lmstudio-js: signal recovery
+# - aiometadata: corrupted cache repair
+
+set -uo pipefail
+
+LOG_FILE="${HOME}/.claude/self-healing.log"
+STATE_DIR=".claude"
+HEALTH_FILE="${STATE_DIR}/health.json"
+CIRCUIT_FILE="${STATE_DIR}/circuit-breaker.json"
+CHECKPOINT_DIR="${STATE_DIR}/checkpoints"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# =============================================================================
+# CIRCUIT BREAKER (from claude-flow pattern)
+# Prevents repeated attempts at failing operations
+# =============================================================================
+
+init_circuit_breaker() {
+    mkdir -p "$STATE_DIR"
+    if [[ ! -f "$CIRCUIT_FILE" ]]; then
+        echo '{"failures":{},"open":{}}' > "$CIRCUIT_FILE"
+    fi
+}
+
+# Check if circuit is open (too many failures)
+is_circuit_open() {
+    local operation="$1"
+    local threshold="${2:-5}"
+
+    init_circuit_breaker
+
+    local failures
+    failures=$(jq -r ".failures[\"$operation\"] // 0" "$CIRCUIT_FILE")
+    local is_open
+    is_open=$(jq -r ".open[\"$operation\"] // false" "$CIRCUIT_FILE")
+
+    if [[ "$is_open" == "true" ]]; then
+        # Check if reset timeout has passed (5 minutes)
+        local open_time
+        open_time=$(jq -r ".openTime[\"$operation\"] // 0" "$CIRCUIT_FILE")
+        local now
+        now=$(date +%s)
+        local elapsed=$((now - open_time))
+
+        if [[ $elapsed -gt 300 ]]; then
+            # Reset circuit to half-open (allow one attempt)
+            log "Circuit half-open for $operation (timeout passed)"
+            echo "half-open"
+            return
+        fi
+        echo "open"
+        return
+    fi
+
+    if [[ $failures -ge $threshold ]]; then
+        echo "open"
+    else
+        echo "closed"
+    fi
+}
+
+# Record a failure
+record_failure() {
+    local operation="$1"
+
+    init_circuit_breaker
+
+    local current
+    current=$(jq -r ".failures[\"$operation\"] // 0" "$CIRCUIT_FILE")
+    local new_count=$((current + 1))
+
+    # Update failures count
+    local temp_file
+    temp_file=$(mktemp)
+    jq ".failures[\"$operation\"] = $new_count" "$CIRCUIT_FILE" > "$temp_file"
+    mv "$temp_file" "$CIRCUIT_FILE"
+
+    # Open circuit if threshold reached
+    if [[ $new_count -ge 5 ]]; then
+        local now
+        now=$(date +%s)
+        temp_file=$(mktemp)
+        jq ".open[\"$operation\"] = true | .openTime[\"$operation\"] = $now" "$CIRCUIT_FILE" > "$temp_file"
+        mv "$temp_file" "$CIRCUIT_FILE"
+        log "Circuit opened for $operation (failures: $new_count)"
+    fi
+}
+
+# Record a success (reset failures)
+record_success() {
+    local operation="$1"
+
+    init_circuit_breaker
+
+    local temp_file
+    temp_file=$(mktemp)
+    jq ".failures[\"$operation\"] = 0 | .open[\"$operation\"] = false" "$CIRCUIT_FILE" > "$temp_file"
+    mv "$temp_file" "$CIRCUIT_FILE"
+
+    log "Circuit reset for $operation"
+}
+
+# =============================================================================
+# CHECKPOINTING (from medusa/Roo-Code patterns)
+# Save state before risky operations, rollback on failure
+# =============================================================================
+
+save_checkpoint() {
+    local checkpoint_name="$1"
+    local files_to_backup="${2:-}"  # Space-separated list of files
+
+    mkdir -p "$CHECKPOINT_DIR"
+
+    local checkpoint_id
+    checkpoint_id=$(date +%Y%m%d_%H%M%S)_${checkpoint_name}
+    local checkpoint_path="$CHECKPOINT_DIR/$checkpoint_id"
+    mkdir -p "$checkpoint_path"
+
+    # Save metadata
+    cat > "$checkpoint_path/metadata.json" << EOF
+{
+    "name": "$checkpoint_name",
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "files": []
+}
+EOF
+
+    # Backup specified files
+    if [[ -n "$files_to_backup" ]]; then
+        for file in $files_to_backup; do
+            if [[ -f "$file" ]]; then
+                local backup_path="$checkpoint_path/$(basename "$file")"
+                cp "$file" "$backup_path"
+                log "Checkpointed: $file → $backup_path"
+            fi
+        done
+    fi
+
+    # Also backup key state files
+    for state_file in ".claude/current-build.local.md" "CLAUDE.md" ".claude/docs/debug-log.md"; do
+        if [[ -f "$state_file" ]]; then
+            cp "$state_file" "$checkpoint_path/" 2>/dev/null || true
+        fi
+    done
+
+    echo "$checkpoint_id"
+    log "Checkpoint saved: $checkpoint_id"
+}
+
+rollback_to_checkpoint() {
+    local checkpoint_id="$1"
+    local checkpoint_path="$CHECKPOINT_DIR/$checkpoint_id"
+
+    if [[ ! -d "$checkpoint_path" ]]; then
+        log "Checkpoint not found: $checkpoint_id"
+        return 1
+    fi
+
+    # Restore all backed up files
+    for backup_file in "$checkpoint_path"/*; do
+        if [[ -f "$backup_file" ]] && [[ "$(basename "$backup_file")" != "metadata.json" ]]; then
+            local filename
+            filename=$(basename "$backup_file")
+
+            # Determine original location
+            case "$filename" in
+                current-build.local.md)
+                    cp "$backup_file" ".claude/current-build.local.md"
+                    ;;
+                CLAUDE.md)
+                    cp "$backup_file" "CLAUDE.md"
+                    ;;
+                debug-log.md)
+                    cp "$backup_file" ".claude/docs/debug-log.md"
+                    ;;
+                *)
+                    # For other files, restore to current directory
+                    cp "$backup_file" "./$filename"
+                    ;;
+            esac
+            log "Restored: $filename from checkpoint $checkpoint_id"
+        fi
+    done
+
+    log "Rollback complete to checkpoint: $checkpoint_id"
+}
+
+get_latest_checkpoint() {
+    ls -t "$CHECKPOINT_DIR" 2>/dev/null | head -1
+}
+
+# =============================================================================
+# HEALTH CHECKS (from claude-flow/TabbyML patterns)
+# Monitor system health and trigger recovery
+# =============================================================================
+
+perform_health_check() {
+    mkdir -p "$STATE_DIR"
+
+    local health_status="healthy"
+    local issues=()
+
+    # Check 1: State files integrity
+    if [[ -f ".claude/current-build.local.md" ]]; then
+        if ! head -1 ".claude/current-build.local.md" | grep -q "^---"; then
+            issues+=("corrupted_build_state")
+            health_status="degraded"
+        fi
+    fi
+
+    # Check 2: Debug log integrity
+    if [[ -f ".claude/docs/debug-log.md" ]]; then
+        if ! head -1 ".claude/docs/debug-log.md" | grep -q "^#"; then
+            issues+=("corrupted_debug_log")
+            health_status="degraded"
+        fi
+    fi
+
+    # Check 3: Check for stuck processes
+    local stuck_count=0
+    if [[ -f ".claude/docs/debug-log.md" ]]; then
+        stuck_count=$(grep "STUCK" ".claude/docs/debug-log.md" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    stuck_count=$((stuck_count + 0))  # Ensure it's a number
+    if [[ $stuck_count -gt 3 ]]; then
+        issues+=("too_many_stuck_issues")
+        health_status="degraded"
+    fi
+
+    # Check 4: Circuit breaker status
+    local open_circuits=0
+    if [[ -f "$CIRCUIT_FILE" ]]; then
+        open_circuits=$(jq '[.open | to_entries[] | select(.value == true)] | length' "$CIRCUIT_FILE" 2>/dev/null || echo "0")
+    fi
+    open_circuits=$((open_circuits + 0))  # Ensure it's a number
+    if [[ $open_circuits -gt 0 ]]; then
+        issues+=("circuits_open:$open_circuits")
+        health_status="degraded"
+    fi
+
+    # Check 5: Recent error rate
+    local recent_errors=0
+    if [[ -f "$LOG_FILE" ]]; then
+        recent_errors=$(tail -100 "$LOG_FILE" 2>/dev/null | grep "ERROR\|FAIL" | wc -l | tr -d ' ')
+    fi
+    recent_errors=$((recent_errors + 0))  # Ensure it's a number
+    if [[ $recent_errors -gt 10 ]]; then
+        issues+=("high_error_rate:$recent_errors")
+        health_status="unhealthy"
+    fi
+
+    # Convert issues array to JSON
+    local issues_json="[]"
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        issues_json=$(printf '%s\n' "${issues[@]}" | jq -R . | jq -s .)
+    fi
+
+    # Save health status
+    cat > "$HEALTH_FILE" << EOF
+{
+    "status": "$health_status",
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "issues": $issues_json,
+    "checks": {
+        "stuck_issues": $stuck_count,
+        "circuits_open": ${open_circuits:-0},
+        "recent_errors": $recent_errors
+    }
+}
+EOF
+
+    log "Health check: $health_status (issues: ${issues[*]:-none})"
+    echo "$health_status"
+}
+
+# =============================================================================
+# SELF-HEALING ACTIONS (from aiometadata/Roo-Code patterns)
+# Attempt to repair common issues automatically
+# =============================================================================
+
+attempt_self_healing() {
+    local issue="$1"
+
+    log "Attempting self-healing for: $issue"
+
+    case "$issue" in
+        corrupted_build_state)
+            # Repair by recreating from last checkpoint or resetting
+            local latest
+            latest=$(get_latest_checkpoint)
+            if [[ -n "$latest" ]]; then
+                rollback_to_checkpoint "$latest"
+                log "Healed: restored build state from checkpoint"
+            else
+                # Reset to clean state
+                rm -f ".claude/current-build.local.md"
+                log "Healed: removed corrupted build state"
+            fi
+            ;;
+
+        corrupted_debug_log)
+            # Repair by recreating header
+            local temp_file
+            temp_file=$(mktemp)
+            echo "# Debug Log" > "$temp_file"
+            echo "" >> "$temp_file"
+            echo "## Session Log" >> "$temp_file"
+            echo "" >> "$temp_file"
+            if [[ -f ".claude/docs/debug-log.md" ]]; then
+                tail -n +2 ".claude/docs/debug-log.md" >> "$temp_file" 2>/dev/null || true
+            fi
+            mv "$temp_file" ".claude/docs/debug-log.md"
+            log "Healed: repaired debug log header"
+            ;;
+
+        too_many_stuck_issues)
+            # Archive old stuck issues
+            if [[ -f ".claude/docs/debug-log.md" ]]; then
+                local archive_file=".claude/docs/debug-log-archive-$(date +%Y%m%d).md"
+                mv ".claude/docs/debug-log.md" "$archive_file"
+                # Create fresh debug log
+                cat > ".claude/docs/debug-log.md" << 'EOF'
+# Debug Log
+
+## Session Log
+
+---
+
+## Resolved Issues
+
+## Patterns Discovered
+EOF
+                log "Healed: archived debug log with stuck issues to $archive_file"
+            fi
+            ;;
+
+        circuits_open:*)
+            # Reset all circuits after timeout
+            if [[ -f "$CIRCUIT_FILE" ]]; then
+                echo '{"failures":{},"open":{}}' > "$CIRCUIT_FILE"
+                log "Healed: reset all circuit breakers"
+            fi
+            ;;
+
+        *)
+            log "No self-healing action for: $issue"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# =============================================================================
+# RECOVERY FROM ERROR (from Roo-Code pattern)
+# Full recovery when system is in error state
+# =============================================================================
+
+recover_from_error() {
+    log "Starting full error recovery..."
+
+    # 1. Perform health check
+    local health
+    health=$(perform_health_check)
+
+    # 2. If unhealthy, attempt healing
+    if [[ "$health" != "healthy" ]]; then
+        # Read issues from health file
+        if [[ -f "$HEALTH_FILE" ]]; then
+            local issues
+            issues=$(jq -r '.issues[]' "$HEALTH_FILE" 2>/dev/null || echo "")
+            for issue in $issues; do
+                attempt_self_healing "$issue"
+            done
+        fi
+    fi
+
+    # 3. Reset circuit breakers
+    if [[ -f "$CIRCUIT_FILE" ]]; then
+        echo '{"failures":{},"open":{}}' > "$CIRCUIT_FILE"
+    fi
+
+    # 4. Clear any lock files
+    rm -f ".claude/*.lock" 2>/dev/null || true
+
+    # 5. Re-check health
+    health=$(perform_health_check)
+
+    log "Recovery complete. Health status: $health"
+    echo "$health"
+}
+
+# =============================================================================
+# MAIN COMMAND INTERFACE
+# =============================================================================
+
+case "${1:-help}" in
+    health)
+        perform_health_check
+        ;;
+    circuit-check)
+        is_circuit_open "${2:-default}"
+        ;;
+    circuit-fail)
+        record_failure "${2:-default}"
+        ;;
+    circuit-success)
+        record_success "${2:-default}"
+        ;;
+    checkpoint)
+        save_checkpoint "${2:-auto}" "${3:-}"
+        ;;
+    rollback)
+        rollback_to_checkpoint "${2:-$(get_latest_checkpoint)}"
+        ;;
+    heal)
+        attempt_self_healing "${2:-}"
+        ;;
+    recover)
+        recover_from_error
+        ;;
+    status)
+        if [[ -f "$HEALTH_FILE" ]]; then
+            cat "$HEALTH_FILE"
+        else
+            echo '{"status":"unknown"}'
+        fi
+        ;;
+    help|*)
+        echo "Self-Healing System"
+        echo ""
+        echo "Usage: $0 <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  health              - Run health check"
+        echo "  circuit-check <op>  - Check if circuit is open"
+        echo "  circuit-fail <op>   - Record a failure"
+        echo "  circuit-success <op>- Record a success"
+        echo "  checkpoint <name>   - Save checkpoint"
+        echo "  rollback [id]       - Rollback to checkpoint"
+        echo "  heal <issue>        - Attempt to heal specific issue"
+        echo "  recover             - Full error recovery"
+        echo "  status              - Show current health status"
+        ;;
+esac

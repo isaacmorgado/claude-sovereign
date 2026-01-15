@@ -1,0 +1,958 @@
+/**
+ * Music Generation Service
+ * Generates AI music using Mureka API
+ */
+
+const https = require('https');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs').promises;
+const path = require('path');
+const sceneAnalysis = require('./sceneAnalysis');
+
+// SECURITY: Using execFile with array arguments prevents command injection
+const execFileAsync = promisify(execFile);
+
+// Mureka API configuration
+const MUREKA_API_KEY = process.env.MUREKA_API_KEY;
+const MUREKA_BASE_URL = 'api.mureka.ai';
+const MUREKA_API_VERSION = 'v1';
+
+// Generation settings
+const DEFAULT_DURATION = 60;
+const MIN_DURATION = 30;
+const MAX_DURATION = 180;
+const POLL_INTERVAL = 5000; // 5 seconds
+const MAX_POLL_ATTEMPTS = 120; // 10 minutes max
+
+// Mood presets with Mureka-compatible descriptions
+const MOOD_PRESETS = {
+  energetic: 'upbeat, high energy, driving rhythm, motivational',
+  relaxed: 'calm, peaceful, ambient, soothing',
+  melancholic: 'sad, emotional, introspective, minor key',
+  intense: 'powerful, dramatic, cinematic, building tension',
+  happy: 'joyful, cheerful, bright, uplifting',
+  mysterious: 'dark, suspenseful, atmospheric, enigmatic',
+  romantic: 'warm, intimate, gentle, loving',
+  epic: 'grand, orchestral, sweeping, heroic',
+  chill: 'lo-fi, laid-back, smooth, easy-going',
+  neutral: 'balanced, versatile, general purpose'
+};
+
+// Instrument categories
+const INSTRUMENT_PRESETS = {
+  acoustic: ['acoustic guitar', 'piano', 'strings', 'woodwinds'],
+  electronic: ['synthesizer', 'drum machine', 'bass', 'pads'],
+  rock: ['electric guitar', 'drums', 'bass guitar', 'distortion'],
+  orchestral: ['strings', 'brass', 'woodwinds', 'percussion', 'harp'],
+  minimal: ['piano', 'ambient pads'],
+  hiphop: ['808 bass', 'hi-hats', 'trap drums', 'synth']
+};
+
+/**
+ * Check if Mureka API key is configured
+ * @returns {boolean}
+ */
+function hasMurekaCredentials() {
+  return !!MUREKA_API_KEY;
+}
+
+/**
+ * Build prompt for Mureka API from generation options
+ * @param {Object} options - Generation options
+ * @returns {string} Formatted prompt
+ */
+function buildMurekaPrompt(options) {
+  const parts = [];
+
+  // Add custom prompt if provided
+  if (options.prompt) {
+    parts.push(options.prompt);
+  }
+
+  // Add reference song style if available
+  if (options.referenceSong && options.referenceSong.identified) {
+    parts.push(`Style inspired by "${options.referenceSong.title}" by ${options.referenceSong.artist}`);
+
+    if (options.referenceSong.bpm) {
+      parts.push(`Tempo around ${options.referenceSong.bpm} BPM`);
+    }
+
+    if (options.referenceSong.key) {
+      parts.push(`Key: ${options.referenceSong.key}`);
+    }
+
+    if (options.referenceSong.genres?.length > 0) {
+      parts.push(`Genre: ${options.referenceSong.genres.join(', ')}`);
+    }
+  }
+
+  // Add mood description
+  if (options.mood) {
+    const moodDescription = MOOD_PRESETS[options.mood] || options.mood;
+    parts.push(`Mood: ${moodDescription}`);
+  }
+
+  // Add instruments
+  if (options.instruments?.length > 0) {
+    const instruments = options.instruments.map(i => {
+      // Check if it's a preset or individual instrument
+      if (INSTRUMENT_PRESETS[i]) {
+        return INSTRUMENT_PRESETS[i].join(', ');
+      }
+      return i;
+    }).join(', ');
+    parts.push(`Instruments: ${instruments}`);
+  }
+
+  // Add duration
+  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+  parts.push(`Duration: approximately ${duration} seconds`);
+
+  // Add quality markers
+  parts.push('Instrumental only, no vocals');
+  parts.push('Suitable as background music for video');
+  parts.push('Professional quality, well-mixed');
+
+  return parts.join('. ');
+}
+
+/**
+ * Clamp duration to valid range
+ * @param {number} duration - Duration in seconds
+ * @returns {number} Clamped duration
+ */
+function clampDuration(duration) {
+  return Math.min(Math.max(duration, MIN_DURATION), MAX_DURATION);
+}
+
+/**
+ * Make HTTP request to Mureka API
+ * @param {string} method - HTTP method
+ * @param {string} endpoint - API endpoint
+ * @param {Object} data - Request body (for POST)
+ * @returns {Promise<Object>} API response
+ */
+async function murekaRequest(method, endpoint, data = null) {
+  if (!MUREKA_API_KEY) {
+    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+  }
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: MUREKA_BASE_URL,
+      path: `/${MUREKA_API_VERSION}${endpoint}`,
+      method,
+      headers: {
+        'Authorization': `Bearer ${MUREKA_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(responseData);
+
+          if (res.statusCode >= 400) {
+            const error = new Error(parsed.message || parsed.error || 'Mureka API error');
+            error.statusCode = res.statusCode;
+            error.response = parsed;
+            reject(error);
+            return;
+          }
+
+          resolve(parsed);
+        } catch (parseError) {
+          reject(new Error(`Failed to parse Mureka response: ${parseError.message}`));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(new Error(`Mureka API request failed: ${error.message}`));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Mureka API request timeout'));
+    });
+
+    req.setTimeout(60000); // 60 second timeout
+
+    if (data) {
+      req.write(JSON.stringify(data));
+    }
+
+    req.end();
+  });
+}
+
+/**
+ * Submit music generation request to Mureka
+ * @param {Object} options - Generation options
+ * @returns {Promise<{taskId: string, status: string}>}
+ */
+async function submitGeneration(options) {
+  const prompt = buildMurekaPrompt(options);
+  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+
+  const requestBody = {
+    prompt,
+    duration,
+    type: 'instrumental', // Background music mode
+    format: 'wav',
+    quality: 'high'
+  };
+
+  // Add reference track if available
+  if (options.referenceTrackUrl) {
+    requestBody.reference_url = options.referenceTrackUrl;
+  }
+
+  const response = await murekaRequest('POST', '/generate', requestBody);
+
+  if (!response.task_id) {
+    throw new Error('Mureka did not return a task ID');
+  }
+
+  return {
+    taskId: response.task_id,
+    status: response.status || 'pending',
+    estimatedTime: response.estimated_time || '3-5 minutes'
+  };
+}
+
+/**
+ * Check status of a generation task
+ * @param {string} taskId - Mureka task ID
+ * @returns {Promise<Object>} Task status
+ */
+async function checkTaskStatus(taskId) {
+  const response = await murekaRequest('GET', `/tasks/${taskId}`);
+
+  return {
+    taskId,
+    status: response.status,
+    progress: response.progress || 0,
+    audioUrl: response.audio_url || null,
+    previewUrl: response.preview_url || null,
+    duration: response.duration || null,
+    error: response.error || null
+  };
+}
+
+/**
+ * Poll for task completion
+ * @param {string} taskId - Mureka task ID
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<Object>} Completed task result
+ */
+async function pollForCompletion(taskId, onProgress = null) {
+  let attempts = 0;
+
+  while (attempts < MAX_POLL_ATTEMPTS) {
+    attempts++;
+
+    const status = await checkTaskStatus(taskId);
+
+    if (onProgress) {
+      onProgress(status.progress, status.status);
+    }
+
+    if (status.status === 'completed') {
+      if (!status.audioUrl) {
+        throw new Error('Mureka completed but no audio URL provided');
+      }
+      return status;
+    }
+
+    if (status.status === 'failed') {
+      throw new Error(status.error || 'Mureka generation failed');
+    }
+
+    if (status.status === 'cancelled') {
+      throw new Error('Mureka generation was cancelled');
+    }
+
+    // Wait before polling again
+    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+  }
+
+  throw new Error('Mureka generation timed out after 10 minutes');
+}
+
+/**
+ * Download audio file from URL
+ * @param {string} url - Audio URL
+ * @returns {Promise<Buffer>} Audio buffer
+ */
+async function downloadAudio(url) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : require('http');
+
+    protocol.get(url, (res) => {
+      if (res.statusCode === 302 || res.statusCode === 301) {
+        // Handle redirect
+        return downloadAudio(res.headers.location).then(resolve).catch(reject);
+      }
+
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed to download audio: HTTP ${res.statusCode}`));
+        return;
+      }
+
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+/**
+ * Convert audio buffer to preview MP3
+ * @param {Buffer} wavBuffer - WAV audio buffer
+ * @returns {Promise<Buffer>} MP3 buffer
+ */
+async function createPreviewMp3(wavBuffer) {
+  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+  const tempWav = path.join(tempDir, `preview_${Date.now()}.wav`);
+  const tempMp3 = path.join(tempDir, `preview_${Date.now()}.mp3`);
+
+  try {
+    // Ensure temp dir exists
+    await fs.mkdir(tempDir, { recursive: true });
+
+    // Write WAV to temp file
+    await fs.writeFile(tempWav, wavBuffer);
+
+    // Convert to MP3 using FFmpeg
+    await execAsync(`ffmpeg -y -i "${tempWav}" -codec:a libmp3lame -qscale:a 4 "${tempMp3}"`, {
+      timeout: 30000
+    });
+
+    // Read MP3 buffer
+    const mp3Buffer = await fs.readFile(tempMp3);
+
+    return mp3Buffer;
+  } finally {
+    // Cleanup temp files
+    try {
+      await fs.unlink(tempWav);
+      await fs.unlink(tempMp3);
+    } catch (_e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Generate music title from options
+ * @param {Object} options - Generation options
+ * @returns {string} Generated title
+ */
+function generateTitle(options) {
+  const parts = [];
+
+  // Add mood
+  if (options.mood) {
+    parts.push(options.mood.charAt(0).toUpperCase() + options.mood.slice(1));
+  }
+
+  // Add reference song if available
+  if (options.referenceSong?.title) {
+    parts.push(`(${options.referenceSong.title} style)`);
+  }
+
+  // Add genre if available
+  if (options.referenceSong?.genres?.[0]) {
+    parts.push(options.referenceSong.genres[0]);
+  }
+
+  // Fallback
+  if (parts.length === 0) {
+    parts.push('AI Generated');
+  }
+
+  parts.push('Music');
+
+  return parts.join(' ');
+}
+
+/**
+ * Full music generation flow
+ * @param {Object} options - Generation options
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<Object>} Generated music result
+ */
+async function generateMusic(options, onProgress = null) {
+  // Validate credentials
+  if (!hasMurekaCredentials()) {
+    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+  }
+
+  // Submit generation request
+  const { taskId } = await submitGeneration(options);
+
+  if (onProgress) {
+    onProgress(10, 'submitted');
+  }
+
+  // Poll for completion
+  const result = await pollForCompletion(taskId, (progress, status) => {
+    if (onProgress) {
+      // Scale progress to 10-90 range (10 for submitted, 90 for downloading)
+      const scaledProgress = 10 + Math.floor(progress * 0.8);
+      onProgress(scaledProgress, status);
+    }
+  });
+
+  if (onProgress) {
+    onProgress(90, 'downloading');
+  }
+
+  // Download audio
+  const audioBuffer = await downloadAudio(result.audioUrl);
+
+  if (onProgress) {
+    onProgress(95, 'processing');
+  }
+
+  // Create preview MP3
+  let previewBuffer;
+  try {
+    previewBuffer = await createPreviewMp3(audioBuffer);
+  } catch (error) {
+    console.warn('Failed to create preview MP3:', error.message);
+    previewBuffer = null;
+  }
+
+  // Generate title
+  const title = generateTitle(options);
+
+  if (onProgress) {
+    onProgress(100, 'completed');
+  }
+
+  return {
+    title,
+    taskId: result.taskId,
+    duration: result.duration || options.duration || DEFAULT_DURATION,
+    audioBuffer,
+    previewBuffer,
+    audioUrl: result.audioUrl,
+    previewUrl: result.previewUrl
+  };
+}
+
+/**
+ * Get available moods
+ * @returns {Object} Mood presets
+ */
+function getAvailableMoods() {
+  return Object.keys(MOOD_PRESETS).map(key => ({
+    id: key,
+    name: key.charAt(0).toUpperCase() + key.slice(1),
+    description: MOOD_PRESETS[key]
+  }));
+}
+
+/**
+ * Get available instrument presets
+ * @returns {Object} Instrument presets
+ */
+function getAvailableInstruments() {
+  return Object.keys(INSTRUMENT_PRESETS).map(key => ({
+    id: key,
+    name: key.charAt(0).toUpperCase() + key.slice(1),
+    instruments: INSTRUMENT_PRESETS[key]
+  }));
+}
+
+/**
+ * Validate generation options
+ * @param {Object} options - Generation options
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+function validateOptions(options) {
+  const errors = [];
+
+  // Check duration
+  if (options.duration !== undefined) {
+    if (typeof options.duration !== 'number') {
+      errors.push('Duration must be a number');
+    } else if (options.duration < MIN_DURATION) {
+      errors.push(`Duration must be at least ${MIN_DURATION} seconds`);
+    } else if (options.duration > MAX_DURATION) {
+      errors.push(`Duration must be at most ${MAX_DURATION} seconds`);
+    }
+  }
+
+  // Check mood
+  if (options.mood && !MOOD_PRESETS[options.mood]) {
+    // Allow custom moods, just log a warning
+    console.warn(`Unknown mood preset: ${options.mood}. Using as custom description.`);
+  }
+
+  // Check instruments
+  if (options.instruments && !Array.isArray(options.instruments)) {
+    errors.push('Instruments must be an array');
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+/**
+ * Generate multiple music variations in parallel
+ * Creates 3 variations with subtle prompt differences for user selection
+ * @param {Object} options - Generation options
+ * @param {Function} onProgress - Progress callback (variationIndex, progress, status)
+ * @returns {Promise<Object>} Object with variations array
+ */
+async function generateVariations(options, onProgress = null) {
+  // Validate credentials
+  if (!hasMurekaCredentials()) {
+    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+  }
+
+  // Create 3 prompt variations with subtle differences
+  const variationPrompts = createVariationPrompts(options);
+  const variationCount = 3;
+
+  // Track progress for each variation
+  const variationProgress = new Array(variationCount).fill(0);
+  const variationStatus = new Array(variationCount).fill('pending');
+
+  // Submit all variations in parallel
+  const submittedTasks = await Promise.all(
+    variationPrompts.map(async (varOptions, index) => {
+      try {
+        const { taskId } = await submitGeneration(varOptions);
+        variationStatus[index] = 'submitted';
+        if (onProgress) {
+          onProgress(index, 10, 'submitted');
+        }
+        return { taskId, options: varOptions, index };
+      } catch (error) {
+        console.error(`Variation ${index + 1} submission failed:`, error.message);
+        throw new Error(`Variation ${index + 1} failed to submit: ${error.message}`);
+      }
+    })
+  );
+
+  // Poll all tasks in parallel
+  const results = await Promise.all(
+    submittedTasks.map(async ({ taskId, options: varOptions, index }) => {
+      try {
+        const result = await pollForCompletion(taskId, (progress, status) => {
+          variationProgress[index] = progress;
+          variationStatus[index] = status;
+          if (onProgress) {
+            // Scale progress to 10-90 range
+            const scaledProgress = 10 + Math.floor(progress * 0.8);
+            onProgress(index, scaledProgress, status);
+          }
+        });
+
+        if (onProgress) {
+          onProgress(index, 90, 'downloading');
+        }
+
+        // Download audio
+        const audioBuffer = await downloadAudio(result.audioUrl);
+
+        if (onProgress) {
+          onProgress(index, 95, 'processing');
+        }
+
+        // Create preview MP3
+        let previewBuffer;
+        try {
+          previewBuffer = await createPreviewMp3(audioBuffer);
+        } catch (error) {
+          console.warn(`Failed to create preview MP3 for variation ${index + 1}:`, error.message);
+          previewBuffer = null;
+        }
+
+        if (onProgress) {
+          onProgress(index, 100, 'completed');
+        }
+
+        return {
+          variationIndex: index,
+          variationName: getVariationName(index),
+          title: generateTitle(varOptions),
+          taskId: result.taskId,
+          duration: result.duration || varOptions.duration || DEFAULT_DURATION,
+          audioBuffer,
+          previewBuffer,
+          audioUrl: result.audioUrl,
+          previewUrl: result.previewUrl,
+          promptDescription: varOptions.variationDescription || ''
+        };
+      } catch (error) {
+        console.error(`Variation ${index + 1} failed:`, error.message);
+        return {
+          variationIndex: index,
+          variationName: getVariationName(index),
+          error: error.message,
+          failed: true
+        };
+      }
+    })
+  );
+
+  // Check if at least one variation succeeded
+  const successfulVariations = results.filter(r => !r.failed);
+  if (successfulVariations.length === 0) {
+    throw new Error('All variations failed to generate');
+  }
+
+  return {
+    variations: results,
+    successCount: successfulVariations.length,
+    failedCount: results.length - successfulVariations.length,
+    totalCount: results.length
+  };
+}
+
+/**
+ * Create 3 variation prompts with subtle differences
+ * @param {Object} baseOptions - Base generation options
+ * @returns {Object[]} Array of 3 variation options
+ */
+function createVariationPrompts(baseOptions) {
+  // Variation modifiers to create subtle differences
+  const variations = [
+    {
+      suffix: 'Version A - Original interpretation',
+      variationDescription: 'Original interpretation with balanced arrangement',
+      moodModifier: ''
+    },
+    {
+      suffix: 'Version B - More dynamic',
+      variationDescription: 'More dynamic with increased energy and variation',
+      moodModifier: 'with added dynamic range and rhythmic variation'
+    },
+    {
+      suffix: 'Version C - More subtle',
+      variationDescription: 'More subtle and minimalist approach',
+      moodModifier: 'with a more subtle, understated approach'
+    }
+  ];
+
+  return variations.map((variation, index) => {
+    // Create modified options for each variation
+    const modifiedOptions = { ...baseOptions };
+
+    // Build variation-specific prompt
+    const basePrompt = baseOptions.prompt || '';
+    const variationPrompt = basePrompt
+      ? `${basePrompt}. ${variation.suffix}`
+      : variation.suffix;
+
+    modifiedOptions.prompt = variationPrompt;
+    modifiedOptions.variationIndex = index;
+    modifiedOptions.variationDescription = variation.variationDescription;
+
+    // Slightly modify mood description for variety
+    if (variation.moodModifier) {
+      modifiedOptions.moodModifier = variation.moodModifier;
+    }
+
+    return modifiedOptions;
+  });
+}
+
+/**
+ * Get variation display name
+ * @param {number} index - Variation index (0-2)
+ * @returns {string} Display name
+ */
+function getVariationName(index) {
+  const names = ['Version A', 'Version B', 'Version C'];
+  return names[index] || `Version ${index + 1}`;
+}
+
+/**
+ * Build Mureka prompt with variation modifier
+ * Extended version of buildMurekaPrompt that handles variations
+ * @param {Object} options - Generation options with potential variation modifiers
+ * @returns {string} Formatted prompt
+ */
+function buildMurekaPromptWithVariation(options) {
+  const parts = [];
+
+  // Add custom prompt if provided (includes variation suffix)
+  if (options.prompt) {
+    parts.push(options.prompt);
+  }
+
+  // Add reference song style if available
+  if (options.referenceSong && options.referenceSong.identified) {
+    parts.push(`Style inspired by "${options.referenceSong.title}" by ${options.referenceSong.artist}`);
+
+    if (options.referenceSong.bpm) {
+      parts.push(`Tempo around ${options.referenceSong.bpm} BPM`);
+    }
+
+    if (options.referenceSong.key) {
+      parts.push(`Key: ${options.referenceSong.key}`);
+    }
+
+    if (options.referenceSong.genres?.length > 0) {
+      parts.push(`Genre: ${options.referenceSong.genres.join(', ')}`);
+    }
+  }
+
+  // Add mood description with variation modifier
+  if (options.mood) {
+    let moodDescription = MOOD_PRESETS[options.mood] || options.mood;
+    if (options.moodModifier) {
+      moodDescription = `${moodDescription} ${options.moodModifier}`;
+    }
+    parts.push(`Mood: ${moodDescription}`);
+  }
+
+  // Add instruments
+  if (options.instruments?.length > 0) {
+    const instruments = options.instruments.map(i => {
+      if (INSTRUMENT_PRESETS[i]) {
+        return INSTRUMENT_PRESETS[i].join(', ');
+      }
+      return i;
+    }).join(', ');
+    parts.push(`Instruments: ${instruments}`);
+  }
+
+  // Add duration
+  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+  parts.push(`Duration: approximately ${duration} seconds`);
+
+  // Add quality markers
+  parts.push('Instrumental only, no vocals');
+  parts.push('Suitable as background music for video');
+  parts.push('Professional quality, well-mixed');
+
+  return parts.join('. ');
+}
+
+/**
+ * Generate scene-aware music using transcript analysis
+ * Analyzes transcript for mood/energy and builds enhanced prompt
+ * @param {Object[]} segments - Transcript segments with {id, start, end, text}
+ * @param {Object} options - Generation options
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<Object>} Generated music result with scene context
+ */
+async function generateSceneAwareMusic(segments, options, onProgress = null) {
+  // Validate credentials
+  if (!hasMurekaCredentials()) {
+    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+  }
+
+  if (onProgress) {
+    onProgress(5, 'analyzing');
+  }
+
+  // Analyze scenes from transcript
+  const sceneContext = await sceneAnalysis.analyzeScenes(segments);
+
+  if (onProgress) {
+    onProgress(15, 'building_prompt');
+  }
+
+  // Build scene-aware prompt
+  const enhancedPrompt = sceneAnalysis.buildSceneAwarePrompt(sceneContext, options);
+
+  // Create modified options with scene-aware prompt
+  const sceneAwareOptions = {
+    ...options,
+    prompt: enhancedPrompt,
+    // Store scene context for metadata
+    _sceneContext: sceneContext
+  };
+
+  if (onProgress) {
+    onProgress(20, 'generating');
+  }
+
+  // Submit generation with scene-aware prompt
+  const { taskId } = await submitGeneration(sceneAwareOptions);
+
+  // Poll for completion
+  const result = await pollForCompletion(taskId, (progress, pollStatus) => {
+    if (onProgress) {
+      // Scale progress to 20-90 range
+      const scaledProgress = 20 + Math.floor(progress * 0.7);
+      onProgress(scaledProgress, pollStatus);
+    }
+  });
+
+  if (onProgress) {
+    onProgress(90, 'downloading');
+  }
+
+  // Download audio
+  const audioBuffer = await downloadAudio(result.audioUrl);
+
+  if (onProgress) {
+    onProgress(95, 'processing');
+  }
+
+  // Create preview MP3
+  let previewBuffer;
+  try {
+    previewBuffer = await createPreviewMp3(audioBuffer);
+  } catch (error) {
+    console.warn('Failed to create preview MP3:', error.message);
+    previewBuffer = null;
+  }
+
+  // Generate title with scene context
+  const title = generateSceneAwareTitle(options, sceneContext);
+
+  if (onProgress) {
+    onProgress(100, 'completed');
+  }
+
+  return {
+    title,
+    taskId: result.taskId,
+    duration: result.duration || options.duration || DEFAULT_DURATION,
+    audioBuffer,
+    previewBuffer,
+    audioUrl: result.audioUrl,
+    previewUrl: result.previewUrl,
+    // Include scene analysis metadata
+    sceneContext: {
+      dominantMood: sceneContext.dominantMood,
+      averageEnergy: sceneContext.averageEnergy,
+      sceneCount: sceneContext.scenes.length,
+      summary: sceneAnalysis.getSceneContextSummary(sceneContext)
+    }
+  };
+}
+
+/**
+ * Generate title for scene-aware music
+ * @param {Object} options - Generation options
+ * @param {Object} sceneContext - Scene analysis result
+ * @returns {string} Generated title
+ */
+function generateSceneAwareTitle(options, sceneContext) {
+  const parts = [];
+
+  // Add detected mood
+  if (sceneContext.dominantMood && sceneContext.dominantMood !== 'neutral') {
+    const moodName = sceneContext.dominantMood.charAt(0).toUpperCase() +
+      sceneContext.dominantMood.slice(1);
+    parts.push(moodName);
+  }
+
+  // Add energy indicator
+  const energy = sceneContext.averageEnergy;
+  if (energy >= 75) {
+    parts.push('High-Energy');
+  } else if (energy <= 30) {
+    parts.push('Ambient');
+  }
+
+  // Add user mood if different
+  if (options.mood && options.mood !== sceneContext.dominantMood) {
+    const userMood = options.mood.charAt(0).toUpperCase() + options.mood.slice(1);
+    parts.push(userMood);
+  }
+
+  // Add reference song if available
+  if (options.referenceSong?.title) {
+    parts.push(`(${options.referenceSong.title} style)`);
+  }
+
+  // Fallback
+  if (parts.length === 0) {
+    parts.push('Scene-Aware');
+  }
+
+  parts.push('Music');
+
+  return parts.join(' ');
+}
+
+/**
+ * Validate scene-aware generation options
+ * @param {Object[]} segments - Transcript segments
+ * @param {Object} options - Generation options
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+function validateSceneAwareOptions(segments, options) {
+  const errors = [];
+
+  // Check segments
+  if (!segments || !Array.isArray(segments)) {
+    errors.push('Transcript segments are required');
+  } else if (segments.length === 0) {
+    errors.push('At least one transcript segment is required');
+  } else {
+    // Validate segment format
+    const hasValidFormat = segments.every(s =>
+      typeof s.start === 'number' &&
+      typeof s.end === 'number' &&
+      typeof s.text === 'string'
+    );
+    if (!hasValidFormat) {
+      errors.push('Segments must have start, end (numbers), and text (string)');
+    }
+  }
+
+  // Also validate base options
+  const baseValidation = validateOptions(options);
+  if (!baseValidation.valid) {
+    errors.push(...baseValidation.errors);
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+module.exports = {
+  hasMurekaCredentials,
+  buildMurekaPrompt,
+  buildMurekaPromptWithVariation,
+  clampDuration,
+  submitGeneration,
+  checkTaskStatus,
+  pollForCompletion,
+  downloadAudio,
+  createPreviewMp3,
+  generateTitle,
+  generateMusic,
+  generateVariations,
+  createVariationPrompts,
+  getVariationName,
+  getAvailableMoods,
+  getAvailableInstruments,
+  validateOptions,
+  // Scene-aware functions
+  generateSceneAwareMusic,
+  generateSceneAwareTitle,
+  validateSceneAwareOptions,
+  MOOD_PRESETS,
+  INSTRUMENT_PRESETS,
+  MIN_DURATION,
+  MAX_DURATION,
+  DEFAULT_DURATION
+};

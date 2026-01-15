@@ -1,0 +1,911 @@
+'use client';
+
+import React, { createContext, useContext, useState, useMemo, useCallback, ReactNode } from 'react';
+import { LandmarkPoint } from '@/lib/landmarks';
+import {
+  analyzeFrontProfile,
+  analyzeSideProfile,
+  analyzeHarmony,
+  HarmonyAnalysis,
+  FaceIQScoreResult,
+  FACEIQ_METRICS,
+  Ethnicity,
+  Gender,
+} from '@/lib/faceiq-scoring';
+import {
+  Ratio,
+  Strength,
+  Flaw,
+  Recommendation,
+  ResultsTab,
+  FullHarmonyAnalysis,
+} from '@/types/results';
+
+// ============================================
+// CONTEXT TYPES
+// ============================================
+
+interface ResultsContextType {
+  // Raw data
+  frontLandmarks: LandmarkPoint[];
+  sideLandmarks: LandmarkPoint[];
+  gender: Gender;
+  ethnicity: Ethnicity;
+  frontPhoto: string;
+  sidePhoto: string | null;
+
+  // Computed results
+  harmonyAnalysis: FullHarmonyAnalysis | null;
+  frontRatios: Ratio[];
+  sideRatios: Ratio[];
+  strengths: Strength[];
+  flaws: Flaw[];
+  recommendations: Recommendation[];
+
+  // Scores
+  overallScore: number;
+  frontScore: number;
+  sideScore: number;
+
+  // UI state
+  activeTab: ResultsTab;
+  setActiveTab: (tab: ResultsTab) => void;
+  expandedMeasurementId: string | null;
+  setExpandedMeasurementId: (id: string | null) => void;
+  selectedVisualizationMetric: string | null;
+  setSelectedVisualizationMetric: (id: string | null) => void;
+  categoryFilter: string | null;
+  setCategoryFilter: (category: string | null) => void;
+  showLandmarkOverlay: boolean;
+  setShowLandmarkOverlay: (show: boolean) => void;
+
+  // Actions
+  setResultsData: (data: ResultsInputData) => void;
+}
+
+interface ResultsInputData {
+  frontLandmarks: LandmarkPoint[];
+  sideLandmarks: LandmarkPoint[];
+  frontPhoto: string;
+  sidePhoto?: string;
+  gender: Gender;
+  ethnicity?: Ethnicity;
+}
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+function convertUnitToRatioUnit(unit: string): 'x' | 'mm' | '%' | '°' {
+  switch (unit) {
+    case 'ratio': return 'x';
+    case 'percent': return '%';
+    case 'degrees': return '°';
+    case 'mm': return 'mm';
+    default: return 'x';
+  }
+}
+
+function transformToRatio(result: FaceIQScoreResult, landmarks: LandmarkPoint[]): Ratio {
+  const metricConfig = FACEIQ_METRICS[result.metricId];
+
+  // Generate illustration based on metric
+  const illustration = generateIllustration(result.metricId, landmarks);
+
+  // Get flaw/strength mappings
+  const { mayIndicateFlaws, mayIndicateStrengths } = getFlawStrengthMappings(result);
+
+  return {
+    id: result.metricId,
+    name: result.name,
+    value: result.value,
+    score: result.score,
+    standardizedScore: result.standardizedScore,
+    unit: convertUnitToRatioUnit(result.unit),
+    idealMin: result.idealMin,
+    idealMax: result.idealMax,
+    rangeMin: metricConfig?.rangeMin || result.idealMin - 0.5,
+    rangeMax: metricConfig?.rangeMax || result.idealMax + 0.5,
+    description: metricConfig?.description || '',
+    category: result.category,
+    qualityLevel: result.qualityTier,
+    severity: result.severity,
+    illustration,
+    mayIndicateFlaws,
+    mayIndicateStrengths,
+    usedLandmarks: getUsedLandmarks(result.metricId),
+    scoringCurveConfig: metricConfig ? {
+      decayRate: metricConfig.decayRate,
+      maxScore: metricConfig.maxScore,
+    } : undefined,
+  };
+}
+
+// Enhanced illustration configuration type
+interface IllustrationConfig {
+  points: string[];
+  lines: Array<{
+    from: string;
+    to: string;
+    label?: string;
+    color?: string;
+    labelPosition?: 'left' | 'right' | 'top' | 'bottom';
+  }>;
+}
+
+// Comprehensive illustration configurations for all metrics
+const ILLUSTRATION_CONFIGS: Record<string, IllustrationConfig> = {
+  // ==========================================
+  // FACE SHAPE / PROPORTIONS
+  // ==========================================
+  faceWidthToHeight: {
+    points: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+    lines: [
+      { from: 'left_zygion', to: 'right_zygion', label: 'Width', color: '#67e8f9', labelPosition: 'top' },
+      { from: 'trichion', to: 'menton', label: 'Height', color: '#a78bfa', labelPosition: 'right' },
+    ],
+  },
+  totalFacialWidthToHeight: {
+    points: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+    lines: [
+      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek Width', color: '#67e8f9' },
+      { from: 'trichion', to: 'menton', label: 'Total Height', color: '#a78bfa' },
+    ],
+  },
+  lowerThirdProportion: {
+    points: ['subnasale', 'menton', 'trichion'],
+    lines: [
+      { from: 'subnasale', to: 'menton', label: 'Lower Third', color: '#f97316', labelPosition: 'right' },
+      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'left' },
+    ],
+  },
+  middleThirdProportion: {
+    points: ['nasal_base', 'subnasale', 'trichion', 'menton'],
+    lines: [
+      { from: 'nasal_base', to: 'subnasale', label: 'Middle Third', color: '#22c55e', labelPosition: 'right' },
+      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'left' },
+    ],
+  },
+  upperThirdProportion: {
+    points: ['trichion', 'nasal_base', 'menton'],
+    lines: [
+      { from: 'trichion', to: 'nasal_base', label: 'Upper Third', color: '#fbbf24', labelPosition: 'right' },
+      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'left' },
+    ],
+  },
+  bitemporalWidth: {
+    points: ['left_temporal', 'right_temporal', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_temporal', to: 'right_temporal', label: 'Temple', color: '#fbbf24' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek', color: '#67e8f9' },
+    ],
+  },
+  cheekboneHeight: {
+    points: ['left_zygion', 'right_zygion', 'left_canthus_lateralis', 'right_canthus_lateralis', 'menton'],
+    lines: [
+      { from: 'left_zygion', to: 'right_zygion', label: 'Cheekbone', color: '#ec4899' },
+      { from: 'left_canthus_lateralis', to: 'left_zygion', color: '#67e8f9' },
+    ],
+  },
+  midfaceRatio: {
+    points: ['left_zygion', 'right_zygion', 'left_canthus_medialis', 'right_canthus_medialis', 'subnasale'],
+    lines: [
+      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Midface Width', color: '#67e8f9' },
+      { from: 'left_canthus_medialis', to: 'subnasale', label: 'Midface Height', color: '#a78bfa' },
+    ],
+  },
+
+  // ==========================================
+  // JAW MEASUREMENTS
+  // ==========================================
+  jawSlope: {
+    points: ['left_gonion_inferior', 'left_mentum_lateralis', 'menton', 'right_mentum_lateralis', 'right_gonion_inferior'],
+    lines: [
+      { from: 'left_gonion_inferior', to: 'left_mentum_lateralis', label: 'Jaw Slope', color: '#f97316' },
+      { from: 'right_gonion_inferior', to: 'right_mentum_lateralis', color: '#f97316' },
+    ],
+  },
+  jawFrontalAngle: {
+    points: ['left_gonion_inferior', 'menton', 'right_gonion_inferior'],
+    lines: [
+      { from: 'left_gonion_inferior', to: 'menton', label: 'Jaw Angle', color: '#f97316' },
+      { from: 'menton', to: 'right_gonion_inferior', color: '#f97316' },
+    ],
+  },
+  bigonialWidth: {
+    points: ['left_gonion_inferior', 'right_gonion_inferior', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw Width', color: '#f97316' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek Width', color: '#67e8f9' },
+    ],
+  },
+  jawWidthRatio: {
+    points: ['left_gonion_inferior', 'right_gonion_inferior', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw', color: '#f97316' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Face', color: '#67e8f9' },
+    ],
+  },
+
+  // ==========================================
+  // EYE MEASUREMENTS
+  // ==========================================
+  lateralCanthalTilt: {
+    points: ['left_canthus_medialis', 'left_canthus_lateralis', 'right_canthus_medialis', 'right_canthus_lateralis'],
+    lines: [
+      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Tilt', color: '#06b6d4', labelPosition: 'bottom' },
+      { from: 'right_canthus_medialis', to: 'right_canthus_lateralis', color: '#06b6d4' },
+    ],
+  },
+  eyeAspectRatio: {
+    points: ['left_canthus_medialis', 'left_canthus_lateralis', 'left_palpebra_superior', 'left_palpebra_inferior'],
+    lines: [
+      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Width', color: '#06b6d4' },
+      { from: 'left_palpebra_superior', to: 'left_palpebra_inferior', label: 'Height', color: '#a78bfa' },
+    ],
+  },
+  eyeSeparationRatio: {
+    points: ['left_canthus_medialis', 'right_canthus_medialis', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Intercanthal', color: '#06b6d4' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+    ],
+  },
+  interpupillaryRatio: {
+    points: ['left_pupila', 'right_pupila', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_pupila', to: 'right_pupila', label: 'IPD', color: '#06b6d4' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+    ],
+  },
+  interpupillaryMouthWidthRatio: {
+    points: ['left_pupila', 'right_pupila', 'left_cheilion', 'right_cheilion'],
+    lines: [
+      { from: 'left_pupila', to: 'right_pupila', label: 'IPD', color: '#06b6d4' },
+      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth', color: '#ec4899' },
+    ],
+  },
+  oneEyeApartTest: {
+    points: ['left_canthus_medialis', 'right_canthus_medialis', 'left_canthus_lateralis'],
+    lines: [
+      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Between Eyes', color: '#06b6d4' },
+      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Eye Width', color: '#a78bfa' },
+    ],
+  },
+
+  // ==========================================
+  // EYEBROW MEASUREMENTS
+  // ==========================================
+  browLengthRatio: {
+    points: ['left_supercilium_medialis', 'left_supercilium_lateralis', 'left_zygion', 'right_zygion'],
+    lines: [
+      { from: 'left_supercilium_medialis', to: 'left_supercilium_lateralis', label: 'Brow', color: '#84cc16' },
+      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+    ],
+  },
+  eyebrowTilt: {
+    points: ['left_supercilium_medialis', 'left_supercilium_apex', 'left_supercilium_lateralis'],
+    lines: [
+      { from: 'left_supercilium_medialis', to: 'left_supercilium_apex', label: 'Tilt', color: '#84cc16' },
+      { from: 'left_supercilium_apex', to: 'left_supercilium_lateralis', color: '#84cc16' },
+    ],
+  },
+  eyebrowLowSetedness: {
+    points: ['left_supercilium_medialis', 'left_palpebra_superior', 'left_canthus_medialis'],
+    lines: [
+      { from: 'left_supercilium_medialis', to: 'left_palpebra_superior', label: 'Brow-Eye Gap', color: '#84cc16' },
+    ],
+  },
+
+  // ==========================================
+  // NOSE MEASUREMENTS (FRONT)
+  // ==========================================
+  nasalIndex: {
+    points: ['left_ala_nasi', 'right_ala_nasi', 'nasal_base', 'subnasale'],
+    lines: [
+      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Width', color: '#fbbf24' },
+      { from: 'nasal_base', to: 'subnasale', label: 'Height', color: '#a78bfa' },
+    ],
+  },
+  intercanthalNasalRatio: {
+    points: ['left_ala_nasi', 'right_ala_nasi', 'left_canthus_medialis', 'right_canthus_medialis'],
+    lines: [
+      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Nose Width', color: '#fbbf24' },
+      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Intercanthal', color: '#06b6d4' },
+    ],
+  },
+  noseBridgeWidth: {
+    points: ['left_dorsum_nasi', 'right_dorsum_nasi', 'left_ala_nasi', 'right_ala_nasi'],
+    lines: [
+      { from: 'left_dorsum_nasi', to: 'right_dorsum_nasi', label: 'Bridge', color: '#fbbf24' },
+      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Base', color: '#f97316' },
+    ],
+  },
+  noseTipPosition: {
+    points: ['subnasale', 'left_ala_nasi', 'right_ala_nasi'],
+    lines: [
+      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Tip Position', color: '#fbbf24' },
+    ],
+  },
+
+  // ==========================================
+  // MOUTH/LIP MEASUREMENTS
+  // ==========================================
+  mouthNoseWidthRatio: {
+    points: ['left_cheilion', 'right_cheilion', 'left_ala_nasi', 'right_ala_nasi'],
+    lines: [
+      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth', color: '#ec4899' },
+      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Nose', color: '#fbbf24' },
+    ],
+  },
+  lowerUpperLipRatio: {
+    points: ['labrale_superius', 'mouth_middle', 'labrale_inferius'],
+    lines: [
+      { from: 'labrale_superius', to: 'mouth_middle', label: 'Upper', color: '#ec4899' },
+      { from: 'mouth_middle', to: 'labrale_inferius', label: 'Lower', color: '#f97316' },
+    ],
+  },
+  chinPhiltrumRatio: {
+    points: ['subnasale', 'labrale_superius', 'labrale_inferius', 'menton'],
+    lines: [
+      { from: 'subnasale', to: 'labrale_superius', label: 'Philtrum', color: '#ec4899' },
+      { from: 'labrale_inferius', to: 'menton', label: 'Chin', color: '#ef4444' },
+    ],
+  },
+  mouthWidth: {
+    points: ['left_cheilion', 'right_cheilion'],
+    lines: [{ from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth Width', color: '#ec4899' }],
+  },
+
+  // ==========================================
+  // CHIN MEASUREMENTS
+  // ==========================================
+  chinHeight: {
+    points: ['labrale_inferius', 'menton'],
+    lines: [{ from: 'labrale_inferius', to: 'menton', label: 'Chin Height', color: '#ef4444' }],
+  },
+
+  // ==========================================
+  // NECK MEASUREMENTS
+  // ==========================================
+  neckWidthRatio: {
+    points: ['left_cervical_lateralis', 'right_cervical_lateralis', 'left_gonion_inferior', 'right_gonion_inferior'],
+    lines: [
+      { from: 'left_cervical_lateralis', to: 'right_cervical_lateralis', label: 'Neck', color: '#14b8a6' },
+      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw', color: '#f97316' },
+    ],
+  },
+
+  // ==========================================
+  // SIDE PROFILE MEASUREMENTS
+  // ==========================================
+  gonialAngle: {
+    points: ['tragus', 'gonionBottom', 'menton'],
+    lines: [
+      { from: 'tragus', to: 'gonionBottom', label: 'Ramus', color: '#f97316' },
+      { from: 'gonionBottom', to: 'menton', label: 'Mandible', color: '#ef4444' },
+    ],
+  },
+  nasofrontalAngle: {
+    points: ['glabella', 'nasion', 'pronasale'],
+    lines: [
+      { from: 'glabella', to: 'nasion', label: 'Forehead', color: '#84cc16' },
+      { from: 'nasion', to: 'pronasale', label: 'Nose', color: '#fbbf24' },
+    ],
+  },
+  nasofacialAngle: {
+    points: ['nasion', 'pronasale', 'pogonion'],
+    lines: [
+      { from: 'nasion', to: 'pronasale', color: '#fbbf24' },
+      { from: 'pronasale', to: 'pogonion', color: '#67e8f9' },
+    ],
+  },
+  nasomentaAngle: {
+    points: ['nasion', 'pronasale', 'pogonion'],
+    lines: [
+      { from: 'nasion', to: 'pronasale', label: 'Nose', color: '#fbbf24' },
+      { from: 'pronasale', to: 'pogonion', label: 'To Chin', color: '#ef4444' },
+    ],
+  },
+  submentalCervicalAngle: {
+    points: ['menton', 'cervicalPoint', 'neckPoint'],
+    lines: [
+      { from: 'menton', to: 'cervicalPoint', label: 'Submental', color: '#14b8a6' },
+      { from: 'cervicalPoint', to: 'neckPoint', label: 'Cervical', color: '#06b6d4' },
+    ],
+  },
+  facialDepthToHeight: {
+    points: ['pronasale', 'tragus', 'nasion', 'menton'],
+    lines: [
+      { from: 'pronasale', to: 'tragus', label: 'Depth', color: '#67e8f9' },
+      { from: 'nasion', to: 'menton', label: 'Height', color: '#a78bfa' },
+    ],
+  },
+  anteriorFacialDepth: {
+    points: ['glabella', 'pronasale', 'pogonion'],
+    lines: [
+      { from: 'glabella', to: 'pronasale', color: '#67e8f9' },
+      { from: 'pronasale', to: 'pogonion', color: '#a78bfa' },
+    ],
+  },
+  mandibularPlaneAngle: {
+    points: ['gonionBottom', 'menton', 'orbitale', 'porion'],
+    lines: [
+      { from: 'gonionBottom', to: 'menton', label: 'Mandibular', color: '#f97316' },
+      { from: 'orbitale', to: 'porion', label: 'Frankfort', color: '#67e8f9' },
+    ],
+  },
+  ramusToMandibleRatio: {
+    points: ['gonionTop', 'gonionBottom', 'menton'],
+    lines: [
+      { from: 'gonionTop', to: 'gonionBottom', label: 'Ramus', color: '#f97316' },
+      { from: 'gonionBottom', to: 'menton', label: 'Mandible', color: '#ef4444' },
+    ],
+  },
+  orbitalVector: {
+    points: ['cornealApex', 'orbitale', 'cheekbone'],
+    lines: [
+      { from: 'cornealApex', to: 'cheekbone', label: 'Orbital Vector', color: '#06b6d4' },
+    ],
+  },
+  eLineLowerLip: {
+    points: ['pronasale', 'pogonion', 'labraleInferius'],
+    lines: [
+      { from: 'pronasale', to: 'pogonion', label: 'E-Line', color: '#67e8f9' },
+    ],
+  },
+  sLineLowerLip: {
+    points: ['pronasale', 'pogonion', 'labraleInferius'],
+    lines: [
+      { from: 'pronasale', to: 'pogonion', label: 'S-Line', color: '#a78bfa' },
+    ],
+  },
+  holdawayHLine: {
+    points: ['pronasale', 'pogonion', 'labraleSuperius', 'labraleInferius'],
+    lines: [
+      { from: 'pronasale', to: 'pogonion', label: 'H-Line', color: '#ec4899' },
+    ],
+  },
+  burstoneLowerLip: {
+    points: ['subnasale', 'pogonion', 'labraleInferius'],
+    lines: [
+      { from: 'subnasale', to: 'pogonion', label: 'Burstone', color: '#fbbf24' },
+    ],
+  },
+};
+
+function generateIllustration(metricId: string, landmarks: LandmarkPoint[]): Ratio['illustration'] {
+  const landmarkMap: Record<string, LandmarkPoint> = {};
+  landmarks.forEach(l => { landmarkMap[l.id] = l; });
+
+  const config = ILLUSTRATION_CONFIGS[metricId];
+  const points: Record<string, { type: 'landmark'; landmarkId: string }> = {};
+  const lines: Record<string, { from: string; to: string; color: string; label?: string; labelPosition?: string }> = {};
+
+  if (config) {
+    config.points.forEach((pointId, i) => {
+      if (landmarkMap[pointId]) {
+        points[`point_${i}`] = { type: 'landmark', landmarkId: pointId };
+      }
+    });
+    config.lines.forEach((line, i) => {
+      lines[`line_${i}`] = {
+        from: line.from,
+        to: line.to,
+        color: line.color || '#67e8f9',
+        label: line.label,
+        labelPosition: line.labelPosition,
+      };
+    });
+  }
+
+  return { points, lines };
+}
+
+function getUsedLandmarks(metricId: string): string[] {
+  const landmarkMappings: Record<string, string[]> = {
+    faceWidthToHeight: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+    lateralCanthalTilt: ['left_canthus_medialis', 'left_canthus_lateralis'],
+    nasalIndex: ['left_ala_nasi', 'right_ala_nasi', 'nasal_base', 'subnasale'],
+    ipd: ['left_pupila', 'right_pupila'],
+    mouthWidth: ['left_cheilion', 'right_cheilion'],
+    jawWidth: ['left_gonion_inferior', 'right_gonion_inferior'],
+    chinHeight: ['labrale_inferius', 'menton'],
+    gonialAngle: ['tragus', 'gonionBottom', 'menton'],
+  };
+  return landmarkMappings[metricId] || [];
+}
+
+function getFlawStrengthMappings(result: FaceIQScoreResult): { mayIndicateFlaws: string[]; mayIndicateStrengths: string[] } {
+  const flawMappings: Record<string, { low: string[]; high: string[] }> = {
+    faceWidthToHeight: {
+      low: ['Narrow face', 'Vertically elongated face'],
+      high: ['Wide face', 'Horizontally expanded face'],
+    },
+    lowerThirdProportion: {
+      low: ['Short lower third', 'Deficient mandible'],
+      high: ['Long lower third', 'Mandibular excess'],
+    },
+    lateralCanthalTilt: {
+      low: ['Negative canthal tilt', 'Drooping eyes'],
+      high: ['Excessive positive canthal tilt'],
+    },
+    nasalIndex: {
+      low: ['Narrow nose', 'Leptorrhine nose'],
+      high: ['Wide nose', 'Platyrrhine nose'],
+    },
+    gonialAngle: {
+      low: ['Steep mandibular plane'],
+      high: ['Flat mandibular plane', 'Weak jaw definition'],
+    },
+  };
+
+  const strengthMappings: Record<string, { ideal: string[] }> = {
+    faceWidthToHeight: { ideal: ['Balanced facial proportions', 'Harmonious face shape'] },
+    lateralCanthalTilt: { ideal: ['Attractive eye shape', 'Positive canthal tilt'] },
+    nasalIndex: { ideal: ['Well-proportioned nose', 'Balanced nasal width'] },
+    gonialAngle: { ideal: ['Well-defined jawline', 'Strong jaw structure'] },
+  };
+
+  const mapping = flawMappings[result.metricId];
+  const strengthMapping = strengthMappings[result.metricId];
+
+  let mayIndicateFlaws: string[] = [];
+  let mayIndicateStrengths: string[] = [];
+
+  if (result.qualityTier === 'ideal' || result.qualityTier === 'excellent') {
+    mayIndicateStrengths = strengthMapping?.ideal || [];
+  } else if (mapping) {
+    mayIndicateFlaws = result.deviationDirection === 'below' ? mapping.low : mapping.high;
+  }
+
+  return { mayIndicateFlaws, mayIndicateStrengths };
+}
+
+function generateStrengthsFromAnalysis(analysis: HarmonyAnalysis): Strength[] {
+  const strengths: Strength[] = [];
+
+  analysis.strengths.forEach((s, i) => {
+    const matchingMeasurement = analysis.measurements.find(m => m.metricId === s.metricId);
+
+    strengths.push({
+      id: `strength_${i}`,
+      strengthName: s.metricName,
+      summary: s.reasoning,
+      avgScore: matchingMeasurement?.score || 8,
+      qualityLevel: s.qualityTier,
+      categoryName: s.category,
+      responsibleRatios: [{
+        ratioName: s.metricName,
+        ratioId: s.metricId,
+        score: matchingMeasurement?.score || 8,
+        value: s.value,
+      }],
+    });
+  });
+
+  return strengths;
+}
+
+function generateFlawsFromAnalysis(analysis: HarmonyAnalysis): Flaw[] {
+  const flaws: Flaw[] = [];
+  let rollingLost = 0;
+
+  analysis.flaws.forEach((f, i) => {
+    const matchingMeasurement = analysis.measurements.find(m => m.metricId === f.metricId);
+    const impact = matchingMeasurement ? (10 - matchingMeasurement.score) * 0.5 : 2;
+    rollingLost += impact;
+
+    flaws.push({
+      id: `flaw_${i}`,
+      flawName: f.metricName,
+      summary: f.reasoning,
+      harmonyPercentageLost: impact,
+      standardizedImpact: impact / 10,
+      categoryName: f.category,
+      responsibleRatios: [{
+        ratioName: f.metricName,
+        ratioId: f.metricId,
+        score: matchingMeasurement?.score || 3,
+        value: matchingMeasurement?.value || 0,
+      }],
+      rollingPointsDeducted: rollingLost,
+      rollingHarmonyPercentageLost: rollingLost,
+      rollingStandardizedImpact: rollingLost / 10,
+    });
+  });
+
+  return flaws.sort((a, b) => b.harmonyPercentageLost - a.harmonyPercentageLost);
+}
+
+function generateRecommendations(flaws: Flaw[]): Recommendation[] {
+  // Generate recommendations based on detected flaws
+  const recommendations: Recommendation[] = [];
+
+  const procedureDatabase: Array<Omit<Recommendation, 'matchedFlaws' | 'matchedRatios' | 'ratios_impacted'> & { targetFlaws: string[] }> = [
+    {
+      ref_id: 'SUR-01',
+      name: 'Genioplasty',
+      description: 'Surgical chin repositioning to improve chin projection and facial harmony. Can move the chin forward, backward, up, or down.',
+      phase: 'Surgical',
+      impact: 0.85,
+      coverage: 8,
+      percentage: '15-25%',
+      expectedImprovementRange: { min: 0.5, max: 1.5 },
+      targetFlaws: ['Weak chin', 'Recessed chin', 'Short chin', 'chin'],
+      timeline: { effect_start: 'delayed', full_results_weeks: 12, full_results_weeks_max: 24 },
+      cost: { type: 'flat', min: 5000, max: 15000, currency: 'USD' },
+      risks_side_effects: 'Temporary numbness, swelling, bruising. Rare: infection, nerve damage.',
+      warnings: [],
+      gender: 'both',
+    },
+    {
+      ref_id: 'SUR-02',
+      name: 'Rhinoplasty',
+      description: 'Nose reshaping surgery to improve nasal proportions, reduce or increase size, change angle, or correct breathing issues.',
+      phase: 'Surgical',
+      impact: 0.8,
+      coverage: 6,
+      percentage: '10-20%',
+      targetFlaws: ['Wide nose', 'Long nose', 'Crooked nose', 'nose', 'nasal'],
+      timeline: { effect_start: 'delayed', full_results_weeks: 24, full_results_weeks_max: 52 },
+      cost: { type: 'flat', min: 8000, max: 20000, currency: 'USD' },
+      risks_side_effects: 'Swelling for 6-12 months, numbness, possible revision needed.',
+      warnings: [],
+      gender: 'both',
+    },
+    {
+      ref_id: 'SUR-03',
+      name: 'Jaw Implants',
+      description: 'Custom or standard implants to enhance jaw width and definition. Creates a more angular, masculine jawline.',
+      phase: 'Surgical',
+      impact: 0.75,
+      coverage: 5,
+      percentage: '10-15%',
+      targetFlaws: ['Narrow jaw', 'Weak jaw', 'jaw'],
+      timeline: { effect_start: 'delayed', full_results_weeks: 8, full_results_weeks_max: 16 },
+      cost: { type: 'flat', min: 8000, max: 25000, currency: 'USD' },
+      risks_side_effects: 'Swelling, asymmetry risk, implant migration, infection.',
+      warnings: [],
+      gender: 'both',
+    },
+    {
+      ref_id: 'MIN-01',
+      name: 'Dermal Fillers',
+      description: 'Hyaluronic acid injections to add volume to chin, jawline, or cheeks. Non-permanent and reversible.',
+      phase: 'Minimally Invasive',
+      impact: 0.4,
+      coverage: 4,
+      percentage: '5-10%',
+      targetFlaws: ['Weak chin', 'Flat cheeks', 'chin', 'midface'],
+      timeline: { effect_start: 'immediate', full_results_weeks: 1 },
+      cost: { type: 'per_session', min: 600, max: 2000, currency: 'USD' },
+      risks_side_effects: 'Bruising, swelling, rare vascular occlusion.',
+      warnings: ['Results temporary (6-18 months)'],
+      gender: 'both',
+    },
+    {
+      ref_id: 'MIN-02',
+      name: 'Orthodontic Treatment',
+      description: 'Braces or clear aligners to correct bite alignment and tooth positioning. Can impact facial profile over time.',
+      phase: 'Minimally Invasive',
+      impact: 0.5,
+      coverage: 3,
+      percentage: '5-15%',
+      targetFlaws: ['Bite issues', 'Midface recession', 'jaw'],
+      timeline: { effect_start: 'gradual', full_results_weeks: 52, full_results_weeks_max: 104 },
+      cost: { type: 'flat', min: 3000, max: 10000, currency: 'USD' },
+      risks_side_effects: 'Temporary discomfort, requires compliance.',
+      warnings: [],
+      gender: 'both',
+    },
+    {
+      ref_id: 'FND-01',
+      name: 'Mewing / Proper Tongue Posture',
+      description: 'Maintaining correct tongue posture on the palate to potentially influence facial development over time.',
+      phase: 'Foundational',
+      impact: 0.2,
+      coverage: 4,
+      percentage: '2-5%',
+      targetFlaws: ['Midface recession', 'Narrow palate', 'jaw', 'midface'],
+      timeline: { effect_start: 'gradual', full_results_weeks: 104, full_results_weeks_max: 260 },
+      cost: { type: 'flat', min: 0, max: 0, currency: 'USD' },
+      risks_side_effects: 'None if done correctly. Jaw pain if excessive.',
+      warnings: ['Results vary significantly', 'Most effective in younger individuals'],
+      gender: 'both',
+    },
+    {
+      ref_id: 'FND-02',
+      name: 'Body Recomposition',
+      description: 'Reducing body fat percentage to enhance facial definition and reveal underlying bone structure.',
+      phase: 'Foundational',
+      impact: 0.3,
+      coverage: 6,
+      percentage: '5-10%',
+      targetFlaws: ['Undefined jawline', 'Soft features', 'jaw', 'face'],
+      timeline: { effect_start: 'gradual', full_results_weeks: 12, full_results_weeks_max: 52 },
+      cost: { type: 'per_month', min: 50, max: 200, currency: 'USD' },
+      risks_side_effects: 'None if done healthily.',
+      warnings: [],
+      gender: 'both',
+    },
+  ];
+
+  flaws.forEach(flaw => {
+    procedureDatabase.forEach(proc => {
+      const flawLower = flaw.flawName.toLowerCase();
+      const matches = proc.targetFlaws.some(target =>
+        flawLower.includes(target.toLowerCase()) || target.toLowerCase().includes(flawLower)
+      );
+
+      if (matches && !recommendations.find(r => r.ref_id === proc.ref_id)) {
+        recommendations.push({
+          ...proc,
+          matchedFlaws: [flaw.flawName],
+          matchedRatios: flaw.responsibleRatios.map(r => r.ratioName),
+          ratios_impacted: flaw.responsibleRatios.map(r => ({
+            ratioId: r.ratioId,
+            ratioName: r.ratioName,
+            direction: 'both' as const,
+            percentageEffect: 1.0,
+          })),
+        });
+      }
+    });
+  });
+
+  return recommendations.sort((a, b) => b.impact - a.impact);
+}
+
+// ============================================
+// CONTEXT CREATION
+// ============================================
+
+const ResultsContext = createContext<ResultsContextType | null>(null);
+
+export function useResults(): ResultsContextType {
+  const context = useContext(ResultsContext);
+  if (!context) {
+    throw new Error('useResults must be used within a ResultsProvider');
+  }
+  return context;
+}
+
+interface ResultsProviderProps {
+  children: ReactNode;
+  initialData?: ResultsInputData;
+}
+
+export function ResultsProvider({ children, initialData }: ResultsProviderProps) {
+  // Raw data state
+  const [frontLandmarks, setFrontLandmarks] = useState<LandmarkPoint[]>(initialData?.frontLandmarks || []);
+  const [sideLandmarks, setSideLandmarks] = useState<LandmarkPoint[]>(initialData?.sideLandmarks || []);
+  const [gender, setGender] = useState<Gender>(initialData?.gender || 'male');
+  const [ethnicity, setEthnicity] = useState<Ethnicity>(initialData?.ethnicity || 'other');
+  const [frontPhoto, setFrontPhoto] = useState<string>(initialData?.frontPhoto || '');
+  const [sidePhoto, setSidePhoto] = useState<string | null>(initialData?.sidePhoto || null);
+
+  // UI state
+  const [activeTab, setActiveTab] = useState<ResultsTab>('overview');
+  const [expandedMeasurementId, setExpandedMeasurementId] = useState<string | null>(null);
+  const [selectedVisualizationMetric, setSelectedVisualizationMetric] = useState<string | null>(null);
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+  const [showLandmarkOverlay, setShowLandmarkOverlay] = useState(true);
+
+  // Compute analysis results (now with demographic-specific scoring)
+  const analysisResults = useMemo(() => {
+    if (frontLandmarks.length === 0) {
+      return null;
+    }
+
+    try {
+      const frontAnalysis = analyzeFrontProfile(frontLandmarks, gender, ethnicity);
+      const sideAnalysis = sideLandmarks.length > 0
+        ? analyzeSideProfile(sideLandmarks, gender, ethnicity)
+        : null;
+      // analyzeHarmony expects landmarks directly, not analysis results
+      const harmony = analyzeHarmony(frontLandmarks, sideLandmarks, gender, ethnicity);
+
+      return { frontAnalysis, sideAnalysis, harmony };
+    } catch (error) {
+      console.error('Analysis error:', error);
+      return null;
+    }
+  }, [frontLandmarks, sideLandmarks, gender, ethnicity]);
+
+  // Transform to Ratio format
+  const frontRatios = useMemo(() => {
+    if (!analysisResults?.frontAnalysis) return [];
+    return analysisResults.frontAnalysis.measurements.map(m => transformToRatio(m, frontLandmarks));
+  }, [analysisResults, frontLandmarks]);
+
+  const sideRatios = useMemo(() => {
+    if (!analysisResults?.sideAnalysis) return [];
+    return analysisResults.sideAnalysis.measurements.map(m => transformToRatio(m, sideLandmarks));
+  }, [analysisResults, sideLandmarks]);
+
+  // Generate strengths and flaws
+  const strengths = useMemo(() => {
+    if (!analysisResults?.harmony) return [];
+    return generateStrengthsFromAnalysis(analysisResults.harmony);
+  }, [analysisResults]);
+
+  const flaws = useMemo(() => {
+    if (!analysisResults?.harmony) return [];
+    return generateFlawsFromAnalysis(analysisResults.harmony);
+  }, [analysisResults]);
+
+  // Generate recommendations
+  const recommendations = useMemo(() => {
+    return generateRecommendations(flaws);
+  }, [flaws]);
+
+  // Build full harmony analysis
+  const harmonyAnalysis = useMemo((): FullHarmonyAnalysis | null => {
+    if (!analysisResults?.harmony) return null;
+
+    return {
+      standardizedScore: analysisResults.harmony.overallScore,
+      front: {
+        standardizedScore: analysisResults.harmony.frontScore,
+        ratios: frontRatios,
+      },
+      side: {
+        standardizedScore: analysisResults.harmony.sideScore,
+        ratios: sideRatios,
+      },
+      strengths,
+      flaws,
+    };
+  }, [analysisResults, frontRatios, sideRatios, strengths, flaws]);
+
+  // Scores
+  const overallScore = analysisResults?.harmony?.overallScore || 0;
+  const frontScore = analysisResults?.harmony?.frontScore || 0;
+  const sideScore = analysisResults?.harmony?.sideScore || 0;
+
+  // Action to set all results data
+  const setResultsData = useCallback((data: ResultsInputData) => {
+    setFrontLandmarks(data.frontLandmarks);
+    setSideLandmarks(data.sideLandmarks);
+    setFrontPhoto(data.frontPhoto);
+    setSidePhoto(data.sidePhoto || null);
+    setGender(data.gender);
+    setEthnicity(data.ethnicity || 'other');
+  }, []);
+
+  const value: ResultsContextType = {
+    frontLandmarks,
+    sideLandmarks,
+    gender,
+    ethnicity,
+    frontPhoto,
+    sidePhoto,
+    harmonyAnalysis,
+    frontRatios,
+    sideRatios,
+    strengths,
+    flaws,
+    recommendations,
+    overallScore,
+    frontScore,
+    sideScore,
+    activeTab,
+    setActiveTab,
+    expandedMeasurementId,
+    setExpandedMeasurementId,
+    selectedVisualizationMetric,
+    setSelectedVisualizationMetric,
+    categoryFilter,
+    setCategoryFilter,
+    showLandmarkOverlay,
+    setShowLandmarkOverlay,
+    setResultsData,
+  };
+
+  return (
+    <ResultsContext.Provider value={value}>
+      {children}
+    </ResultsContext.Provider>
+  );
+}

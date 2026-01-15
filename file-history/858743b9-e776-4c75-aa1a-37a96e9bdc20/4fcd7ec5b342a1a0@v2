@@ -1,0 +1,748 @@
+import * as vscode from "vscode"
+import * as http from "http"
+import { EventEmitter } from "events"
+import { WebSocketServer, WebSocket } from "ws"
+import { v4 as uuidv4 } from "uuid"
+
+import type {
+	BridgeConnectionState,
+	BridgeMessage,
+	BridgeMessageType,
+	BridgeConfig,
+	BridgeEvents,
+	HandshakePayload,
+	DOMElementInfo,
+	PageInfo,
+	NetworkRequestInfo,
+	ConsoleMessageInfo,
+	TabInfo,
+} from "./types"
+import { DEFAULT_BRIDGE_CONFIG, BridgeMessageSchema } from "./types"
+
+/**
+ * Manages WebSocket communication between VS Code extension and Chrome companion extension.
+ *
+ * Features:
+ * - WebSocket server for browser extension connection
+ * - DOM inspection tools
+ * - Network request monitoring
+ * - Console message capture
+ * - Tab management
+ * - Heartbeat/ping-pong for connection health
+ *
+ * Architecture:
+ * ```
+ * VS Code Extension (this)
+ *        ↕ WebSocket
+ * Chrome Extension (companion)
+ *        ↕ Chrome APIs
+ * Browser Tab (content script)
+ * ```
+ */
+export class BrowserExtensionBridge extends EventEmitter implements vscode.Disposable {
+	private static instance: BrowserExtensionBridge | null = null
+	private context: vscode.ExtensionContext
+	private config: BridgeConfig
+	private server: http.Server | null = null
+	private wss: WebSocketServer | null = null
+	private client: WebSocket | null = null
+	private connectionState: BridgeConnectionState = "disconnected"
+	private extensionInfo: HandshakePayload | null = null
+	private heartbeatTimer: NodeJS.Timeout | null = null
+	private connectionTimeoutTimer: NodeJS.Timeout | null = null
+	private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }> =
+		new Map()
+	private networkRequests: NetworkRequestInfo[] = []
+	private consoleMessages: ConsoleMessageInfo[] = []
+	private disposables: vscode.Disposable[] = []
+
+	private constructor(context: vscode.ExtensionContext, config?: Partial<BridgeConfig>) {
+		super()
+		this.context = context
+		this.config = { ...DEFAULT_BRIDGE_CONFIG, ...config }
+	}
+
+	/**
+	 * Get the singleton instance of BrowserExtensionBridge
+	 */
+	static getInstance(context: vscode.ExtensionContext, config?: Partial<BridgeConfig>): BrowserExtensionBridge {
+		if (!BrowserExtensionBridge.instance) {
+			BrowserExtensionBridge.instance = new BrowserExtensionBridge(context, config)
+		}
+		return BrowserExtensionBridge.instance
+	}
+
+	/**
+	 * Check if instance exists
+	 */
+	static hasInstance(): boolean {
+		return BrowserExtensionBridge.instance !== null
+	}
+
+	/**
+	 * Cleanup the singleton instance
+	 */
+	static cleanup(): void {
+		if (BrowserExtensionBridge.instance) {
+			BrowserExtensionBridge.instance.dispose()
+			BrowserExtensionBridge.instance = null
+		}
+	}
+
+	/**
+	 * Start the WebSocket server
+	 */
+	async start(): Promise<void> {
+		if (this.server) {
+			console.log("[BrowserExtensionBridge] Server already running")
+			return
+		}
+
+		return new Promise((resolve, reject) => {
+			try {
+				this.server = http.createServer()
+				this.wss = new WebSocketServer({ server: this.server })
+
+				this.wss.on("connection", (ws: WebSocket) => {
+					this.handleConnection(ws)
+				})
+
+				this.wss.on("error", (error) => {
+					console.error("[BrowserExtensionBridge] WebSocket server error:", error)
+					this.emit("error", error)
+				})
+
+				this.server.listen(this.config.port, this.config.host, () => {
+					console.log(`[BrowserExtensionBridge] Server started on ws://${this.config.host}:${this.config.port}`)
+					resolve()
+				})
+
+				this.server.on("error", (error: NodeJS.ErrnoException) => {
+					if (error.code === "EADDRINUSE") {
+						console.error(`[BrowserExtensionBridge] Port ${this.config.port} is already in use`)
+					}
+					reject(error)
+				})
+			} catch (error) {
+				reject(error)
+			}
+		})
+	}
+
+	/**
+	 * Stop the WebSocket server
+	 */
+	async stop(): Promise<void> {
+		this.clearTimers()
+
+		if (this.client) {
+			this.client.close()
+			this.client = null
+		}
+
+		if (this.wss) {
+			this.wss.close()
+			this.wss = null
+		}
+
+		if (this.server) {
+			return new Promise((resolve) => {
+				this.server!.close(() => {
+					this.server = null
+					this.setConnectionState("disconnected")
+					console.log("[BrowserExtensionBridge] Server stopped")
+					resolve()
+				})
+			})
+		}
+	}
+
+	/**
+	 * Handle new WebSocket connection from Chrome extension
+	 */
+	private handleConnection(ws: WebSocket): void {
+		// Only allow one connection at a time
+		if (this.client) {
+			ws.close(1000, "Another client already connected")
+			return
+		}
+
+		this.client = ws
+		this.setConnectionState("connecting")
+
+		// Set connection timeout
+		this.connectionTimeoutTimer = setTimeout(() => {
+			if (this.connectionState === "connecting") {
+				console.error("[BrowserExtensionBridge] Connection timeout - no handshake received")
+				ws.close(1000, "Handshake timeout")
+				this.setConnectionState("disconnected")
+			}
+		}, this.config.connectionTimeout)
+
+		ws.on("message", (data: Buffer) => {
+			try {
+				const message = JSON.parse(data.toString()) as BridgeMessage
+				this.handleMessage(message)
+			} catch (error) {
+				console.error("[BrowserExtensionBridge] Failed to parse message:", error)
+			}
+		})
+
+		ws.on("close", (code, reason) => {
+			console.log(`[BrowserExtensionBridge] Client disconnected: ${code} - ${reason.toString()}`)
+			this.client = null
+			this.extensionInfo = null
+			this.clearTimers()
+			this.setConnectionState("disconnected")
+			this.emit("disconnected", reason.toString())
+		})
+
+		ws.on("error", (error) => {
+			console.error("[BrowserExtensionBridge] WebSocket error:", error)
+			this.emit("error", error)
+			this.setConnectionState("error")
+		})
+
+		ws.on("pong", () => {
+			// Connection is alive
+		})
+	}
+
+	/**
+	 * Handle incoming message from Chrome extension
+	 */
+	private handleMessage(message: BridgeMessage): void {
+		// Validate message structure
+		const parseResult = BridgeMessageSchema.safeParse(message)
+		if (!parseResult.success) {
+			console.error("[BrowserExtensionBridge] Invalid message:", parseResult.error)
+			return
+		}
+
+		switch (message.type) {
+			case "handshake":
+				this.handleHandshake(message)
+				break
+
+			case "pong":
+				// Heartbeat response - connection is alive
+				break
+
+			case "network_request":
+				this.handleNetworkRequest(message)
+				break
+
+			case "network_response":
+				this.handleNetworkResponse(message)
+				break
+
+			case "console_message":
+				this.handleConsoleMessage(message)
+				break
+
+			default:
+				// Check if this is a response to a pending request
+				if (this.pendingRequests.has(message.id)) {
+					const { resolve } = this.pendingRequests.get(message.id)!
+					this.pendingRequests.delete(message.id)
+					resolve(message.payload)
+				}
+				break
+		}
+	}
+
+	/**
+	 * Handle handshake message from Chrome extension
+	 */
+	private handleHandshake(message: BridgeMessage): void {
+		if (this.connectionTimeoutTimer) {
+			clearTimeout(this.connectionTimeoutTimer)
+			this.connectionTimeoutTimer = null
+		}
+
+		this.extensionInfo = message.payload as unknown as HandshakePayload
+		this.setConnectionState("connected")
+
+		// Send handshake acknowledgment
+		this.send({
+			id: uuidv4(),
+			type: "handshake_ack",
+			timestamp: Date.now(),
+			payload: {
+				serverVersion: "1.0.0",
+				capabilities: ["dom_inspection", "network_monitoring", "console_monitoring", "tab_management"],
+			},
+		})
+
+		// Start heartbeat
+		this.startHeartbeat()
+
+		// Enable monitoring if configured
+		if (this.config.enableNetworkMonitoring) {
+			this.enableNetworkMonitoring()
+		}
+		if (this.config.enableConsoleMonitoring) {
+			this.enableConsoleMonitoring()
+		}
+
+		console.log(
+			`[BrowserExtensionBridge] Connected to ${this.extensionInfo.browserName} v${this.extensionInfo.browserVersion}`,
+		)
+		this.emit("connected", this.extensionInfo)
+	}
+
+	/**
+	 * Handle network request event
+	 */
+	private handleNetworkRequest(message: BridgeMessage): void {
+		const request = message.payload as unknown as NetworkRequestInfo
+		this.networkRequests.push(request)
+
+		// Trim if exceeds max
+		if (this.networkRequests.length > this.config.maxNetworkRequests) {
+			this.networkRequests.shift()
+		}
+
+		this.emit("network-request", request)
+	}
+
+	/**
+	 * Handle network response event
+	 */
+	private handleNetworkResponse(message: BridgeMessage): void {
+		const response = message.payload as unknown as NetworkRequestInfo
+
+		// Find and update the corresponding request
+		const index = this.networkRequests.findIndex((r) => r.requestId === response.requestId)
+		if (index !== -1) {
+			this.networkRequests[index] = { ...this.networkRequests[index], ...response }
+		}
+
+		this.emit("network-response", response)
+	}
+
+	/**
+	 * Handle console message event
+	 */
+	private handleConsoleMessage(message: BridgeMessage): void {
+		const consoleMsg = message.payload as unknown as ConsoleMessageInfo
+		this.consoleMessages.push(consoleMsg)
+
+		// Trim if exceeds max
+		if (this.consoleMessages.length > this.config.maxConsoleMessages) {
+			this.consoleMessages.shift()
+		}
+
+		this.emit("console-message", consoleMsg)
+	}
+
+	/**
+	 * Send a message to the Chrome extension
+	 */
+	private send(message: BridgeMessage): boolean {
+		if (!this.client || this.client.readyState !== WebSocket.OPEN) {
+			console.warn("[BrowserExtensionBridge] Cannot send - not connected")
+			return false
+		}
+
+		try {
+			this.client.send(JSON.stringify(message))
+			return true
+		} catch (error) {
+			console.error("[BrowserExtensionBridge] Send error:", error)
+			return false
+		}
+	}
+
+	/**
+	 * Send a request and wait for response
+	 */
+	private async sendRequest<T>(
+		type: BridgeMessageType,
+		payload?: Record<string, unknown>,
+		tabId?: number,
+		timeout = 30000,
+	): Promise<T> {
+		return new Promise((resolve, reject) => {
+			const id = uuidv4()
+
+			const timer = setTimeout(() => {
+				this.pendingRequests.delete(id)
+				reject(new Error(`Request timeout: ${type}`))
+			}, timeout)
+
+			this.pendingRequests.set(id, {
+				resolve: (value) => {
+					clearTimeout(timer)
+					resolve(value as T)
+				},
+				reject: (error) => {
+					clearTimeout(timer)
+					reject(error)
+				},
+			})
+
+			const success = this.send({
+				id,
+				type,
+				timestamp: Date.now(),
+				tabId,
+				payload,
+			})
+
+			if (!success) {
+				this.pendingRequests.delete(id)
+				clearTimeout(timer)
+				reject(new Error("Failed to send request"))
+			}
+		})
+	}
+
+	/**
+	 * Start heartbeat to maintain connection
+	 */
+	private startHeartbeat(): void {
+		this.heartbeatTimer = setInterval(() => {
+			if (this.client && this.client.readyState === WebSocket.OPEN) {
+				this.client.ping()
+			}
+		}, this.config.heartbeatInterval)
+	}
+
+	/**
+	 * Clear all timers
+	 */
+	private clearTimers(): void {
+		if (this.heartbeatTimer) {
+			clearInterval(this.heartbeatTimer)
+			this.heartbeatTimer = null
+		}
+		if (this.connectionTimeoutTimer) {
+			clearTimeout(this.connectionTimeoutTimer)
+			this.connectionTimeoutTimer = null
+		}
+	}
+
+	/**
+	 * Set connection state and emit event
+	 */
+	private setConnectionState(state: BridgeConnectionState): void {
+		if (this.connectionState !== state) {
+			this.connectionState = state
+			this.emit("connection-state-changed", state)
+		}
+	}
+
+	// ==================== Public API ====================
+
+	/**
+	 * Get current connection state
+	 */
+	getConnectionState(): BridgeConnectionState {
+		return this.connectionState
+	}
+
+	/**
+	 * Check if connected to Chrome extension
+	 */
+	isConnected(): boolean {
+		return this.connectionState === "connected"
+	}
+
+	/**
+	 * Get connected extension info
+	 */
+	getExtensionInfo(): HandshakePayload | null {
+		return this.extensionInfo
+	}
+
+	/**
+	 * Get server URL for the Chrome extension to connect
+	 */
+	getServerUrl(): string {
+		return `ws://${this.config.host}:${this.config.port}`
+	}
+
+	// ==================== DOM Inspection ====================
+
+	/**
+	 * Inspect DOM element at coordinates
+	 */
+	async inspectElementAt(tabId: number, x: number, y: number): Promise<DOMElementInfo | null> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<DOMElementInfo | null>("dom_inspect_request", { x, y }, tabId)
+	}
+
+	/**
+	 * Query DOM elements by CSS selector
+	 */
+	async querySelectorAll(tabId: number, selector: string, includeChildren = false): Promise<DOMElementInfo[]> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<DOMElementInfo[]>("dom_query_selector", { selector, includeChildren }, tabId)
+	}
+
+	/**
+	 * Get computed styles for an element
+	 */
+	async getComputedStyles(tabId: number, selector: string): Promise<Record<string, string> | null> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<Record<string, string> | null>("dom_get_computed_styles", { selector }, tabId)
+	}
+
+	/**
+	 * Highlight an element on the page
+	 */
+	async highlightElement(tabId: number, selector: string, color = "rgba(255, 0, 0, 0.3)"): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("dom_highlight_element", { selector, color }, tabId)
+	}
+
+	/**
+	 * Clear element highlights
+	 */
+	async clearHighlights(tabId: number): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("dom_highlight_clear", {}, tabId)
+	}
+
+	// ==================== Page Interaction ====================
+
+	/**
+	 * Take a screenshot of the page
+	 */
+	async takeScreenshot(
+		tabId: number,
+		options?: { format?: "png" | "jpeg"; quality?: number; fullPage?: boolean },
+	): Promise<string> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<string>("page_screenshot", options ?? {}, tabId)
+	}
+
+	/**
+	 * Navigate to a URL
+	 */
+	async navigateTo(tabId: number, url: string): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("page_navigate", { url }, tabId)
+	}
+
+	/**
+	 * Reload the page
+	 */
+	async reloadPage(tabId: number, ignoreCache = false): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("page_reload", { ignoreCache }, tabId)
+	}
+
+	/**
+	 * Execute JavaScript in the page context
+	 */
+	async executeScript<T>(tabId: number, script: string): Promise<T> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<T>("page_execute_script", { script }, tabId)
+	}
+
+	/**
+	 * Get current page info
+	 */
+	async getPageInfo(tabId: number): Promise<PageInfo> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<PageInfo>("page_get_info", {}, tabId)
+	}
+
+	// ==================== Network Monitoring ====================
+
+	/**
+	 * Enable network request monitoring
+	 */
+	async enableNetworkMonitoring(): Promise<void> {
+		if (!this.isConnected()) {
+			return
+		}
+
+		this.send({
+			id: uuidv4(),
+			type: "network_enable",
+			timestamp: Date.now(),
+		})
+	}
+
+	/**
+	 * Disable network request monitoring
+	 */
+	async disableNetworkMonitoring(): Promise<void> {
+		if (!this.isConnected()) {
+			return
+		}
+
+		this.send({
+			id: uuidv4(),
+			type: "network_disable",
+			timestamp: Date.now(),
+		})
+	}
+
+	/**
+	 * Get captured network requests
+	 */
+	getNetworkRequests(): NetworkRequestInfo[] {
+		return [...this.networkRequests]
+	}
+
+	/**
+	 * Clear captured network requests
+	 */
+	clearNetworkRequests(): void {
+		this.networkRequests = []
+	}
+
+	// ==================== Console Monitoring ====================
+
+	/**
+	 * Enable console message monitoring
+	 */
+	async enableConsoleMonitoring(): Promise<void> {
+		if (!this.isConnected()) {
+			return
+		}
+
+		this.send({
+			id: uuidv4(),
+			type: "console_enable",
+			timestamp: Date.now(),
+		})
+	}
+
+	/**
+	 * Disable console message monitoring
+	 */
+	async disableConsoleMonitoring(): Promise<void> {
+		if (!this.isConnected()) {
+			return
+		}
+
+		this.send({
+			id: uuidv4(),
+			type: "console_disable",
+			timestamp: Date.now(),
+		})
+	}
+
+	/**
+	 * Get captured console messages
+	 */
+	getConsoleMessages(): ConsoleMessageInfo[] {
+		return [...this.consoleMessages]
+	}
+
+	/**
+	 * Clear captured console messages
+	 */
+	clearConsoleMessages(): void {
+		this.consoleMessages = []
+	}
+
+	// ==================== Tab Management ====================
+
+	/**
+	 * List all browser tabs
+	 */
+	async listTabs(): Promise<TabInfo[]> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<TabInfo[]>("tabs_list", {})
+	}
+
+	/**
+	 * Activate a tab
+	 */
+	async activateTab(tabId: number): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("tabs_activate", { tabId })
+	}
+
+	/**
+	 * Close a tab
+	 */
+	async closeTab(tabId: number): Promise<void> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		await this.sendRequest<void>("tabs_close", { tabId })
+	}
+
+	/**
+	 * Create a new tab
+	 */
+	async createTab(url?: string): Promise<TabInfo> {
+		if (!this.isConnected()) {
+			throw new Error("Not connected to browser extension")
+		}
+
+		return this.sendRequest<TabInfo>("tabs_create", { url })
+	}
+
+	// ==================== Dispose ====================
+
+	/**
+	 * Dispose of resources
+	 */
+	dispose(): void {
+		// Reject all pending requests
+		for (const [id, { reject }] of this.pendingRequests) {
+			reject(new Error("Bridge disposed"))
+		}
+		this.pendingRequests.clear()
+
+		// Stop server
+		this.stop().catch(console.error)
+
+		// Dispose subscriptions
+		for (const disposable of this.disposables) {
+			disposable.dispose()
+		}
+		this.disposables = []
+
+		// Clear data
+		this.networkRequests = []
+		this.consoleMessages = []
+
+		this.removeAllListeners()
+	}
+}

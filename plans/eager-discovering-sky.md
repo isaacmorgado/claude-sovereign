@@ -1,0 +1,419 @@
+# Forum Implementation Plan: Personalized Looksmaxxing Community
+
+## Overview
+
+Build a personalized forum/guides system where users are recommended specific forums based on their detected flaws/issues from the facial analysis. The forum covers the complete looksmaxxing spectrum beyond just facial metrics.
+
+---
+
+## Forum Structure (12 Main Categories + Sub-Forums)
+
+### Issue Categories → Sub-Forums
+
+| # | Issue Category | Sub-Forums | Maps From Analysis |
+|---|----------------|------------|-------------------|
+| 1 | **Skinny/Fat (Body Composition)** | Nutrition, Training, Pharma, Frame | *(New - not in current analysis)* |
+| 2 | **Weak Bone Structure** | Teeth, Jawline, Sculpting, Surgery | Weak Jaw, Narrow Jaw, Recessed Chin, Mandibular Recession |
+| 3 | **Poor Skin Complexion** | Nutrition, Skincare, Pharma | *(New - not in current analysis)* |
+| 4 | **Teeth/Smile Issues** | Teeth, Surgery | *(New - limited in current analysis)* |
+| 5 | **Weak Eye Area** | Eyebrows, Eyelashes, Eyes, Aesthetics, Surgery | Negative Canthal Tilt, Small Eyes, Low-Set Eyebrows |
+| 6 | **Short Height/Narrow Frame** | Frame, Biohacking, Pharma, Surgery | *(New - not in current analysis)* |
+| 7 | **Bloated/Face Fat** | Nutrition, Sculpting, Surgery | Flat Midface, Long Face *(partial)* |
+| 8 | **Poor Fashion Sense** | Archetype, Styling, Appeal | *(New - not in current analysis)* |
+| 9 | **Hair Thinning/Recession** | Hairstyle, Pharma, Surgery | *(New - not in current analysis)* |
+| 10 | **Narrow/Thin Lips** | Lips, Aesthetics, Surgery | Thin Lip Profile, Long Philtrum |
+| 11 | **Anxiety/High Inhibition** | Charisma, Aesthetics, Surgery | *(New - not in current analysis)* |
+| 12 | **Low Social Media Presence** | Charisma, Appeal, Frauding, Dynamics | *(New - not in current analysis)* |
+
+---
+
+## Database Schema
+
+### Tables
+
+```sql
+-- Main issue categories (the 12 categories)
+forum_issue_categories (
+  id UUID PRIMARY KEY,
+  name VARCHAR(100),           -- "Weak Bone Structure"
+  slug VARCHAR(50) UNIQUE,     -- "weak-bone-structure"
+  description TEXT,
+  icon VARCHAR(10),            -- Emoji
+  display_order INT,
+  is_active BOOLEAN DEFAULT TRUE
+)
+
+-- Sub-forums under each issue category
+forum_sub_forums (
+  id UUID PRIMARY KEY,
+  issue_category_id UUID REFERENCES forum_issue_categories(id),
+  name VARCHAR(100),           -- "Jawline"
+  slug VARCHAR(50),            -- "jawline"
+  description TEXT,
+  icon VARCHAR(10),
+  display_order INT,
+  is_active BOOLEAN DEFAULT TRUE,
+  UNIQUE(issue_category_id, slug)
+)
+
+-- Mapping: Analysis flaws → Issue categories
+flaw_to_forum_mapping (
+  id UUID PRIMARY KEY,
+  flaw_id VARCHAR(100),        -- "weak_jaw", "negative_canthal_tilt"
+  issue_category_id UUID REFERENCES forum_issue_categories(id),
+  priority INT DEFAULT 1       -- Primary (1) vs secondary (2) recommendation
+)
+
+-- Posts in sub-forums
+forum_posts (
+  id UUID PRIMARY KEY,
+  sub_forum_id UUID REFERENCES forum_sub_forums(id),
+  author_id UUID REFERENCES users(id),
+  title VARCHAR(200),
+  content TEXT,
+  is_pinned BOOLEAN DEFAULT FALSE,
+  is_guide BOOLEAN DEFAULT FALSE,
+  vote_count INT DEFAULT 0,
+  comment_count INT DEFAULT 0,
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+)
+
+-- Comments, Votes, Reports (same as forum.md)
+```
+
+### Seed Data: Issue Categories
+
+```sql
+INSERT INTO forum_issue_categories (name, slug, icon, display_order) VALUES
+('Skinny/Fat (Body Composition)', 'body-composition', '💪', 1),
+('Weak Bone Structure', 'weak-bone-structure', '🦴', 2),
+('Poor Skin Complexion', 'poor-skin', '✨', 3),
+('Teeth/Smile Issues', 'teeth-smile', '😁', 4),
+('Weak Eye Area', 'weak-eyes', '👁️', 5),
+('Short Height/Narrow Frame', 'height-frame', '📏', 6),
+('Bloated/Face Fat', 'face-fat', '💧', 7),
+('Poor Fashion Sense', 'fashion', '👔', 8),
+('Hair Thinning/Recession', 'hair-loss', '💇', 9),
+('Narrow/Thin Lips', 'thin-lips', '👄', 10),
+('Anxiety/High Inhibition', 'anxiety', '🧠', 11),
+('Low Social Media Presence', 'social-media', '📱', 12);
+```
+
+### Seed Data: Sub-Forums
+
+```sql
+-- Body Composition
+INSERT INTO forum_sub_forums (issue_category_id, name, slug, display_order) VALUES
+((SELECT id FROM forum_issue_categories WHERE slug='body-composition'), 'Nutrition', 'nutrition', 1),
+((SELECT id FROM forum_issue_categories WHERE slug='body-composition'), 'Training', 'training', 2),
+((SELECT id FROM forum_issue_categories WHERE slug='body-composition'), 'Pharma', 'pharma', 3),
+((SELECT id FROM forum_issue_categories WHERE slug='body-composition'), 'Frame', 'frame', 4);
+
+-- Weak Bone Structure
+INSERT INTO forum_sub_forums (issue_category_id, name, slug, display_order) VALUES
+((SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 'Teeth', 'teeth', 1),
+((SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 'Jawline', 'jawline', 2),
+((SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 'Sculpting', 'sculpting', 3),
+((SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 'Surgery', 'surgery', 4);
+
+-- ... (continue for all 12 categories)
+```
+
+---
+
+## Flaw → Forum Mapping
+
+Map existing analysis flaws to forum categories:
+
+```sql
+-- Weak Bone Structure mappings
+INSERT INTO flaw_to_forum_mapping (flaw_id, issue_category_id, priority) VALUES
+('weak_jaw', (SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 1),
+('narrow_jaw', (SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 1),
+('recessed_chin', (SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 1),
+('mandibular_recession', (SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 1),
+('steep_mandibular_plane', (SELECT id FROM forum_issue_categories WHERE slug='weak-bone-structure'), 2);
+
+-- Weak Eye Area mappings
+INSERT INTO flaw_to_forum_mapping (flaw_id, issue_category_id, priority) VALUES
+('negative_canthal_tilt', (SELECT id FROM forum_issue_categories WHERE slug='weak-eyes'), 1),
+('small_eyes', (SELECT id FROM forum_issue_categories WHERE slug='weak-eyes'), 1),
+('low_set_eyebrows', (SELECT id FROM forum_issue_categories WHERE slug='weak-eyes'), 1),
+('wide_set_eyes', (SELECT id FROM forum_issue_categories WHERE slug='weak-eyes'), 2),
+('close_set_eyes', (SELECT id FROM forum_issue_categories WHERE slug='weak-eyes'), 2);
+
+-- Thin Lips mappings
+INSERT INTO flaw_to_forum_mapping (flaw_id, issue_category_id, priority) VALUES
+('thin_lip_profile', (SELECT id FROM forum_issue_categories WHERE slug='thin-lips'), 1),
+('long_philtrum', (SELECT id FROM forum_issue_categories WHERE slug='thin-lips'), 2);
+
+-- Face Fat/Bloating mappings
+INSERT INTO flaw_to_forum_mapping (flaw_id, issue_category_id, priority) VALUES
+('flat_midface', (SELECT id FROM forum_issue_categories WHERE slug='face-fat'), 2),
+('long_face', (SELECT id FROM forum_issue_categories WHERE slug='face-fat'), 2);
+```
+
+---
+
+## API Endpoints
+
+### New Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/forum/issue-categories` | List all 12 issue categories with sub-forum counts |
+| GET | `/forum/issue-categories/{slug}` | Get category details with sub-forums |
+| GET | `/forum/issue-categories/{slug}/sub-forums/{subSlug}/posts` | Posts in sub-forum |
+| GET | `/forum/recommended` | **Personalized recommendations based on user's flaws** |
+| GET | `/forum/guides` | Featured guides across all categories |
+
+### Personalized Recommendations Endpoint
+
+```python
+@router.get("/forum/recommended")
+async def get_recommended_forums(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns forum categories recommended based on user's detected flaws.
+
+    1. Get user's latest analysis
+    2. Extract detected flaws
+    3. Map flaws → issue categories via flaw_to_forum_mapping
+    4. Return ranked list of recommended categories + sub-forums
+    """
+    # Get user's latest analysis
+    analysis = await get_latest_analysis(current_user.id, db)
+
+    if not analysis:
+        # Return all categories if no analysis
+        return await list_all_categories(db)
+
+    # Extract flaw IDs from analysis
+    flaws = analysis.flaws or []
+    flaw_ids = [f['id'] for f in flaws]
+
+    # Get mapped issue categories
+    query = (
+        select(ForumIssueCategory, FlawToForumMapping.priority)
+        .join(FlawToForumMapping)
+        .where(FlawToForumMapping.flaw_id.in_(flaw_ids))
+        .order_by(FlawToForumMapping.priority, ForumIssueCategory.display_order)
+    )
+
+    result = await db.execute(query)
+
+    return {
+        "recommended": [...],  # Matched categories
+        "other": [...]         # Remaining categories
+    }
+```
+
+---
+
+## Frontend Routes
+
+```
+/forum                                    - Forum home (recommended + browse)
+/forum/category/[slug]                    - Issue category (shows sub-forums)
+/forum/category/[slug]/[subSlug]          - Sub-forum posts list
+/forum/category/[slug]/[subSlug]/post/[id] - Single post
+/forum/new?category=...&subforum=...      - Create post
+```
+
+---
+
+## UI Layout
+
+### Forum Home (`/forum`)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  🎯 RECOMMENDED FOR YOU                                     │
+│  Based on your analysis results                             │
+├─────────────────────────────────────────────────────────────┤
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐            │
+│ │ 🦴 Weak     │ │ 👁️ Weak Eye │ │ 👄 Thin    │            │
+│ │ Bone        │ │ Area        │ │ Lips       │            │
+│ │ Structure   │ │             │ │            │            │
+│ │ ────────── │ │ ────────── │ │ ────────── │            │
+│ │ • Jawline  │ │ • Eyes     │ │ • Lips     │            │
+│ │ • Surgery  │ │ • Eyebrows │ │ • Surgery  │            │
+│ └─────────────┘ └─────────────┘ └─────────────┘            │
+├─────────────────────────────────────────────────────────────┤
+│  📚 BROWSE ALL CATEGORIES                                   │
+├─────────────────────────────────────────────────────────────┤
+│ [Grid of all 12 categories with icons]                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Category Page (`/forum/category/weak-bone-structure`)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 🦴 Weak Bone Structure                                      │
+│ Improve your jaw, facial structure, and bone development   │
+├─────────────────────────────────────────────────────────────┤
+│  SUB-FORUMS                                                 │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────┐│
+│ │ 🦷 Teeth   │ │ 💪 Jawline │ │ 🎨 Sculpting│ │🔪Surgery││
+│ │ 42 posts   │ │ 128 posts  │ │ 67 posts   │ │ 89 posts││
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────┘│
+├─────────────────────────────────────────────────────────────┤
+│  📌 PINNED GUIDES                                           │
+│ ┌─────────────────────────────────────────────────────────┐│
+│ │ ⭐ Complete Jawline Guide 2024 | ▲ 234 | 💬 56         ││
+│ │ ⭐ Mewing Technique Masterclass | ▲ 189 | 💬 43        ││
+│ └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Implementation Steps
+
+### Phase 1: Backend Schema & Migration
+1. Create `forum_issue_categories` table
+2. Create `forum_sub_forums` table
+3. Create `flaw_to_forum_mapping` table
+4. Update `forum_posts` to reference `sub_forum_id`
+5. Seed all 12 categories + sub-forums
+6. Seed flaw → category mappings
+
+### Phase 2: Backend API
+1. Issue categories CRUD endpoints
+2. Sub-forum endpoints
+3. **Personalized `/forum/recommended` endpoint**
+4. Update existing forum endpoints for new structure
+
+### Phase 3: Frontend
+1. Update forum types for new structure
+2. Create `RecommendedSection` component
+3. Create `IssueCategoryCard` component
+4. Create `SubForumGrid` component
+5. Update routing for new URL structure
+
+### Phase 4: Integration
+1. Connect Results page → Forum recommendations
+2. Add "Get Help" CTA on flaw cards → links to relevant forum
+3. Show recommended forums on user dashboard
+
+---
+
+## Critical Files to Modify
+
+### Backend
+- `looksmaxx-api/app/models/forum.py` - Add new models
+- `looksmaxx-api/app/routers/forum.py` - Add new endpoints
+- `looksmaxx-api/app/schemas/forum.py` - Add new schemas
+- `looksmaxx-api/migrations/` - New migration file
+
+### Frontend
+- `looksmaxx-app/src/types/forum.ts` - Update types
+- `looksmaxx-app/src/lib/api.ts` - Add API methods
+- `looksmaxx-app/src/contexts/ForumContext.tsx` - Update state
+- `looksmaxx-app/src/app/forum/` - Update pages
+- `looksmaxx-app/src/components/forum/` - New components
+
+---
+
+## Design Decisions (Confirmed)
+
+1. **Access**: Open Access - All users can browse all forums, personalized recommendations only show after analysis
+2. **Priority**: Personalized First - Build full recommendation system with flaw→forum mapping from the start
+3. **Display**: Recommended + All - Show recommended categories at top, then all other categories below
+
+---
+
+## Complete Sub-Forum List (All 12 Categories)
+
+### 1. Skinny/Fat (Body Composition) - `body-composition`
+- Nutrition (`nutrition`)
+- Training (`training`)
+- Pharma (`pharma`)
+- Frame (`frame`)
+
+### 2. Weak Bone Structure - `weak-bone-structure`
+- Teeth (`teeth`)
+- Jawline (`jawline`)
+- Sculpting (`sculpting`)
+- Surgery (`surgery`)
+
+### 3. Poor Skin Complexion - `poor-skin`
+- Nutrition (`nutrition`)
+- Skincare (`skincare`)
+- Pharma (`pharma`)
+
+### 4. Teeth/Smile Issues - `teeth-smile`
+- Teeth (`teeth`)
+- Surgery (`surgery`)
+
+### 5. Weak Eye Area - `weak-eyes`
+- Eyebrows (`eyebrows`)
+- Eyelashes (`eyelashes`)
+- Eyes (`eyes`)
+- Aesthetics (`aesthetics`)
+- Surgery (`surgery`)
+
+### 6. Short Height/Narrow Frame - `height-frame`
+- Frame (`frame`)
+- Biohacking (`biohacking`)
+- Pharma (`pharma`)
+- Surgery (`surgery`)
+
+### 7. Bloated/Face Fat - `face-fat`
+- Nutrition (`nutrition`)
+- Sculpting (`sculpting`)
+- Surgery (`surgery`)
+
+### 8. Poor Fashion Sense - `fashion`
+- Archetype (`archetype`)
+- Styling (`styling`)
+- Appeal (`appeal`)
+
+### 9. Hair Thinning/Recession - `hair-loss`
+- Hairstyle (`hairstyle`)
+- Pharma (`pharma`)
+- Surgery (`surgery`)
+
+### 10. Narrow/Thin Lips - `thin-lips`
+- Lips (`lips`)
+- Aesthetics (`aesthetics`)
+- Surgery (`surgery`)
+
+### 11. Anxiety/High Inhibition - `anxiety`
+- Charisma (`charisma`)
+- Aesthetics (`aesthetics`)
+- Surgery (`surgery`)
+
+### 12. Low Social Media Presence - `social-media`
+- Charisma (`charisma`)
+- Appeal (`appeal`)
+- Frauding (`frauding`)
+- Dynamics (`dynamics`)
+
+---
+
+## Flaw → Category Mapping (Complete)
+
+| Detected Flaw | Maps To Category |
+|---------------|------------------|
+| `weak_jaw`, `narrow_jaw`, `recessed_chin`, `mandibular_recession`, `steep_mandibular_plane`, `steep_jaw` | Weak Bone Structure |
+| `negative_canthal_tilt`, `small_eyes`, `low_set_eyebrows`, `wide_set_eyes`, `close_set_eyes`, `soft_brow_ridge` | Weak Eye Area |
+| `thin_lip_profile`, `long_philtrum` | Narrow/Thin Lips |
+| `flat_midface`, `long_face`, `long_midface` | Bloated/Face Fat |
+| `wide_nasal_base`, `bulbous_nasal_tip`, `droopy_nasal_tip`, `overprojected_nose` | *(Create: Nose Issues category if needed)* |
+
+**Note**: Categories without direct flaw mappings (Body Composition, Skin, Hair, Fashion, Height, Anxiety, Social Media) will be browseable but not auto-recommended until user manually indicates interest or future analysis features are added.
+
+---
+
+## Summary: What Gets Built
+
+1. **Database**: 6 new tables (issue_categories, sub_forums, flaw_mapping, posts, comments, votes, reports)
+2. **Backend**: 15+ new API endpoints including personalized `/forum/recommended`
+3. **Frontend**: New `/forum` section with category/sub-forum/post hierarchy
+4. **Integration**: Results page links to recommended forums based on detected flaws
+5. **Seed Data**: 12 categories, 44 sub-forums, flaw mappings

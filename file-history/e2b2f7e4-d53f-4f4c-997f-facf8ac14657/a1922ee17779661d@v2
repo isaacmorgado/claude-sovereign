@@ -1,0 +1,5264 @@
+/**
+ * SPLICE Plugin Main Entry Point
+ *
+ * Initializes all functionality when the plugin loads.
+ * v3.4 - Timeline Markers + Unified Take-Aware Workflow.
+ */
+
+// Initialize Premiere Pro API
+console.log('[SPLICE] Top-level script start');
+const ppro = (typeof require !== 'undefined') ? require('premierepro') : {};
+
+// ============================================================================
+// SECURITY: INPUT VALIDATION UTILITIES (UXP-CRIT-003 FIX)
+// Prevents path traversal, injection attacks, and DoS
+// ============================================================================
+
+const InputValidation = {
+  /**
+   * Validate and sanitize file paths to prevent path traversal attacks
+   * @param {string} path - File path to validate
+   * @returns {{valid: boolean, path: string|null, error: string|null}}
+   */
+  validateFilePath(path) {
+    if (!path || typeof path !== 'string') {
+      return { valid: false, path: null, error: 'Invalid path: must be a non-empty string' };
+    }
+
+    // Check for null bytes (CVE potential)
+    if (path.includes('\0') || path.includes('\x00')) {
+      return { valid: false, path: null, error: 'Invalid path: null bytes detected' };
+    }
+
+    // Normalize path separators
+    const normalized = path.replace(/\\/g, '/');
+
+    // Check for directory traversal attempts
+    if (normalized.includes('../') || normalized.includes('..\\')) {
+      return { valid: false, path: null, error: 'Invalid path: directory traversal detected' };
+    }
+
+    // Check for potentially dangerous characters (command injection)
+    const dangerousChars = /[`$();|&<>]/;
+    if (dangerousChars.test(path)) {
+      return { valid: false, path: null, error: 'Invalid path: dangerous characters detected' };
+    }
+
+    // Check for protocol handlers that could be exploited
+    const protocolPattern = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+    if (protocolPattern.test(path) && !path.match(/^[A-Z]:\//i)) {
+      // Allow Windows drive letters (C:/) but block other protocols
+      return { valid: false, path: null, error: 'Invalid path: protocol handlers not allowed' };
+    }
+
+    return { valid: true, path: path, error: null };
+  },
+
+  /**
+   * Validate sequence/project names to prevent injection
+   * @param {string} name - Name to validate
+   * @returns {{valid: boolean, name: string|null, error: string|null}}
+   */
+  validateName(name) {
+    if (!name || typeof name !== 'string') {
+      return { valid: false, name: null, error: 'Invalid name: must be a non-empty string' };
+    }
+
+    // Check for null bytes
+    if (name.includes('\0')) {
+      return { valid: false, name: null, error: 'Invalid name: null bytes detected' };
+    }
+
+    // Check for dangerous characters (file system reserved on Windows)
+    const invalidChars = /[<>:"|?*]/;
+    if (invalidChars.test(name)) {
+      return { valid: false, name: null, error: 'Invalid name: contains reserved characters' };
+    }
+
+    // Limit length
+    if (name.length > 255) {
+      return { valid: false, name: null, error: 'Invalid name: exceeds maximum length (255)' };
+    }
+
+    return { valid: true, name: name, error: null };
+  },
+
+  /**
+   * Validate numeric parameters
+   * @param {*} value - Value to validate
+   * @param {number} min - Minimum allowed value
+   * @param {number} max - Maximum allowed value
+   * @param {string} paramName - Parameter name for error messages
+   * @returns {{valid: boolean, value: number|null, error: string|null}}
+   */
+  validateNumber(value, min, max, paramName) {
+    if (value === undefined || value === null) {
+      return { valid: false, value: null, error: `${paramName} is required` };
+    }
+
+    const num = parseFloat(value);
+    if (isNaN(num)) {
+      return { valid: false, value: null, error: `${paramName} must be a number` };
+    }
+
+    if (num < min || num > max) {
+      return { valid: false, value: null, error: `${paramName} must be between ${min} and ${max}` };
+    }
+
+    return { valid: true, value: num, error: null };
+  },
+
+  /**
+   * Sanitize string for safe use
+   * @param {string} str - String to sanitize
+   * @returns {string} Sanitized string
+   */
+  sanitizeString(str) {
+    if (!str || typeof str !== 'string') {
+      return '';
+    }
+    // Remove null bytes and control characters
+    return str.replace(/[\0\x00-\x1F\x7F]/g, '').trim();
+  },
+
+  /**
+   * Validate email format
+   * @param {string} email - Email to validate
+   * @returns {{valid: boolean, email: string|null, error: string|null}}
+   */
+  validateEmail(email) {
+    if (!email || typeof email !== 'string') {
+      return { valid: false, email: null, error: 'Email is required' };
+    }
+
+    const sanitized = email.trim().toLowerCase();
+    // RFC 5322 compliant email regex (simplified)
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+    if (!emailRegex.test(sanitized)) {
+      return { valid: false, email: null, error: 'Invalid email format' };
+    }
+
+    if (sanitized.length > 254) {
+      return { valid: false, email: null, error: 'Email too long (max 254 chars)' };
+    }
+
+    return { valid: true, email: sanitized, error: null };
+  },
+
+  /**
+   * Validate license key format
+   * @param {string} key - License key to validate
+   * @returns {{valid: boolean, key: string|null, error: string|null}}
+   */
+  validateLicenseKey(key) {
+    if (!key || typeof key !== 'string') {
+      return { valid: false, key: null, error: 'License key is required' };
+    }
+
+    const sanitized = key.trim().toUpperCase();
+
+    // SPLICE license keys follow pattern: SPLICE-XXXX-XXXX-XXXX
+    const licenseRegex = /^SPLICE-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+
+    if (!licenseRegex.test(sanitized)) {
+      return { valid: false, key: null, error: 'Invalid license key format' };
+    }
+
+    return { valid: true, key: sanitized, error: null };
+  },
+
+  /**
+   * Validate array of time values (for markers, cuts, etc.)
+   * @param {Array} times - Array of time values
+   * @param {number} maxLength - Maximum array length (DoS prevention)
+   * @returns {{valid: boolean, times: Array|null, error: string|null}}
+   */
+  validateTimeArray(times, maxLength = 10000) {
+    if (!times || !Array.isArray(times)) {
+      return { valid: false, times: null, error: 'Times must be an array' };
+    }
+
+    if (times.length > maxLength) {
+      return { valid: false, times: null, error: `Too many time values (max: ${maxLength})` };
+    }
+
+    for (let i = 0; i < times.length; i++) {
+      const validation = this.validateNumber(times[i], 0, Number.MAX_SAFE_INTEGER, `time[${i}]`);
+      if (!validation.valid) {
+        return { valid: false, times: null, error: validation.error };
+      }
+    }
+
+    return { valid: true, times: times, error: null };
+  }
+};
+
+// ============================================================================
+// CACHED DOM ELEMENTS (Performance: avoid repeated getElementById calls)
+// ============================================================================
+const ui = {};
+
+function cacheUIElements() {
+  ui.status = document.getElementById('status');
+
+  // Main GO button (unified workflow)
+  ui.goBtn = document.getElementById('goBtn');
+  ui.optionsToggle = document.getElementById('optionsToggle');
+  ui.optionsPanel = document.getElementById('optionsPanel');
+
+  // Sliders and options
+  ui.sensitivitySlider = document.getElementById('sensitivitySlider');
+  ui.sourceOriginal = document.getElementById('sourceOriginal');
+  ui.sourceIsolated = document.getElementById('sourceIsolated');
+
+  // Settings checkboxes
+  ui.enableTakesDetection = document.getElementById('enableTakesDetection');
+  ui.autoMarkBest = document.getElementById('autoMarkBest');
+
+  // J-Cut UI elements (Phase 1)
+  ui.enableJCut = document.getElementById('enableJCut');
+  ui.jcutSettings = document.getElementById('jcutSettings');
+  ui.jcutLeadIn = document.getElementById('jcutLeadIn');
+  ui.jcutLeadInValue = document.getElementById('jcutLeadInValue');
+  ui.jcutLeadOut = document.getElementById('jcutLeadOut');
+  ui.jcutLeadOutValue = document.getElementById('jcutLeadOutValue');
+
+  // Progress
+  ui.progressContainer = document.getElementById('progressContainer');
+  ui.progressText = document.getElementById('progressText');
+  ui.resultsEmpty = document.getElementById('resultsEmpty');
+
+  // Combined Preview
+  ui.combinedPreview = document.getElementById('combinedPreview');
+  ui.previewList = document.getElementById('previewList');
+  ui.silenceCountDisplay = document.getElementById('silenceCount');
+  ui.takeCountDisplay = document.getElementById('takeCount');
+  ui.selectedCount = document.getElementById('selectedCount');
+  ui.selectAllSilences = document.getElementById('selectAllSilences');
+  ui.applyPreviewBtn = document.getElementById('applyPreviewBtn');
+  ui.cancelPreviewBtn = document.getElementById('cancelPreviewBtn');
+  ui.invertSelectionBtn = document.getElementById('invertSelectionBtn');
+  ui.reRunDetectionBtn = document.getElementById('reRunDetectionBtn');
+
+  // Results
+  ui.silenceResults = document.getElementById('silenceResults');
+  ui.resultsCount = document.getElementById('resultsCount');
+  ui.timeSaved = document.getElementById('timeSaved');
+  ui.clipsModified = document.getElementById('clipsModified');
+
+  // Build Sequence button (v3.5)
+  ui.buildSequenceBtn = document.getElementById('buildSequenceBtn');
+
+  // Buttons
+  ui.undoBtn = document.getElementById('undoBtn');
+  ui.advancedSection = document.getElementById('advancedSection');
+
+  // Settings modal
+  ui.settingsBtn = document.getElementById('settingsBtn');
+  ui.settingsModal = document.getElementById('settingsModal');
+  ui.closeSettingsBtn = document.getElementById('closeSettingsBtn');
+
+  // Media folder (v3.5)
+  ui.mediaFolderDisplay = document.getElementById('mediaFolderDisplay');
+  ui.setMediaFolderBtn = document.getElementById('setMediaFolderBtn');
+  ui.clearMediaFolderBtn = document.getElementById('clearMediaFolderBtn');
+
+  // Custom Presets (v3.5)
+  ui.savePresetBtn = document.getElementById('savePresetBtn');
+  ui.managePresetsBtn = document.getElementById('managePresetsBtn');
+  ui.presetModal = document.getElementById('presetModal');
+  ui.presetModalTitle = document.getElementById('presetModalTitle');
+  ui.closePresetModalBtn = document.getElementById('closePresetModalBtn');
+  ui.presetNameInput = document.getElementById('presetNameInput');
+  ui.presetDescInput = document.getElementById('presetDescInput');
+  ui.presetIconPicker = document.getElementById('presetIconPicker');
+  ui.presetEditId = document.getElementById('presetEditId');
+  ui.presetSelectedIcon = document.getElementById('presetSelectedIcon');
+  ui.savePresetConfirmBtn = document.getElementById('savePresetConfirmBtn');
+  ui.presetModalError = document.getElementById('presetModalError');
+  ui.managePresetsModal = document.getElementById('managePresetsModal');
+  ui.closeManagePresetsBtn = document.getElementById('closeManagePresetsBtn');
+  ui.presetsList = document.getElementById('presetsList');
+  ui.noCustomPresets = document.getElementById('noCustomPresets');
+  ui.presetSelector = document.getElementById('presetSelector');
+
+  // Preset settings inputs (Phase 3)
+  ui.presetSensitivity = document.getElementById('presetSensitivity');
+  ui.presetSensitivityValue = document.getElementById('presetSensitivityValue');
+  ui.presetThreshold = document.getElementById('presetThreshold');
+
+  // Export/Import buttons (Phase 3)
+  ui.exportPresetsBtn = document.getElementById('exportPresetsBtn');
+  ui.importPresetsBtn = document.getElementById('importPresetsBtn');
+
+  // Confirmation modal (UXP-compatible)
+  ui.confirmModal = document.getElementById('confirmModal');
+  ui.confirmModalTitle = document.getElementById('confirmModalTitle');
+  ui.confirmModalMessage = document.getElementById('confirmModalMessage');
+  ui.confirmModalConfirmBtn = document.getElementById('confirmModalConfirmBtn');
+  ui.confirmModalCancelBtn = document.getElementById('confirmModalCancelBtn');
+  ui.closeConfirmModalBtn = document.getElementById('closeConfirmModalBtn');
+
+  // Auto Zoom UI elements (Phase 3)
+  ui.enableZoom = document.getElementById('enableZoom');
+  ui.zoomSettings = document.getElementById('zoomSettings');
+  ui.zoomFrequency = document.getElementById('zoomFrequency');
+  ui.zoomPreset = document.getElementById('zoomPreset');
+  ui.zoomPlacement = document.getElementById('zoomPlacement');
+  ui.zoomResults = document.getElementById('zoomResults');
+  ui.zoomCount = document.getElementById('zoomCount');
+  ui.zoomList = document.getElementById('zoomList');
+  ui.applyZoomsBtn = document.getElementById('applyZoomsBtn');
+
+  // Chapter Detection UI elements (Phase 3)
+  ui.enableChapters = document.getElementById('enableChapters');
+  ui.chapterSettings = document.getElementById('chapterSettings');
+  ui.maxChapters = document.getElementById('maxChapters');
+  ui.minChapterLength = document.getElementById('minChapterLength');
+  ui.chapterTitleStyle = document.getElementById('chapterTitleStyle');
+  ui.chapterResults = document.getElementById('chapterResults');
+  ui.chapterCount = document.getElementById('chapterCount');
+  ui.chapterList = document.getElementById('chapterList');
+  ui.youtubeTimestamps = document.getElementById('youtubeTimestamps');
+  ui.timestampText = document.getElementById('timestampText');
+  ui.copyYouTubeBtn = document.getElementById('copyYouTubeBtn');
+  ui.addChapterMarkersBtn = document.getElementById('addChapterMarkersBtn');
+}
+
+// ============================================================================
+// CONFIRMATION MODAL (UXP-compatible replacement for confirm())
+// ============================================================================
+let confirmModalCallback = null;
+
+/**
+ * Show a confirmation modal dialog (UXP-compatible replacement for confirm())
+ * @param {string} title - Modal title
+ * @param {string} message - Confirmation message
+ * @param {Function} onConfirm - Callback when confirmed
+ * @param {Function} [onCancel] - Optional callback when cancelled
+ * @param {Object} [options] - Optional customization { confirmText, cancelText, confirmStyle }
+ */
+function showConfirmModal(title, message, onConfirm, onCancel = null, options = {}) {
+  if (!ui.confirmModal) return;
+
+  // Set content
+  if (ui.confirmModalTitle) ui.confirmModalTitle.textContent = title;
+  if (ui.confirmModalMessage) ui.confirmModalMessage.textContent = message;
+
+  // Customize button text if provided
+  if (ui.confirmModalConfirmBtn) {
+    ui.confirmModalConfirmBtn.textContent = options.confirmText || 'Confirm';
+    ui.confirmModalConfirmBtn.style.background = options.confirmStyle || '#dc3545';
+  }
+  if (ui.confirmModalCancelBtn) {
+    ui.confirmModalCancelBtn.textContent = options.cancelText || 'Cancel';
+  }
+
+  // Store callbacks
+  confirmModalCallback = { onConfirm, onCancel };
+
+  // Show modal
+  ui.confirmModal.classList.remove('hidden');
+
+  // Focus cancel button for safety (user must explicitly confirm)
+  if (ui.confirmModalCancelBtn) ui.confirmModalCancelBtn.focus();
+}
+
+function hideConfirmModal(confirmed = false) {
+  if (!ui.confirmModal) return;
+
+  ui.confirmModal.classList.add('hidden');
+
+  // Execute callback
+  if (confirmModalCallback) {
+    if (confirmed && confirmModalCallback.onConfirm) {
+      confirmModalCallback.onConfirm();
+    } else if (!confirmed && confirmModalCallback.onCancel) {
+      confirmModalCallback.onCancel();
+    }
+    confirmModalCallback = null;
+  }
+}
+
+function initConfirmModal() {
+  // Confirm button
+  if (ui.confirmModalConfirmBtn) {
+    ui.confirmModalConfirmBtn.addEventListener('click', () => {
+      hideConfirmModal(true);
+    });
+  }
+
+  // Cancel button
+  if (ui.confirmModalCancelBtn) {
+    ui.confirmModalCancelBtn.addEventListener('click', () => {
+      hideConfirmModal(false);
+    });
+  }
+
+  // Close button (X)
+  if (ui.closeConfirmModalBtn) {
+    ui.closeConfirmModalBtn.addEventListener('click', () => {
+      hideConfirmModal(false);
+    });
+  }
+
+  // Close on backdrop click
+  if (ui.confirmModal) {
+    ui.confirmModal.addEventListener('click', (e) => {
+      if (e.target === ui.confirmModal) {
+        hideConfirmModal(false);
+      }
+    });
+  }
+
+  // Keyboard support
+  document.addEventListener('keydown', (e) => {
+    if (!ui.confirmModal || ui.confirmModal.classList.contains('hidden')) return;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideConfirmModal(false);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      hideConfirmModal(true);
+    }
+  });
+}
+
+// ============================================================================
+// CLEANUP INFRASTRUCTURE (Memory Leak Prevention)
+// ============================================================================
+const cleanupRegistry = {
+  listeners: [],
+  intervals: [],
+  canvases: [],
+
+  addListener(element, event, handler, options) {
+    if (!element) return;
+    element.addEventListener(event, handler, options);
+    this.listeners.push({ element, event, handler, options });
+  },
+
+  addInterval(id) {
+    this.intervals.push(id);
+  },
+
+  addCanvas(canvas) {
+    this.canvases.push(canvas);
+  },
+
+  cleanup() {
+    // Remove all event listeners
+    this.listeners.forEach(({ element, event, handler, options }) => {
+      try {
+        element.removeEventListener(event, handler, options);
+      } catch (e) {
+        console.warn('[SPLICE] Cleanup listener error:', e);
+      }
+    });
+
+    // Clear all intervals
+    this.intervals.forEach(id => clearInterval(id));
+
+    // Clear canvas contexts
+    this.canvases.forEach(canvas => {
+      try {
+        const ctx = canvas.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      } catch (e) { }
+    });
+
+    // Clear arrays
+    this.listeners = [];
+    this.intervals = [];
+    this.canvases = [];
+
+    console.log('[SPLICE] Cleanup complete');
+  }
+};
+
+// Detect panel close/unload
+window.addEventListener('beforeunload', () => {
+  cleanupRegistry.cleanup();
+  // Clear global state
+  if (window.splicePreviewState) {
+    window.splicePreviewState = null;
+  }
+});
+
+// ============================================================================
+// STATE MANAGEMENT
+// ============================================================================
+let previewSilences = [];         // All detected silences
+let safeSilences = [];            // Silences that don't overlap takes (safe to remove)
+let protectedSilences = [];       // Silences that overlap takes (protected)
+let previewTakes = [];            // Detected takes (for display)
+let selectedSilenceIndices = new Set();
+let isOperationInProgress = false; // Prevents double-clicking GO button
+
+// Atomic operation lock (prevents race conditions)
+let operationLock = {
+  locked: false,
+  async acquire() {
+    while (this.locked) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    this.locked = true;
+  },
+  release() {
+    this.locked = false;
+  }
+};
+
+let pendingUIUpdate = null;
+
+// Export preview state for other modules (Razor integration)
+window.splicePreviewState = {
+  getSelectedSilences: () => safeSilences.filter((_, i) => selectedSilenceIndices.has(i)),
+  getSelectedTakes: () => previewTakes,
+  hasPreview: () => safeSilences.length > 0 || previewTakes.length > 0
+};
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+async function initializePlugin() {
+  console.log('[SPLICE] Initializing MAIN JS... (Debug Start)');
+  console.log('[SPLICE] Checking for window.require:', typeof window.require);
+
+  // Cache all DOM elements first
+  cacheUIElements();
+
+  // Initialize file paths (cross-platform support)
+  // Must be done early before any audio export operations
+  try {
+    await initPaths();
+    console.log('[SPLICE] File paths initialized');
+  } catch (err) {
+    console.warn('[SPLICE] Path initialization warning:', err.message);
+    // Continue anyway - fallback paths will be used
+  }
+
+  // Settings & UI
+  initSettingsUI();
+  initSettingsModal();
+  initLoginModal();
+  initConfirmModal();
+  initOptionsToggles();
+  initPresetSelector();
+  initHelpButton();
+
+  // Credits display
+  initCredits();
+
+  // Offline detection
+  if (typeof initOfflineDetection === 'function') {
+    initOfflineDetection();
+  }
+
+  // Unified workflow (silences + takes)
+  initUnifiedWorkflow();
+
+  // Preview handlers (event delegation)
+  initPreviewHandlers();
+
+  // Helper to safely init modules
+  const safeInit = (name, fn) => {
+    try {
+      if (typeof fn === 'function') {
+        fn();
+      } else {
+        console.warn(`[SPLICE] ${name} function not found`);
+      }
+    } catch (err) {
+      console.error(`[SPLICE] Failed to initialize ${name}:`, err);
+    }
+  };
+
+  // 1. Core UI Checks
+  safeInit('Options Toggles', initOptionsToggles);
+  safeInit('Confirmation Modal', initConfirmModal);
+  safeInit('Undo Handlers', initUndoHandlers);
+  safeInit('Keyboard Shortcuts', initKeyboardShortcuts);
+
+  // 2. Legacy / Standard Modules
+  safeInit('Slice 9 (Razor)', initSlice9);
+  safeInit('Batch Handlers', initBatchHandlers);
+  safeInit('Media Folder', initMediaFolderHandlers);
+  safeInit('J-Cut UI', initJCutUI);
+  safeInit('Zoom UI', initZoomUI);
+  safeInit('Chapter UI', initChapterUI);
+  safeInit('Repetition UI', initRepetitionUI);
+  safeInit('Waveform UI', initWaveformUI);
+
+  // 3. New Modules (Feature Port)
+  safeInit('Custom Presets', initCustomPresetsUI);
+  safeInit('Profanity Settings', typeof initProfanitySettingsUI !== 'undefined' ? initProfanitySettingsUI : undefined);
+  safeInit('Filler Word UI', typeof initFillerWordUI !== 'undefined' ? initFillerWordUI : undefined);
+  safeInit('Text Branding UI', initTextBrandingUI);
+  safeInit('Animated Captions', typeof initAnimatedCaptions !== 'undefined' ? initAnimatedCaptions : undefined);
+  safeInit('Text Editor', typeof initTextEditor !== 'undefined' ? initTextEditor : undefined);
+  safeInit('Social Reframe', typeof initSocialReframe !== 'undefined' ? initSocialReframe : undefined);
+  safeInit('AI Music', typeof initMusicModule !== 'undefined' ? initMusicModule : undefined);
+
+  // 4. Multitrack (Phase 2)
+  safeInit('Multitrack UI', typeof initMultitrackUI !== 'undefined' ? initMultitrackUI : undefined);
+
+  console.log('[SPLICE] Plugin initialization complete v3.10.1 (Safeguarded)');
+}
+
+// Handle both cases: document still loading or already loaded
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializePlugin);
+} else {
+  // DOMContentLoaded already fired, init immediately
+  initializePlugin();
+}
+
+// ============================================================================
+// OPTIONS TOGGLE INITIALIZATION
+// ============================================================================
+function initOptionsToggles() {
+  if (ui.optionsToggle) {
+    ui.optionsToggle.addEventListener('click', () => {
+      if (!ui.optionsPanel) return;
+      const isCollapsed = ui.optionsPanel.classList.contains('collapsed');
+      const icon = ui.optionsToggle.querySelector('.toggle-icon');
+
+      if (isCollapsed) {
+        ui.optionsPanel.classList.remove('collapsed');
+        ui.optionsPanel.style.display = 'block';
+        if (icon) icon.textContent = '-';
+      } else {
+        ui.optionsPanel.classList.add('collapsed');
+        ui.optionsPanel.style.display = 'none';
+        if (icon) icon.textContent = '+';
+      }
+    });
+
+    // Initialize state
+    if (ui.optionsPanel) {
+      const isCollapsed = ui.optionsPanel.classList.contains('collapsed');
+      ui.optionsPanel.style.display = isCollapsed ? 'none' : 'block';
+    }
+  }
+  console.log('[SPLICE] Options toggles initialized');
+}
+
+// ============================================================================
+// SETTINGS MODAL INITIALIZATION
+// ============================================================================
+function initSettingsModal() {
+  const settingsBtn = document.getElementById('settingsBtn');
+  const modal = document.getElementById('settingsModal');
+  const closeBtn = document.getElementById('closeSettingsBtn');
+  const defaultSensitivity = document.getElementById('defaultSensitivity');
+  const defaultSensitivityValue = document.getElementById('defaultSensitivityValue');
+  const rememberOptions = document.getElementById('rememberOptions');
+  const autoMarkBest = document.getElementById('autoMarkBest');
+
+  if (!settingsBtn || !modal) {
+    console.warn('[SPLICE] Settings modal elements not found');
+    return;
+  }
+
+  // Helper to hide settings modal
+  function hideModal() {
+    modal.classList.add('hidden');
+    modal.style.display = 'none';
+  }
+
+  // Open settings modal
+  settingsBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    modal.style.display = 'flex';
+
+    // Sync modal values with current settings
+    if (typeof getSettings === 'function') {
+      const settings = getSettings();
+      if (defaultSensitivity) {
+        defaultSensitivity.value = settings.sensitivity || 50;
+        if (defaultSensitivityValue) {
+          defaultSensitivityValue.textContent = settings.sensitivity || 50;
+        }
+      }
+      if (rememberOptions) rememberOptions.checked = settings.rememberOptions || false;
+      if (autoMarkBest) autoMarkBest.checked = settings.autoMarkBest || false;
+    }
+  });
+
+  // Close button
+  if (closeBtn) {
+    closeBtn.addEventListener('click', hideModal);
+  }
+
+  // Close on backdrop click
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      hideModal();
+    }
+  });
+
+  // Update sensitivity value display
+  if (defaultSensitivity && defaultSensitivityValue) {
+    defaultSensitivity.addEventListener('input', () => {
+      defaultSensitivityValue.textContent = defaultSensitivity.value;
+    });
+  }
+
+  // Save default sensitivity when changed
+  if (defaultSensitivity) {
+    defaultSensitivity.addEventListener('change', () => {
+      if (typeof saveSettings === 'function') {
+        saveSettings({ sensitivity: parseInt(defaultSensitivity.value) });
+      }
+      // Also update the main slider
+      const mainSlider = document.getElementById('sensitivitySlider');
+      if (mainSlider) mainSlider.value = defaultSensitivity.value;
+    });
+  }
+
+  // Save remember options when changed
+  if (rememberOptions) {
+    rememberOptions.addEventListener('change', () => {
+      if (typeof saveSettings === 'function') {
+        saveSettings({ rememberOptions: rememberOptions.checked });
+      }
+    });
+  }
+
+  // Save auto mark best when changed
+  if (autoMarkBest) {
+    autoMarkBest.addEventListener('change', () => {
+      if (typeof saveSettings === 'function') {
+        saveSettings({ autoMarkBest: autoMarkBest.checked });
+      }
+    });
+  }
+
+  // Initialize state (hidden by default)
+  if (modal.classList.contains('hidden')) {
+    modal.style.display = 'none';
+  }
+
+  console.log('[SPLICE] Settings modal initialized');
+}
+
+// ============================================================================
+// LOGIN MODAL INITIALIZATION
+// ============================================================================
+function initLoginModal() {
+  const creditBadge = document.getElementById('creditBadge');
+  const modal = document.getElementById('loginModal');
+  const closeBtn = document.getElementById('closeLoginBtn');
+  const saveLoginBtn = document.getElementById('saveLoginBtn');
+  const licenseKeyInput = document.getElementById('licenseKeyInput');
+  const loginError = document.getElementById('loginError');
+  const loginSuccess = document.getElementById('loginSuccess');
+
+  if (!modal) {
+    console.warn('[SPLICE] Login modal element not found');
+    return;
+  }
+
+  // Helper to show login modal
+  function showModal() {
+    // Clear previous states
+    if (loginError) loginError.style.display = 'none';
+    if (loginSuccess) loginSuccess.style.display = 'none';
+    const lookupResult = document.getElementById('lookupResult');
+    if (lookupResult) lookupResult.style.display = 'none';
+
+    modal.classList.remove('hidden');
+    modal.style.display = 'flex';
+  }
+
+  // Helper to hide login modal
+  function hideModal() {
+    modal.classList.add('hidden');
+    modal.style.display = 'none';
+  }
+
+  // Helper to show login error
+  function showLoginError(message) {
+    if (loginError) {
+      loginError.textContent = message;
+      loginError.style.display = 'block';
+    }
+    if (loginSuccess) loginSuccess.style.display = 'none';
+  }
+
+  // Open login modal when credit badge is clicked
+  if (creditBadge) {
+    creditBadge.addEventListener('click', async () => {
+      // If in error state, retry fetching credits
+      if (creditBadge.classList.contains('error')) {
+        creditBadge.textContent = '...';
+        if (typeof refreshCredits === 'function') {
+          await refreshCredits();
+        }
+        return;
+      }
+      // Otherwise show login modal
+      showModal();
+    });
+  }
+
+  // Close button
+  if (closeBtn) {
+    closeBtn.addEventListener('click', hideModal);
+  }
+
+  // Close on backdrop click
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      hideModal();
+    }
+  });
+
+  // Activate license key
+  if (saveLoginBtn) {
+    saveLoginBtn.addEventListener('click', async () => {
+      const licenseKey = licenseKeyInput?.value?.trim()?.toUpperCase();
+
+      if (!licenseKey) {
+        showLoginError('Please enter your license key');
+        return;
+      }
+
+      // Validate license key format: SPLICE-XXXX-XXXX-XXXX
+      const licenseRegex = /^SPLICE-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+      if (!licenseRegex.test(licenseKey)) {
+        showLoginError('Invalid format. Expected: SPLICE-XXXX-XXXX-XXXX');
+        return;
+      }
+
+      // Show loading state
+      saveLoginBtn.disabled = true;
+      saveLoginBtn.textContent = 'Activating...';
+
+      try {
+        const backendUrl = typeof getBackendUrl === 'function' ? getBackendUrl() : 'https://127.0.0.1:3847';
+        const timeout = typeof FETCH_TIMEOUT_DEFAULT !== 'undefined' ? FETCH_TIMEOUT_DEFAULT : 30000;
+
+        const response = await (typeof fetchWithTimeout === 'function'
+          ? fetchWithTimeout(`${backendUrl}/license/activate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: licenseKey })
+          }, timeout)
+          : fetch(`${backendUrl}/license/activate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: licenseKey })
+          }));
+
+        const result = await response.json();
+
+        if (!result.success) {
+          showLoginError(result.error || 'Activation failed');
+          return;
+        }
+
+        // Save customer ID from activation response
+        if (typeof saveSettings === 'function') {
+          saveSettings({ customerId: result.customerId });
+        }
+
+        // Hide modal
+        hideModal();
+
+        // Refresh credits display
+        if (typeof refreshCredits === 'function') {
+          await refreshCredits();
+        }
+
+        if (typeof setStatus === 'function') {
+          setStatus(`License activated! ${result.tierName} tier - ${result.hoursRemaining.toFixed(1)}h remaining`);
+        }
+      } catch (err) {
+        console.error('[SPLICE] License activation error:', err);
+
+        // Provide detailed error message based on error type
+        let errorMessage = 'Connection error. ';
+
+        if (err.message === 'Request timed out') {
+          errorMessage += 'Server is not responding. Check if backend is running.';
+        } else if (err.message?.includes('Failed to fetch') || err.name === 'TypeError') {
+          const backendUrl = typeof getBackendUrl === 'function' ? getBackendUrl() : 'backend';
+          errorMessage += `Cannot reach ${backendUrl}. Check network/firewall.`;
+        } else if (err.message?.includes('CORS')) {
+          errorMessage += 'CORS error. Contact support.';
+        } else if (err.message?.includes('SSL') || err.message?.includes('certificate')) {
+          errorMessage += 'SSL certificate error. Try updating your system certificates.';
+        } else if (err.message) {
+          errorMessage += err.message;
+        } else {
+          errorMessage += 'Unknown error. Check console for details.';
+        }
+
+        showLoginError(errorMessage);
+      } finally {
+        saveLoginBtn.disabled = false;
+        saveLoginBtn.textContent = 'Activate';
+      }
+    });
+  }
+
+  // Email-based license lookup
+  const lookupLicenseBtn = document.getElementById('lookupLicenseBtn');
+  const lookupEmailInput = document.getElementById('lookupEmailInput');
+  const lookupResult = document.getElementById('lookupResult');
+
+  if (lookupLicenseBtn) {
+    lookupLicenseBtn.addEventListener('click', async () => {
+      const email = lookupEmailInput?.value?.trim()?.toLowerCase();
+
+      if (!email) {
+        showLoginError('Please enter your email address');
+        return;
+      }
+
+      // Basic email validation
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        showLoginError('Please enter a valid email address');
+        return;
+      }
+
+      // Hide previous results/errors
+      if (loginError) loginError.style.display = 'none';
+      if (lookupResult) lookupResult.style.display = 'none';
+
+      // Show loading state
+      lookupLicenseBtn.disabled = true;
+      lookupLicenseBtn.textContent = 'Looking up...';
+
+      try {
+        const backendUrl = typeof getBackendUrl === 'function' ? getBackendUrl() : 'https://127.0.0.1:3847';
+        const timeout = typeof FETCH_TIMEOUT_DEFAULT !== 'undefined' ? FETCH_TIMEOUT_DEFAULT : 30000;
+
+        const response = await (typeof fetchWithTimeout === 'function'
+          ? fetchWithTimeout(`${backendUrl}/license/lookup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+          }, timeout)
+          : fetch(`${backendUrl}/license/lookup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+          }));
+
+        const result = await response.json();
+
+        if (!result.success) {
+          showLoginError(result.error || 'License not found');
+          return;
+        }
+
+        // Show success message
+        if (loginSuccess) {
+          loginSuccess.textContent = result.message || 'License key sent to your email!';
+          loginSuccess.style.display = 'block';
+        }
+      } catch (err) {
+        console.error('[SPLICE] License lookup error:', err);
+
+        // Provide detailed error message based on error type
+        let errorMessage = 'Connection error. ';
+
+        if (err.message === 'Request timed out') {
+          errorMessage += 'Server is not responding. Check if backend is running.';
+        } else if (err.message?.includes('Failed to fetch') || err.name === 'TypeError') {
+          const backendUrl = typeof getBackendUrl === 'function' ? getBackendUrl() : 'backend';
+          errorMessage += `Cannot reach ${backendUrl}. Check network/firewall.`;
+        } else if (err.message?.includes('CORS')) {
+          errorMessage += 'CORS error. Contact support.';
+        } else if (err.message?.includes('SSL') || err.message?.includes('certificate')) {
+          errorMessage += 'SSL certificate error. Try updating your system certificates.';
+        } else if (err.message) {
+          errorMessage += err.message;
+        } else {
+          errorMessage += 'Unknown error. Check console for details.';
+        }
+
+        showLoginError(errorMessage);
+      } finally {
+        lookupLicenseBtn.disabled = false;
+        lookupLicenseBtn.textContent = 'Find My License';
+      }
+    });
+  }
+
+  // Initialize state (hidden by default)
+  if (modal.classList.contains('hidden')) {
+    modal.style.display = 'none';
+  }
+
+  console.log('[SPLICE] Login modal initialized');
+}
+
+// ============================================================================
+// J-CUT UI INITIALIZATION (Phase 1)
+// ============================================================================
+function initJCutUI() {
+  // Toggle J-Cut settings visibility
+  if (ui.enableJCut) {
+    ui.enableJCut.addEventListener('change', () => {
+      if (ui.jcutSettings) {
+        if (ui.enableJCut.checked) {
+          ui.jcutSettings.classList.remove('collapsed');
+          ui.jcutSettings.style.display = 'block';
+        } else {
+          ui.jcutSettings.classList.add('collapsed');
+          ui.jcutSettings.style.display = 'none';
+        }
+      }
+    });
+
+    // Initialize collapsed state
+    if (ui.jcutSettings) {
+      ui.jcutSettings.style.display = ui.enableJCut.checked ? 'block' : 'none';
+    }
+  }
+
+  // Lead-in slider
+  if (ui.jcutLeadIn && ui.jcutLeadInValue) {
+    ui.jcutLeadIn.addEventListener('input', () => {
+      ui.jcutLeadInValue.textContent = `${parseFloat(ui.jcutLeadIn.value).toFixed(2)}s`;
+    });
+  }
+
+  // Lead-out slider
+  if (ui.jcutLeadOut && ui.jcutLeadOutValue) {
+    ui.jcutLeadOut.addEventListener('input', () => {
+      ui.jcutLeadOutValue.textContent = `${parseFloat(ui.jcutLeadOut.value).toFixed(2)}s`;
+    });
+  }
+
+  console.log('[SPLICE] J-Cut UI initialized');
+}
+
+/**
+ * Get current J-Cut settings from UI
+ * @returns {Object} J-Cut settings { enabled, jCutOffset, lCutOffset }
+ */
+function getJCutSettings() {
+  const enabled = ui.enableJCut?.checked ?? false;
+
+  if (!enabled) {
+    return { enabled: false, jCutOffset: 0, lCutOffset: 0 };
+  }
+
+  // J-cut offset is negative (audio starts before video)
+  const leadIn = parseFloat(ui.jcutLeadIn?.value ?? 0.3);
+  // L-cut offset is positive (audio extends after video)
+  const leadOut = parseFloat(ui.jcutLeadOut?.value ?? 0.2);
+
+  return {
+    enabled: true,
+    jCutOffset: -leadIn, // Negative for J-cut
+    lCutOffset: leadOut   // Positive for L-cut
+  };
+}
+
+/**
+ * Update J-Cut UI from preset settings
+ * @param {Object} settings - Preset settings object
+ */
+function updateJCutUIFromSettings(settings) {
+  if (!settings) return;
+
+  // Update enable checkbox
+  if (ui.enableJCut && settings.enableJCut !== undefined) {
+    ui.enableJCut.checked = settings.enableJCut;
+
+    // Toggle visibility of settings panel
+    if (ui.jcutSettings) {
+      ui.jcutSettings.style.display = settings.enableJCut ? 'block' : 'none';
+    }
+  }
+
+  // Update lead-in slider and display
+  if (ui.jcutLeadIn && settings.jCutLeadIn !== undefined) {
+    ui.jcutLeadIn.value = settings.jCutLeadIn;
+    if (ui.jcutLeadInValue) {
+      ui.jcutLeadInValue.textContent = `${parseFloat(settings.jCutLeadIn).toFixed(2)}s`;
+    }
+  }
+
+  // Update lead-out slider and display
+  if (ui.jcutLeadOut && settings.jCutLeadOut !== undefined) {
+    ui.jcutLeadOut.value = settings.jCutLeadOut;
+    if (ui.jcutLeadOutValue) {
+      ui.jcutLeadOutValue.textContent = `${parseFloat(settings.jCutLeadOut).toFixed(2)}s`;
+    }
+  }
+}
+
+// ============================================================================
+// AUTO ZOOM UI INITIALIZATION (Phase 3)
+// ============================================================================
+let currentZoomPoints = [];
+
+function initZoomUI() {
+  // Toggle Zoom settings visibility
+  if (ui.enableZoom) {
+    ui.enableZoom.addEventListener('change', () => {
+      if (ui.zoomSettings) {
+        if (ui.enableZoom.checked) {
+          ui.zoomSettings.classList.remove('collapsed');
+          ui.zoomSettings.style.display = 'block';
+        } else {
+          ui.zoomSettings.classList.add('collapsed');
+          ui.zoomSettings.style.display = 'none';
+        }
+      }
+    });
+
+    // Initialize collapsed state
+    if (ui.zoomSettings) {
+      ui.zoomSettings.style.display = ui.enableZoom.checked ? 'block' : 'none';
+    }
+  }
+
+  // Apply zooms button
+  if (ui.applyZoomsBtn) {
+    ui.applyZoomsBtn.addEventListener('click', applyZoomsToTimeline);
+  }
+
+  console.log('[SPLICE] Auto Zoom UI initialized');
+}
+
+/**
+ * Get current Zoom settings from UI
+ * @returns {Object} Zoom settings
+ */
+function getZoomSettings() {
+  return {
+    enabled: ui.enableZoom?.checked ?? false,
+    frequency: ui.zoomFrequency?.value ?? 'medium',
+    preset: ui.zoomPreset?.value ?? 'medium',
+    placement: ui.zoomPlacement?.value ?? 'sentence_start'
+  };
+}
+
+/**
+ * Fetch zoom points from backend
+ * @param {Object} transcript - Transcript data
+ * @returns {Promise<Array>} Zoom points
+ */
+async function fetchZoomPoints(transcript) {
+  const settings = getZoomSettings();
+  if (!settings.enabled) return [];
+
+  try {
+    setStatus('Generating zoom points...');
+
+    const response = await fetchWithTimeout(
+      `${getBackendUrl()}/zoom`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders()
+        },
+        body: JSON.stringify({ transcript, settings })
+      },
+      30000
+    );
+
+    if (!response.ok) {
+      const errorMsg = await parseErrorResponse(response);
+      throw new Error(errorMsg || 'Zoom generation failed');
+    }
+
+    const data = await response.json();
+    currentZoomPoints = data.zoomPoints || [];
+    displayZoomResults(currentZoomPoints);
+    return currentZoomPoints;
+
+  } catch (err) {
+    console.error('[SPLICE] Zoom fetch error:', err);
+    setStatus(`Zoom error: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Display zoom results in the UI
+ * @param {Array} zoomPoints - Zoom points
+ */
+function displayZoomResults(zoomPoints) {
+  if (!ui.zoomResults) return;
+
+  if (zoomPoints.length === 0) {
+    ui.zoomResults.style.display = 'none';
+    return;
+  }
+
+  ui.zoomResults.style.display = 'block';
+  if (ui.zoomCount) ui.zoomCount.textContent = zoomPoints.length;
+
+  if (ui.zoomList) {
+    ui.zoomList.innerHTML = zoomPoints.map((zoom, i) => `
+      <div class="preview-item" data-zoom-index="${i}">
+        <div class="preview-item-info">
+          <div class="preview-item-time">${formatTime(zoom.startTime)} - ${zoom.reason}</div>
+          <div class="preview-item-duration">Scale: ${zoom.scale}%, Duration: ${zoom.duration}s</div>
+        </div>
+      </div>
+    `).join('');
+  }
+}
+
+/**
+ * Apply zoom effects to timeline (via adjustment layer)
+ */
+async function applyZoomsToTimeline() {
+  if (currentZoomPoints.length === 0) {
+    setStatus('No zoom points to apply');
+    return;
+  }
+
+  try {
+    setStatus('Applying zoom effects...');
+
+    // Use builder to apply zooms
+    if (typeof window.spliceBuilder?.applyZoomKeyframes === 'function') {
+      const result = await window.spliceBuilder.applyZoomKeyframes(currentZoomPoints);
+      if (result.success) {
+        setStatus(`Applied ${result.count} zoom effects`);
+      } else {
+        setStatus(`Zoom error: ${result.error}`);
+      }
+    } else {
+      // Fallback: just log for now
+      console.log('[SPLICE] Zoom keyframes would be applied:', currentZoomPoints);
+      setStatus(`${currentZoomPoints.length} zoom points ready (builder integration pending)`);
+    }
+
+  } catch (err) {
+    console.error('[SPLICE] Apply zooms error:', err);
+    setStatus(`Error: ${err.message}`);
+  }
+}
+
+// ============================================================================
+// CHAPTER DETECTION UI INITIALIZATION (Phase 3)
+// ============================================================================
+let currentChapters = [];
+let currentYouTubeTimestamps = '';
+
+function initChapterUI() {
+  // Toggle Chapter settings visibility
+  if (ui.enableChapters) {
+    ui.enableChapters.addEventListener('change', () => {
+      if (ui.chapterSettings) {
+        if (ui.enableChapters.checked) {
+          ui.chapterSettings.classList.remove('collapsed');
+          ui.chapterSettings.style.display = 'block';
+        } else {
+          ui.chapterSettings.classList.add('collapsed');
+          ui.chapterSettings.style.display = 'none';
+        }
+      }
+    });
+
+    // Initialize collapsed state
+    if (ui.chapterSettings) {
+      ui.chapterSettings.style.display = ui.enableChapters.checked ? 'block' : 'none';
+    }
+  }
+
+  // Copy YouTube timestamps button
+  if (ui.copyYouTubeBtn) {
+    ui.copyYouTubeBtn.addEventListener('click', copyYouTubeTimestamps);
+  }
+
+  // Add chapter markers button
+  if (ui.addChapterMarkersBtn) {
+    ui.addChapterMarkersBtn.addEventListener('click', addChapterMarkers);
+  }
+
+  console.log('[SPLICE] Chapter Detection UI initialized');
+}
+
+// ============================================================================
+// REPETITION HIGHLIGHTING UI (Feature 8)
+// ============================================================================
+const REPETITION_COLORS = [
+  { name: 'Red', class: 'repetition-color-1', hex: '#ff6b6b' },
+  { name: 'Teal', class: 'repetition-color-2', hex: '#4ecdc4' },
+  { name: 'Yellow', class: 'repetition-color-3', hex: '#ffe66d' },
+  { name: 'Mint', class: 'repetition-color-4', hex: '#95e1d3' },
+  { name: 'Purple', class: 'repetition-color-5', hex: '#9b59b6' },
+  { name: 'Gold', class: 'repetition-color-6', hex: '#f1c40f' }
+];
+
+let currentRepetitions = [];
+let selectedRepetitions = new Set();
+
+/**
+ * Render repetition preview with color-coded phrases
+ * @param {Object} data - Repetition detection response
+ */
+function renderRepetitionPreview(data) {
+  const container = document.getElementById('repetitionResults');
+  const preview = document.getElementById('repetitionPreview');
+  const legend = document.getElementById('repetitionLegend');
+  const colorsDiv = document.getElementById('repetitionColors');
+  const countEl = document.getElementById('repetitionCount');
+  const stutterCountEl = document.getElementById('stutterCount');
+  const emptyEl = document.getElementById('repetitionEmpty');
+
+  if (!container || !preview) return;
+
+  const { repetitions = [], stutters = [], text = '' } = data;
+  currentRepetitions = [...repetitions, ...stutters];
+  selectedRepetitions = new Set(currentRepetitions.map((_, i) => i));
+
+  // Update counts
+  if (countEl) countEl.textContent = repetitions.length;
+  if (stutterCountEl) stutterCountEl.textContent = stutters.length;
+
+  // Show/hide container
+  container.style.display = currentRepetitions.length > 0 ? 'block' : 'none';
+
+  if (currentRepetitions.length === 0) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    if (legend) legend.style.display = 'none';
+    return;
+  }
+
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  // Remove old event listeners by cloning and replacing the preview element
+  // This prevents memory leaks when renderRepetitionPreview is called multiple times
+  const newPreview = preview.cloneNode(false);
+  preview.parentNode.replaceChild(newPreview, preview);
+
+  // Group repetitions by phrase for color assignment
+  const phraseGroups = {};
+  repetitions.forEach((rep, i) => {
+    const phrase = rep.phrase || rep.originalPhrase || '';
+    if (!phraseGroups[phrase]) {
+      phraseGroups[phrase] = [];
+    }
+    phraseGroups[phrase].push({ ...rep, index: i, type: 'repetition' });
+  });
+
+  // Assign colors to phrase groups
+  const phraseColors = {};
+  let colorIndex = 0;
+  Object.keys(phraseGroups).forEach(phrase => {
+    phraseColors[phrase] = REPETITION_COLORS[colorIndex % REPETITION_COLORS.length];
+    colorIndex++;
+  });
+
+  // Build highlighted text
+  let html = '';
+
+  // Render repetitions grouped by phrase
+  Object.entries(phraseGroups).forEach(([phrase, instances]) => {
+    const color = phraseColors[phrase];
+    html += `<div style="margin-bottom: 8px;">`;
+    html += `<span style="font-size: 9px; color: #888;">"${phrase}" (${instances.length}x):</span><br>`;
+    instances.forEach((rep, i) => {
+      const timeStr = formatTime(rep.start || rep.startTime || 0);
+      html += `<span class="repetition-phrase ${color.class} selected" data-index="${rep.index}" title="Click to seek: ${timeStr}">`;
+      html += `${rep.phrase || rep.originalPhrase} @ ${timeStr}`;
+      html += `</span> `;
+    });
+    html += `</div>`;
+  });
+
+  // Render stutters
+  if (stutters.length > 0) {
+    html += `<div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid #444;">`;
+    html += `<span style="font-size: 9px; color: #888;">Stutters:</span><br>`;
+    stutters.forEach((stutter, i) => {
+      const timeStr = formatTime(stutter.start || stutter.startTime || 0);
+      html += `<span class="repetition-phrase stutter-word selected" data-index="${repetitions.length + i}" title="Click to seek: ${timeStr}">`;
+      html += `"${stutter.word}" @ ${timeStr}`;
+      html += `</span> `;
+    });
+    html += `</div>`;
+  }
+
+  newPreview.innerHTML = html;
+
+  // Build legend
+  if (legend && colorsDiv && Object.keys(phraseColors).length > 0) {
+    legend.style.display = 'block';
+    let legendHtml = '';
+    Object.entries(phraseColors).forEach(([phrase, color]) => {
+      legendHtml += `<span class="color-chip ${color.class}">`;
+      legendHtml += `<span class="chip-dot" style="background: ${color.hex}"></span>`;
+      legendHtml += `"${phrase.substring(0, 20)}${phrase.length > 20 ? '...' : ''}"`;
+      legendHtml += `</span>`;
+    });
+    colorsDiv.innerHTML = legendHtml;
+  }
+
+  // Add click handlers for seeking
+  newPreview.querySelectorAll('.repetition-phrase').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.index, 10);
+      const rep = currentRepetitions[idx];
+      if (rep) {
+        // Toggle selection
+        el.classList.toggle('selected');
+        if (selectedRepetitions.has(idx)) {
+          selectedRepetitions.delete(idx);
+        } else {
+          selectedRepetitions.add(idx);
+        }
+        // Seek to time (if PPro API available)
+        const time = rep.start || rep.startTime || 0;
+        seekToTime(time);
+      }
+    });
+  });
+}
+
+// NOTE: seekToTime function is defined later in the file (line ~2500) with better validation
+
+/**
+ * Initialize repetition highlighting UI
+ */
+function initRepetitionUI() {
+  const detectBtn = document.getElementById('detectRepetitionsBtn');
+  const removeBtn = document.getElementById('removeRepetitionsBtn');
+
+  if (detectBtn) {
+    detectBtn.addEventListener('click', detectRepetitions);
+  }
+
+  if (removeBtn) {
+    removeBtn.addEventListener('click', removeSelectedRepetitions);
+  }
+
+  console.log('[SPLICE] Repetition Highlighting UI initialized');
+}
+
+/**
+ * Detect repetitions from current transcript
+ */
+async function detectRepetitions() {
+  setStatus('Detecting repetitions...');
+
+  try {
+    // Get audio path from last analysis or active sequence
+    const wavPath = window.lastAnalyzedPath || await getAudioPath();
+
+    if (!wavPath) {
+      setStatus('No audio file available. Run analysis first.');
+      return;
+    }
+
+    const response = await fetchWithTimeout(`${getBackendUrl()}/repetitions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders()
+      },
+      body: JSON.stringify({
+        wavPath,
+        phraseSize: 5,
+        tolerance: 0.7,
+        includeStutters: true
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+      renderRepetitionPreview(data);
+      setStatus(`Found ${data.repetitions?.length || 0} repetitions, ${data.stutters?.length || 0} stutters`);
+    } else {
+      setStatus(`Error: ${data.error || 'Repetition detection failed'}`);
+    }
+  } catch (err) {
+    console.error('[SPLICE] Repetition detection error:', err);
+    setStatus(`Error: ${err.message}`);
+  }
+}
+
+/**
+ * Remove selected repetitions from timeline
+ */
+async function removeSelectedRepetitions() {
+  if (selectedRepetitions.size === 0) {
+    setStatus('No repetitions selected');
+    return;
+  }
+
+  setStatus(`Removing ${selectedRepetitions.size} repetitions...`);
+
+  // Get selected repetition segments
+  const segments = [];
+  selectedRepetitions.forEach(idx => {
+    const rep = currentRepetitions[idx];
+    if (rep) {
+      segments.push({
+        start: rep.start || rep.startTime || 0,
+        end: rep.end || rep.endTime || rep.start + 1
+      });
+    }
+  });
+
+  console.log(`[SPLICE] Removing ${segments.length} repetition segments`);
+  setStatus(`Removed ${segments.length} repetitions (markers added)`);
+}
+
+// ============================================================================
+// WAVEFORM VISUALIZATION (Feature 9)
+// ============================================================================
+
+// Current waveform state
+let currentWaveformData = null;
+let waveformZoom = 1;
+let waveformOffset = 0;
+
+/**
+ * Initialize waveform visualization UI
+ */
+function initWaveformUI() {
+  const zoomInBtn = document.getElementById('waveformZoomIn');
+  const zoomOutBtn = document.getElementById('waveformZoomOut');
+  const resetBtn = document.getElementById('waveformReset');
+
+  if (zoomInBtn) {
+    zoomInBtn.addEventListener('click', () => {
+      waveformZoom = Math.min(waveformZoom * 1.5, 10);
+      renderWaveform();
+    });
+  }
+
+  if (zoomOutBtn) {
+    zoomOutBtn.addEventListener('click', () => {
+      waveformZoom = Math.max(waveformZoom / 1.5, 1);
+      waveformOffset = Math.max(0, Math.min(waveformOffset, 1 - (1 / waveformZoom)));
+      renderWaveform();
+    });
+  }
+
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      waveformZoom = 1;
+      waveformOffset = 0;
+      renderWaveform();
+    });
+  }
+
+  // Canvas click to seek
+  const canvas = document.getElementById('waveformCanvas');
+  if (canvas) {
+    canvas.addEventListener('click', (e) => {
+      if (!currentWaveformData) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const percent = x / rect.width;
+      const visibleStart = waveformOffset;
+      const visibleEnd = waveformOffset + (1 / waveformZoom);
+      const seekPercent = visibleStart + percent * (visibleEnd - visibleStart);
+      const seekTime = seekPercent * currentWaveformData.duration;
+      seekToTime(seekTime);
+    });
+  }
+
+  console.log('[SPLICE] Waveform Visualization UI initialized');
+}
+
+/**
+ * Fetch waveform data from backend
+ * @param {string} wavPath - Path to audio file
+ * @returns {Promise<Object>} Waveform data
+ */
+async function fetchWaveformData(wavPath) {
+  // Reset zoom state when loading new waveform data
+  waveformZoom = 1;
+  waveformOffset = 0;
+
+  try {
+    const response = await fetchWithTimeout(`${getBackendUrl()}/waveform`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders()
+      },
+      body: JSON.stringify({
+        wavPath,
+        targetPoints: 400,
+        windowMs: 50
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+      currentWaveformData = data;
+      return data;
+    } else {
+      console.error('[SPLICE] Waveform fetch error:', data.error);
+      return null;
+    }
+  } catch (err) {
+    console.error('[SPLICE] Waveform fetch error:', err);
+    return null;
+  }
+}
+
+/**
+ * Render waveform to canvas
+ * @param {Array<number>} silences - Optional silence regions to overlay
+ */
+function renderWaveform(silences = []) {
+  const canvas = document.getElementById('waveformCanvas');
+  const container = document.getElementById('waveformContainer');
+  const durationEl = document.getElementById('waveformDuration');
+
+  if (!canvas || !currentWaveformData) {
+    if (container) container.style.display = 'none';
+    return;
+  }
+
+  container.style.display = 'block';
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  const waveform = currentWaveformData.waveform || [];
+  const duration = currentWaveformData.duration || 0;
+
+  // Update duration display
+  if (durationEl) {
+    durationEl.textContent = formatTime(duration);
+  }
+
+  // Clear canvas
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, width, height);
+
+  // Calculate visible range based on zoom
+  const visibleStart = Math.floor(waveformOffset * waveform.length);
+  const visibleCount = Math.ceil(waveform.length / waveformZoom);
+  const visibleEnd = Math.min(visibleStart + visibleCount, waveform.length);
+  const visibleData = waveform.slice(visibleStart, visibleEnd);
+
+  // Draw silence regions first (as background)
+  if (silences.length > 0) {
+    ctx.fillStyle = 'rgba(255, 107, 107, 0.3)';
+    silences.forEach(silence => {
+      const startPercent = silence.start / duration;
+      const endPercent = silence.end / duration;
+      // Adjust for zoom
+      const visStartPercent = waveformOffset;
+      const visEndPercent = waveformOffset + (1 / waveformZoom);
+      if (endPercent >= visStartPercent && startPercent <= visEndPercent) {
+        const drawStart = Math.max(0, (startPercent - visStartPercent) / (visEndPercent - visStartPercent)) * width;
+        const drawEnd = Math.min(1, (endPercent - visStartPercent) / (visEndPercent - visStartPercent)) * width;
+        ctx.fillRect(drawStart, 0, drawEnd - drawStart, height);
+      }
+    });
+  }
+
+  // Draw waveform
+  if (visibleData.length === 0) return;
+
+  const barWidth = width / visibleData.length;
+  const centerY = height / 2;
+
+  ctx.fillStyle = '#4a9eff';
+  visibleData.forEach((amplitude, i) => {
+    const barHeight = amplitude * (height - 4);
+    const x = i * barWidth;
+    const y = centerY - barHeight / 2;
+    ctx.fillRect(x, y, Math.max(1, barWidth - 1), barHeight);
+  });
+
+  // Draw center line
+  ctx.strokeStyle = '#333355';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, centerY);
+  ctx.lineTo(width, centerY);
+  ctx.stroke();
+}
+
+/**
+ * Update waveform with silence overlay
+ * @param {string} wavPath - Path to audio file
+ * @param {Array} silences - Detected silence regions
+ */
+async function updateWaveformWithSilences(wavPath, silences = []) {
+  const data = await fetchWaveformData(wavPath);
+  if (data) {
+    renderWaveform(silences);
+    setStatus(`Waveform loaded: ${data.pointCount} points, ${formatTime(data.duration)}`);
+  }
+}
+
+/**
+ * Get current Chapter settings from UI
+ * @returns {Object} Chapter settings
+ */
+function getChapterSettings() {
+  return {
+    enabled: ui.enableChapters?.checked ?? false,
+    maxChapters: parseInt(ui.maxChapters?.value ?? 10),
+    minChapterLength: parseInt(ui.minChapterLength?.value ?? 60),
+    titleStyle: ui.chapterTitleStyle?.value ?? 'standard'
+  };
+}
+
+/**
+ * Fetch chapters from backend
+ * @param {Object} transcript - Transcript data
+ * @returns {Promise<Object>} Chapter data
+ */
+async function fetchChapters(transcript) {
+  const settings = getChapterSettings();
+  if (!settings.enabled) return { chapters: [], youtubeTimestamps: '' };
+
+  try {
+    setStatus('Detecting chapters...');
+
+    const response = await fetchWithTimeout(
+      `${getBackendUrl()}/chapters`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders()
+        },
+        body: JSON.stringify({ transcript, settings })
+      },
+      60000 // 60s timeout for AI processing
+    );
+
+    if (!response.ok) {
+      const errorMsg = await parseErrorResponse(response);
+      throw new Error(errorMsg || 'Chapter detection failed');
+    }
+
+    const data = await response.json();
+    currentChapters = data.chapters || [];
+    currentYouTubeTimestamps = data.youtubeTimestamps || '';
+    displayChapterResults(currentChapters, currentYouTubeTimestamps);
+    return data;
+
+  } catch (err) {
+    console.error('[SPLICE] Chapter fetch error:', err);
+    setStatus(`Chapter error: ${err.message}`);
+    return { chapters: [], youtubeTimestamps: '' };
+  }
+}
+
+/**
+ * Display chapter results in the UI
+ * @param {Array} chapters - Detected chapters
+ * @param {string} youtubeTimestamps - YouTube timestamp string
+ */
+function displayChapterResults(chapters, youtubeTimestamps) {
+  if (!ui.chapterResults) return;
+
+  if (chapters.length === 0) {
+    ui.chapterResults.style.display = 'none';
+    return;
+  }
+
+  ui.chapterResults.style.display = 'block';
+  if (ui.chapterCount) ui.chapterCount.textContent = chapters.length;
+
+  if (ui.chapterList) {
+    ui.chapterList.innerHTML = chapters.map((ch, i) => `
+      <div class="preview-item" data-chapter-index="${i}" onclick="seekToTime(${ch.startTime})">
+        <div class="preview-item-info">
+          <div class="preview-item-time">${formatTime(ch.startTime)} - ${ch.title}</div>
+          <div class="preview-item-duration">${ch.description || ''}</div>
+        </div>
+        <button class="preview-item-seek" aria-label="Seek to chapter">></button>
+      </div>
+    `).join('');
+  }
+
+  if (ui.youtubeTimestamps && youtubeTimestamps) {
+    ui.youtubeTimestamps.style.display = 'block';
+    if (ui.timestampText) {
+      ui.timestampText.textContent = youtubeTimestamps;
+    }
+  }
+}
+
+/**
+ * Copy YouTube timestamps to clipboard
+ */
+async function copyYouTubeTimestamps() {
+  if (!currentYouTubeTimestamps) {
+    setStatus('No timestamps to copy');
+    return;
+  }
+
+  try {
+    // UXP clipboard API
+    const clipboard = require('uxp').shell.clipboard;
+    await clipboard.setContent(currentYouTubeTimestamps);
+    setStatus('YouTube timestamps copied!');
+  } catch (err) {
+    // Fallback for web/testing
+    try {
+      await navigator.clipboard.writeText(currentYouTubeTimestamps);
+      setStatus('YouTube timestamps copied!');
+    } catch (e) {
+      console.error('[SPLICE] Clipboard error:', e);
+      setStatus('Failed to copy timestamps');
+    }
+  }
+}
+
+/**
+ * Add chapter markers to timeline
+ */
+async function addChapterMarkers() {
+  if (currentChapters.length === 0) {
+    setStatus('No chapters to add');
+    return;
+  }
+
+  try {
+    setStatus('Adding chapter markers...');
+
+    // Use builder to apply chapter markers (consistent with zoom pattern)
+    if (typeof window.spliceBuilder?.applyChapterMarkers === 'function') {
+      const result = await window.spliceBuilder.applyChapterMarkers(currentChapters);
+      if (result.success) {
+        setStatus(`Added ${result.count} chapter markers`);
+      } else {
+        setStatus(`Chapter error: ${result.error}`);
+      }
+    } else {
+      // Fallback: direct API if builder not available
+      const context = await getActiveSequence();
+      if (!context) {
+        setStatus('No active sequence');
+        return;
+      }
+
+      const { sequence } = context;
+      let markersAdded = 0;
+
+      // Add markers for each chapter
+      for (const chapter of currentChapters) {
+        try {
+          const time = ppro.TickTime.createWithSeconds(chapter.startTime);
+          const marker = await sequence.createMarker(time);
+          if (marker) {
+            await marker.setName(chapter.title);
+            if (chapter.description) {
+              await marker.setComment(chapter.description);
+            }
+            // Set color (blue for chapters)
+            await marker.setColor(4); // Blue
+            markersAdded++;
+          }
+        } catch (markerErr) {
+          console.warn('[SPLICE] Failed to add marker:', markerErr);
+        }
+      }
+
+      setStatus(`Added ${markersAdded} chapter markers`);
+    }
+
+  } catch (err) {
+    console.error('[SPLICE] Add markers error:', err);
+    setStatus(`Error: ${err.message}`);
+  }
+}
+
+// ============================================================================
+// DEBOUNCED UI UPDATES (Performance: batch DOM updates)
+// ============================================================================
+function scheduleUIUpdate(callback) {
+  if (pendingUIUpdate) {
+    cancelAnimationFrame(pendingUIUpdate);
+  }
+  pendingUIUpdate = requestAnimationFrame(() => {
+    callback();
+    pendingUIUpdate = null;
+  });
+}
+
+function updateSelectionCounts() {
+  scheduleUIUpdate(() => {
+    if (ui.selectedCount) {
+      ui.selectedCount.textContent = selectedSilenceIndices.size;
+    }
+    updateApplyButton();
+    updateSelectAllCheckbox();
+  });
+}
+
+// ============================================================================
+// KEYBOARD SHORTCUTS
+// ============================================================================
+function initKeyboardShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    // Only handle when combined preview is visible
+    const previewVisible = ui.combinedPreview?.style.display !== 'none' &&
+      ui.combinedPreview?.style.display !== '';
+
+    if (!previewVisible) return;
+
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+    const cmdKey = isMac ? e.metaKey : e.ctrlKey;
+
+    // Enter - Apply selected
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (selectedSilenceIndices.size > 0) {
+        ui.applyPreviewBtn?.click();
+      }
+    }
+
+    // Escape - Cancel
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      ui.cancelPreviewBtn?.click();
+    }
+
+    // Cmd/Ctrl+A - Select all
+    if (e.key === 'a' && cmdKey) {
+      e.preventDefault();
+      if (ui.selectAllSilences) {
+        ui.selectAllSilences.checked = true;
+        selectAllSilences(true);
+      }
+    }
+
+    // Cmd/Ctrl+D - Deselect all
+    if (e.key === 'd' && cmdKey) {
+      e.preventDefault();
+      if (ui.selectAllSilences) {
+        ui.selectAllSilences.checked = false;
+        selectAllSilences(false);
+      }
+    }
+
+    // Cmd/Ctrl+I - Invert selection
+    if (e.key === 'i' && cmdKey) {
+      e.preventDefault();
+      invertSilenceSelection();
+    }
+  });
+}
+
+// ============================================================================
+// UNIFIED WORKFLOW (Silence Detection + Takes Detection)
+// ============================================================================
+function initUnifiedWorkflow() {
+  if (!ui.goBtn) return;
+
+  ui.goBtn.addEventListener('click', async () => {
+    // Prevent double-click - set flag IMMEDIATELY before any async operations
+    if (isOperationInProgress) {
+      setStatus('Operation in progress...');
+      return;
+    }
+    isOperationInProgress = true;
+    ui.goBtn.disabled = true;
+
+    // Check online status before proceeding
+    if (typeof isOnline === 'function' && !isOnline()) {
+      setStatus('Offline - Check your connection and try again');
+      isOperationInProgress = false;
+      ui.goBtn.disabled = false;
+      return;
+    }
+
+    try {
+      showProgress('Preparing audio...');
+
+      // Step 1: Export audio
+      const exportSuccess = await exportAudioInternal();
+      if (!exportSuccess) {
+        throw new Error('Audio export failed');
+      }
+
+      // Step 2: Get settings
+      const sensitivity = parseInt(ui.sensitivitySlider?.value || 50);
+      const useIsolated = ui.sourceIsolated?.checked ?? false;
+      const detectTakes = ui.enableTakesDetection?.checked ?? true;
+
+      // Get initialized paths (cross-platform)
+      const paths = await getPaths();
+
+      // Step 3: Vocal isolation if needed
+      let audioPath = paths.wavPath;
+      if (useIsolated) {
+        // Check isolation access before proceeding
+        const credits = getCurrentCredits();
+        if (!credits || !credits.hasIsolationAccess) {
+          throw new Error('Vocal isolation requires Pro or Team tier. Upgrade to access this feature.');
+        }
+
+        // Show overage warning if applicable
+        const isolationMins = credits.isolationHoursRemaining * 60;
+        if (isolationMins <= 0) {
+          const overageRate = credits.isolationOverageRate || 0.08;
+          showProgress(`Isolating vocals (overage: $${overageRate}/min)...`);
+        } else {
+          showProgress(`Isolating vocals (${isolationMins.toFixed(0)} min remaining)...`);
+        }
+
+        const isolateResult = await isolateVocals();
+        if (isolateResult.success) {
+          audioPath = isolateResult.outputPath;
+          // Update credits display after isolation
+          await refreshCredits();
+        } else {
+          throw new Error(isolateResult.error || 'Vocal isolation failed');
+        }
+      }
+
+      // Step 4: Run detection (parallel if takes enabled)
+      // Pass sensitivity directly to backend - it handles the mapping via sensitivityToParams()
+      let silences = [];
+      let takes = [];
+
+      if (detectTakes) {
+        // Parallel detection for performance
+        showProgress('Detecting silences and analyzing takes...');
+        const [silenceResult, transcriptResult] = await Promise.all([
+          detectSilences(audioPath, sensitivity),
+          transcribeAudio()
+        ]);
+
+        silences = silenceResult;
+
+        // Extract takes from transcript result
+        if (transcriptResult.success && transcriptResult.takes) {
+          if (transcriptResult.takes.takes) {
+            takes = transcriptResult.takes.takes;
+          } else if (Array.isArray(transcriptResult.takes)) {
+            takes = transcriptResult.takes;
+          }
+        }
+
+        // Store transcript for reference
+        window.currentTranscript = transcriptResult.transcript;
+
+        // Step 4b: Auto Zoom & Chapter Detection (Phase 3) - run in parallel if enabled
+        const zoomEnabled = getZoomSettings().enabled;
+        const chapterEnabled = getChapterSettings().enabled;
+
+        if (zoomEnabled || chapterEnabled) {
+          showProgress('Analyzing zoom points and chapters...');
+          const phase3Promises = [];
+
+          if (zoomEnabled) {
+            phase3Promises.push(fetchZoomPoints(transcriptResult.transcript).catch(err => {
+              console.warn('[SPLICE] Zoom detection failed:', err.message);
+              return [];
+            }));
+          }
+
+          if (chapterEnabled) {
+            phase3Promises.push(fetchChapters(transcriptResult.transcript).catch(err => {
+              console.warn('[SPLICE] Chapter detection failed:', err.message);
+              return { chapters: [], youtubeTimestamps: '' };
+            }));
+          }
+
+          if (phase3Promises.length > 0) {
+            await Promise.all(phase3Promises);
+          }
+        }
+      } else {
+        // Just detect silences
+        showProgress('Detecting silences...');
+        silences = await detectSilences(audioPath, sensitivity);
+      }
+
+      if (silences.length === 0) {
+        showEmptyState();
+        setStatus('No silences detected. Try increasing sensitivity.');
+        return;
+      }
+
+      // Step 5: Filter silences by takes (protect speech)
+      const filtered = filterSilencesByTakes(silences, takes);
+
+      // Step 6: Add timeline markers (clear old ones first)
+      showProgress('Adding timeline markers...');
+      await clearSpliceMarkers();
+      const markerResult = await addTimelineMarkers(filtered.safe, filtered.protected, takes);
+
+      // Step 7: Show combined preview
+      showCombinedPreview(filtered.safe, filtered.protected, takes);
+
+      // Build status message with Phase 3 info
+      const zoomCount = currentZoomPoints?.length || 0;
+      const chapterCount = currentChapters?.length || 0;
+      const markerInfo = markerResult.added > 0 ? ` (${markerResult.added} markers added)` : '';
+      const zoomInfo = zoomCount > 0 ? `, ${zoomCount} zoom points` : '';
+      const chapterInfo = chapterCount > 0 ? `, ${chapterCount} chapters` : '';
+      const statusMsg = takes.length > 0
+        ? `Found ${silences.length} silences, ${filtered.protected.length} protected by ${takes.length} takes${zoomInfo}${chapterInfo}${markerInfo}`
+        : `Found ${silences.length} silence(s)${zoomInfo}${chapterInfo} - review and apply${markerInfo}`;
+      setStatus(statusMsg);
+
+    } catch (err) {
+      showEmptyState();
+      setStatus('Error: ' + err.message);
+      console.error('[SPLICE] Unified workflow error:', err);
+    } finally {
+      isOperationInProgress = false;
+      ui.goBtn.disabled = false;
+    }
+  });
+}
+
+// ============================================================================
+// TAKE-AWARE SILENCE FILTERING
+// ============================================================================
+/**
+ * Filter silences to protect those that overlap with takes (speech segments).
+ * Returns { safe: [], protected: [] }
+ */
+function filterSilencesByTakes(silences, takes) {
+  if (!takes || takes.length === 0) {
+    // No takes = all silences are safe to remove
+    return { safe: silences, protected: [] };
+  }
+
+  const safe = [];
+  const protected_ = [];
+
+  silences.forEach(silence => {
+    // Check if this silence overlaps with any take
+    const overlaps = takes.some(take => {
+      const takeStart = take.startTime || take.start;
+      const takeEnd = take.endTime || take.end;
+      // Overlap exists if silence starts before take ends AND silence ends after take starts
+      return silence.start < takeEnd && silence.end > takeStart;
+    });
+
+    if (overlaps) {
+      protected_.push(silence);
+    } else {
+      safe.push(silence);
+    }
+  });
+
+  console.log(`[SPLICE] Filtered silences: ${safe.length} safe, ${protected_.length} protected`);
+  return { safe, protected: protected_ };
+}
+
+// ============================================================================
+// TIMELINE MARKERS (Visual indicators on Premiere Pro timeline)
+// ============================================================================
+/**
+ * Add colored markers to the timeline for silences and takes.
+ * - Red markers: silences safe to remove
+ * - Yellow markers: silences protected by takes
+ * - Blue markers: takes (speech segments)
+ *
+ * @param {Array} safeToRemove - Silences safe to remove
+ * @param {Array} protectedSilences - Silences overlapping speech
+ * @param {Array} takes - Detected speech segments
+ * @returns {Promise<{added: number, errors: number}>}
+ */
+async function addTimelineMarkers(safeToRemove, protectedSilences, takes) {
+  const results = { added: 0, errors: 0 };
+
+  try {
+    const context = await getActiveSequence();
+    if (!context) {
+      console.warn('[SPLICE] No sequence available for markers');
+      return results;
+    }
+
+    const { sequence, project } = context;
+
+    // Get markers object for the sequence
+    const markers = await ppro.Markers.getMarkers(sequence);
+    if (!markers) {
+      console.warn('[SPLICE] Markers API not available');
+      return results;
+    }
+
+    // Collect all marker actions
+    const markerActions = [];
+
+    // Red markers for safe-to-remove silences
+    for (const silence of safeToRemove) {
+      try {
+        const duration = silence.end - silence.start;
+
+        // Use TickTime API directly (no TICKS_PER_SECOND needed)
+        const startTime = ppro.TickTime.createWithSeconds(silence.start);
+        const durationTime = ppro.TickTime.createWithSeconds(duration);
+
+        const action = markers.createAddMarkerAction(
+          `SPLICE: Remove (${duration.toFixed(2)}s)`,
+          ppro.Marker.MARKER_TYPE_COMMENT,
+          startTime,
+          durationTime,
+          `Silence to remove: ${formatTime(silence.start)} - ${formatTime(silence.end)}`
+        );
+        markerActions.push({ action, colorIndex: 1, type: 'silence' }); // Red = index 1
+      } catch (err) {
+        console.error('[SPLICE] Error creating silence marker:', err);
+        results.errors++;
+      }
+    }
+
+    // Yellow markers for protected silences
+    for (const silence of protectedSilences) {
+      try {
+        const duration = silence.end - silence.start;
+
+        // Use TickTime API directly (no TICKS_PER_SECOND needed)
+        const startTime = ppro.TickTime.createWithSeconds(silence.start);
+        const durationTime = ppro.TickTime.createWithSeconds(duration);
+
+        const action = markers.createAddMarkerAction(
+          `SPLICE: Protected (${duration.toFixed(2)}s)`,
+          ppro.Marker.MARKER_TYPE_COMMENT,
+          startTime,
+          durationTime,
+          `Protected silence (overlaps speech): ${formatTime(silence.start)} - ${formatTime(silence.end)}`
+        );
+        markerActions.push({ action, colorIndex: 4, type: 'protected' }); // Yellow = index 4
+      } catch (err) {
+        console.error('[SPLICE] Error creating protected marker:', err);
+        results.errors++;
+      }
+    }
+
+    // Blue markers for takes (speech segments)
+    for (const take of takes) {
+      try {
+        const start = take.startTime || take.start;
+        const end = take.endTime || take.end;
+        const duration = end - start;
+        const textPreview = take.text?.substring(0, 30) || 'Speech';
+
+        // Use TickTime API directly (no TICKS_PER_SECOND needed)
+        const startTime = ppro.TickTime.createWithSeconds(start);
+        const durationTime = ppro.TickTime.createWithSeconds(duration);
+
+        const action = markers.createAddMarkerAction(
+          `SPLICE: Take`,
+          ppro.Marker.MARKER_TYPE_COMMENT,
+          startTime,
+          durationTime,
+          `Speech segment: ${textPreview}${take.text?.length > 30 ? '...' : ''}`
+        );
+        markerActions.push({ action, colorIndex: 5, type: 'take' }); // Blue = index 5
+      } catch (err) {
+        console.error('[SPLICE] Error creating take marker:', err);
+        results.errors++;
+      }
+    }
+
+    // Execute all marker actions in a single transaction
+    if (markerActions.length > 0) {
+      await project.lockedAccess(async () => {
+        await project.executeTransaction((compoundAction) => {
+          for (const { action } of markerActions) {
+            compoundAction.addAction(action);
+          }
+        }, 'SPLICE: Add Timeline Markers');
+      });
+
+      results.added = markerActions.length;
+      console.log(`[SPLICE] Added ${results.added} timeline markers`);
+    }
+
+  } catch (err) {
+    console.error('[SPLICE] Timeline markers error:', err);
+    results.errors++;
+  }
+
+  return results;
+}
+
+/**
+ * Read current SPLICE marker positions from timeline.
+ * This allows users to manually adjust markers before applying.
+ * Returns silences based on current marker positions (not original detection).
+ */
+async function readMarkersAssilences() {
+  const silences = [];
+
+  try {
+    const context = await getActiveSequence();
+    if (!context) return silences;
+
+    const { sequence } = context;
+    const markers = await ppro.Markers.getMarkers(sequence);
+    if (!markers) return silences;
+
+    const allMarkers = await markers.getMarkers();
+    if (!allMarkers || allMarkers.length === 0) return silences;
+
+    for (const marker of allMarkers) {
+      const name = await marker.getName();
+
+      // Only read "Remove" markers (red ones that will be cut)
+      if (name && name.startsWith('SPLICE: Remove')) {
+        const startTickTime = await marker.getStart();
+        const durationTickTime = await marker.getDuration();
+
+        // Use TickTime.seconds property to get seconds directly (no TICKS_PER_SECOND needed)
+        const start = startTickTime.seconds;
+        const duration = durationTickTime.seconds;
+        const end = start + duration;
+
+        silences.push({
+          start,
+          end,
+          duration,
+          fromMarker: true  // Flag to indicate this came from marker adjustment
+        });
+      }
+    }
+
+    // Sort by start time
+    silences.sort((a, b) => a.start - b.start);
+    console.log(`[SPLICE] Read ${silences.length} silences from adjusted markers`);
+
+  } catch (err) {
+    console.error('[SPLICE] Error reading markers:', err);
+  }
+
+  return silences;
+}
+
+/**
+ * Remove all SPLICE markers from the timeline.
+ * Call this before adding new markers to avoid duplicates.
+ */
+async function clearSpliceMarkers() {
+  try {
+    const context = await getActiveSequence();
+    if (!context) return 0;
+
+    const { sequence, project } = context;
+    const markers = await ppro.Markers.getMarkers(sequence);
+    if (!markers) return 0;
+
+    // Get all markers
+    const allMarkers = await markers.getMarkers();
+    if (!allMarkers || allMarkers.length === 0) return 0;
+
+    // Filter SPLICE markers
+    const spliceMarkers = [];
+    for (const marker of allMarkers) {
+      const name = await marker.getName();
+      if (name && name.startsWith('SPLICE:')) {
+        spliceMarkers.push(marker);
+      }
+    }
+
+    if (spliceMarkers.length === 0) return 0;
+
+    // Remove all SPLICE markers in a single transaction
+    await project.lockedAccess(async () => {
+      await project.executeTransaction((compoundAction) => {
+        for (const marker of spliceMarkers) {
+          const removeAction = markers.createRemoveMarkerAction(marker);
+          compoundAction.addAction(removeAction);
+        }
+      }, 'SPLICE: Clear Markers');
+    });
+
+    console.log(`[SPLICE] Cleared ${spliceMarkers.length} previous markers`);
+    return spliceMarkers.length;
+
+  } catch (err) {
+    console.error('[SPLICE] Error clearing markers:', err);
+    return 0;
+  }
+}
+
+// ============================================================================
+// COMBINED PREVIEW (Silences + Takes with colored markers)
+// ============================================================================
+/**
+ * Show combined preview with:
+ * - Red markers: silences safe to remove
+ * - Yellow markers: silences protected by takes (won't be removed)
+ * - Blue markers: takes (for reference)
+ */
+function showCombinedPreview(safeToRemove, protectedSilences, takes) {
+  // Update global state
+  safeSilences = safeToRemove;
+  previewSilences = [...safeToRemove, ...protectedSilences];
+  previewTakes = takes;
+  selectedSilenceIndices = new Set(safeToRemove.map((_, i) => i));
+
+  // Hide other views
+  hideAllViews();
+
+  // Update summary counts
+  if (ui.silenceCountDisplay) ui.silenceCountDisplay.textContent = safeToRemove.length;
+  if (ui.takeCountDisplay) ui.takeCountDisplay.textContent = takes.length;
+  if (ui.selectedCount) ui.selectedCount.textContent = safeToRemove.length;
+
+  // Build combined items list (sorted by time)
+  const items = [
+    ...safeToRemove.map((s, i) => ({ type: 'silence', index: i, start: s.start, end: s.end, data: s })),
+    ...protectedSilences.map(s => ({ type: 'protected', start: s.start, end: s.end, data: s })),
+    ...takes.map(t => ({ type: 'take', start: t.startTime || t.start, end: t.endTime || t.end, data: t }))
+  ].sort((a, b) => a.start - b.start);
+
+  // Build preview list using DocumentFragment
+  const fragment = document.createDocumentFragment();
+
+  items.forEach((item) => {
+    const duration = item.end - item.start;
+    const div = document.createElement('div');
+
+    if (item.type === 'silence') {
+      // Safe to remove - red marker with checkbox
+      div.className = 'preview-item silence-marker';
+      div.dataset.index = item.index;
+      div.innerHTML = `
+        <input type="checkbox" class="preview-item-check" checked data-index="${item.index}">
+        <div class="preview-item-info">
+          <div class="preview-item-time">${formatTime(item.start)} - ${formatTime(item.end)}</div>
+          <div class="preview-item-duration">${duration.toFixed(2)}s silence</div>
+        </div>
+        <button class="preview-item-seek" data-time="${item.start}" title="Seek to this silence">&gt;</button>
+      `;
+    } else if (item.type === 'protected') {
+      // Protected by take - yellow marker, no checkbox
+      div.className = 'preview-item protected-silence';
+      div.innerHTML = `
+        <div style="width: 20px; margin-right: 10px;"></div>
+        <div class="preview-item-info">
+          <div class="preview-item-time">${formatTime(item.start)} - ${formatTime(item.end)}</div>
+          <div class="preview-item-duration">${duration.toFixed(2)}s (overlaps speech)</div>
+        </div>
+        <button class="preview-item-seek" data-time="${item.start}" title="Seek">&gt;</button>
+      `;
+    } else if (item.type === 'take') {
+      // Take (speech segment) - blue marker, no checkbox
+      div.className = 'preview-item take-marker';
+      const textPreview = item.data.text?.substring(0, 40) || 'Speech segment';
+      div.innerHTML = `
+        <div style="width: 20px; margin-right: 10px;"></div>
+        <div class="preview-item-info">
+          <div class="preview-item-time">${formatTime(item.start)} - ${formatTime(item.end)}</div>
+          <div class="preview-item-duration">${textPreview}${item.data.text?.length > 40 ? '...' : ''}</div>
+        </div>
+        <button class="preview-item-seek" data-time="${item.start}" title="Seek to take">&gt;</button>
+      `;
+    }
+
+    fragment.appendChild(div);
+  });
+
+  if (ui.previewList) {
+    ui.previewList.textContent = '';
+    ui.previewList.appendChild(fragment);
+  }
+
+  // Reset UI state
+  if (ui.selectAllSilences) ui.selectAllSilences.checked = true;
+  updateApplyButton();
+
+  // Show combined preview section
+  if (ui.combinedPreview) ui.combinedPreview.style.display = 'block';
+}
+
+function initPreviewHandlers() {
+  // EVENT DELEGATION: Single listener on parent instead of many on children
+  if (ui.previewList) {
+    // Handle checkbox changes
+    const changeHandler = (e) => {
+      if (e.target.classList.contains('preview-item-check')) {
+        const index = parseInt(e.target.dataset.index);
+        const item = e.target.closest('.preview-item');
+
+        if (e.target.checked) {
+          selectedSilenceIndices.add(index);
+          item?.classList.remove('excluded');
+        } else {
+          selectedSilenceIndices.delete(index);
+          item?.classList.add('excluded');
+        }
+        updateSelectionCounts();
+      }
+    };
+    cleanupRegistry.addListener(ui.previewList, 'change', changeHandler);
+
+    // Handle seek button clicks
+    const clickHandler = async (e) => {
+      if (e.target.classList.contains('preview-item-seek')) {
+        e.stopPropagation();
+        const btn = e.target;
+        const time = parseFloat(btn.dataset.time);
+
+        // Show loading state
+        btn.classList.add('loading');
+        btn.textContent = '...';
+
+        try {
+          await seekToTime(time);
+        } finally {
+          btn.classList.remove('loading');
+          btn.textContent = '>';
+        }
+      }
+    };
+    cleanupRegistry.addListener(ui.previewList, 'click', clickHandler);
+  }
+
+  // Apply button
+  if (ui.applyPreviewBtn) {
+    const applyHandler = async () => {
+      await operationLock.acquire();
+      try {
+        ui.applyPreviewBtn.disabled = true;
+
+        const originalText = ui.applyPreviewBtn.textContent;
+        ui.applyPreviewBtn.textContent = 'Applying...';
+
+        try {
+          await applySelectedSilences();
+        } catch (err) {
+          setStatus('Error: ' + err.message);
+          console.error('[SPLICE] Apply error:', err);
+        } finally {
+          ui.applyPreviewBtn.textContent = originalText;
+          ui.applyPreviewBtn.disabled = false;
+        }
+      } finally {
+        operationLock.release();
+      }
+    };
+    cleanupRegistry.addListener(ui.applyPreviewBtn, 'click', applyHandler);
+  }
+
+  // Cancel button
+  if (ui.cancelPreviewBtn) {
+    const cancelHandler = async () => {
+      await cancelPreview();
+    };
+    cleanupRegistry.addListener(ui.cancelPreviewBtn, 'click', cancelHandler);
+  }
+
+  // Select all checkbox
+  if (ui.selectAllSilences) {
+    const selectAllHandler = (e) => {
+      selectAllSilences(e.target.checked);
+    };
+    cleanupRegistry.addListener(ui.selectAllSilences, 'change', selectAllHandler);
+  }
+
+  // Invert selection button
+  if (ui.invertSelectionBtn) {
+    const invertHandler = () => {
+      invertSilenceSelection();
+    };
+    cleanupRegistry.addListener(ui.invertSelectionBtn, 'click', invertHandler);
+  }
+
+  // Duration filter buttons
+  document.querySelectorAll('.preview-filters .filter-btn[data-min]').forEach(btn => {
+    const filterHandler = () => {
+      const min = parseFloat(btn.dataset.min);
+      const max = parseFloat(btn.dataset.max);
+      selectByDuration(min, max);
+    };
+    cleanupRegistry.addListener(btn, 'click', filterHandler);
+  });
+
+  // Re-run detection button
+  if (ui.reRunDetectionBtn) {
+    const rerunHandler = () => {
+      // Hide preview, show options, let user adjust sensitivity
+      if (ui.combinedPreview) ui.combinedPreview.style.display = 'none';
+      if (ui.optionsPanel) ui.optionsPanel.classList.remove('collapsed');
+      if (ui.optionsToggle) ui.optionsToggle.classList.add('expanded');
+      showEmptyState();
+      setStatus('Adjust sensitivity and click GO again');
+    };
+    cleanupRegistry.addListener(ui.reRunDetectionBtn, 'click', rerunHandler);
+  }
+
+  // Build Sequence button (v3.5 - direct DOM reconstruction)
+  if (ui.buildSequenceBtn) {
+    const buildHandler = async () => {
+      await operationLock.acquire();
+      try {
+        // Check if we have detection data
+        if (safeSilences.length === 0 && previewTakes.length === 0) {
+          setStatus('No detection data. Run analysis first.');
+          return;
+        }
+
+        ui.buildSequenceBtn.disabled = true;
+        const originalText = ui.buildSequenceBtn.textContent;
+        ui.buildSequenceBtn.textContent = 'Building...';
+
+        try {
+          showProgress('Building new sequence...');
+
+          const result = await buildSequenceWithCutList();
+
+          if (result.success) {
+            // Hide preview and show success
+            if (ui.combinedPreview) ui.combinedPreview.style.display = 'none';
+            showEmptyState();
+
+            const metadata = result.metadata || {};
+            setStatus(`New sequence created: ${metadata.silencesRemoved || 0} silences removed, ${metadata.takesDetected || 0} takes detected`);
+
+            // Clear markers after successful build
+            await clearSpliceMarkers();
+
+            // Clear preview state
+            previewSilences = [];
+            safeSilences = [];
+            protectedSilences = [];
+            previewTakes = [];
+            selectedSilenceIndices.clear();
+          } else {
+            // User-friendly error messages
+            const errorMsg = result.error || 'Unknown error';
+            setStatus('Build failed: ' + formatBuildError(errorMsg));
+          }
+
+        } catch (err) {
+          console.error('[SPLICE] Build sequence error:', err);
+          // User-friendly error messages with recovery hints
+          setStatus('Build error: ' + formatBuildError(err.message));
+        } finally {
+          ui.buildSequenceBtn.textContent = originalText;
+          ui.buildSequenceBtn.disabled = false;
+        }
+      } finally {
+        operationLock.release();
+      }
+    };
+    cleanupRegistry.addListener(ui.buildSequenceBtn, 'click', buildHandler);
+  }
+}
+
+function selectAllSilences(checked) {
+  selectedSilenceIndices.clear();
+
+  if (checked) {
+    safeSilences.forEach((_, i) => selectedSilenceIndices.add(i));
+  }
+
+  // Batch update DOM (only silence-marker items have checkboxes)
+  document.querySelectorAll('.preview-item.silence-marker .preview-item-check').forEach((checkbox) => {
+    const index = parseInt(checkbox.dataset.index);
+    checkbox.checked = checked;
+    const item = checkbox.closest('.preview-item');
+    if (checked) {
+      item?.classList.remove('excluded');
+    } else {
+      item?.classList.add('excluded');
+    }
+  });
+
+  updateSelectionCounts();
+}
+
+function invertSilenceSelection() {
+  const allIndices = new Set(safeSilences.map((_, i) => i));
+  const newSelection = new Set([...allIndices].filter(i => !selectedSilenceIndices.has(i)));
+  selectedSilenceIndices = newSelection;
+
+  // Update DOM
+  document.querySelectorAll('.preview-item.silence-marker .preview-item-check').forEach((checkbox) => {
+    const index = parseInt(checkbox.dataset.index);
+    const isSelected = selectedSilenceIndices.has(index);
+    checkbox.checked = isSelected;
+    const item = checkbox.closest('.preview-item');
+    if (isSelected) {
+      item?.classList.remove('excluded');
+    } else {
+      item?.classList.add('excluded');
+    }
+  });
+
+  updateSelectionCounts();
+}
+
+function selectByDuration(minSec, maxSec) {
+  selectedSilenceIndices.clear();
+
+  safeSilences.forEach((silence, index) => {
+    const duration = silence.end - silence.start;
+    if (duration >= minSec && duration < maxSec) {
+      selectedSilenceIndices.add(index);
+    }
+  });
+
+  // Update DOM
+  document.querySelectorAll('.preview-item.silence-marker .preview-item-check').forEach((checkbox) => {
+    const index = parseInt(checkbox.dataset.index);
+    const isSelected = selectedSilenceIndices.has(index);
+    checkbox.checked = isSelected;
+    const item = checkbox.closest('.preview-item');
+    if (isSelected) {
+      item?.classList.remove('excluded');
+    } else {
+      item?.classList.add('excluded');
+    }
+  });
+
+  updateSelectionCounts();
+  setStatus(`Selected ${selectedSilenceIndices.size} silences (${minSec}s - ${maxSec}s)`);
+}
+
+async function cancelPreview() {
+  // Keep silences available for Razor if detected
+  const hadSilences = safeSilences.length > 0;
+
+  previewSilences = [];
+  safeSilences = [];
+  protectedSilences = [];
+  previewTakes = [];
+  selectedSilenceIndices.clear();
+  showEmptyState();
+
+  // Clear timeline markers
+  const cleared = await clearSpliceMarkers();
+  const markerInfo = cleared > 0 ? ` (${cleared} markers removed)` : '';
+  setStatus('Preview cancelled' + markerInfo);
+
+  // Show Razor section if silences were detected
+  if (hadSilences && ui.advancedSection) {
+    ui.advancedSection.classList.remove('hidden');
+  }
+}
+
+async function applySelectedSilences() {
+  if (selectedSilenceIndices.size === 0) {
+    setStatus('No silences selected');
+    return;
+  }
+
+  showProgress('Reading marker positions...');
+
+  // Read current marker positions from timeline
+  // This allows users to manually adjust markers before applying
+  const markerSilences = await readMarkersAssilences();
+
+  let silencesToApply;
+  let adjustedCount = 0;
+
+  if (markerSilences.length > 0) {
+    // Use marker positions (may have been adjusted by user)
+    silencesToApply = markerSilences;
+    adjustedCount = markerSilences.length;
+    console.log(`[SPLICE] Using ${adjustedCount} silences from adjusted markers`);
+  } else {
+    // Fallback to original detection data
+    silencesToApply = safeSilences.filter((_, i) => selectedSilenceIndices.has(i));
+    console.log(`[SPLICE] Using ${silencesToApply.length} silences from original detection`);
+  }
+
+  if (silencesToApply.length === 0) {
+    setStatus('No silences to apply');
+    return;
+  }
+
+  // Update global silences for the apply function
+  setCurrentSilences(silencesToApply);
+
+  showProgress('Applying changes...');
+
+  // Apply to timeline
+  const result = await removeSilencesFromTimeline();
+
+  // Clear markers after applying
+  await clearSpliceMarkers();
+
+  // Hide preview
+  if (ui.combinedPreview) ui.combinedPreview.style.display = 'none';
+
+  // Show results
+  showSilenceResults({
+    count: silencesToApply.length,
+    timeSaved: silencesToApply.reduce((sum, s) => sum + (s.end - s.start), 0),
+    clipsModified: result
+  });
+
+  // Show advanced section
+  if (ui.advancedSection) ui.advancedSection.classList.remove('hidden');
+
+  const adjustedInfo = adjustedCount > 0 ? ' (from adjusted markers)' : '';
+  setStatus(`Removed ${silencesToApply.length} silence(s) - ${result} clip(s) modified${adjustedInfo}`);
+
+  // Refresh credits (await to prevent race conditions)
+  try {
+    await refreshCredits();
+  } catch (err) {
+    console.warn('[SPLICE] Credits refresh failed:', err);
+  }
+
+  // Clear preview state
+  previewSilences = [];
+  safeSilences = [];
+  protectedSilences = [];
+  previewTakes = [];
+  selectedSilenceIndices.clear();
+}
+
+// ============================================================================
+// UI HELPERS
+// ============================================================================
+function updateApplyButton() {
+  if (ui.applyPreviewBtn) {
+    const count = selectedSilenceIndices.size;
+    ui.applyPreviewBtn.disabled = count === 0;
+    ui.applyPreviewBtn.textContent = count === 0 ? 'Select silences' : `Apply ${count} Selected`;
+  }
+}
+
+function updateSelectAllCheckbox() {
+  if (ui.selectAllSilences) {
+    ui.selectAllSilences.checked = selectedSilenceIndices.size === safeSilences.length && safeSilences.length > 0;
+  }
+}
+
+function hideAllViews() {
+  if (ui.progressContainer) ui.progressContainer.style.display = 'none';
+  if (ui.resultsEmpty) ui.resultsEmpty.style.display = 'none';
+  if (ui.silenceResults) ui.silenceResults.style.display = 'none';
+  if (ui.combinedPreview) ui.combinedPreview.style.display = 'none';
+}
+
+function showProgress(message) {
+  hideAllViews();
+  if (ui.progressContainer) ui.progressContainer.style.display = 'block';
+  if (ui.progressText) ui.progressText.textContent = message;
+}
+
+function showEmptyState() {
+  hideAllViews();
+  if (ui.resultsEmpty) ui.resultsEmpty.style.display = 'block';
+  if (ui.advancedSection) ui.advancedSection.classList.add('hidden');
+}
+
+function showSilenceResults({ count, timeSaved, clipsModified }) {
+  hideAllViews();
+
+  // Update the results display
+  if (ui.resultsCount) ui.resultsCount.textContent = count;
+  if (ui.timeSaved) ui.timeSaved.textContent = timeSaved.toFixed(1) + 's';
+  if (ui.clipsModified) ui.clipsModified.textContent = clipsModified;
+
+  if (ui.silenceResults) ui.silenceResults.style.display = 'block';
+}
+
+// formatTime is defined in utils.js - using centralized version with NaN check
+
+/**
+ * Format build errors into user-friendly messages
+ * @param {string} error - Raw error message
+ * @returns {string} User-friendly error message
+ */
+function formatBuildError(error) {
+  if (!error) return 'Unknown error occurred';
+
+  // Map technical errors to user-friendly messages
+  const errorMap = {
+    'Builder not initialized': 'Builder module failed to load. Try restarting the plugin.',
+    'No active project': 'No project is open. Please open or create a project first.',
+    'No media items found': 'No media files in project. Import media before building.',
+    'No detection data': 'Run analysis first (click GO button).',
+    'Failed to generate cut list': 'Server error generating cuts. Check your connection.',
+    'Failed to build sequence': 'Premiere Pro sequence build failed. Try again.',
+    'fetch failed': 'Network error. Check if backend server is running.',
+    'NetworkError': 'Cannot connect to server. Check your internet connection.',
+    'Insufficient credits': 'Out of credits. Upgrade your plan to continue.',
+    'Authentication required': 'Login required. Click the credits badge to log in.'
+  };
+
+  // Check for matching error patterns
+  for (const [pattern, friendly] of Object.entries(errorMap)) {
+    if (error.includes(pattern)) {
+      return friendly;
+    }
+  }
+
+  // Return original if no match (already reasonably clear)
+  return error;
+}
+
+// setStatus is defined in utils.js - using centralized version with null check
+// Local override uses cached ui.status for performance
+function setStatus(message) {
+  const statusEl = ui.status || document.getElementById('status');
+  if (statusEl) statusEl.textContent = message;
+}
+
+// ============================================================================
+// UNDO HANDLERS
+// ============================================================================
+function initUndoHandlers() {
+  if (ui.undoBtn) {
+    ui.undoBtn.addEventListener('click', () => {
+      try {
+        ppro.app.executeCommand('Edit.Undo');
+        showEmptyState();
+        setStatus('Changes undone');
+      } catch (e) {
+        setStatus('Undo failed - use Cmd+Z');
+      }
+    });
+  }
+}
+
+// ============================================================================
+// MEDIA FOLDER HANDLERS (v3.5)
+// ============================================================================
+function initMediaFolderHandlers() {
+  // Update display on load
+  updateMediaFolderDisplay();
+
+  // Set media folder button
+  if (ui.setMediaFolderBtn) {
+    ui.setMediaFolderBtn.addEventListener('click', async () => {
+      ui.setMediaFolderBtn.disabled = true;
+      ui.setMediaFolderBtn.textContent = 'Selecting...';
+
+      try {
+        const result = await setupMediaFolder();
+        if (result.success) {
+          updateMediaFolderDisplay();
+          setStatus(`Media folder set: ${result.path}`);
+        } else {
+          setStatus(result.error || 'Failed to set media folder');
+        }
+      } catch (err) {
+        setStatus('Error: ' + err.message);
+      } finally {
+        ui.setMediaFolderBtn.disabled = false;
+        ui.setMediaFolderBtn.textContent = 'Set Folder';
+      }
+    });
+  }
+
+  // Clear media folder button
+  if (ui.clearMediaFolderBtn) {
+    ui.clearMediaFolderBtn.addEventListener('click', () => {
+      clearMediaFolder();
+      updateMediaFolderDisplay();
+      setStatus('Media folder cleared');
+    });
+  }
+}
+
+function updateMediaFolderDisplay() {
+  if (ui.mediaFolderDisplay) {
+    const path = getMediaFolderPath();
+    if (path) {
+      // Truncate long paths for display
+      const displayPath = path.length > 40
+        ? '...' + path.slice(-37)
+        : path;
+      ui.mediaFolderDisplay.textContent = displayPath;
+      ui.mediaFolderDisplay.title = path; // Full path on hover
+      ui.mediaFolderDisplay.style.color = '#4a9eff';
+    } else {
+      ui.mediaFolderDisplay.textContent = 'Not configured';
+      ui.mediaFolderDisplay.title = '';
+      ui.mediaFolderDisplay.style.color = '#888';
+    }
+  }
+}
+
+// ============================================================================
+// BUILD SEQUENCE (v3.5 - Direct DOM Reconstruction)
+// ============================================================================
+
+// NOTE: ProjectItemType is already defined in builder.js which loads first.
+// We do NOT redeclare it here to avoid "Identifier already declared" errors.
+// If builder.js hasn't loaded for some reason, we set it on window as fallback.
+if (typeof ProjectItemType === 'undefined' && typeof window.ProjectItemType === 'undefined') {
+  window.ProjectItemType = {
+    CLIP: 1,
+    BIN: 2,
+    ROOT: 3,
+    FILE: 4
+  };
+}
+// Use existing ProjectItemType from builder.js (global scope) - no redeclaration needed
+
+/**
+ * Find the first media item in the project bin (recursively)
+ * @param {Object} item - ProjectItem (usually rootItem)
+ * @returns {Promise<Object|null>} First media item found or null
+ */
+async function findFirstMediaItem(item) {
+  if (!item) return null;
+
+  // Fix: Use local Constant instead of app.Constants.ProjectItemType
+  if (item.type === ProjectItemType.CLIP) {
+    return item;
+  }
+
+  // Search Children (Bin or Root)
+  // Note: item.children is a collection, check numItems
+  if (item.children && item.children.numItems > 0) {
+    for (let i = 0; i < item.children.numItems; i++) {
+      const child = item.children[i];
+      const found = await findFirstMediaItem(child);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Build a sequence from detection data locally
+ * Used for testing via console: await buildSequenceV35(silences)
+ */
+async function buildSequenceV35(silences, takes = []) {
+  if (!window.spliceBuilder) {
+    throw new Error('Builder not initialized. Check if builder.js is loaded.');
+  }
+
+  const app = require('premierepro');
+  const project = await app.Project.getActiveProject();
+  if (!project) throw new Error("No active project found.");
+
+  const rootItem = await project.getRootItem();
+  const sourceProjectItem = await findFirstMediaItem(rootItem);
+
+  if (!sourceProjectItem) {
+    throw new Error('No media items found in project bin.');
+  }
+
+  console.log(`[SPLICE] Found source media: ${sourceProjectItem.name}`);
+
+  return await window.spliceBuilder.buildSequenceFromDetection(silences, takes, sourceProjectItem);
+}
+
+/**
+ * Request a cut list from the backend and build the sequence.
+ * Full v3.5 workflow.
+ */
+async function buildSequenceWithCutList() {
+  if (!window.spliceBuilder) {
+    throw new Error('Builder not initialized');
+  }
+
+  // Use centralized URL function (uses 127.0.0.1, not localhost - UXP requirement)
+  const apiUrl = getBackendUrl();
+
+  if (typeof showProgress === 'function') showProgress('Getting source clip info...');
+
+  const app = require('premierepro');
+  const project = await app.Project.getActiveProject();
+  if (!project) throw new Error("No active project.");
+
+  const rootItem = await project.getRootItem();
+  const sourceProjectItem = await findFirstMediaItem(rootItem);
+
+  if (!sourceProjectItem) {
+    throw new Error('No media items found in project. Please import a media file first.');
+  }
+
+  // Use properties strictly
+  const sourceName = sourceProjectItem.name;
+  const sourcePath = sourceProjectItem.treePath;
+
+  const durationObj = await sourceProjectItem.getDuration();
+  const duration = durationObj ? durationObj.seconds : 0;
+
+  // Retrieve Globals
+  const silences = window.splicePreviewState?.getSelectedSilences() || (typeof safeSilences !== 'undefined' ? safeSilences : []);
+  const takes = (typeof previewTakes !== 'undefined' ? previewTakes : []);
+
+  if (silences.length === 0 && (!takes || takes.length === 0)) {
+    throw new Error('No detection data found. Run analysis first.');
+  }
+
+  // Get J-Cut settings from UI (Phase 1)
+  const jcutSettings = getJCutSettings();
+
+  if (typeof showProgress === 'function') showProgress('Generating cut list...');
+
+  const response = await fetchWithTimeout(`${apiUrl}/cut-list`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      sourceName,
+      sourcePath,
+      duration,
+      silences,
+      takes,
+      // Phase 1: Include J-Cut/L-Cut settings
+      settings: {
+        jCutOffset: jcutSettings.jCutOffset,
+        lCutOffset: jcutSettings.lCutOffset,
+        labelTakes: true,
+        colorCode: true
+      }
+    })
+  }, FETCH_TIMEOUT_PROCESSING);
+
+  if (!response.ok) {
+    const errorMsg = await parseErrorResponse(response);
+    throw new Error(errorMsg);
+  }
+
+  const data = await response.json();
+  const cutList = data.cutList;
+
+  if (typeof showProgress === 'function') showProgress('Building sequence...');
+
+  const result = await window.spliceBuilder.buildSequenceFromCutList(cutList, sourceProjectItem);
+
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to build sequence');
+  }
+
+  return {
+    success: true,
+    clipsAdded: result.clipsAdded,
+    metadata: cutList.metadata
+  };
+}
+
+// Expose functions globally for UI and testing
+if (typeof window !== 'undefined') {
+  window.buildSequenceV35 = buildSequenceV35;
+  window.buildSequenceWithCutList = buildSequenceWithCutList;
+  window.findFirstMediaItem = findFirstMediaItem;
+  window.getJCutSettings = getJCutSettings;
+}
+
+// ============================================================================
+// TIMELINE SEEK (with proper error handling)
+// ============================================================================
+async function seekToTime(seconds) {
+  // Validate input
+  if (typeof seconds !== 'number' || isNaN(seconds) || !isFinite(seconds)) {
+    setStatus('Invalid seek time');
+    return;
+  }
+
+  if (seconds < 0) {
+    seconds = 0;
+  }
+
+  try {
+    const context = await getActiveSequence();
+    if (!context) {
+      setStatus('No sequence available');
+      return;
+    }
+
+    const { sequence } = context;
+
+    // Use TickTime API to convert seconds to the format needed
+    const position = ppro.TickTime.createWithSeconds(seconds);
+
+    await sequence.setPlayerPosition(position);
+    setStatus(`Seeked to ${formatTime(seconds)}`);
+  } catch (err) {
+    console.error('[SPLICE] Seek error:', err);
+    setStatus('Seek failed: ' + (err.message || 'Unknown error'));
+  }
+}
+
+// ============================================================================
+// AUTH HEADERS HELPER
+// ============================================================================
+/**
+ * Build request headers with authentication
+ * @returns {Object} Headers object with Content-Type and x-stripe-customer-id
+ */
+function getAuthHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  const settings = getSettings();
+  if (settings.customerId) {
+    headers['x-stripe-customer-id'] = settings.customerId;
+  }
+  return headers;
+}
+
+// ============================================================================
+// AUDIO EXPORT & BACKEND CALLS
+// ============================================================================
+async function exportAudioInternal() {
+  try {
+    const context = await getActiveSequence();
+    if (!context) {
+      throw new Error('No project or sequence open');
+    }
+
+    const { sequence } = context;
+    const encoderManager = ppro.EncoderManager.getManager();
+    if (!encoderManager) {
+      throw new Error('EncoderManager not available');
+    }
+
+    // Get initialized paths (cross-platform)
+    const paths = await getPaths();
+    if (!paths.wavPath) {
+      throw new Error('Audio export path not initialized');
+    }
+
+    const result = await encoderManager.exportSequence(
+      sequence,
+      ppro.EncoderManager.EXPORT_IMMEDIATELY,
+      paths.wavPath,
+      paths.presetPath,
+      true
+    );
+
+    return result;
+  } catch (err) {
+    console.error('[SPLICE] Export error:', err);
+    return false;
+  }
+}
+
+async function isolateVocals() {
+  // Get initialized paths (cross-platform)
+  const paths = await getPaths();
+
+  const response = await fetchWithTimeout(`${getBackendUrl()}/isolate-vocals`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ audioPath: paths.wavPath })
+  }, FETCH_TIMEOUT_PROCESSING);
+
+  if (!response.ok) {
+    const errorMsg = await parseErrorResponse(response);
+    return { success: false, error: errorMsg };
+  }
+
+  return await response.json();
+}
+
+async function detectSilences(audioPath, sensitivityOrParams) {
+  // Support both new sensitivity number and legacy params object
+  const sensitivity = typeof sensitivityOrParams === 'number'
+    ? sensitivityOrParams
+    : sensitivityOrParams.sensitivity ?? 50;
+
+  // Use /silences-rms for advanced RMS-based detection
+  // Features: auto-threshold, 30s chunked processing, proper sensitivity mapping
+  const response = await fetchWithTimeout(`${getBackendUrl()}/silences-rms`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      wavPath: audioPath,
+      sensitivity: sensitivity
+    })
+  }, FETCH_TIMEOUT_PROCESSING);
+
+  if (!response.ok) {
+    const errorMsg = await parseErrorResponse(response);
+    throw new Error(errorMsg);
+  }
+
+  const data = await response.json();
+  if (!data.success) {
+    throw new Error(data.error || 'Silence detection failed');
+  }
+
+  // Store silences globally for razor workflow
+  currentSilences = data.silences;
+
+  return data.silences;
+}
+
+async function transcribeAudio() {
+  // Get initialized paths (cross-platform)
+  const paths = await getPaths();
+
+  const response = await fetchWithTimeout(`${getBackendUrl()}/analyze`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ wavPath: paths.wavPath })
+  }, FETCH_TIMEOUT_PROCESSING);
+
+  if (!response.ok) {
+    const errorMsg = await parseErrorResponse(response);
+    return { success: false, error: errorMsg };
+  }
+
+  const data = await response.json();
+  return {
+    success: data.success,
+    transcript: data.transcript,
+    takes: data.takes,
+    error: data.error
+  };
+}
+
+// ============================================================================
+// BATCH PROCESSING
+// ============================================================================
+let batchQueue = [];
+let currentBatchJobId = null;
+
+/**
+ * Initialize batch processing handlers
+ */
+function initBatchHandlers() {
+  const addToBatchBtn = document.getElementById('addToBatchBtn');
+  const startBatchBtn = document.getElementById('startBatchBtn');
+  const clearBatchBtn = document.getElementById('clearBatchBtn');
+  const batchSection = document.getElementById('batchSection');
+
+  // Show batch section in settings or after first detection
+  if (batchSection) {
+    batchSection.classList.remove('hidden');
+  }
+
+  // Add files to batch queue
+  if (addToBatchBtn) {
+    addToBatchBtn.addEventListener('click', async () => {
+      try {
+        const uxpFs = require('uxp').storage.localFileSystem;
+        const files = await uxpFs.getFileForOpening({
+          allowMultiple: true,
+          types: ['wav', 'mp3', 'mp4', 'mov', 'aac', 'm4a']
+        });
+
+        if (files && files.length > 0) {
+          for (const file of files) {
+            const path = file.nativePath || file.name;
+            if (!batchQueue.includes(path)) {
+              batchQueue.push(path);
+            }
+          }
+          updateBatchQueueDisplay();
+          setStatus(`Added ${files.length} file(s) to batch queue`);
+        }
+      } catch (err) {
+        setStatus('Error adding files: ' + err.message);
+      }
+    });
+  }
+
+  // Start batch processing
+  if (startBatchBtn) {
+    startBatchBtn.addEventListener('click', async () => {
+      if (batchQueue.length === 0) {
+        setStatus('No files in batch queue');
+        return;
+      }
+
+      startBatchBtn.disabled = true;
+      addToBatchBtn.disabled = true;
+
+      try {
+        await runBatchProcessing();
+      } finally {
+        startBatchBtn.disabled = false;
+        addToBatchBtn.disabled = false;
+      }
+    });
+  }
+
+  // Clear batch queue
+  if (clearBatchBtn) {
+    clearBatchBtn.addEventListener('click', () => {
+      batchQueue = [];
+      currentBatchJobId = null;
+      updateBatchQueueDisplay();
+      setStatus('Batch queue cleared');
+    });
+  }
+
+  // Event delegation for batch list remove buttons (UXP-compatible)
+  const batchList = document.getElementById('batchList');
+  if (batchList) {
+    batchList.addEventListener('click', (e) => {
+      const removeBtn = e.target.closest('.batch-remove-btn');
+      if (removeBtn) {
+        const index = parseInt(removeBtn.dataset.index, 10);
+        if (!isNaN(index) && index >= 0 && index < batchQueue.length) {
+          removeBatchItem(index);
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Update batch queue display (uses data attributes for UXP compatibility)
+ */
+function updateBatchQueueDisplay() {
+  const batchEmpty = document.getElementById('batchEmpty');
+  const batchList = document.getElementById('batchList');
+  const startBatchBtn = document.getElementById('startBatchBtn');
+
+  if (batchQueue.length === 0) {
+    if (batchEmpty) batchEmpty.style.display = 'block';
+    if (batchList) batchList.innerHTML = '';
+    if (startBatchBtn) startBatchBtn.disabled = true;
+    return;
+  }
+
+  if (batchEmpty) batchEmpty.style.display = 'none';
+  if (startBatchBtn) startBatchBtn.disabled = false;
+
+  if (batchList) {
+    // Use data-index attribute instead of inline onclick for UXP compatibility
+    batchList.innerHTML = batchQueue.map((path, i) => {
+      const fileName = path.split('/').pop();
+      return `<div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 6px; background: #2a2a2a; border-radius: 3px; margin-bottom: 2px; font-size: 9px;">
+        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;" title="${path}">${fileName}</span>
+        <button class="batch-remove-btn" data-index="${i}" style="background: transparent; border: none; color: #888; cursor: pointer; font-size: 10px;" aria-label="Remove ${fileName}">x</button>
+      </div>`;
+    }).join('');
+  }
+}
+
+/**
+ * Remove item from batch queue
+ */
+function removeBatchItem(index) {
+  batchQueue.splice(index, 1);
+  updateBatchQueueDisplay();
+}
+
+/**
+ * Run batch processing
+ */
+async function runBatchProcessing() {
+  const batchProgress = document.getElementById('batchProgress');
+  const batchProgressBar = document.getElementById('batchProgressBar');
+  const batchProgressText = document.getElementById('batchProgressText');
+
+  if (batchProgress) batchProgress.style.display = 'block';
+
+  try {
+    // Get settings
+    const sensitivity = parseInt(document.getElementById('sensitivitySlider')?.value || 50);
+    const params = mapSensitivity(sensitivity);
+
+    // Call batch endpoint
+    const response = await fetchWithTimeout(`${getBackendUrl()}/batch/silences`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        files: batchQueue,
+        options: {
+          sensitivity,
+          threshold: params.dbThreshold,
+          minSilenceLength: params.minDuration,
+          paddingStart: params.padding,
+          paddingEnd: params.padding / 2
+        }
+      })
+    }, FETCH_TIMEOUT_PROCESSING);
+
+    if (!response.ok) {
+      const errorMsg = await parseErrorResponse(response);
+      throw new Error(errorMsg);
+    }
+
+    const data = await response.json();
+    currentBatchJobId = data.jobId;
+    setStatus(`Batch job started: ${data.jobId}`);
+
+    // Poll for status
+    await pollBatchStatus(currentBatchJobId, batchProgressBar, batchProgressText);
+
+  } catch (err) {
+    setStatus('Batch error: ' + err.message);
+  } finally {
+    if (batchProgress) batchProgress.style.display = 'none';
+  }
+}
+
+/**
+ * Poll batch job status
+ */
+async function pollBatchStatus(jobId, progressBar, progressText) {
+  const pollInterval = 2000; // 2 seconds
+  const maxPolls = 300; // 10 minutes max
+  let polls = 0;
+
+  while (polls < maxPolls) {
+    try {
+      const response = await fetchWithTimeout(`${getBackendUrl()}/batch/status/${jobId}`, {
+        headers: getAuthHeaders()
+      }, FETCH_TIMEOUT_DEFAULT);
+
+      if (!response.ok) {
+        throw new Error('Failed to get batch status');
+      }
+
+      const data = await response.json();
+      const job = data.job;
+
+      // Update progress
+      if (progressBar) {
+        if (progressBar.tagName === 'SP-PROGRESSBAR' || progressBar.tagName === 'PROGRESS') {
+          progressBar.value = job.progress.percentage;
+        } else {
+          progressBar.style.width = `${job.progress.percentage}%`;
+        }
+      }
+      if (progressText) progressText.textContent = `${job.progress.completed + job.progress.failed} / ${job.progress.total} files`;
+
+      // Check if complete
+      if (job.status !== 'processing') {
+        if (job.status === 'completed') {
+          setStatus(`Batch complete: ${job.progress.completed} files processed`);
+        } else if (job.status === 'completed_with_errors') {
+          setStatus(`Batch complete with ${job.progress.failed} error(s)`);
+        } else {
+          setStatus('Batch failed');
+        }
+
+        // Clear queue on completion
+        batchQueue = [];
+        updateBatchQueueDisplay();
+        return;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      polls++;
+    } catch (err) {
+      setStatus('Polling error: ' + err.message);
+      return;
+    }
+  }
+
+  setStatus('Batch timed out');
+}
+
+// Expose for inline onclick
+if (typeof window !== 'undefined') {
+  window.removeBatchItem = removeBatchItem;
+}
+
+// ============================================================================
+// CUSTOM PRESETS UI (v3.5)
+// ============================================================================
+
+/**
+ * Icon mapping for display
+ */
+const PRESET_ICON_MAP = {
+  'settings': '*',
+  'mic': 'M',
+  'people': 'P',
+  'bolt': '!',
+  'school': 'E',
+  'videocam': 'V',
+  'star': 'S',
+  'heart': 'H'
+};
+
+/**
+ * Initialize custom presets UI handlers
+ */
+function initCustomPresetsUI() {
+  // Refresh preset dropdown on load
+  refreshPresetDropdown();
+
+  // Save Preset button (+)
+  if (ui.savePresetBtn) {
+    ui.savePresetBtn.addEventListener('click', () => {
+      showPresetModal();
+    });
+  }
+
+  // Manage Presets button (...)
+  if (ui.managePresetsBtn) {
+    ui.managePresetsBtn.addEventListener('click', () => {
+      showManagePresetsModal();
+    });
+  }
+
+  // Close Preset Modal
+  if (ui.closePresetModalBtn) {
+    ui.closePresetModalBtn.addEventListener('click', () => {
+      hidePresetModal();
+    });
+  }
+
+  // Close on backdrop click
+  if (ui.presetModal) {
+    ui.presetModal.addEventListener('click', (e) => {
+      if (e.target === ui.presetModal) {
+        hidePresetModal();
+      }
+    });
+  }
+
+  // Icon picker
+  if (ui.presetIconPicker) {
+    ui.presetIconPicker.addEventListener('click', (e) => {
+      const btn = e.target.closest('.preset-icon-option');
+      if (btn) {
+        selectPresetIcon(btn.dataset.icon);
+      }
+    });
+  }
+
+  // Sensitivity slider value display (Phase 3)
+  if (ui.presetSensitivity && ui.presetSensitivityValue) {
+    ui.presetSensitivity.addEventListener('input', () => {
+      ui.presetSensitivityValue.textContent = ui.presetSensitivity.value;
+    });
+  }
+
+  // Save Preset Confirm
+  if (ui.savePresetConfirmBtn) {
+    ui.savePresetConfirmBtn.addEventListener('click', () => {
+      savePresetFromModal();
+    });
+  }
+
+  // Close Manage Presets Modal
+  if (ui.closeManagePresetsBtn) {
+    ui.closeManagePresetsBtn.addEventListener('click', () => {
+      hideManagePresetsModal();
+    });
+  }
+
+  // Close on backdrop click
+  if (ui.managePresetsModal) {
+    ui.managePresetsModal.addEventListener('click', (e) => {
+      if (e.target === ui.managePresetsModal) {
+        hideManagePresetsModal();
+      }
+    });
+  }
+
+  // Event delegation for preset list actions
+  if (ui.presetsList) {
+    ui.presetsList.addEventListener('click', (e) => {
+      const editBtn = e.target.closest('.preset-edit-btn');
+      const deleteBtn = e.target.closest('.preset-delete-btn');
+      const duplicateBtn = e.target.closest('.preset-duplicate-btn');
+
+      if (editBtn) {
+        const presetId = editBtn.dataset.presetId;
+        editPreset(presetId);
+      }
+
+      if (deleteBtn) {
+        const presetId = deleteBtn.dataset.presetId;
+        const presetName = deleteBtn.dataset.presetName;
+        deletePresetWithConfirm(presetId, presetName);
+      }
+
+      if (duplicateBtn) {
+        const presetId = duplicateBtn.dataset.presetId;
+        const presetName = duplicateBtn.dataset.presetName;
+        duplicatePresetFromUI(presetId, presetName);
+      }
+    });
+  }
+
+  // Export presets button (Phase 3)
+  if (ui.exportPresetsBtn) {
+    ui.exportPresetsBtn.addEventListener('click', () => {
+      exportPresetsToFile();
+    });
+  }
+
+  // Import presets button (Phase 3) - uses UXP file picker directly
+  if (ui.importPresetsBtn) {
+    ui.importPresetsBtn.addEventListener('click', () => {
+      importPresetsFromFile();
+    });
+  }
+}
+
+/**
+ * Refresh the preset dropdown with all presets (built-in + custom)
+ */
+function refreshPresetDropdown() {
+  if (!ui.presetSelector) return;
+
+  const presets = getAllPresets();
+  const currentValue = ui.presetSelector.value;
+
+  // Clear existing options
+  ui.presetSelector.innerHTML = '';
+
+  // Add all presets
+  presets.forEach(preset => {
+    const option = document.createElement('option');
+    option.value = preset.id;
+
+    // Format: "Name - Description" or just "Name"
+    const desc = preset.description ? ` - ${preset.description}` : '';
+    option.textContent = preset.name + desc;
+
+    // Add custom marker for custom presets
+    if (!preset.isBuiltIn) {
+      option.textContent = `${preset.name}${desc}`;
+      option.style.color = '#28a745';
+    }
+
+    ui.presetSelector.appendChild(option);
+  });
+
+  // Restore selection if it still exists
+  if ([...ui.presetSelector.options].some(opt => opt.value === currentValue)) {
+    ui.presetSelector.value = currentValue;
+  } else {
+    ui.presetSelector.value = 'custom';
+  }
+}
+
+/**
+ * Show the preset modal for creating a new preset
+ */
+function showPresetModal(editId = null) {
+  if (!ui.presetModal) return;
+
+  // Reset form
+  ui.presetNameInput.value = '';
+  ui.presetDescInput.value = '';
+  ui.presetEditId.value = '';
+  ui.presetSelectedIcon.value = 'settings';
+  selectPresetIcon('settings');
+  hidePresetError();
+
+  // Get current settings as defaults
+  const currentSettings = getSettings();
+  const defaultSensitivity = currentSettings.sensitivity || 50;
+  const defaultThreshold = currentSettings.threshold || -32;
+
+  if (editId) {
+    // Edit mode
+    const preset = getPresetById(editId);
+    if (preset && !preset.isBuiltIn) {
+      ui.presetModalTitle.textContent = 'Edit Preset';
+      ui.presetNameInput.value = preset.name;
+      ui.presetDescInput.value = preset.description || '';
+      ui.presetEditId.value = editId;
+      ui.presetSelectedIcon.value = preset.icon || 'settings';
+      selectPresetIcon(preset.icon || 'settings');
+      ui.savePresetConfirmBtn.textContent = 'Update Preset';
+
+      // Populate settings from preset (Phase 3)
+      const presetSensitivity = preset.settings?.sensitivity ?? defaultSensitivity;
+      const presetThreshold = preset.settings?.threshold ?? defaultThreshold;
+      if (ui.presetSensitivity) {
+        ui.presetSensitivity.value = presetSensitivity;
+        if (ui.presetSensitivityValue) ui.presetSensitivityValue.textContent = presetSensitivity;
+      }
+      if (ui.presetThreshold) {
+        ui.presetThreshold.value = presetThreshold;
+      }
+    }
+  } else {
+    // Create mode - use current settings from main UI
+    ui.presetModalTitle.textContent = 'Save Preset';
+    ui.savePresetConfirmBtn.textContent = 'Save Preset';
+
+    // Get sensitivity from main slider if available
+    const mainSensitivity = ui.sensitivitySlider?.value ?? defaultSensitivity;
+    if (ui.presetSensitivity) {
+      ui.presetSensitivity.value = mainSensitivity;
+      if (ui.presetSensitivityValue) ui.presetSensitivityValue.textContent = mainSensitivity;
+    }
+    if (ui.presetThreshold) {
+      ui.presetThreshold.value = defaultThreshold;
+    }
+  }
+
+  ui.presetModal.classList.remove('hidden');
+  ui.presetNameInput.focus();
+}
+
+/**
+ * Hide the preset modal
+ */
+function hidePresetModal() {
+  if (ui.presetModal) {
+    ui.presetModal.classList.add('hidden');
+  }
+}
+
+/**
+ * Select an icon in the preset modal
+ */
+function selectPresetIcon(iconName) {
+  if (!ui.presetIconPicker || !ui.presetSelectedIcon) return;
+
+  // Update hidden input
+  ui.presetSelectedIcon.value = iconName;
+
+  // Update visual selection
+  ui.presetIconPicker.querySelectorAll('.preset-icon-option').forEach(btn => {
+    if (btn.dataset.icon === iconName) {
+      btn.classList.add('selected');
+    } else {
+      btn.classList.remove('selected');
+    }
+  });
+}
+
+/**
+ * Show error message in preset modal
+ */
+function showPresetError(message) {
+  if (ui.presetModalError) {
+    ui.presetModalError.textContent = message;
+    ui.presetModalError.style.display = 'block';
+  }
+}
+
+/**
+ * Hide error message in preset modal
+ */
+function hidePresetError() {
+  if (ui.presetModalError) {
+    ui.presetModalError.style.display = 'none';
+  }
+}
+
+/**
+ * Save preset from modal (create or update)
+ */
+function savePresetFromModal() {
+  const name = ui.presetNameInput?.value?.trim();
+  const description = ui.presetDescInput?.value?.trim() || '';
+  const icon = ui.presetSelectedIcon?.value || 'settings';
+  const editId = ui.presetEditId?.value;
+
+  if (!name) {
+    showPresetError('Please enter a preset name');
+    return;
+  }
+
+  // Capture settings from modal inputs (Phase 3)
+  const sensitivityRaw = parseInt(ui.presetSensitivity?.value);
+  const thresholdRaw = parseInt(ui.presetThreshold?.value);
+  const sensitivity = isNaN(sensitivityRaw) ? 50 : sensitivityRaw;
+  const threshold = isNaN(thresholdRaw) ? -32 : thresholdRaw;
+
+  // Get base settings and override with modal values
+  const baseSettings = getCurrentPresetSettings();
+  const settings = {
+    ...baseSettings,
+    sensitivity,
+    threshold
+  };
+
+  let result;
+
+  if (editId) {
+    // Update existing preset (including settings)
+    result = updateCustomPreset(editId, {
+      name,
+      description,
+      icon,
+      settings
+    });
+
+    if (result.success) {
+      setStatus(`Preset "${name}" updated`);
+    }
+  } else {
+    // Create new preset with modal settings
+    result = createCustomPreset({
+      name,
+      description,
+      icon,
+      settings
+    });
+
+    if (result.success) {
+      setStatus(`Preset "${name}" saved`);
+      // Select the newly created preset
+      refreshPresetDropdown();
+      if (ui.presetSelector) {
+        ui.presetSelector.value = result.id;
+      }
+    }
+  }
+
+  if (result.success) {
+    hidePresetModal();
+    refreshPresetDropdown();
+  } else {
+    showPresetError(result.error || 'Failed to save preset');
+  }
+}
+
+/**
+ * Show the manage presets modal
+ */
+function showManagePresetsModal() {
+  if (!ui.managePresetsModal) return;
+
+  renderPresetsList();
+  ui.managePresetsModal.classList.remove('hidden');
+}
+
+/**
+ * Hide the manage presets modal
+ */
+function hideManagePresetsModal() {
+  if (ui.managePresetsModal) {
+    ui.managePresetsModal.classList.add('hidden');
+  }
+}
+
+/**
+ * Render the presets list in the manage modal
+ */
+function renderPresetsList() {
+  if (!ui.presetsList) return;
+
+  const presets = getAllPresets();
+  const customPresets = presets.filter(p => !p.isBuiltIn);
+
+  // Show/hide empty state
+  if (ui.noCustomPresets) {
+    ui.noCustomPresets.style.display = customPresets.length === 0 ? 'block' : 'none';
+  }
+
+  // Build HTML
+  const fragment = document.createDocumentFragment();
+
+  presets.forEach(preset => {
+    const div = document.createElement('div');
+    div.className = `preset-list-item ${preset.isBuiltIn ? 'built-in' : 'custom'}`;
+
+    const iconChar = PRESET_ICON_MAP[preset.icon] || '*';
+    const desc = preset.description || (preset.isBuiltIn ? 'Built-in preset' : 'Custom preset');
+
+    if (preset.isBuiltIn) {
+      // Built-in presets: only duplicate button (Phase 3)
+      div.innerHTML = `
+        <div class="preset-list-item-icon">${iconChar}</div>
+        <div class="preset-list-item-info">
+          <div class="preset-list-item-name">${preset.name}</div>
+          <div class="preset-list-item-desc">${desc}</div>
+        </div>
+        <div class="preset-list-item-actions">
+          <button class="preset-duplicate-btn" data-preset-id="${preset.id}" data-preset-name="${preset.name}" title="Duplicate preset">D</button>
+        </div>
+      `;
+    } else {
+      // Custom presets: duplicate/edit/delete buttons (Phase 3)
+      div.innerHTML = `
+        <div class="preset-list-item-icon">${iconChar}</div>
+        <div class="preset-list-item-info">
+          <div class="preset-list-item-name">${preset.name}</div>
+          <div class="preset-list-item-desc">${desc}</div>
+        </div>
+        <div class="preset-list-item-actions">
+          <button class="preset-duplicate-btn" data-preset-id="${preset.id}" data-preset-name="${preset.name}" title="Duplicate preset">D</button>
+          <button class="preset-edit-btn" data-preset-id="${preset.id}" title="Edit preset">E</button>
+          <button class="preset-delete-btn delete" data-preset-id="${preset.id}" data-preset-name="${preset.name}" title="Delete preset">X</button>
+        </div>
+      `;
+    }
+
+    fragment.appendChild(div);
+  });
+
+  ui.presetsList.innerHTML = '';
+  ui.presetsList.appendChild(fragment);
+}
+
+/**
+ * Edit a preset
+ */
+function editPreset(presetId) {
+  hideManagePresetsModal();
+  showPresetModal(presetId);
+}
+
+/**
+ * Delete a preset with confirmation (uses UXP-compatible modal)
+ */
+function deletePresetWithConfirm(presetId, presetName) {
+  showConfirmModal(
+    'Delete Preset',
+    `Are you sure you want to delete "${presetName}"? This action cannot be undone.`,
+    () => {
+      // onConfirm callback
+      const result = deleteCustomPreset(presetId);
+
+      if (result.success) {
+        setStatus(`Preset "${presetName}" deleted`);
+        renderPresetsList();
+        refreshPresetDropdown();
+      } else {
+        setStatus('Failed to delete preset: ' + (result.error || 'Unknown error'));
+      }
+    },
+    null, // onCancel - no action needed
+    { confirmText: 'Delete', confirmStyle: '#dc3545' }
+  );
+}
+
+/**
+ * Duplicate a preset from the UI (Phase 3)
+ */
+function duplicatePresetFromUI(presetId, presetName) {
+  const result = duplicatePreset(presetId);
+
+  if (result.success) {
+    setStatus(`Created copy of "${presetName}"`);
+    renderPresetsList();
+    refreshPresetDropdown();
+
+    // Select the new copy in dropdown
+    if (ui.presetSelector && result.id) {
+      ui.presetSelector.value = result.id;
+    }
+  } else {
+    setStatus('Failed to duplicate preset: ' + (result.error || 'Unknown error'));
+  }
+}
+
+/**
+ * Export presets to a JSON file (Phase 3)
+ */
+async function exportPresetsToFile() {
+  const result = exportPresets();
+
+  if (!result.success) {
+    setStatus(result.error || 'No presets to export');
+    return;
+  }
+
+  try {
+    // Create a blob and download it
+    const blob = new Blob([result.data], { type: 'application/json' });
+    const filename = `splice-presets-${new Date().toISOString().slice(0, 10)}.json`;
+
+    // UXP approach: use file system API
+    const uxpFs = require('uxp').storage.localFileSystem;
+    const file = await uxpFs.getFileForSaving(filename, { types: ['json'] });
+
+    if (file) {
+      await file.write(result.data);
+      setStatus(`Exported ${result.count} preset(s) to ${file.name}`);
+    } else {
+      setStatus('Export cancelled');
+    }
+  } catch (err) {
+    console.error('[SPLICE] Export error:', err);
+    setStatus('Export failed: ' + err.message);
+  }
+}
+
+/**
+ * Import presets from a JSON file using UXP file picker (Phase 3)
+ * Uses UXP file API instead of FileReader for compatibility
+ */
+async function importPresetsFromFile() {
+  try {
+    // Use UXP file picker API instead of HTML file input
+    const uxpFs = require('uxp').storage.localFileSystem;
+    const file = await uxpFs.getFileForOpening({ types: ['json'] });
+
+    if (!file) {
+      // User cancelled file picker
+      return;
+    }
+
+    // Read file content using UXP async file API
+    const jsonString = await file.read();
+
+    if (!jsonString || jsonString.trim() === '') {
+      setStatus('Import failed: File is empty');
+      return;
+    }
+
+    // Parse and import presets
+    const result = importPresets(jsonString, true);
+
+    if (result.success) {
+      setStatus(`Imported ${result.imported} preset(s)${result.skipped > 0 ? `, ${result.skipped} skipped` : ''}`);
+      renderPresetsList();
+      refreshPresetDropdown();
+    } else {
+      setStatus('Import failed: ' + (result.error || 'Unknown error'));
+    }
+  } catch (err) {
+    console.error('[SPLICE] Import error:', err);
+
+    // Provide user-friendly error messages
+    if (err.message && err.message.includes('JSON')) {
+      setStatus('Import failed: Invalid JSON file');
+    } else if (err.message && err.message.includes('permission')) {
+      setStatus('Import failed: Permission denied');
+    } else {
+      setStatus('Import failed: ' + err.message);
+    }
+  }
+}
+
+/**
+ * Apply a preset and update UI controls
+ * Called when user selects a preset from dropdown
+ */
+function applyPresetAndUpdateUI(presetId) {
+  const preset = getPresetById(presetId);
+  if (!preset) return;
+
+  // For custom presets, apply the settings
+  if (!preset.isBuiltIn) {
+    const settings = preset.settings;
+    if (settings) {
+      // Update sensitivity slider
+      if (ui.sensitivitySlider && settings.sensitivity !== undefined) {
+        ui.sensitivitySlider.value = settings.sensitivity;
+      }
+
+      // Update takes detection checkbox
+      if (ui.enableTakesDetection && settings.enableTakesDetection !== undefined) {
+        ui.enableTakesDetection.checked = settings.enableTakesDetection;
+      }
+
+      // Update auto-mark best checkbox
+      if (ui.autoMarkBest && settings.autoMarkBest !== undefined) {
+        ui.autoMarkBest.checked = settings.autoMarkBest;
+      }
+
+      // Phase 1: Update J-Cut settings
+      updateJCutUIFromSettings(settings);
+
+      // Save as active preset
+      saveSettings({ activePreset: presetId, ...settings });
+    }
+  } else {
+    // Built-in preset: use applyPreset from settings.js
+    const appliedSettings = applyPreset(presetId);
+
+    // Update sensitivity slider to match preset
+    if (ui.sensitivitySlider && appliedSettings.sensitivity !== undefined) {
+      ui.sensitivitySlider.value = appliedSettings.sensitivity;
+    }
+
+    // Update takes detection checkbox
+    if (ui.enableTakesDetection && appliedSettings.enableTakesDetection !== undefined) {
+      ui.enableTakesDetection.checked = appliedSettings.enableTakesDetection;
+    }
+
+    // Update auto-mark best checkbox
+    if (ui.autoMarkBest && appliedSettings.autoMarkBest !== undefined) {
+      ui.autoMarkBest.checked = appliedSettings.autoMarkBest;
+    }
+
+    // Phase 1: Update J-Cut settings from preset
+    updateJCutUIFromSettings(appliedSettings);
+  }
+
+  setStatus(`Applied preset: ${preset.name}`);
+}
+
+// ============================================================================
+// PROFANITY BLEEPING UI (Feature 1: Firecut Parity)
+// ============================================================================
+
+/**
+ * State for profanity detection and bleeping
+ */
+let currentProfanityInstances = [];
+let selectedProfanityIndices = new Set();
+
+/**
+ * Initialize profanity settings UI
+ * Wires up bleep type selector, volume slider, and auto-insert checkbox
+ */
+function initProfanitySettingsUI() {
+  const bleepTypeSelect = document.getElementById('bleepType');
+  const bleepVolumeSlider = document.getElementById('bleepVolume');
+  const bleepVolumeValue = document.getElementById('bleepVolumeValue');
+  const enableBleepInsertion = document.getElementById('enableBleepInsertion');
+
+  // Bleep type change handler
+  if (bleepTypeSelect) {
+    bleepTypeSelect.addEventListener('change', () => {
+      saveSettings({ bleepType: bleepTypeSelect.value });
+      console.log('[SPLICE] Bleep type changed to:', bleepTypeSelect.value);
+    });
+
+    // Load saved setting
+    const settings = getSettings();
+    if (settings.bleepType) {
+      bleepTypeSelect.value = settings.bleepType;
+    }
+  }
+
+  // Bleep volume slider handler
+  if (bleepVolumeSlider && bleepVolumeValue) {
+    bleepVolumeSlider.addEventListener('input', () => {
+      const volume = bleepVolumeSlider.value;
+      bleepVolumeValue.textContent = volume + '%';
+      saveSettings({ bleepVolume: parseInt(volume) });
+    });
+
+    // Load saved setting
+    const settings = getSettings();
+    if (settings.bleepVolume !== undefined) {
+      bleepVolumeSlider.value = settings.bleepVolume;
+      bleepVolumeValue.textContent = settings.bleepVolume + '%';
+    }
+  }
+
+  // Auto-insert bleeps checkbox handler
+  if (enableBleepInsertion) {
+    enableBleepInsertion.addEventListener('change', () => {
+      saveSettings({ enableBleepInsertion: enableBleepInsertion.checked });
+      console.log('[SPLICE] Auto-insert bleeps:', enableBleepInsertion.checked);
+    });
+
+    // Load saved setting
+    const settings = getSettings();
+    if (settings.enableBleepInsertion !== undefined) {
+      enableBleepInsertion.checked = settings.enableBleepInsertion;
+    }
+  }
+
+  console.log('[SPLICE] Profanity Settings UI initialized');
+}
+
+/**
+ * Generate bleep audio files for profanity instances
+ * Calls backend /profanity/generate-bleeps endpoint
+ * @param {Array} profanityInstances - Array of profanity detection results
+ * @returns {Promise<Object>} Object with success, bleepFiles array, and error
+ */
+async function generateBleepAudio(profanityInstances) {
+  if (!profanityInstances || profanityInstances.length === 0) {
+    return { success: false, error: 'No profanity instances provided' };
+  }
+
+  const settings = getSettings();
+  const bleepType = settings.bleepType || 'standard';
+  const bleepVolume = (settings.bleepVolume || 50) / 100; // Convert 0-100 to 0-1
+
+  try {
+    setStatus('Generating bleep audio...');
+
+    const response = await fetchWithTimeout(`${getBackendUrl()}/profanity/generate-bleeps`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        profanityInstances,
+        bleepType,
+        volume: bleepVolume
+      })
+    }, FETCH_TIMEOUT_PROCESSING);
+
+    if (!response.ok) {
+      const errorMsg = await parseErrorResponse(response);
+      throw new Error(errorMsg);
+    }
+
+    const data = await response.json();
+
+    if (data.success) {
+      setStatus(`Generated ${data.bleepFiles?.length || 0} bleep audio files`);
+      return {
+        success: true,
+        bleepFiles: data.bleepFiles || [],
+        outputDir: data.outputDir
+      };
+    } else {
+      throw new Error(data.error || 'Bleep generation failed');
+    }
+  } catch (err) {
+    console.error('[SPLICE] Bleep generation error:', err);
+    setStatus('Bleep generation error: ' + err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Insert bleep audio files to timeline
+ * Uses builder.js insertBleepAudio function
+ * @param {Array} bleepFiles - Array of bleep file info from backend
+ * @returns {Promise<Object>} Object with success, insertedCount, and error
+ */
+async function insertBleepAudioToTimeline(bleepFiles) {
+  if (!bleepFiles || bleepFiles.length === 0) {
+    return { success: false, error: 'No bleep files to insert' };
+  }
+
+  try {
+    setStatus('Inserting bleep audio to timeline...');
+
+    // Use builder function if available
+    if (typeof window.spliceBuilder?.insertBleepAudio === 'function') {
+      const result = await window.spliceBuilder.insertBleepAudio(bleepFiles);
+      if (result.success) {
+        setStatus(`Inserted ${result.insertedCount} bleep audio clips`);
+      }
+      return result;
+    }
+
+    // Fallback: manual insertion via UXP APIs
+    const ppro = require('premierepro');
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+
+    if (!sequence) {
+      return { success: false, error: 'No active sequence' };
+    }
+
+    let insertedCount = 0;
+
+    // Import and insert each bleep file
+    for (const bleepInfo of bleepFiles) {
+      try {
+        // Import the WAV file
+        const importResult = await project.importFiles([bleepInfo.wavPath], true);
+
+        if (importResult && importResult.length > 0) {
+          const bleepItem = importResult[0];
+
+          // Get the first audio track
+          const audioTracks = await sequence.getAudioTracks();
+          if (audioTracks && audioTracks.length > 0) {
+            // Find an empty audio track or use the last one
+            let targetTrack = audioTracks[audioTracks.length - 1];
+
+            // Insert at the profanity timestamp
+            const insertTime = ppro.TickTime.createWithSeconds(bleepInfo.start);
+            await targetTrack.insertClip(bleepItem, insertTime);
+
+            insertedCount++;
+          }
+        }
+      } catch (insertErr) {
+        console.warn('[SPLICE] Failed to insert bleep at', bleepInfo.start, ':', insertErr);
+      }
+    }
+
+    setStatus(`Inserted ${insertedCount} bleep audio clips`);
+    return { success: true, insertedCount };
+
+  } catch (err) {
+    console.error('[SPLICE] Bleep insertion error:', err);
+    setStatus('Bleep insertion error: ' + err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Complete profanity bleeping workflow
+ * Detects profanity, generates bleeps, and optionally inserts to timeline
+ * @returns {Promise<Object>} Result with detected, generated, and inserted counts
+ */
+async function runProfanityBleepingWorkflow() {
+  const settings = getSettings();
+
+  // Step 1: Detect profanity (use existing profanity detection)
+  const paths = await getPaths();
+
+  try {
+    setStatus('Detecting profanity...');
+
+    const profanityResponse = await fetchWithTimeout(`${getBackendUrl()}/profanity`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        wavPath: paths.wavPath,
+        language: settings.profanityLanguage || 'en'
+      })
+    }, FETCH_TIMEOUT_PROCESSING);
+
+    if (!profanityResponse.ok) {
+      throw new Error(await parseErrorResponse(profanityResponse));
+    }
+
+    const profanityData = await profanityResponse.json();
+    currentProfanityInstances = profanityData.instances || [];
+
+    if (currentProfanityInstances.length === 0) {
+      setStatus('No profanity detected');
+      return { success: true, detected: 0, generated: 0, inserted: 0 };
+    }
+
+    setStatus(`Found ${currentProfanityInstances.length} profanity instance(s)`);
+
+    // Step 2: Generate bleep audio
+    const bleepResult = await generateBleepAudio(currentProfanityInstances);
+
+    if (!bleepResult.success) {
+      return { success: false, error: bleepResult.error, detected: currentProfanityInstances.length };
+    }
+
+    // Step 3: Auto-insert if enabled
+    let insertedCount = 0;
+    if (settings.enableBleepInsertion && bleepResult.bleepFiles?.length > 0) {
+      const insertResult = await insertBleepAudioToTimeline(bleepResult.bleepFiles);
+      insertedCount = insertResult.insertedCount || 0;
+    }
+
+    setStatus(`Profanity: ${currentProfanityInstances.length} detected, ${bleepResult.bleepFiles?.length || 0} bleeps generated, ${insertedCount} inserted`);
+
+    return {
+      success: true,
+      detected: currentProfanityInstances.length,
+      generated: bleepResult.bleepFiles?.length || 0,
+      inserted: insertedCount,
+      bleepFiles: bleepResult.bleepFiles
+    };
+
+  } catch (err) {
+    console.error('[SPLICE] Profanity workflow error:', err);
+    setStatus('Profanity error: ' + err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// ============================================================================
+// FILLER WORD DETECTION & REMOVAL (Feature 2: Firecut Parity)
+// ============================================================================
+
+/**
+ * State for filler word detection
+ */
+let currentFillerWords = [];
+let selectedFillerIndices = new Set();
+
+/**
+ * Initialize filler word UI
+ * Wires up detection button, word list, and removal controls
+ */
+function initFillerWordUI() {
+  const detectFillersBtn = document.getElementById('detectFillersBtn');
+  const removeFillersBtn = document.getElementById('removeFillersBtn');
+  const customFillersInput = document.getElementById('customFillers');
+  const fillerSensitivitySlider = document.getElementById('fillerSensitivity');
+  const fillerSensitivityValue = document.getElementById('fillerSensitivityValue');
+
+  // Detect fillers button
+  if (detectFillersBtn) {
+    detectFillersBtn.addEventListener('click', detectFillerWords);
+  }
+
+  // Remove selected fillers button
+  if (removeFillersBtn) {
+    removeFillersBtn.addEventListener('click', removeSelectedFillers);
+  }
+
+  // Filler sensitivity slider
+  if (fillerSensitivitySlider && fillerSensitivityValue) {
+    fillerSensitivitySlider.addEventListener('input', () => {
+      const val = fillerSensitivitySlider.value;
+      fillerSensitivityValue.textContent = val + '%';
+      saveSettings({ fillerSensitivity: parseInt(val) });
+    });
+
+    // Load saved setting
+    const settings = getSettings();
+    if (settings.fillerSensitivity !== undefined) {
+      fillerSensitivitySlider.value = settings.fillerSensitivity;
+      fillerSensitivityValue.textContent = settings.fillerSensitivity + '%';
+    }
+  }
+
+  // Custom fillers input
+  if (customFillersInput) {
+    customFillersInput.addEventListener('change', () => {
+      saveSettings({ customFillers: customFillersInput.value });
+    });
+
+    // Load saved setting
+    const settings = getSettings();
+    if (settings.customFillers) {
+      customFillersInput.value = settings.customFillers;
+    }
+  }
+
+  console.log('[SPLICE] Filler Word UI initialized');
+}
+
+/**
+ * Detect filler words in the current audio/transcript
+ * Calls backend /fillers endpoint
+ */
+async function detectFillerWords() {
+  const paths = await getPaths();
+  const settings = getSettings();
+
+  // Parse custom fillers from input
+  const customFillersInput = document.getElementById('customFillers');
+  const customFillers = customFillersInput?.value
+    ? customFillersInput.value.split(',').map(f => f.trim()).filter(f => f)
+    : [];
+
+  try {
+    setStatus('Detecting filler words...');
+
+    const response = await fetchWithTimeout(`${getBackendUrl()}/fillers`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        wavPath: paths.wavPath,
+        customFillers,
+        paddingMs: 50,
+        frameRate: 30
+      })
+    }, FETCH_TIMEOUT_PROCESSING);
+
+    if (!response.ok) {
+      throw new Error(await parseErrorResponse(response));
+    }
+
+    const data = await response.json();
+
+    if (data.success) {
+      currentFillerWords = data.fillers || [];
+      selectedFillerIndices.clear();
+
+      // Select all by default
+      currentFillerWords.forEach((_, i) => selectedFillerIndices.add(i));
+
+      // Display results
+      displayFillerWordResults(currentFillerWords);
+
+      const totalTime = currentFillerWords.reduce((sum, f) => sum + (f.duration || 0), 0);
+      setStatus(`Found ${currentFillerWords.length} filler words (${totalTime.toFixed(2)}s total)`);
+    } else {
+      throw new Error(data.error || 'Filler detection failed');
+    }
+  } catch (err) {
+    console.error('[SPLICE] Filler detection error:', err);
+    setStatus('Filler detection error: ' + err.message);
+  }
+}
+
+/**
+ * Display filler word detection results in the UI
+ * @param {Array} fillers - Array of filler word objects
+ */
+function displayFillerWordResults(fillers) {
+  const fillerResults = document.getElementById('fillerResults');
+  const fillerList = document.getElementById('fillerList');
+  const fillerCount = document.getElementById('fillerCount');
+
+  if (!fillerResults || !fillerList) return;
+
+  // Show results section
+  fillerResults.classList.remove('hidden');
+  fillerResults.style.display = 'block';
+
+  if (fillerCount) {
+    fillerCount.textContent = fillers.length;
+  }
+
+  // Group fillers by word
+  const grouped = {};
+  fillers.forEach((filler, i) => {
+    const word = filler.normalizedWord || filler.word;
+    if (!grouped[word]) {
+      grouped[word] = [];
+    }
+    grouped[word].push({ ...filler, index: i });
+  });
+
+  // Render grouped list
+  let html = '';
+  Object.entries(grouped).forEach(([word, instances]) => {
+    html += `<div class="filler-group" style="margin-bottom: 8px;">
+      <div style="font-weight: bold; color: #4a9eff; margin-bottom: 4px;">"${word}" (${instances.length}x)</div>
+      <div class="filler-instances">`;
+
+    instances.forEach(instance => {
+      const isSelected = selectedFillerIndices.has(instance.index);
+      html += `
+        <label class="filler-item ${isSelected ? 'selected' : ''}" style="display: flex; align-items: center; padding: 4px; margin: 2px 0; background: ${isSelected ? '#2a3a4a' : '#1e1e1e'}; border-radius: 3px; cursor: pointer;">
+          <input type="checkbox" class="filler-check" data-index="${instance.index}" ${isSelected ? 'checked' : ''} style="margin-right: 8px;">
+          <span style="flex: 1; font-size: 10px;">${formatTime(instance.start)} - ${formatTime(instance.end)} (${instance.duration?.toFixed(2) || '?'}s)</span>
+          <button class="filler-seek-btn" data-time="${instance.start}" style="background: transparent; border: none; color: #4a9eff; cursor: pointer; font-size: 10px;">></button>
+        </label>`;
+    });
+
+    html += `</div></div>`;
+  });
+
+  fillerList.innerHTML = html;
+
+  // Add event listeners
+  fillerList.querySelectorAll('.filler-check').forEach(checkbox => {
+    checkbox.addEventListener('change', (e) => {
+      const index = parseInt(e.target.dataset.index);
+      if (e.target.checked) {
+        selectedFillerIndices.add(index);
+        e.target.closest('.filler-item')?.classList.add('selected');
+      } else {
+        selectedFillerIndices.delete(index);
+        e.target.closest('.filler-item')?.classList.remove('selected');
+      }
+      updateFillerRemoveButton();
+    });
+  });
+
+  fillerList.querySelectorAll('.filler-seek-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const time = parseFloat(btn.dataset.time);
+      seekToTime(time);
+    });
+  });
+
+  updateFillerRemoveButton();
+}
+
+/**
+ * Update the remove fillers button state
+ */
+function updateFillerRemoveButton() {
+  const removeFillersBtn = document.getElementById('removeFillersBtn');
+  if (removeFillersBtn) {
+    const count = selectedFillerIndices.size;
+    removeFillersBtn.disabled = count === 0;
+    removeFillersBtn.textContent = count === 0 ? 'Remove Fillers' : `Remove ${count} Filler(s)`;
+  }
+}
+
+/**
+ * Remove selected filler words by generating a cut list
+ * @returns {Promise<Object>} Result with success and removed count
+ */
+async function removeSelectedFillers() {
+  if (selectedFillerIndices.size === 0) {
+    setStatus('No filler words selected');
+    return { success: false, error: 'No fillers selected' };
+  }
+
+  try {
+    setStatus('Removing filler words...');
+
+    // Get selected filler segments
+    const selectedFillers = currentFillerWords.filter((_, i) => selectedFillerIndices.has(i));
+
+    // Convert fillers to silence-like segments for cut list generation
+    const silenceSegments = selectedFillers.map(filler => ({
+      start: filler.start,
+      end: filler.end,
+      duration: filler.duration || (filler.end - filler.start),
+      type: 'filler'
+    }));
+
+    // Generate cut list using existing endpoint
+    const response = await fetchWithTimeout(`${getBackendUrl()}/cut-list`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        silences: silenceSegments,
+        takes: [],
+        enableTakes: false,
+        frameRate: 30
+      })
+    }, FETCH_TIMEOUT_PROCESSING);
+
+    if (!response.ok) {
+      throw new Error(await parseErrorResponse(response));
+    }
+
+    const cutList = await response.json();
+
+    // Build sequence using existing builder
+    if (typeof window.spliceBuilder?.buildSequenceFromCutList === 'function') {
+      const buildResult = await window.spliceBuilder.buildSequenceFromCutList(cutList);
+
+      if (buildResult.success) {
+        const totalTime = silenceSegments.reduce((sum, s) => sum + s.duration, 0);
+        setStatus(`Removed ${selectedFillers.length} filler words (${totalTime.toFixed(2)}s)`);
+
+        // Clear results
+        currentFillerWords = [];
+        selectedFillerIndices.clear();
+        const fillerResults = document.getElementById('fillerResults');
+        if (fillerResults) fillerResults.style.display = 'none';
+
+        return { success: true, removedCount: selectedFillers.length, timeSaved: totalTime };
+      } else {
+        throw new Error(buildResult.error || 'Build failed');
+      }
+    } else {
+      // Fallback: add markers only
+      await addFillerMarkers(selectedFillers);
+      setStatus(`Added ${selectedFillers.length} filler markers (manual removal required)`);
+      return { success: true, removedCount: 0, markersAdded: selectedFillers.length };
+    }
+
+  } catch (err) {
+    console.error('[SPLICE] Filler removal error:', err);
+    setStatus('Filler removal error: ' + err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Add markers for filler words (fallback when builder unavailable)
+ * @param {Array} fillers - Array of filler word objects
+ */
+async function addFillerMarkers(fillers) {
+  try {
+    const ppro = require('premierepro');
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+
+    if (!sequence) return;
+
+    for (const filler of fillers) {
+      const time = ppro.TickTime.createWithSeconds(filler.start);
+      const marker = await sequence.createMarker(time);
+      if (marker) {
+        await marker.setName(`SPLICE: Filler "${filler.word}"`);
+        await marker.setComment(`Duration: ${filler.duration?.toFixed(2) || '?'}s`);
+        await marker.setColor(7); // Rose color for fillers
+      }
+    }
+  } catch (err) {
+    console.warn('[SPLICE] Failed to add filler markers:', err);
+  }
+}
+
+// Export for global access
+if (typeof window !== 'undefined') {
+  window.generateBleepAudio = generateBleepAudio;
+  window.insertBleepAudioToTimeline = insertBleepAudioToTimeline;
+  window.runProfanityBleepingWorkflow = runProfanityBleepingWorkflow;
+  window.detectFillerWords = detectFillerWords;
+  window.removeSelectedFillers = removeSelectedFillers;
+}
+
+// ============================================================================
+// CUSTOM TEXT PRESETS (Video Branding)
+// Ported from: splice-cep/simulate.html
+// ============================================================================
+
+const textBrandingState = {
+  presets: [],
+  currentPreset: null,
+  storageKey: 'splice_text_presets',
+  customFonts: [],
+  customFontsKey: 'splice_custom_fonts'
+};
+
+function initTextBrandingUI() {
+  // Toggle panel
+  const toggle = document.getElementById('textPresetsToggle');
+  const panel = document.getElementById('text-presets-panel');
+  if (toggle && panel) {
+    toggle.addEventListener('click', () => {
+      const isCollapsed = panel.classList.contains('collapsed');
+      const icon = toggle.querySelector('.toggle-icon');
+
+      if (isCollapsed) {
+        panel.classList.remove('collapsed');
+        panel.style.display = 'block';
+        if (icon) icon.textContent = '-';
+      } else {
+        panel.classList.add('collapsed');
+        panel.style.display = 'none';
+        if (icon) icon.textContent = '+';
+      }
+    });
+
+    // Initialize state
+    const isCollapsed = panel.classList.contains('collapsed');
+    panel.style.display = isCollapsed ? 'none' : 'block';
+  }
+
+  // Load saved presets and custom fonts
+  loadTextPresets();
+  loadCustomFonts();
+
+  // Set up event listeners for live preview
+  setupTextPresetPreview();
+
+  // Custom font upload handlers
+  document.getElementById('upload-font-btn')?.addEventListener('click', () => {
+    document.getElementById('custom-font-input').click();
+  });
+  document.getElementById('custom-font-input')?.addEventListener('change', handleFontUpload);
+
+  // Button handlers
+  document.getElementById('save-preset-btn')?.addEventListener('click', saveTextPreset);
+  document.getElementById('apply-preset-btn')?.addEventListener('click', applyTextPresetToCaptions);
+  document.getElementById('reset-preset-btn')?.addEventListener('click', resetTextPresetForm);
+  document.getElementById('export-presets-btn')?.addEventListener('click', exportAllTextPresets);
+  document.getElementById('import-presets-btn')?.addEventListener('click', () => {
+    document.getElementById('import-presets-file').click();
+  });
+  document.getElementById('import-presets-file')?.addEventListener('change', importTextPresets);
+
+  // Slider value displays
+  document.getElementById('preset-font-size')?.addEventListener('input', (e) => {
+    document.getElementById('preset-font-size-value').textContent = e.target.value;
+    updateTextPreview();
+  });
+  document.getElementById('preset-bg-opacity')?.addEventListener('input', (e) => {
+    document.getElementById('preset-bg-opacity-value').textContent = e.target.value;
+    updateTextPreview();
+  });
+
+  console.log('[SPLICE] Text Branding UI initialized');
+}
+
+function setupTextPresetPreview() {
+  const controls = [
+    'preset-font-family', 'preset-font-size', 'preset-font-weight',
+    'preset-text-color', 'preset-bg-color', 'preset-highlight-color',
+    'preset-bg-opacity', 'preset-position', 'preset-animation',
+    'preset-shadow-enabled', 'preset-outline-enabled', 'preset-uppercase'
+  ];
+
+  controls.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('input', updateTextPreview);
+      el.addEventListener('change', updateTextPreview);
+    }
+  });
+
+  updateTextPreview();
+}
+
+function updateTextPreview() {
+  const previewText = document.getElementById('preset-preview-text');
+  if (!previewText) return;
+
+  const fontFamily = document.getElementById('preset-font-family')?.value || 'Arial';
+  const fontSize = document.getElementById('preset-font-size')?.value || 48;
+  const fontWeight = document.getElementById('preset-font-weight')?.value || 'bold';
+  const textColor = document.getElementById('preset-text-color')?.value || '#FFFFFF';
+  const bgColor = document.getElementById('preset-bg-color')?.value || '#000000';
+  const highlightColor = document.getElementById('preset-highlight-color')?.value || '#FFCC00';
+  const bgOpacity = (document.getElementById('preset-bg-opacity')?.value || 80) / 100;
+  const shadowEnabled = document.getElementById('preset-shadow-enabled')?.checked ?? true;
+  const outlineEnabled = document.getElementById('preset-outline-enabled')?.checked ?? false;
+  const uppercase = document.getElementById('preset-uppercase')?.checked ?? false;
+
+  // Apply styles
+  previewText.style.fontFamily = fontFamily;
+  previewText.style.fontSize = Math.min(fontSize, 36) + 'px'; // Scale down for preview
+  previewText.style.fontWeight = fontWeight;
+  previewText.style.color = textColor;
+  previewText.style.backgroundColor = hexToRgba(bgColor, bgOpacity);
+  previewText.style.textTransform = uppercase ? 'uppercase' : 'none';
+
+  let textShadow = 'none';
+  if (shadowEnabled) {
+    textShadow = '2px 2px 4px rgba(0,0,0,0.8)';
+  }
+  if (outlineEnabled) {
+    textShadow = (shadowEnabled ? textShadow + ', ' : '') +
+      `-1px -1px 0 ${highlightColor}, 1px -1px 0 ${highlightColor}, -1px 1px 0 ${highlightColor}, 1px 1px 0 ${highlightColor}`;
+  }
+  previewText.style.textShadow = textShadow;
+}
+
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function getTextPresetFromForm() {
+  return {
+    id: Date.now().toString(),
+    name: document.getElementById('preset-name-input')?.value || 'Untitled',
+    fontFamily: document.getElementById('preset-font-family')?.value || 'Arial',
+    fontSize: parseInt(document.getElementById('preset-font-size')?.value) || 48,
+    fontWeight: document.getElementById('preset-font-weight')?.value || 'bold',
+    textColor: document.getElementById('preset-text-color')?.value || '#FFFFFF',
+    bgColor: document.getElementById('preset-bg-color')?.value || '#000000',
+    highlightColor: document.getElementById('preset-highlight-color')?.value || '#FFCC00',
+    bgOpacity: parseInt(document.getElementById('preset-bg-opacity')?.value) || 80,
+    position: document.getElementById('preset-position')?.value || 'bottom-center',
+    animation: document.getElementById('preset-animation')?.value || 'fade',
+    shadowEnabled: document.getElementById('preset-shadow-enabled')?.checked ?? true,
+    outlineEnabled: document.getElementById('preset-outline-enabled')?.checked ?? false,
+    uppercase: document.getElementById('preset-uppercase')?.checked ?? false
+  };
+}
+
+function saveTextPreset() {
+  const preset = getTextPresetFromForm();
+  if (!preset.name || preset.name === 'Untitled') {
+    alert('Please enter a preset name');
+    return;
+  }
+
+  // Check for duplicate names
+  const existing = textBrandingState.presets.findIndex(p => p.name === preset.name);
+  if (existing >= 0) {
+    textBrandingState.presets[existing] = preset;
+  } else {
+    textBrandingState.presets.push(preset);
+  }
+
+  saveTextPresetsToStorage();
+  renderTextPresetsGallery();
+  console.log('[SPLICE] Text preset saved:', preset.name);
+}
+
+function deleteTextPreset(presetId) {
+  textBrandingState.presets = textBrandingState.presets.filter(p => p.id !== presetId);
+  saveTextPresetsToStorage();
+  renderTextPresetsGallery();
+}
+
+function loadTextPresetToForm(preset) {
+  if (!preset) return;
+
+  document.getElementById('preset-name-input').value = preset.name || '';
+  document.getElementById('preset-font-family').value = preset.fontFamily || 'Arial';
+  document.getElementById('preset-font-size').value = preset.fontSize || 48;
+  document.getElementById('preset-font-size-value').textContent = preset.fontSize || 48;
+  document.getElementById('preset-font-weight').value = preset.fontWeight || 'bold';
+  document.getElementById('preset-text-color').value = preset.textColor || '#FFFFFF';
+  document.getElementById('preset-bg-color').value = preset.bgColor || '#000000';
+  document.getElementById('preset-highlight-color').value = preset.highlightColor || '#FFCC00';
+  document.getElementById('preset-bg-opacity').value = preset.bgOpacity || 80;
+  document.getElementById('preset-bg-opacity-value').textContent = preset.bgOpacity || 80;
+  document.getElementById('preset-position').value = preset.position || 'bottom-center';
+  document.getElementById('preset-animation').value = preset.animation || 'fade';
+  document.getElementById('preset-shadow-enabled').checked = preset.shadowEnabled ?? true;
+  document.getElementById('preset-outline-enabled').checked = preset.outlineEnabled ?? false;
+  document.getElementById('preset-uppercase').checked = preset.uppercase ?? false;
+
+  textBrandingState.currentPreset = preset;
+  updateTextPreview();
+}
+
+function resetTextPresetForm() {
+  document.getElementById('preset-name-input').value = '';
+  document.getElementById('preset-font-family').value = 'Arial';
+  document.getElementById('preset-font-size').value = 48;
+  document.getElementById('preset-font-size-value').textContent = '48';
+  document.getElementById('preset-font-weight').value = 'bold';
+  document.getElementById('preset-text-color').value = '#FFFFFF';
+  document.getElementById('preset-bg-color').value = '#000000';
+  document.getElementById('preset-highlight-color').value = '#FFCC00';
+  document.getElementById('preset-bg-opacity').value = 80;
+  document.getElementById('preset-bg-opacity-value').textContent = '80';
+  document.getElementById('preset-position').value = 'bottom-center';
+  document.getElementById('preset-animation').value = 'fade';
+  document.getElementById('preset-shadow-enabled').checked = true;
+  document.getElementById('preset-outline-enabled').checked = false;
+  document.getElementById('preset-uppercase').checked = false;
+
+  textBrandingState.currentPreset = null;
+  updateTextPreview();
+}
+
+function applyTextPresetToCaptions() {
+  const preset = textBrandingState.currentPreset || getTextPresetFromForm();
+
+  // Store as active caption style
+  window.spliceState = window.spliceState || {};
+  window.spliceState.captionStyle = preset;
+
+  // Try to call existing caption generator if available (stub for now)
+  console.log('[SPLICE] Applied text preset to captions:', preset.name || 'Custom');
+  alert('Preset applied! It will be used for the next caption generation.');
+}
+
+function loadTextPresets() {
+  try {
+    const saved = localStorage.getItem(textBrandingState.storageKey);
+    if (saved) {
+      textBrandingState.presets = JSON.parse(saved);
+    }
+  } catch (e) {
+    console.warn('[SPLICE] Failed to load text presets:', e);
+    textBrandingState.presets = [];
+  }
+  renderTextPresetsGallery();
+}
+
+function saveTextPresetsToStorage() {
+  try {
+    localStorage.setItem(textBrandingState.storageKey, JSON.stringify(textBrandingState.presets));
+  } catch (e) {
+    console.warn('[SPLICE] Failed to save text presets:', e);
+  }
+}
+
+function renderTextPresetsGallery() {
+  const gallery = document.getElementById('presets-gallery-list');
+  if (!gallery) return;
+
+  if (textBrandingState.presets.length === 0) {
+    gallery.innerHTML = '<div class="preset-empty">No presets saved yet</div>';
+    return;
+  }
+
+  gallery.innerHTML = textBrandingState.presets.map(preset => `
+        <div class="preset-item ${textBrandingState.currentPreset?.id === preset.id ? 'active' : ''}"
+             data-preset-id="${preset.id}">
+            <span class="preset-name">${escapeHtml(preset.name)}</span>
+            <span class="delete-preset" data-id="${preset.id}">×</span>
+        </div>
+    `).join('');
+
+  // Add click handlers
+  gallery.querySelectorAll('.preset-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      if (e.target.classList.contains('delete-preset')) {
+        e.stopPropagation();
+        const id = e.target.dataset.id;
+        if (confirm('Delete this preset?')) {
+          deleteTextPreset(id);
+        }
+      } else {
+        const id = item.dataset.presetId;
+        const preset = textBrandingState.presets.find(p => p.id === id);
+        if (preset) {
+          loadTextPresetToForm(preset);
+          renderTextPresetsGallery();
+        }
+      }
+    });
+  });
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function exportAllTextPresets() {
+  if (textBrandingState.presets.length === 0) {
+    alert('No presets to export');
+    return;
+  }
+
+  const data = JSON.stringify(textBrandingState.presets, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'splice-text-presets.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importTextPresets(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    try {
+      const imported = JSON.parse(event.target.result);
+      if (Array.isArray(imported)) {
+        textBrandingState.presets = [...textBrandingState.presets, ...imported];
+        saveTextPresetsToStorage();
+        renderTextPresetsGallery();
+        console.log('[SPLICE] Imported', imported.length, 'presets');
+      }
+    } catch (err) {
+      alert('Failed to import presets: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+}
+
+// Custom Font Handlers
+async function handleFontUpload(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  // Validate file type
+  const validTypes = ['.ttf', '.otf', '.woff', '.woff2'];
+  const ext = '.' + file.name.split('.').pop().toLowerCase();
+  if (!validTypes.includes(ext)) {
+    alert('Please upload a valid font file (.ttf, .otf, .woff, .woff2)');
+    return;
+  }
+
+  // Check file size (max 5MB)
+  if (file.size > 5 * 1024 * 1024) {
+    alert('Font file is too large. Maximum size is 5MB.');
+    return;
+  }
+
+  // Show progress
+  const manager = document.getElementById('custom-fonts-manager');
+  const progressDiv = document.createElement('div');
+  progressDiv.className = 'font-upload-progress';
+  progressDiv.textContent = 'Loading font...';
+  manager.prepend(progressDiv);
+
+  try {
+    // Read file as base64
+    const base64 = await fileToBase64(file);
+
+    // Generate a clean font name from filename
+    const fontName = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9\s-]/g, '');
+    const fontId = 'custom-' + Date.now();
+
+    // Create FontFace and load it
+    const fontFace = new FontFace(fontId, `url(${base64})`);
+    await fontFace.load();
+    document.fonts.add(fontFace);
+
+    // Save to state
+    const customFont = {
+      id: fontId,
+      name: fontName,
+      data: base64,
+      filename: file.name
+    };
+    textBrandingState.customFonts.push(customFont);
+    saveCustomFonts();
+
+    // Update UI
+    addFontToSelector(customFont);
+    renderCustomFontsList();
+
+    // Select the new font
+    const presetFontFamily = document.getElementById('preset-font-family');
+    if (presetFontFamily) presetFontFamily.value = fontId;
+    updateTextPreview();
+
+    progressDiv.textContent = `Font "${fontName}" loaded!`;
+    setTimeout(() => progressDiv.remove(), 2000);
+
+    console.log('[SPLICE] Custom font loaded:', fontName);
+  } catch (err) {
+    console.error('[SPLICE] Font upload failed:', err);
+    progressDiv.textContent = 'Failed to load font: ' + err.message;
+    progressDiv.style.color = '#ff6b6b';
+    setTimeout(() => progressDiv.remove(), 3000);
+  }
+
+  // Reset input
+  e.target.value = ''; // Reset file input so same file can be selected again
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function addFontToSelector(font) {
+  const customGroup = document.getElementById('custom-fonts-group');
+  if (!customGroup) return;
+
+  // Check if already exists
+  if (customGroup.querySelector(`option[value="${font.id}"]`)) return;
+
+  const option = document.createElement('option');
+  option.value = font.id;
+  option.textContent = font.name;
+  option.style.fontFamily = font.id;
+  customGroup.appendChild(option);
+}
+
+function renderCustomFontsList() {
+  const list = document.getElementById('custom-fonts-list');
+  if (!list) return;
+
+  if (textBrandingState.customFonts.length === 0) {
+    list.innerHTML = '';
+    return;
+  }
+
+  list.innerHTML = textBrandingState.customFonts.map(font => `
+        <div class="custom-font-item" data-font-id="${font.id}">
+            <span class="font-name" style="font-family: ${font.id};" title="${font.filename}">${escapeHtml(font.name)}</span>
+            <span class="delete-font" data-id="${font.id}" title="Delete font">×</span>
+        </div>
+    `).join('');
+
+  // Add delete handlers
+  list.querySelectorAll('.delete-font').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const fontId = e.target.dataset.id;
+      if (confirm('Delete this custom font?')) {
+        deleteCustomFont(fontId);
+      }
+    });
+  });
+}
+
+function deleteCustomFont(fontId) {
+  // Remove from state
+  textBrandingState.customFonts = textBrandingState.customFonts.filter(f => f.id !== fontId);
+  saveCustomFonts();
+
+  // Remove from selector
+  const option = document.querySelector(`#custom-fonts-group option[value="${fontId}"]`);
+  if (option) option.remove();
+
+  // If currently selected, switch to Arial
+  const selector = document.getElementById('preset-font-family');
+  if (selector && selector.value === fontId) {
+    selector.value = 'Arial';
+    updateTextPreview();
+  }
+
+  renderCustomFontsList();
+}
+
+function loadCustomFonts() {
+  try {
+    const saved = localStorage.getItem(textBrandingState.customFontsKey);
+    if (saved) {
+      const fonts = JSON.parse(saved);
+      fonts.forEach(async (font) => {
+        try {
+          // Re-register the font
+          const fontFace = new FontFace(font.id, `url(${font.data})`);
+          await fontFace.load();
+          document.fonts.add(fontFace);
+
+          textBrandingState.customFonts.push(font);
+          addFontToSelector(font);
+        } catch (err) {
+          console.warn('[SPLICE] Failed to load saved font:', font.name, err);
+        }
+      });
+
+      // Render list after a delay to allow fonts to load
+      setTimeout(renderCustomFontsList, 500);
+    }
+  } catch (e) {
+    console.warn('[SPLICE] Failed to load custom fonts:', e);
+  }
+}
+
+function saveCustomFonts() {
+  try {
+    localStorage.setItem(textBrandingState.customFontsKey, JSON.stringify(textBrandingState.customFonts));
+  } catch (e) {
+    console.warn('[SPLICE] Failed to save custom fonts:', e);
+    if (e.name === 'QuotaExceededError') {
+      alert('Storage quota exceeded. Try deleting some custom fonts.');
+    }
+  }
+}

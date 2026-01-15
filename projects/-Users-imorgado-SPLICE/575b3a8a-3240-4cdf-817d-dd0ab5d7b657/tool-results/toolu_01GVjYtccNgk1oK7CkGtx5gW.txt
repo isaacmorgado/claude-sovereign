@@ -1,0 +1,368 @@
+     1→/**
+     2→ * License Key Service
+     3→ *
+     4→ * Generates and validates license keys for user authentication.
+     5→ * License keys are generated when a user purchases a subscription via Stripe.
+     6→ * Format: SPLICE-XXXX-XXXX-XXXX (alphanumeric, no confusing characters)
+     7→ */
+     8→
+     9→const { Pool } = require('pg');
+    10→const crypto = require('crypto');
+    11→
+    12→// Use the same pool configuration as other services
+    13→const pool = new Pool({
+    14→  connectionString: process.env.DATABASE_URL,
+    15→  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    16→  max: 20,
+    17→  idleTimeoutMillis: 30000,
+    18→  connectionTimeoutMillis: 5000
+    19→});
+    20→
+    21→// Characters for key generation (no confusing chars: 0/O, 1/I/L)
+    22→const KEY_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    23→
+    24→/**
+    25→ * Initialize license_keys table
+    26→ */
+    27→async function initLicenseTables() {
+    28→  const client = await pool.connect();
+    29→  try {
+    30→    await client.query(`
+    31→      CREATE TABLE IF NOT EXISTS license_keys (
+    32→        id SERIAL PRIMARY KEY,
+    33→        key VARCHAR(21) UNIQUE NOT NULL,
+    34→        stripe_customer_id VARCHAR(255) NOT NULL,
+    35→        created_at TIMESTAMP DEFAULT NOW(),
+    36→        activated_at TIMESTAMP,
+    37→        is_active BOOLEAN DEFAULT TRUE
+    38→      )
+    39→    `);
+    40→
+    41→    // Migrate existing column if needed (for existing databases)
+    42→    await client.query(`
+    43→      DO $$
+    44→      BEGIN
+    45→        IF EXISTS (
+    46→          SELECT 1 FROM information_schema.columns
+    47→          WHERE table_name = 'license_keys'
+    48→          AND column_name = 'key'
+    49→          AND character_maximum_length = 19
+    50→        ) THEN
+    51→          ALTER TABLE license_keys ALTER COLUMN key TYPE VARCHAR(21);
+    52→        END IF;
+    53→      END $$;
+    54→    `);
+    55→
+    56→    // Add indexes for efficient lookups
+    57→    await client.query(`
+    58→      CREATE INDEX IF NOT EXISTS idx_license_keys_key
+    59→      ON license_keys(key)
+    60→    `);
+    61→
+    62→    await client.query(`
+    63→      CREATE INDEX IF NOT EXISTS idx_license_keys_customer
+    64→      ON license_keys(stripe_customer_id)
+    65→    `);
+    66→
+    67→    console.log('[License] Database tables initialized');
+    68→  } finally {
+    69→    client.release();
+    70→  }
+    71→}
+    72→
+    73→/**
+    74→ * Generate a random 4-character segment
+    75→ * @returns {string} 4 uppercase alphanumeric characters
+    76→ */
+    77→function generateSegment() {
+    78→  let segment = '';
+    79→  for (let i = 0; i < 4; i++) {
+    80→    segment += KEY_CHARS.charAt(crypto.randomInt(KEY_CHARS.length));
+    81→  }
+    82→  return segment;
+    83→}
+    84→
+    85→/**
+    86→ * Generate a license key in format SPLICE-XXXX-XXXX-XXXX
+    87→ * @returns {string} License key
+    88→ */
+    89→function generateKeyString() {
+    90→  return `SPLICE-${generateSegment()}-${generateSegment()}-${generateSegment()}`;
+    91→}
+    92→
+    93→/**
+    94→ * Validate license key format
+    95→ * @param {string} key - License key to validate
+    96→ * @returns {boolean} True if format is valid
+    97→ */
+    98→function isValidKeyFormat(key) {
+    99→  if (!key || typeof key !== 'string') return false;
+   100→
+   101→  // Normalize: uppercase and trim
+   102→  const normalized = key.toUpperCase().trim();
+   103→
+   104→  // Must match SPLICE-XXXX-XXXX-XXXX pattern
+   105→  // Character set excludes confusing chars: 0/O, 1/I/L
+   106→  const pattern = /^SPLICE-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}$/;
+   107→  return pattern.test(normalized);
+   108→}
+   109→
+   110→/**
+   111→ * Normalize a license key (uppercase, trim)
+   112→ * @param {string} key - License key
+   113→ * @returns {string} Normalized key
+   114→ */
+   115→function normalizeKey(key) {
+   116→  return (key || '').toUpperCase().trim();
+   117→}
+   118→
+   119→/**
+   120→ * Generate a new license key for a Stripe customer
+   121→ *
+   122→ * @param {string} stripeCustomerId - Stripe customer ID
+   123→ * @returns {Promise<{success: boolean, key?: string, error?: string}>}
+   124→ */
+   125→async function generateLicenseKey(stripeCustomerId) {
+   126→  if (!stripeCustomerId) {
+   127→    return { success: false, error: 'Customer ID is required' };
+   128→  }
+   129→
+   130→  const client = await pool.connect();
+   131→  try {
+   132→    // Check if customer already has a key
+   133→    const existing = await client.query(
+   134→      'SELECT key FROM license_keys WHERE stripe_customer_id = $1',
+   135→      [stripeCustomerId]
+   136→    );
+   137→
+   138→    if (existing.rows.length > 0) {
+   139→      return {
+   140→        success: true,
+   141→        key: existing.rows[0].key,
+   142→        existing: true
+   143→      };
+   144→    }
+   145→
+   146→    // Generate unique key with retry logic
+   147→    let key;
+   148→    let attempts = 0;
+   149→    const maxAttempts = 10;
+   150→
+   151→    while (attempts < maxAttempts) {
+   152→      key = generateKeyString();
+   153→      try {
+   154→        await client.query(
+   155→          `INSERT INTO license_keys (key, stripe_customer_id)
+   156→           VALUES ($1, $2)`,
+   157→          [key, stripeCustomerId]
+   158→        );
+   159→        break;
+   160→      } catch (err) {
+   161→        if (err.code === '23505') { // Unique violation
+   162→          attempts++;
+   163→          continue;
+   164→        }
+   165→        throw err;
+   166→      }
+   167→    }
+   168→
+   169→    if (attempts >= maxAttempts) {
+   170→      return { success: false, error: 'Failed to generate unique license key' };
+   171→    }
+   172→
+   173→    // SECURITY: Mask license key in logs to prevent credential exposure
+   174→    const maskedKey = key.substring(0, 10) + '****';
+   175→    console.log(`[License] Generated key for customer ${stripeCustomerId.substring(0, 8)}****: ${maskedKey}`);
+   176→    return { success: true, key };
+   177→  } finally {
+   178→    client.release();
+   179→  }
+   180→}
+   181→
+   182→/**
+   183→ * Activate a license key
+   184→ *
+   185→ * Uses SELECT ... FOR UPDATE to prevent race conditions where
+   186→ * the same license key could be activated on multiple devices simultaneously.
+   187→ *
+   188→ * @param {string} key - License key to activate
+   189→ * @returns {Promise<{success: boolean, customerId?: string, error?: string}>}
+   190→ */
+   191→async function activateLicenseKey(key) {
+   192→  if (!key) {
+   193→    return { success: false, error: 'License key is required' };
+   194→  }
+   195→
+   196→  const normalized = normalizeKey(key);
+   197→
+   198→  if (!isValidKeyFormat(normalized)) {
+   199→    return { success: false, error: 'Invalid license key format. Expected: SPLICE-XXXX-XXXX-XXXX' };
+   200→  }
+   201→
+   202→  const client = await pool.connect();
+   203→  try {
+   204→    // Begin transaction
+   205→    await client.query('BEGIN');
+   206→
+   207→    // Look up the key WITH ROW LOCK to prevent concurrent activation
+   208→    const result = await client.query(
+   209→      'SELECT * FROM license_keys WHERE key = $1 FOR UPDATE',
+   210→      [normalized]
+   211→    );
+   212→
+   213→    if (result.rows.length === 0) {
+   214→      await client.query('ROLLBACK');
+   215→      return { success: false, error: 'License key not found' };
+   216→    }
+   217→
+   218→    const license = result.rows[0];
+   219→
+   220→    if (!license.is_active) {
+   221→      await client.query('ROLLBACK');
+   222→      return { success: false, error: 'License key has been deactivated' };
+   223→    }
+   224→
+   225→    // Check if already activated (within the transaction lock)
+   226→    if (license.activated_at) {
+   227→      await client.query('COMMIT');
+   228→      // Key already activated - still return success with customer ID
+   229→      // This allows the same user to re-activate on new devices
+   230→      return {
+   231→        success: true,
+   232→        customerId: license.stripe_customer_id,
+   233→        alreadyActivated: true,
+   234→        activatedAt: license.activated_at
+   235→      };
+   236→    }
+   237→
+   238→    // Activate the key
+   239→    await client.query(
+   240→      'UPDATE license_keys SET activated_at = NOW() WHERE id = $1',
+   241→      [license.id]
+   242→    );
+   243→
+   244→    // Commit the transaction
+   245→    await client.query('COMMIT');
+   246→
+   247→    // SECURITY: Mask license key and customer ID in logs
+   248→    const maskedKey = normalized.substring(0, 10) + '****';
+   249→    const maskedCustomer = license.stripe_customer_id.substring(0, 8) + '****';
+   250→    console.log(`[License] Activated key ${maskedKey} for customer ${maskedCustomer}`);
+   251→
+   252→    return {
+   253→      success: true,
+   254→      customerId: license.stripe_customer_id,
+   255→      alreadyActivated: false
+   256→    };
+   257→  } catch (err) {
+   258→    // Rollback on any error
+   259→    await client.query('ROLLBACK');
+   260→    console.error('[License] Activation error:', err);
+   261→    throw err;
+   262→  } finally {
+   263→    client.release();
+   264→  }
+   265→}
+   266→
+   267→/**
+   268→ * Get license key for a customer
+   269→ *
+   270→ * @param {string} stripeCustomerId - Stripe customer ID
+   271→ * @returns {Promise<{success: boolean, key?: string, activated?: boolean, error?: string}>}
+   272→ */
+   273→async function getLicenseByCustomerId(stripeCustomerId) {
+   274→  if (!stripeCustomerId) {
+   275→    return { success: false, error: 'Customer ID is required' };
+   276→  }
+   277→
+   278→  const result = await pool.query(
+   279→    'SELECT * FROM license_keys WHERE stripe_customer_id = $1',
+   280→    [stripeCustomerId]
+   281→  );
+   282→
+   283→  if (result.rows.length === 0) {
+   284→    return { success: false, error: 'No license key found for this customer' };
+   285→  }
+   286→
+   287→  const license = result.rows[0];
+   288→  return {
+   289→    success: true,
+   290→    key: license.key,
+   291→    activated: !!license.activated_at,
+   292→    isActive: license.is_active,
+   293→    createdAt: license.created_at,
+   294→    activatedAt: license.activated_at
+   295→  };
+   296→}
+   297→
+   298→/**
+   299→ * Deactivate a license key
+   300→ *
+   301→ * @param {string} key - License key to deactivate
+   302→ * @returns {Promise<{success: boolean, error?: string}>}
+   303→ */
+   304→async function deactivateLicenseKey(key) {
+   305→  if (!key) {
+   306→    return { success: false, error: 'License key is required' };
+   307→  }
+   308→
+   309→  const normalized = normalizeKey(key);
+   310→
+   311→  const result = await pool.query(
+   312→    'UPDATE license_keys SET is_active = FALSE WHERE key = $1 RETURNING id',
+   313→    [normalized]
+   314→  );
+   315→
+   316→  if (result.rowCount === 0) {
+   317→    return { success: false, error: 'License key not found' };
+   318→  }
+   319→
+   320→  // SECURITY: Mask license key in logs
+   321→  console.log(`[License] Deactivated key: ${normalized.substring(0, 10)}****`);
+   322→  return { success: true };
+   323→}
+   324→
+   325→/**
+   326→ * Reactivate a license key
+   327→ *
+   328→ * @param {string} key - License key to reactivate
+   329→ * @returns {Promise<{success: boolean, error?: string}>}
+   330→ */
+   331→async function reactivateLicenseKey(key) {
+   332→  if (!key) {
+   333→    return { success: false, error: 'License key is required' };
+   334→  }
+   335→
+   336→  const normalized = normalizeKey(key);
+   337→
+   338→  const result = await pool.query(
+   339→    'UPDATE license_keys SET is_active = TRUE WHERE key = $1 RETURNING id',
+   340→    [normalized]
+   341→  );
+   342→
+   343→  if (result.rowCount === 0) {
+   344→    return { success: false, error: 'License key not found' };
+   345→  }
+   346→
+   347→  // SECURITY: Mask license key in logs
+   348→  console.log(`[License] Reactivated key: ${normalized.substring(0, 10)}****`);
+   349→  return { success: true };
+   350→}
+   351→
+   352→module.exports = {
+   353→  initLicenseTables,
+   354→  generateLicenseKey,
+   355→  activateLicenseKey,
+   356→  getLicenseByCustomerId,
+   357→  deactivateLicenseKey,
+   358→  reactivateLicenseKey,
+   359→  isValidKeyFormat,
+   360→  normalizeKey,
+   361→  // Exposed for testing
+   362→  generateKeyString
+   363→};
+   364→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,219 @@
+/**
+ * CSRF Protection Middleware
+ *
+ * Implements double-submit cookie pattern for CSRF protection.
+ * Works with stateless JWT authentication.
+ *
+ * How it works:
+ * 1. Client requests a CSRF token via GET /auth/csrf-token
+ * 2. Server generates a cryptographically random token
+ * 3. Server sends token in both:
+ *    - Response body (for JavaScript to read)
+ *    - HttpOnly cookie (for automatic submission)
+ * 4. Client includes token in X-CSRF-Token header on state-changing requests
+ * 5. Server validates header token matches cookie token
+ */
+
+const crypto = require('crypto');
+
+// CSRF Configuration
+const CSRF_TOKEN_LENGTH = 32; // 256 bits
+const CSRF_COOKIE_NAME = 'splice_csrf';
+const CSRF_HEADER_NAME = 'x-csrf-token';
+const CSRF_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+// Check if running in production
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+
+/**
+ * Generate a cryptographically secure CSRF token
+ * @returns {string} Hex-encoded random token
+ */
+function generateCsrfToken() {
+  return crypto.randomBytes(CSRF_TOKEN_LENGTH).toString('hex');
+}
+
+/**
+ * Hash a token for secure comparison
+ * This prevents timing attacks when comparing tokens
+ * @param {string} token - The token to hash
+ * @returns {string} SHA-256 hash of the token
+ */
+function _hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+/**
+ * Constant-time comparison to prevent timing attacks
+ * @param {string} a - First string
+ * @param {string} b - Second string
+ * @returns {boolean} True if strings are equal
+ */
+function safeCompare(a, b) {
+  if (!a || !b || typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+
+  // Use crypto.timingSafeEqual for constant-time comparison
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+
+  if (bufA.length !== bufB.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Get cookie options for CSRF token
+ * @returns {Object} Cookie configuration
+ */
+function getCsrfCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: isProduction, // Only secure in production (HTTPS)
+    sameSite: 'strict', // Strict same-site policy for CSRF protection
+    maxAge: CSRF_TOKEN_EXPIRY,
+    path: '/',
+    // Domain is omitted to default to the current domain
+  };
+}
+
+/**
+ * Handler to generate and return a CSRF token
+ * Should be mounted as GET /auth/csrf-token
+ *
+ * @param {Request} req - Express request
+ * @param {Response} res - Express response
+ */
+function csrfTokenHandler(req, res) {
+  const token = generateCsrfToken();
+
+  // Set the token in an HttpOnly cookie
+  res.cookie(CSRF_COOKIE_NAME, token, getCsrfCookieOptions());
+
+  // Also return token in response body for JavaScript to use
+  // The client will send this in the X-CSRF-Token header
+  res.json({
+    success: true,
+    csrfToken: token,
+    expiresIn: CSRF_TOKEN_EXPIRY / 1000 // seconds
+  });
+
+  console.log('[CSRF] Token generated for request');
+}
+
+/**
+ * Middleware to validate CSRF token on state-changing requests
+ * Checks that the X-CSRF-Token header matches the cookie value
+ *
+ * @param {Request} req - Express request
+ * @param {Response} res - Express response
+ * @param {Function} next - Next middleware
+ */
+function validateCsrfToken(req, res, next) {
+  // Skip CSRF validation for safe methods (GET, HEAD, OPTIONS)
+  const safeMethods = ['GET', 'HEAD', 'OPTIONS'];
+  if (safeMethods.includes(req.method)) {
+    return next();
+  }
+
+  // Get token from header
+  const headerToken = req.headers[CSRF_HEADER_NAME];
+
+  // Get token from cookie
+  const cookieToken = req.cookies?.[CSRF_COOKIE_NAME];
+
+  // Validate both tokens exist
+  if (!headerToken) {
+    console.warn('[CSRF] Missing CSRF token in header');
+    return res.status(403).json({
+      error: 'CSRF token missing',
+      message: 'Please refresh the page and try again'
+    });
+  }
+
+  if (!cookieToken) {
+    console.warn('[CSRF] Missing CSRF cookie');
+    return res.status(403).json({
+      error: 'CSRF validation failed',
+      message: 'Session expired. Please refresh the page and try again'
+    });
+  }
+
+  // Use constant-time comparison to prevent timing attacks
+  if (!safeCompare(headerToken, cookieToken)) {
+    console.warn('[CSRF] Token mismatch - possible CSRF attack');
+    return res.status(403).json({
+      error: 'CSRF validation failed',
+      message: 'Security validation failed. Please refresh the page and try again'
+    });
+  }
+
+  // Token is valid
+  next();
+}
+
+/**
+ * Conditional CSRF validation middleware
+ * Skips validation for certain routes (e.g., webhooks, public endpoints)
+ *
+ * @param {Object} options - Configuration options
+ * @param {string[]} options.skipRoutes - Array of route patterns to skip
+ * @returns {Function} Middleware function
+ */
+function csrfProtection(options = {}) {
+  const { skipRoutes = [] } = options;
+
+  // Default routes to skip CSRF validation
+  const defaultSkipRoutes = [
+    '/webhooks/', // Stripe webhooks use their own signature verification
+    '/health', // Health checks are public
+    '/api-info', // API info is public
+  ];
+
+  const allSkipRoutes = [...defaultSkipRoutes, ...skipRoutes];
+
+  return (req, res, next) => {
+    // Check if this route should skip CSRF validation
+    const shouldSkip = allSkipRoutes.some(route => req.path.startsWith(route));
+
+    if (shouldSkip) {
+      return next();
+    }
+
+    // Apply CSRF validation
+    return validateCsrfToken(req, res, next);
+  };
+}
+
+/**
+ * Middleware to ensure CSRF cookie exists
+ * Sets a new cookie if one doesn't exist
+ * Useful for ensuring cookie is set before any form is shown
+ *
+ * @param {Request} req - Express request
+ * @param {Response} res - Express response
+ * @param {Function} next - Next middleware
+ */
+function ensureCsrfCookie(req, res, next) {
+  // Check if cookie already exists
+  if (!req.cookies?.[CSRF_COOKIE_NAME]) {
+    const token = generateCsrfToken();
+    res.cookie(CSRF_COOKIE_NAME, token, getCsrfCookieOptions());
+  }
+  next();
+}
+
+module.exports = {
+  generateCsrfToken,
+  csrfTokenHandler,
+  validateCsrfToken,
+  csrfProtection,
+  ensureCsrfCookie,
+  // Constants for external use
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
+  CSRF_TOKEN_EXPIRY
+};

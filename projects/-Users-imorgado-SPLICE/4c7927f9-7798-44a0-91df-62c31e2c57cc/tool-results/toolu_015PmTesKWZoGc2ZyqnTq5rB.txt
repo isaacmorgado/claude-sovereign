@@ -1,0 +1,382 @@
+     1→import { NextRequest, NextResponse } from "next/server";
+     2→import { csrfGuard } from "@/lib/csrf-server";
+     3→
+     4→// Force Node.js runtime for better compatibility
+     5→export const runtime = "nodejs";
+     6→export const maxDuration = 30;
+     7→
+     8→// =============================================================================
+     9→// IP-based Rate Limiting
+    10→// =============================================================================
+    11→
+    12→// Rate limit configuration: 5 requests per hour per IP
+    13→const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour in milliseconds
+    14→const RATE_LIMIT_MAX_REQUESTS = 5;
+    15→
+    16→// In-memory store for rate limiting
+    17→// Key: IP address, Value: { count: number, windowStart: number }
+    18→const rateLimitStore = new Map<string, { count: number; windowStart: number }>();
+    19→
+    20→// Cleanup old entries every 10 minutes to prevent memory leaks
+    21→if (typeof setInterval !== "undefined") {
+    22→  setInterval(() => {
+    23→    const now = Date.now();
+    24→    const ipsToDelete: string[] = [];
+    25→    rateLimitStore.forEach((data, ip) => {
+    26→      // Mark entries older than 2x the window (2 hours) for deletion
+    27→      if (now - data.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
+    28→        ipsToDelete.push(ip);
+    29→      }
+    30→    });
+    31→    ipsToDelete.forEach((ip) => rateLimitStore.delete(ip));
+    32→  }, 10 * 60 * 1000); // Every 10 minutes
+    33→}
+    34→
+    35→/**
+    36→ * Get client IP address from request headers
+    37→ * Handles various proxy configurations (Vercel, Cloudflare, nginx, etc.)
+    38→ */
+    39→function getClientIp(request: NextRequest): string {
+    40→  // x-forwarded-for can contain multiple IPs; the first one is the client
+    41→  const forwardedFor = request.headers.get("x-forwarded-for");
+    42→  if (forwardedFor) {
+    43→    const firstIp = forwardedFor.split(",")[0].trim();
+    44→    if (firstIp) return firstIp;
+    45→  }
+    46→
+    47→  // x-real-ip is set by some proxies (nginx, etc.)
+    48→  const realIp = request.headers.get("x-real-ip");
+    49→  if (realIp) return realIp.trim();
+    50→
+    51→  // Vercel-specific header
+    52→  const vercelForwardedFor = request.headers.get("x-vercel-forwarded-for");
+    53→  if (vercelForwardedFor) {
+    54→    const firstIp = vercelForwardedFor.split(",")[0].trim();
+    55→    if (firstIp) return firstIp;
+    56→  }
+    57→
+    58→  // Fallback - this shouldn't happen in production behind a proxy
+    59→  return "unknown";
+    60→}
+    61→
+    62→/**
+    63→ * Check if an IP is rate limited
+    64→ * Returns: { limited: boolean, retryAfter?: number }
+    65→ */
+    66→function checkRateLimit(ip: string): { limited: boolean; retryAfter?: number } {
+    67→  const now = Date.now();
+    68→  const data = rateLimitStore.get(ip);
+    69→
+    70→  // No previous requests or window expired - start fresh
+    71→  if (!data || now - data.windowStart > RATE_LIMIT_WINDOW_MS) {
+    72→    rateLimitStore.set(ip, { count: 1, windowStart: now });
+    73→    return { limited: false };
+    74→  }
+    75→
+    76→  // Increment count
+    77→  data.count++;
+    78→
+    79→  // Check if over limit
+    80→  if (data.count > RATE_LIMIT_MAX_REQUESTS) {
+    81→    // Calculate seconds until window resets
+    82→    const retryAfterMs = RATE_LIMIT_WINDOW_MS - (now - data.windowStart);
+    83→    const retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
+    84→    return { limited: true, retryAfter: retryAfterSeconds };
+    85→  }
+    86→
+    87→  return { limited: false };
+    88→}
+    89→
+    90→// Email configuration
+    91→const EMAIL_CONFIG = {
+    92→  from: process.env.EMAIL_FROM || "SPLICE <noreply@splice.video>",
+    93→  salesEmail: "sales@splice.app",
+    94→  sendgridApiKey: process.env.SENDGRID_API_KEY,
+    95→};
+    96→
+    97→// Request body interface
+    98→interface ContactFormData {
+    99→  name: string;
+   100→  email: string;
+   101→  company?: string;
+   102→  teamSize?: string;
+   103→  message: string;
+   104→}
+   105→
+   106→// Validation helper
+   107→function validateEmail(email: string): boolean {
+   108→  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+   109→  return emailRegex.test(email);
+   110→}
+   111→
+   112→// Escape HTML to prevent XSS in email content
+   113→function escapeHtml(str: string): string {
+   114→  if (str === null || str === undefined) return "";
+   115→  const escapeMap: Record<string, string> = {
+   116→    "&": "&amp;",
+   117→    "<": "&lt;",
+   118→    ">": "&gt;",
+   119→    '"': "&quot;",
+   120→    "'": "&#x27;",
+   121→  };
+   122→  return str.replace(/[&<>"']/g, (char) => escapeMap[char]);
+   123→}
+   124→
+   125→// Generate email HTML template
+   126→function generateEmailHtml(data: ContactFormData): string {
+   127→  return `
+   128→<!DOCTYPE html>
+   129→<html lang="en">
+   130→<head>
+   131→  <meta charset="UTF-8">
+   132→  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   133→  <title>New Contact Form Submission</title>
+   134→  <style>
+   135→    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; margin: 0; padding: 0; }
+   136→    .container { max-width: 600px; margin: 0 auto; padding: 40px 20px; background: white; }
+   137→    .header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #00D4FF; }
+   138→    .logo { font-size: 28px; font-weight: bold; color: #00D4FF; }
+   139→    .badge { display: inline-block; background: #00D4FF; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; margin-top: 10px; }
+   140→    .content { padding: 20px 0; }
+   141→    .field { margin-bottom: 20px; }
+   142→    .field-label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #6b7280; margin-bottom: 5px; }
+   143→    .field-value { font-size: 16px; color: #1e293b; background: #f8fafc; padding: 12px 16px; border-radius: 8px; border-left: 3px solid #00D4FF; }
+   144→    .message-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 20px; margin-top: 20px; }
+   145→    .message-box h3 { color: #166534; margin-top: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+   146→    .message-content { color: #15803d; white-space: pre-wrap; }
+   147→    .footer { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 14px; }
+   148→    .reply-button { display: inline-block; background: #00D4FF; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; margin-top: 20px; font-weight: 500; }
+   149→  </style>
+   150→</head>
+   151→<body>
+   152→  <div class="container">
+   153→    <div class="header">
+   154→      <div class="logo">SPLICE</div>
+   155→      <div class="badge">New Contact Form Submission</div>
+   156→    </div>
+   157→
+   158→    <div class="content">
+   159→      <div class="field">
+   160→        <div class="field-label">Name</div>
+   161→        <div class="field-value">${escapeHtml(data.name)}</div>
+   162→      </div>
+   163→
+   164→      <div class="field">
+   165→        <div class="field-label">Email</div>
+   166→        <div class="field-value"><a href="mailto:${escapeHtml(data.email)}" style="color: #00A8CC;">${escapeHtml(data.email)}</a></div>
+   167→      </div>
+   168→
+   169→      ${
+   170→        data.company
+   171→          ? `
+   172→      <div class="field">
+   173→        <div class="field-label">Company</div>
+   174→        <div class="field-value">${escapeHtml(data.company)}</div>
+   175→      </div>
+   176→      `
+   177→          : ""
+   178→      }
+   179→
+   180→      ${
+   181→        data.teamSize
+   182→          ? `
+   183→      <div class="field">
+   184→        <div class="field-label">Team Size</div>
+   185→        <div class="field-value">${escapeHtml(data.teamSize)}</div>
+   186→      </div>
+   187→      `
+   188→          : ""
+   189→      }
+   190→
+   191→      <div class="message-box">
+   192→        <h3>Message</h3>
+   193→        <div class="message-content">${escapeHtml(data.message)}</div>
+   194→      </div>
+   195→
+   196→      <div style="text-align: center;">
+   197→        <a href="mailto:${escapeHtml(data.email)}?subject=Re: SPLICE Contact Form" class="reply-button">Reply to ${escapeHtml(data.name)}</a>
+   198→      </div>
+   199→    </div>
+   200→
+   201→    <div class="footer">
+   202→      <p>This message was sent from the SPLICE website contact form.</p>
+   203→      <p style="font-size: 12px;">&copy; ${new Date().getFullYear()} SPLICE. All rights reserved.</p>
+   204→    </div>
+   205→  </div>
+   206→</body>
+   207→</html>
+   208→  `;
+   209→}
+   210→
+   211→// Generate plain text email
+   212→function generateEmailText(data: ContactFormData): string {
+   213→  return `
+   214→New Contact Form Submission - SPLICE
+   215→=====================================
+   216→
+   217→Name: ${data.name}
+   218→Email: ${data.email}
+   219→${data.company ? `Company: ${data.company}` : ""}
+   220→${data.teamSize ? `Team Size: ${data.teamSize}` : ""}
+   221→
+   222→Message:
+   223→---------
+   224→${data.message}
+   225→
+   226→---
+   227→This message was sent from the SPLICE website contact form.
+   228→  `.trim();
+   229→}
+   230→
+   231→// Send email via SendGrid
+   232→async function sendEmailNotification(data: ContactFormData): Promise<void> {
+   233→  if (!EMAIL_CONFIG.sendgridApiKey) {
+   234→    console.warn("[Contact API] SENDGRID_API_KEY not configured, logging email to console");
+   235→    console.log("[Contact API] Would send email to:", EMAIL_CONFIG.salesEmail);
+   236→    console.log("[Contact API] From:", data.name, `<${data.email}>`);
+   237→    console.log("[Contact API] Message:", data.message);
+   238→    return;
+   239→  }
+   240→
+   241→  const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+   242→    method: "POST",
+   243→    headers: {
+   244→      Authorization: `Bearer ${EMAIL_CONFIG.sendgridApiKey}`,
+   245→      "Content-Type": "application/json",
+   246→    },
+   247→    body: JSON.stringify({
+   248→      personalizations: [
+   249→        {
+   250→          to: [{ email: EMAIL_CONFIG.salesEmail }],
+   251→        },
+   252→      ],
+   253→      from: {
+   254→        email: EMAIL_CONFIG.from.match(/<(.+)>/)?.[1] || "noreply@splice.video",
+   255→        name: "SPLICE Contact Form",
+   256→      },
+   257→      reply_to: {
+   258→        email: data.email,
+   259→        name: data.name,
+   260→      },
+   261→      subject: `[SPLICE Contact] New inquiry from ${data.name}${data.company ? ` (${data.company})` : ""}`,
+   262→      content: [
+   263→        { type: "text/plain", value: generateEmailText(data) },
+   264→        { type: "text/html", value: generateEmailHtml(data) },
+   265→      ],
+   266→    }),
+   267→  });
+   268→
+   269→  if (!response.ok) {
+   270→    const errorText = await response.text();
+   271→    console.error("[Contact API] SendGrid error:", response.status, errorText);
+   272→    throw new Error(`Failed to send email: ${response.status}`);
+   273→  }
+   274→
+   275→  console.log("[Contact API] Email sent successfully to", EMAIL_CONFIG.salesEmail);
+   276→}
+   277→
+   278→export async function POST(request: NextRequest) {
+   279→  // CSRF validation first
+   280→  const csrfError = await csrfGuard(request);
+   281→  if (csrfError) {
+   282→    console.warn("[Contact API] CSRF validation failed");
+   283→    return csrfError;
+   284→  }
+   285→
+   286→  // Check rate limit
+   287→  const clientIp = getClientIp(request);
+   288→  const rateLimitResult = checkRateLimit(clientIp);
+   289→
+   290→  if (rateLimitResult.limited) {
+   291→    console.warn(
+   292→      `[Contact API] Rate limit exceeded for IP: ${clientIp}`
+   293→    );
+   294→
+   295→    const retryAfter = rateLimitResult.retryAfter || 3600;
+   296→    const retryMinutes = Math.ceil(retryAfter / 60);
+   297→
+   298→    return NextResponse.json(
+   299→      {
+   300→        error: "Too many requests",
+   301→        message: `You have exceeded the maximum number of contact form submissions. Please try again in ${retryMinutes} minute${retryMinutes === 1 ? "" : "s"}.`,
+   302→        retryAfter: retryAfter,
+   303→      },
+   304→      {
+   305→        status: 429,
+   306→        headers: {
+   307→          "Retry-After": String(retryAfter),
+   308→        },
+   309→      }
+   310→    );
+   311→  }
+   312→
+   313→  try {
+   314→    // Parse request body
+   315→    let body: ContactFormData;
+   316→    try {
+   317→      body = await request.json();
+   318→    } catch {
+   319→      return NextResponse.json(
+   320→        { error: "Invalid JSON in request body" },
+   321→        { status: 400 }
+   322→      );
+   323→    }
+   324→
+   325→    const { name, email, company, teamSize, message } = body;
+   326→
+   327→    // Validate required fields
+   328→    const errors: string[] = [];
+   329→
+   330→    if (!name || typeof name !== "string" || name.trim().length === 0) {
+   331→      errors.push("Name is required");
+   332→    }
+   333→
+   334→    if (!email || typeof email !== "string" || email.trim().length === 0) {
+   335→      errors.push("Email is required");
+   336→    } else if (!validateEmail(email.trim())) {
+   337→      errors.push("Invalid email format");
+   338→    }
+   339→
+   340→    if (!message || typeof message !== "string" || message.trim().length === 0) {
+   341→      errors.push("Message is required");
+   342→    }
+   343→
+   344→    if (errors.length > 0) {
+   345→      return NextResponse.json(
+   346→        { error: "Validation failed", details: errors },
+   347→        { status: 400 }
+   348→      );
+   349→    }
+   350→
+   351→    // Sanitize and prepare data
+   352→    const sanitizedData: ContactFormData = {
+   353→      name: name.trim(),
+   354→      email: email.trim().toLowerCase(),
+   355→      company: company?.trim() || undefined,
+   356→      teamSize: teamSize?.trim() || undefined,
+   357→      message: message.trim(),
+   358→    };
+   359→
+   360→    // Send email notification
+   361→    await sendEmailNotification(sanitizedData);
+   362→
+   363→    // Return success response
+   364→    return NextResponse.json({
+   365→      success: true,
+   366→      message: "Your message has been sent successfully. We will get back to you soon!",
+   367→    });
+   368→  } catch (error) {
+   369→    console.error("[Contact API] Error processing contact form:", error);
+   370→
+   371→    return NextResponse.json(
+   372→      {
+   373→        error: "Failed to process your request. Please try again later.",
+   374→        details: error instanceof Error ? error.message : "Unknown error",
+   375→      },
+   376→      { status: 500 }
+   377→    );
+   378→  }
+   379→}
+   380→
+
+</system-reminder>

@@ -1,0 +1,620 @@
+/**
+ * Music Generation Job Queue Service
+ * Uses BullMQ with Upstash Redis for reliable background processing
+ */
+
+const { Queue, Worker, UnrecoverableError } = require('bullmq');
+
+// Redis connection (lazy initialization)
+let redisConnection = null;
+let musicQueue = null;
+let musicWorker = null;
+
+// Job statuses
+const JOB_STATUS = {
+  PENDING: 'pending',
+  EXTRACTING: 'extracting',
+  IDENTIFYING: 'identifying',
+  GENERATING: 'generating',
+  UPLOADING: 'uploading',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  // Variations-specific statuses
+  GENERATING_VARIATIONS: 'generating_variations',
+  SELECTING: 'selecting'  // Waiting for user to select a variation
+};
+
+// Progress percentages for each step
+const PROGRESS_MAP = {
+  [JOB_STATUS.PENDING]: 0,
+  [JOB_STATUS.EXTRACTING]: 10,
+  [JOB_STATUS.IDENTIFYING]: 30,
+  [JOB_STATUS.GENERATING]: 60,
+  [JOB_STATUS.UPLOADING]: 90,
+  [JOB_STATUS.COMPLETED]: 100,
+  // Variations progress
+  [JOB_STATUS.GENERATING_VARIATIONS]: 50,
+  [JOB_STATUS.SELECTING]: 95
+};
+
+/**
+ * Initialize Redis connection
+ * @returns {Object} IORedis connection options
+ */
+function getRedisConnection() {
+  if (!redisConnection) {
+    const redisUrl = process.env.UPSTASH_REDIS_URL;
+
+    if (!redisUrl) {
+      throw new Error('Missing UPSTASH_REDIS_URL environment variable');
+    }
+
+    // Parse Upstash Redis URL
+    const url = new URL(redisUrl);
+
+    redisConnection = {
+      host: url.hostname,
+      port: parseInt(url.port) || 6379,
+      password: url.password,
+      tls: url.protocol === 'rediss:' ? {} : undefined,
+      maxRetriesPerRequest: null // Required for BullMQ workers
+    };
+  }
+  return redisConnection;
+}
+
+/**
+ * Get or create the music generation queue
+ * @returns {Queue} BullMQ Queue instance
+ */
+function getMusicQueue() {
+  if (!musicQueue) {
+    musicQueue = new Queue('music-generation', {
+      connection: getRedisConnection(),
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 5000 // Start with 5s, then 10s, then 20s
+        },
+        removeOnComplete: {
+          age: 24 * 3600, // Keep completed jobs for 24 hours
+          count: 1000 // Keep max 1000 completed jobs
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600 // Keep failed jobs for 7 days
+        }
+      }
+    });
+  }
+  return musicQueue;
+}
+
+/**
+ * Generate a unique job ID
+ * @param {string} customerId - Stripe customer ID
+ * @returns {string} Unique job ID
+ */
+function generateJobId(customerId) {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 8);
+  return `music_${timestamp}_${random}`;
+}
+
+/**
+ * Add a new music generation job to the queue
+ * @param {Object} jobData - Job data
+ * @param {string} jobData.customerId - Stripe customer ID
+ * @param {string} jobData.youtubeUrl - YouTube URL for reference song (optional)
+ * @param {string} jobData.prompt - Text prompt for music generation
+ * @param {number} jobData.duration - Duration in seconds (30-180)
+ * @param {string} jobData.mood - Mood setting
+ * @param {string[]} jobData.instruments - Preferred instruments
+ * @param {boolean} jobData.isSceneAware - Whether to use scene analysis
+ * @param {Object[]} jobData.segments - Transcript segments for scene analysis
+ * @returns {Promise<{jobId: string, status: string}>}
+ */
+async function addMusicJob(jobData) {
+  const queue = getMusicQueue();
+
+  // Validate required fields
+  if (!jobData.customerId) {
+    throw new Error('customerId is required');
+  }
+
+  // For scene-aware jobs, segments are required
+  if (jobData.isSceneAware && (!jobData.segments || jobData.segments.length === 0)) {
+    throw new Error('Transcript segments are required for scene-aware music');
+  }
+
+  // Generate unique job ID
+  const jobId = jobData.isSceneAware
+    ? `scene_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+    : generateJobId(jobData.customerId);
+
+  // Prepare job data with defaults
+  const data = {
+    jobId,
+    customerId: jobData.customerId,
+    youtubeUrl: jobData.youtubeUrl || null,
+    prompt: jobData.prompt || '',
+    duration: Math.min(Math.max(jobData.duration || 60, 30), 180), // Clamp 30-180
+    mood: jobData.mood || 'neutral',
+    instruments: jobData.instruments || [],
+    step: JOB_STATUS.PENDING,
+    createdAt: new Date().toISOString(),
+    // Reference song metadata (populated during identification)
+    referenceSong: jobData.referenceSong || null,
+    // Generated music info (populated after generation)
+    musicResult: null,
+    // Scene-aware specific data
+    isSceneAware: !!jobData.isSceneAware,
+    segments: jobData.isSceneAware ? jobData.segments : null,
+    sceneContext: null  // Populated during scene analysis
+  };
+
+  // Add to queue
+  await queue.add('generate', data, {
+    jobId,
+    priority: 0 // Normal priority
+  });
+
+  return {
+    jobId,
+    status: JOB_STATUS.PENDING,
+    isSceneAware: data.isSceneAware,
+    estimatedTime: data.isSceneAware ? '4-6 minutes' : '3-5 minutes'
+  };
+}
+
+/**
+ * Get job status by job ID
+ * @param {string} jobId - Job ID
+ * @returns {Promise<Object|null>} Job status or null if not found
+ */
+async function getJobStatus(jobId) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    return null;
+  }
+
+  const state = await job.getState();
+  const progress = job.progress || 0;
+
+  return {
+    jobId: job.id,
+    status: job.data.step || state,
+    progress,
+    data: {
+      customerId: job.data.customerId,
+      youtubeUrl: job.data.youtubeUrl,
+      prompt: job.data.prompt,
+      duration: job.data.duration,
+      mood: job.data.mood,
+      instruments: job.data.instruments,
+      referenceSong: job.data.referenceSong,
+      musicResult: job.data.musicResult
+    },
+    createdAt: job.data.createdAt,
+    processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+    completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+    failedReason: job.failedReason || null,
+    attemptsMade: job.attemptsMade || 0
+  };
+}
+
+/**
+ * Get all jobs for a customer
+ * @param {string} customerId - Stripe customer ID
+ * @param {Object} options - Pagination options
+ * @param {number} options.limit - Max jobs to return (default 50)
+ * @param {number} options.offset - Offset for pagination (default 0)
+ * @returns {Promise<Object[]>} Array of job statuses
+ */
+async function getCustomerJobs(customerId, options = {}) {
+  const queue = getMusicQueue();
+  const limit = options.limit || 50;
+  const offset = options.offset || 0;
+
+  // Get all job types
+  const [completed, active, waiting, delayed, failed] = await Promise.all([
+    queue.getCompleted(0, 1000),
+    queue.getActive(),
+    queue.getWaiting(),
+    queue.getDelayed(),
+    queue.getFailed(0, 100)
+  ]);
+
+  // Combine and filter by customer
+  const allJobs = [...completed, ...active, ...waiting, ...delayed, ...failed];
+  const customerJobs = allJobs
+    .filter(job => job.data.customerId === customerId)
+    .sort((a, b) => new Date(b.data.createdAt) - new Date(a.data.createdAt));
+
+  // Apply pagination
+  const paginatedJobs = customerJobs.slice(offset, offset + limit);
+
+  // Format results
+  return Promise.all(paginatedJobs.map(async job => {
+    const state = await job.getState();
+    return {
+      jobId: job.id,
+      status: job.data.step || state,
+      progress: job.progress || 0,
+      title: job.data.musicResult?.title || `Generated Music - ${job.data.mood}`,
+      duration: job.data.duration,
+      mood: job.data.mood,
+      createdAt: job.data.createdAt,
+      completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+      failedReason: job.failedReason || null
+    };
+  }));
+}
+
+/**
+ * Cancel a pending job
+ * @param {string} jobId - Job ID
+ * @returns {Promise<{success: boolean}>}
+ */
+async function cancelJob(jobId) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  const state = await job.getState();
+
+  if (state === 'active') {
+    throw new Error('Cannot cancel job that is already processing');
+  }
+
+  if (state === 'completed' || state === 'failed') {
+    throw new Error(`Cannot cancel job that is already ${state}`);
+  }
+
+  await job.remove();
+
+  return { success: true };
+}
+
+/**
+ * Retry a failed job
+ * @param {string} jobId - Job ID
+ * @returns {Promise<{success: boolean}>}
+ */
+async function retryJob(jobId) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  const state = await job.getState();
+
+  if (state !== 'failed') {
+    throw new Error(`Can only retry failed jobs, current state: ${state}`);
+  }
+
+  await job.retry();
+
+  return { success: true };
+}
+
+/**
+ * Update job data (used internally by worker)
+ * @param {string} jobId - Job ID
+ * @param {Object} updates - Data updates
+ * @returns {Promise<void>}
+ */
+async function updateJobData(jobId, updates) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  await job.updateData({
+    ...job.data,
+    ...updates
+  });
+}
+
+/**
+ * Get queue statistics
+ * @returns {Promise<Object>} Queue stats
+ */
+async function getQueueStats() {
+  const queue = getMusicQueue();
+
+  const [waiting, active, completed, failed, delayed] = await Promise.all([
+    queue.getWaitingCount(),
+    queue.getActiveCount(),
+    queue.getCompletedCount(),
+    queue.getFailedCount(),
+    queue.getDelayedCount()
+  ]);
+
+  return {
+    waiting,
+    active,
+    completed,
+    failed,
+    delayed,
+    total: waiting + active + completed + failed + delayed
+  };
+}
+
+/**
+ * Close queue connections (for graceful shutdown)
+ */
+async function closeQueue() {
+  if (musicQueue) {
+    await musicQueue.close();
+    musicQueue = null;
+  }
+  if (musicWorker) {
+    await musicWorker.close();
+    musicWorker = null;
+  }
+}
+
+/**
+ * Add a new variations job to the queue
+ * Generates 3 variations in parallel for user selection
+ * @param {Object} jobData - Job data
+ * @param {string} jobData.customerId - Stripe customer ID
+ * @param {string} jobData.prompt - Text prompt for music generation
+ * @param {number} jobData.duration - Duration in seconds (30-180)
+ * @param {string} jobData.mood - Mood setting
+ * @param {string[]} jobData.instruments - Preferred instruments
+ * @param {Object} jobData.referenceSong - Reference song info (optional)
+ * @returns {Promise<{jobId: string, status: string}>}
+ */
+async function addVariationsJob(jobData) {
+  const queue = getMusicQueue();
+
+  // Validate required fields
+  if (!jobData.customerId) {
+    throw new Error('customerId is required');
+  }
+
+  // Generate unique job ID with variations prefix
+  const jobId = `variations_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+  // Prepare job data with defaults
+  const data = {
+    jobId,
+    customerId: jobData.customerId,
+    isVariations: true,  // Flag to identify this as a variations job
+    prompt: jobData.prompt || '',
+    duration: Math.min(Math.max(jobData.duration || 60, 30), 180),
+    mood: jobData.mood || 'neutral',
+    instruments: jobData.instruments || [],
+    referenceSong: jobData.referenceSong || null,
+    step: JOB_STATUS.PENDING,
+    createdAt: new Date().toISOString(),
+    // Variations-specific data
+    variations: [],  // Will be populated during generation
+    variationProgress: [0, 0, 0],  // Progress for each variation
+    selectedVariation: null,  // Index of user-selected variation
+    // Generated music info (populated after selection)
+    musicResult: null
+  };
+
+  // Add to queue with higher priority than regular jobs
+  await queue.add('generate-variations', data, {
+    jobId,
+    priority: 1  // Higher priority than regular jobs
+  });
+
+  return {
+    jobId,
+    status: JOB_STATUS.PENDING,
+    isVariations: true,
+    estimatedTime: '5-8 minutes'  // Longer due to 3 parallel generations
+  };
+}
+
+/**
+ * Get variations job status with detailed progress
+ * @param {string} jobId - Job ID
+ * @returns {Promise<Object|null>} Job status with variations info
+ */
+async function getVariationsJobStatus(jobId) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    return null;
+  }
+
+  const state = await job.getState();
+
+  return {
+    jobId: job.id,
+    isVariations: true,
+    status: job.data.step || state,
+    progress: job.progress || 0,
+    variationProgress: job.data.variationProgress || [0, 0, 0],
+    variations: (job.data.variations || []).map(v => ({
+      variationIndex: v.variationIndex,
+      variationName: v.variationName,
+      promptDescription: v.promptDescription,
+      status: v.failed ? 'failed' : 'completed',
+      error: v.error || null,
+      previewUrl: v.previewUrl || null,
+      duration: v.duration || null
+    })),
+    selectedVariation: job.data.selectedVariation,
+    data: {
+      customerId: job.data.customerId,
+      prompt: job.data.prompt,
+      duration: job.data.duration,
+      mood: job.data.mood,
+      instruments: job.data.instruments,
+      musicResult: job.data.musicResult
+    },
+    createdAt: job.data.createdAt,
+    processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+    completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+    failedReason: job.failedReason || null,
+    attemptsMade: job.attemptsMade || 0
+  };
+}
+
+/**
+ * Select a variation from a completed variations job
+ * @param {string} jobId - Job ID
+ * @param {number} variationIndex - Index of variation to select (0-2)
+ * @param {string} customerId - Customer ID for ownership verification
+ * @returns {Promise<Object>} Selected variation info
+ */
+async function selectVariation(jobId, variationIndex, customerId) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  // Verify ownership
+  if (job.data.customerId !== customerId) {
+    throw new Error('Not authorized to access this job');
+  }
+
+  // Check if variations are ready
+  if (!job.data.variations || job.data.variations.length === 0) {
+    throw new Error('Variations not yet generated');
+  }
+
+  // Validate variation index
+  if (variationIndex < 0 || variationIndex >= job.data.variations.length) {
+    throw new Error(`Invalid variation index: ${variationIndex}`);
+  }
+
+  // Check if selected variation failed
+  const selectedVar = job.data.variations[variationIndex];
+  if (selectedVar.failed) {
+    throw new Error(`Selected variation failed: ${selectedVar.error}`);
+  }
+
+  // Update job with selection
+  await job.updateData({
+    ...job.data,
+    selectedVariation: variationIndex,
+    step: JOB_STATUS.COMPLETED,
+    musicResult: {
+      title: selectedVar.title,
+      taskId: selectedVar.taskId,
+      duration: selectedVar.duration,
+      audioUrl: selectedVar.audioUrl,
+      previewUrl: selectedVar.previewUrl,
+      variationName: selectedVar.variationName,
+      variationIndex: selectedVar.variationIndex
+    }
+  });
+
+  return {
+    success: true,
+    selectedVariation: variationIndex,
+    variationName: selectedVar.variationName,
+    musicResult: {
+      title: selectedVar.title,
+      duration: selectedVar.duration,
+      audioUrl: selectedVar.audioUrl,
+      previewUrl: selectedVar.previewUrl
+    }
+  };
+}
+
+/**
+ * Update variation progress (used internally during generation)
+ * @param {string} jobId - Job ID
+ * @param {number} variationIndex - Variation index (0-2)
+ * @param {number} progress - Progress percentage (0-100)
+ * @param {string} status - Current status
+ */
+async function updateVariationProgress(jobId, variationIndex, progress, status) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  const variationProgress = job.data.variationProgress || [0, 0, 0];
+  variationProgress[variationIndex] = progress;
+
+  // Calculate overall progress (average of all variations)
+  const overallProgress = Math.floor(
+    variationProgress.reduce((a, b) => a + b, 0) / 3
+  );
+
+  await job.updateData({
+    ...job.data,
+    variationProgress,
+    step: status === 'completed' ? JOB_STATUS.SELECTING : JOB_STATUS.GENERATING_VARIATIONS
+  });
+
+  await job.updateProgress(overallProgress);
+}
+
+/**
+ * Store generated variations in job data
+ * @param {string} jobId - Job ID
+ * @param {Object[]} variations - Array of variation results
+ */
+async function storeVariations(jobId, variations) {
+  const queue = getMusicQueue();
+
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    throw new Error(`Job ${jobId} not found`);
+  }
+
+  const successCount = variations.filter(v => !v.failed).length;
+
+  await job.updateData({
+    ...job.data,
+    variations,
+    step: successCount > 0 ? JOB_STATUS.SELECTING : JOB_STATUS.FAILED
+  });
+
+  await job.updateProgress(successCount > 0 ? 95 : 100);
+}
+
+module.exports = {
+  JOB_STATUS,
+  PROGRESS_MAP,
+  getMusicQueue,
+  getRedisConnection,
+  generateJobId,
+  addMusicJob,
+  getJobStatus,
+  getCustomerJobs,
+  cancelJob,
+  retryJob,
+  updateJobData,
+  getQueueStats,
+  closeQueue,
+  // Variations-specific exports
+  addVariationsJob,
+  getVariationsJobStatus,
+  selectVariation,
+  updateVariationProgress,
+  storeVariations
+};

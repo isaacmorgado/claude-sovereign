@@ -1,0 +1,366 @@
+/**
+ * SPLICE Chapter Detection Service
+ *
+ * Analyzes transcripts to identify natural chapter/topic boundaries.
+ * Uses GPT-4o-mini for intelligent topic segmentation.
+ *
+ * Features:
+ * - Automatic chapter boundary detection
+ * - YouTube timestamp format generation
+ * - Timeline marker data for Premiere Pro
+ * - Configurable chapter count and minimum length
+ */
+
+const OpenAI = require('openai');
+
+const openai = new OpenAI();
+
+/**
+ * Detect chapters in a transcript using AI
+ * @param {Object} transcript - Transcript with text and/or segments
+ * @param {Object} settings - Detection settings
+ * @returns {Promise<Object>} Detected chapters, timestamps, and markers
+ */
+async function detectChapters(transcript, settings = {}) {
+  const {
+    maxChapters = 10,
+    minChapterLength = 60, // seconds
+    language = 'en'
+  } = settings;
+
+  // Get full text from transcript
+  const text = extractText(transcript);
+
+  if (!text || text.length < 100) {
+    console.log('[SPLICE Chapters] Transcript too short for chapter detection');
+    return {
+      chapters: [],
+      youtubeTimestamps: '',
+      markers: [],
+      metadata: {
+        chapterCount: 0,
+        reason: 'transcript_too_short'
+      }
+    };
+  }
+
+  // Get duration
+  const duration = transcript.duration ||
+    (transcript.segments?.length > 0 ? transcript.segments[transcript.segments.length - 1].end : 0);
+
+  if (duration < minChapterLength * 2) {
+    console.log('[SPLICE Chapters] Content too short for multiple chapters');
+    return {
+      chapters: [{
+        startTime: 0,
+        title: 'Full Video',
+        description: 'Video content'
+      }],
+      youtubeTimestamps: '0:00 Full Video',
+      markers: [{
+        time: 0,
+        name: 'Full Video',
+        comment: 'Video content'
+      }],
+      metadata: {
+        chapterCount: 1,
+        reason: 'single_chapter'
+      }
+    };
+  }
+
+  console.log(`[SPLICE Chapters] Analyzing transcript (${text.length} chars, ${Math.floor(duration)}s)`);
+
+  try {
+    const prompt = buildChapterPrompt(text, maxChapters, minChapterLength, duration);
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a video chapter detection expert. Analyze transcripts to identify natural topic changes and chapter boundaries. Return structured JSON with accurate timestamps.`
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 1000,
+      response_format: { type: 'json_object' }
+    });
+
+    const result = JSON.parse(response.choices[0].message.content);
+    const chapters = result.chapters || result || [];
+
+    // Validate and clean chapters
+    const validChapters = validateChapters(chapters, duration, minChapterLength);
+
+    // Generate YouTube timestamps
+    const youtubeTimestamps = formatYouTubeTimestamps(validChapters);
+
+    // Generate marker data
+    const markers = validChapters.map(ch => ({
+      time: ch.startTime,
+      name: ch.title,
+      comment: ch.description || ''
+    }));
+
+    console.log(`[SPLICE Chapters] Detected ${validChapters.length} chapters`);
+
+    return {
+      chapters: validChapters,
+      youtubeTimestamps,
+      markers,
+      metadata: {
+        chapterCount: validChapters.length,
+        duration,
+        model: 'gpt-4o-mini'
+      }
+    };
+
+  } catch (err) {
+    console.error('[SPLICE Chapters] Detection error:', err);
+    throw new Error(`Chapter detection failed: ${err.message}`);
+  }
+}
+
+/**
+ * Extract plain text from transcript
+ * @param {Object} transcript - Transcript object
+ * @returns {string} Plain text
+ */
+function extractText(transcript) {
+  if (typeof transcript === 'string') {
+    return transcript;
+  }
+
+  if (transcript.text) {
+    return transcript.text;
+  }
+
+  if (transcript.segments) {
+    return transcript.segments
+      .map(s => s.text || s.content || '')
+      .join(' ')
+      .trim();
+  }
+
+  if (transcript.words) {
+    return transcript.words
+      .map(w => w.word || w.text || '')
+      .join(' ')
+      .trim();
+  }
+
+  return '';
+}
+
+/**
+ * Build the prompt for chapter detection
+ * @param {string} text - Transcript text
+ * @param {number} maxChapters - Maximum chapters
+ * @param {number} minLength - Minimum chapter length
+ * @param {number} duration - Total duration
+ * @returns {string} Formatted prompt
+ */
+function buildChapterPrompt(text, maxChapters, minLength, duration) {
+  // Truncate text if too long (keep first 15000 chars)
+  const truncatedText = text.length > 15000 ? text.substring(0, 15000) + '...' : text;
+
+  return `Analyze this transcript and identify natural chapter breaks.
+
+RULES:
+- Maximum ${maxChapters} chapters
+- Minimum ${minLength} seconds between chapters
+- First chapter MUST start at 0 seconds
+- Total video duration is ${Math.floor(duration)} seconds
+- Identify topic/subject changes
+- Create short, descriptive titles (3-5 words max)
+
+TRANSCRIPT:
+${truncatedText}
+
+Return JSON in this exact format:
+{
+  "chapters": [
+    {
+      "startTime": 0,
+      "title": "Introduction",
+      "description": "Brief description of this chapter"
+    },
+    {
+      "startTime": 120,
+      "title": "Main Topic",
+      "description": "Description of what happens"
+    }
+  ]
+}
+
+IMPORTANT: startTime values must be in SECONDS as numbers, not strings.`;
+}
+
+/**
+ * Validate and clean detected chapters
+ * @param {Array} chapters - Raw chapters from AI
+ * @param {number} duration - Total duration
+ * @param {number} minLength - Minimum chapter length
+ * @returns {Array} Validated chapters
+ */
+function validateChapters(chapters, duration, minLength) {
+  if (!Array.isArray(chapters)) {
+    return [{
+      startTime: 0,
+      title: 'Video',
+      description: 'Full video content'
+    }];
+  }
+
+  const validChapters = [];
+  let lastTime = -minLength;
+
+  // Sort by start time
+  const sorted = [...chapters].sort((a, b) => {
+    const aTime = parseFloat(a.startTime) || 0;
+    const bTime = parseFloat(b.startTime) || 0;
+    return aTime - bTime;
+  });
+
+  for (const chapter of sorted) {
+    const startTime = parseFloat(chapter.startTime) || 0;
+
+    // Skip if too close to last chapter
+    if (startTime - lastTime < minLength && validChapters.length > 0) {
+      continue;
+    }
+
+    // Skip if past duration
+    if (startTime >= duration) {
+      continue;
+    }
+
+    // Ensure title exists
+    const title = (chapter.title || 'Chapter ' + (validChapters.length + 1)).substring(0, 50);
+    const description = (chapter.description || '').substring(0, 200);
+
+    validChapters.push({
+      startTime: parseFloat(startTime.toFixed(2)),
+      title,
+      description
+    });
+
+    lastTime = startTime;
+  }
+
+  // Ensure first chapter starts at 0
+  if (validChapters.length > 0 && validChapters[0].startTime > 0) {
+    validChapters.unshift({
+      startTime: 0,
+      title: 'Introduction',
+      description: 'Video introduction'
+    });
+  }
+
+  // Ensure at least one chapter
+  if (validChapters.length === 0) {
+    validChapters.push({
+      startTime: 0,
+      title: 'Video',
+      description: 'Full video content'
+    });
+  }
+
+  return validChapters;
+}
+
+/**
+ * Format chapters as YouTube timestamps
+ * @param {Array} chapters - Array of chapter objects
+ * @returns {string} YouTube-formatted timestamp string
+ */
+function formatYouTubeTimestamps(chapters) {
+  return chapters.map(ch => {
+    const totalSeconds = Math.floor(ch.startTime);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    let time;
+    if (hours > 0) {
+      time = `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    } else {
+      time = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    return `${time} ${ch.title}`;
+  }).join('\n');
+}
+
+/**
+ * Detect chapters from segments (fallback without AI)
+ * Uses silence gaps and segment boundaries
+ * @param {Object} transcript - Transcript with segments
+ * @param {Object} settings - Detection settings
+ * @returns {Object} Detected chapters
+ */
+function detectChaptersFallback(transcript, settings = {}) {
+  const {
+    minChapterLength = 120,
+    gapThreshold = 3 // seconds of silence to consider chapter break
+  } = settings;
+
+  const segments = transcript.segments || [];
+  if (segments.length === 0) {
+    return {
+      chapters: [{ startTime: 0, title: 'Video', description: '' }],
+      youtubeTimestamps: '0:00 Video',
+      markers: [{ time: 0, name: 'Video', comment: '' }],
+      metadata: { chapterCount: 1, method: 'fallback' }
+    };
+  }
+
+  const chapters = [{ startTime: 0, title: 'Chapter 1', description: '' }];
+  let chapterNum = 2;
+  let lastEnd = 0;
+  let lastChapterTime = 0;
+
+  for (const segment of segments) {
+    const gap = segment.start - lastEnd;
+
+    // Large gap indicates potential chapter break
+    if (gap >= gapThreshold && segment.start - lastChapterTime >= minChapterLength) {
+      chapters.push({
+        startTime: parseFloat(segment.start.toFixed(2)),
+        title: `Chapter ${chapterNum}`,
+        description: ''
+      });
+      chapterNum++;
+      lastChapterTime = segment.start;
+    }
+
+    lastEnd = segment.end;
+  }
+
+  return {
+    chapters,
+    youtubeTimestamps: formatYouTubeTimestamps(chapters),
+    markers: chapters.map(ch => ({
+      time: ch.startTime,
+      name: ch.title,
+      comment: ch.description
+    })),
+    metadata: {
+      chapterCount: chapters.length,
+      method: 'fallback'
+    }
+  };
+}
+
+module.exports = {
+  detectChapters,
+  detectChaptersFallback,
+  formatYouTubeTimestamps,
+  extractText,
+  validateChapters
+};

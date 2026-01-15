@@ -1,0 +1,757 @@
+/**
+ * SPLICE Text-Based Editing Service
+ *
+ * Enables editing video by editing transcript text.
+ * Each word has unique ID linked to video timecode.
+ * Diff algorithm detects deletions, insertions, and reorderings.
+ * Changes convert to cut list format for timeline application.
+ */
+
+// ============================================================================
+// EDITABLE TRANSCRIPT GENERATION
+// ============================================================================
+
+/**
+ * Generate an editable transcript structure with unique word IDs
+ * @param {Object} transcript - Transcript with words array
+ * @returns {Object} Editable transcript with word IDs and metadata
+ */
+function generateEditableTranscript(transcript) {
+  const words = extractWords(transcript);
+
+  if (!words || words.length === 0) {
+    return {
+      success: false,
+      error: 'No words found in transcript',
+      editableTranscript: null
+    };
+  }
+
+  // Generate unique ID for each word
+  const editableWords = words.map((word, index) => ({
+    id: `word_${index}_${Math.random().toString(36).substr(2, 6)}`,
+    originalIndex: index,
+    word: word.word,
+    start: word.start,
+    end: word.end,
+    confidence: word.confidence || 1.0,
+    speaker: word.speaker || null,
+    // For paragraph grouping
+    isStartOfSentence: index === 0 || isPunctuation(words[index - 1]?.word),
+    paragraphIndex: null // Will be set when grouping
+  }));
+
+  // Group into paragraphs (sentences or time-based groups)
+  const paragraphs = groupIntoParagraphs(editableWords);
+
+  // Generate plain text with word IDs embedded (for tracking)
+  const plainText = editableWords.map(w => w.word).join(' ');
+
+  return {
+    success: true,
+    editableTranscript: {
+      version: '1.0',
+      words: editableWords,
+      paragraphs,
+      plainText,
+      totalWords: editableWords.length,
+      duration: editableWords.length > 0 ? editableWords[editableWords.length - 1].end : 0,
+      metadata: {
+        generatedAt: new Date().toISOString(),
+        sourceWordCount: words.length
+      }
+    }
+  };
+}
+
+/**
+ * Group words into paragraphs
+ */
+function groupIntoParagraphs(words) {
+  const paragraphs = [];
+  let currentParagraph = { words: [], start: 0, end: 0, text: '' };
+
+  words.forEach((word, index) => {
+    if (currentParagraph.words.length === 0) {
+      currentParagraph.start = word.start;
+    }
+
+    word.paragraphIndex = paragraphs.length;
+    currentParagraph.words.push(word);
+    currentParagraph.end = word.end;
+
+    // End paragraph on sentence-ending punctuation or after ~20 words
+    const endsSentence = /[.!?]$/.test(word.word);
+    const tooLong = currentParagraph.words.length >= 20;
+
+    if (endsSentence || tooLong || index === words.length - 1) {
+      currentParagraph.text = currentParagraph.words.map(w => w.word).join(' ');
+      currentParagraph.id = `para_${paragraphs.length}`;
+      paragraphs.push({ ...currentParagraph });
+      currentParagraph = { words: [], start: 0, end: 0, text: '' };
+    }
+  });
+
+  return paragraphs;
+}
+
+// ============================================================================
+// TEXT EDIT APPLICATION
+// ============================================================================
+
+/**
+ * Apply text edits and generate edit operations
+ * @param {Object} originalTranscript - Original editable transcript
+ * @param {string} editedText - New edited text
+ * @returns {Object} Edit operations and resulting transcript
+ */
+function applyTextEdits(originalTranscript, editedText) {
+  if (!originalTranscript || !originalTranscript.words) {
+    return {
+      success: false,
+      error: 'Invalid original transcript'
+    };
+  }
+
+  if (typeof editedText !== 'string') {
+    return {
+      success: false,
+      error: 'editedText must be a string'
+    };
+  }
+
+  // Tokenize edited text
+  const editedWords = tokenizeText(editedText);
+  const originalWords = originalTranscript.words;
+
+  // Run diff algorithm
+  const diff = computeDiff(originalWords, editedWords);
+
+  // Detect specific edit types
+  const deletions = detectDeletions(diff);
+  const insertions = detectInsertions(diff);
+  const reorderings = detectReorderings(originalWords, editedWords);
+
+  // Generate edit operations
+  const operations = generateOperations(deletions, insertions, reorderings);
+
+  // Create updated transcript
+  const updatedWords = applyOperationsToWords(originalWords, operations);
+
+  return {
+    success: true,
+    operations,
+    stats: {
+      deletions: deletions.length,
+      insertions: insertions.length,
+      reorderings: reorderings.length,
+      originalWordCount: originalWords.length,
+      newWordCount: updatedWords.length
+    },
+    updatedTranscript: {
+      words: updatedWords,
+      plainText: updatedWords.map(w => w.word).join(' ')
+    }
+  };
+}
+
+/**
+ * Tokenize text into words
+ */
+function tokenizeText(text) {
+  return text
+    .split(/\s+/)
+    .filter(w => w.length > 0)
+    .map(word => word.trim());
+}
+
+// Maximum word count before warning about LCS memory usage
+// LCS uses O(m*n) space - 10k words = 100M array elements = ~400MB
+const LCS_MEMORY_WARNING_THRESHOLD = 10000;
+const LCS_MAX_WORDS_LIMIT = 50000; // Hard limit to prevent OOM
+
+/**
+ * Compute diff between original and edited words
+ * Uses Longest Common Subsequence (LCS) based approach
+ *
+ * PERF-NOTE: LCS has O(m*n) space complexity.
+ * For very large transcripts (>10k words), consider:
+ * - Hirschberg's algorithm for O(n) space
+ * - Chunking the transcript into paragraphs
+ * - Using a streaming diff approach
+ */
+function computeDiff(originalWords, editedWords) {
+  const orig = originalWords.map(w => w.word.toLowerCase());
+  const edit = editedWords.map(w => w.toLowerCase());
+
+  const m = orig.length;
+  const n = edit.length;
+
+  // PERF-FIX: Warn and provide guidance for large transcripts
+  if (m > LCS_MEMORY_WARNING_THRESHOLD || n > LCS_MEMORY_WARNING_THRESHOLD) {
+    console.warn(`[SPLICE TextEdit] Large transcript detected: ${m} x ${n} words`);
+    console.warn(`[SPLICE TextEdit] LCS matrix will use ~${Math.round((m + 1) * (n + 1) * 4 / 1024 / 1024)}MB memory`);
+    console.warn(`[SPLICE TextEdit] Consider breaking transcript into smaller sections for editing`);
+  }
+
+  // PERF-FIX: Hard limit to prevent out-of-memory crashes
+  if (m > LCS_MAX_WORDS_LIMIT || n > LCS_MAX_WORDS_LIMIT) {
+    console.error(`[SPLICE TextEdit] Transcript exceeds ${LCS_MAX_WORDS_LIMIT} words - aborting diff`);
+    throw new Error(`Transcript too large for text-based editing (${Math.max(m, n)} words). Maximum is ${LCS_MAX_WORDS_LIMIT} words. Consider splitting into smaller sections.`);
+  }
+
+  // Build LCS matrix
+  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (orig[i - 1] === edit[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to find diff
+  const diff = [];
+  let i = m, j = n;
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && orig[i - 1] === edit[j - 1]) {
+      diff.unshift({ type: 'keep', originalIndex: i - 1, editedIndex: j - 1, word: originalWords[i - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      diff.unshift({ type: 'insert', editedIndex: j - 1, word: editedWords[j - 1] });
+      j--;
+    } else {
+      diff.unshift({ type: 'delete', originalIndex: i - 1, word: originalWords[i - 1] });
+      i--;
+    }
+  }
+
+  return diff;
+}
+
+// ============================================================================
+// EDIT DETECTION
+// ============================================================================
+
+/**
+ * Detect deletions from diff
+ */
+function detectDeletions(diff) {
+  return diff
+    .filter(d => d.type === 'delete')
+    .map(d => ({
+      type: 'deletion',
+      wordId: d.word.id,
+      word: d.word.word,
+      originalIndex: d.originalIndex,
+      start: d.word.start,
+      end: d.word.end
+    }));
+}
+
+/**
+ * Detect insertions from diff
+ * Note: Insertions in text-based editing are typically not supported
+ * as they don't have corresponding video content
+ */
+function detectInsertions(diff) {
+  return diff
+    .filter(d => d.type === 'insert')
+    .map((d, _i) => ({
+      type: 'insertion',
+      word: d.word,
+      editedIndex: d.editedIndex,
+      note: 'Text insertion - no video content available'
+    }));
+}
+
+/**
+ * Detect reorderings (paragraph/sentence moves)
+ */
+function detectReorderings(originalWords, editedWords) {
+  const reorderings = [];
+  const editLower = editedWords.map(w => w.toLowerCase());
+
+  // Find words that exist in both but in different positions
+  const originalPositions = new Map();
+  originalWords.forEach((w, i) => {
+    const key = w.word.toLowerCase();
+    if (!originalPositions.has(key)) {
+      originalPositions.set(key, []);
+    }
+    originalPositions.get(key).push(i);
+  });
+
+  // Detect significant position changes
+  editLower.forEach((word, newPos) => {
+    const origPositions = originalPositions.get(word);
+    if (origPositions && origPositions.length > 0) {
+      const origPos = origPositions[0];
+      const positionDiff = Math.abs(newPos - origPos);
+
+      // If position changed by more than 5 words, consider it a reordering
+      if (positionDiff > 5) {
+        const origWord = originalWords[origPos];
+        reorderings.push({
+          type: 'reorder',
+          wordId: origWord.id,
+          word: origWord.word,
+          originalPosition: origPos,
+          newPosition: newPos,
+          start: origWord.start,
+          end: origWord.end
+        });
+      }
+      origPositions.shift(); // Remove used position
+    }
+  });
+
+  return reorderings;
+}
+
+/**
+ * Generate edit operations from detected changes
+ */
+function generateOperations(deletions, insertions, reorderings) {
+  const operations = [];
+
+  // Sort deletions by time (ascending) to create cut regions
+  const sortedDeletions = [...deletions].sort((a, b) => a.start - b.start);
+
+  // Merge consecutive deletions into cut regions
+  let currentCut = null;
+  sortedDeletions.forEach(del => {
+    if (!currentCut) {
+      currentCut = {
+        type: 'cut',
+        start: del.start,
+        end: del.end,
+        words: [del.word],
+        wordIds: [del.wordId]
+      };
+    } else if (del.start - currentCut.end < 0.5) {
+      // Extend current cut region (within 0.5s gap)
+      currentCut.end = del.end;
+      currentCut.words.push(del.word);
+      currentCut.wordIds.push(del.wordId);
+    } else {
+      // Start new cut region
+      operations.push(currentCut);
+      currentCut = {
+        type: 'cut',
+        start: del.start,
+        end: del.end,
+        words: [del.word],
+        wordIds: [del.wordId]
+      };
+    }
+  });
+  if (currentCut) {
+    operations.push(currentCut);
+  }
+
+  // Add reorder operations (these create move operations in timeline)
+  reorderings.forEach(reorder => {
+    operations.push({
+      type: 'reorder',
+      wordId: reorder.wordId,
+      word: reorder.word,
+      originalPosition: reorder.originalPosition,
+      newPosition: reorder.newPosition,
+      start: reorder.start,
+      end: reorder.end
+    });
+  });
+
+  return operations;
+}
+
+/**
+ * Apply operations to create updated word list
+ */
+function applyOperationsToWords(originalWords, operations) {
+  // Get IDs of deleted words
+  const deletedIds = new Set();
+  operations
+    .filter(op => op.type === 'cut')
+    .forEach(op => op.wordIds.forEach(id => deletedIds.add(id)));
+
+  // Filter out deleted words
+  const remaining = originalWords.filter(w => !deletedIds.has(w.id));
+
+  // Handle reorderings (simplified - just mark them)
+  // Full reordering would require more complex logic
+  return remaining;
+}
+
+// ============================================================================
+// CUT LIST GENERATION
+// ============================================================================
+
+/**
+ * Generate cut list from edit operations
+ * @param {Array} operations - Edit operations
+ * @param {Object} sourceInfo - Source video/audio info
+ * @returns {Object} Cut list in v3.5 format
+ */
+function generateEditCutList(operations, sourceInfo = {}) {
+  const {
+    sourceName = 'source',
+    sourcePath = '',
+    duration = 0,
+    frameRate = 30
+  } = sourceInfo;
+
+  // Sort operations by time
+  const cuts = operations
+    .filter(op => op.type === 'cut')
+    .sort((a, b) => a.start - b.start);
+
+  // Generate segments (keep regions between cuts)
+  const segments = [];
+  let currentTime = 0;
+
+  cuts.forEach((cut, index) => {
+    // Add keep segment before this cut
+    if (cut.start > currentTime) {
+      segments.push({
+        type: 'speech',
+        sourceName,
+        sourcePath,
+        inPoint: currentTime,
+        outPoint: cut.start,
+        originalInPoint: currentTime,
+        originalOutPoint: cut.start
+      });
+    }
+    currentTime = cut.end;
+  });
+
+  // Add final segment after last cut
+  if (currentTime < duration) {
+    segments.push({
+      type: 'speech',
+      sourceName,
+      sourcePath,
+      inPoint: currentTime,
+      outPoint: duration,
+      originalInPoint: currentTime,
+      originalOutPoint: duration
+    });
+  }
+
+  // If no cuts, keep entire duration
+  if (segments.length === 0 && duration > 0) {
+    segments.push({
+      type: 'speech',
+      sourceName,
+      sourcePath,
+      inPoint: 0,
+      outPoint: duration,
+      originalInPoint: 0,
+      originalOutPoint: duration
+    });
+  }
+
+  return {
+    success: true,
+    cutList: {
+      version: '3.5',
+      source: { name: sourceName, path: sourcePath, duration },
+      segments,
+      metadata: {
+        cutsApplied: cuts.length,
+        frameRate,
+        generatedFrom: 'text-based-editing',
+        generatedAt: new Date().toISOString()
+      }
+    },
+    summary: {
+      totalCuts: cuts.length,
+      originalDuration: duration,
+      newDuration: segments.reduce((sum, s) => sum + (s.outPoint - s.inPoint), 0),
+      segmentCount: segments.length
+    }
+  };
+}
+
+// ============================================================================
+// SEARCH AND REPLACE
+// ============================================================================
+
+/**
+ * Search for text and return matches with timestamps
+ * @param {Object} transcript - Editable transcript
+ * @param {string} searchText - Text to search for
+ * @returns {Object} Search results with timestamps
+ */
+function searchTranscript(transcript, searchText) {
+  if (!transcript || !transcript.words) {
+    return { success: false, error: 'Invalid transcript', matches: [] };
+  }
+
+  if (!searchText || searchText.trim().length === 0) {
+    return { success: false, error: 'Search text is required', matches: [] };
+  }
+
+  const searchLower = searchText.toLowerCase().trim();
+  const searchWords = searchLower.split(/\s+/);
+  const matches = [];
+
+  // Search for phrase matches
+  const words = transcript.words;
+  for (let i = 0; i <= words.length - searchWords.length; i++) {
+    let isMatch = true;
+    for (let j = 0; j < searchWords.length; j++) {
+      if (words[i + j].word.toLowerCase() !== searchWords[j]) {
+        isMatch = false;
+        break;
+      }
+    }
+
+    if (isMatch) {
+      const matchWords = words.slice(i, i + searchWords.length);
+      matches.push({
+        index: matches.length,
+        startWordIndex: i,
+        endWordIndex: i + searchWords.length - 1,
+        text: matchWords.map(w => w.word).join(' '),
+        start: matchWords[0].start,
+        end: matchWords[matchWords.length - 1].end,
+        wordIds: matchWords.map(w => w.id)
+      });
+    }
+  }
+
+  return {
+    success: true,
+    query: searchText,
+    totalMatches: matches.length,
+    matches
+  };
+}
+
+/**
+ * Search and replace text (generates deletion operations for matches)
+ * @param {Object} transcript - Editable transcript
+ * @param {string} searchText - Text to search for
+ * @param {string} replaceText - Replacement text (empty for delete)
+ * @returns {Object} Operations to perform
+ */
+function searchAndReplace(transcript, searchText, replaceText = '') {
+  const searchResult = searchTranscript(transcript, searchText);
+
+  if (!searchResult.success) {
+    return searchResult;
+  }
+
+  if (searchResult.matches.length === 0) {
+    return {
+      success: true,
+      message: 'No matches found',
+      operations: [],
+      matchCount: 0
+    };
+  }
+
+  // For text-based video editing, "replace" with empty = delete
+  // Replace with text would need AI-generated speech (out of scope)
+  const isDelete = !replaceText || replaceText.trim().length === 0;
+
+  const operations = searchResult.matches.map(match => ({
+    type: 'cut',
+    reason: isDelete ? 'search_delete' : 'search_replace',
+    searchText,
+    replaceText: isDelete ? null : replaceText,
+    start: match.start,
+    end: match.end,
+    wordIds: match.wordIds,
+    words: match.text
+  }));
+
+  return {
+    success: true,
+    searchText,
+    replaceText: isDelete ? '(deleted)' : replaceText,
+    matchCount: searchResult.matches.length,
+    operations,
+    note: isDelete
+      ? 'Matched segments will be cut from video'
+      : 'Replace requires text-to-speech (marking for deletion instead)'
+  };
+}
+
+// ============================================================================
+// PREVIEW GENERATION
+// ============================================================================
+
+/**
+ * Generate preview of edits without applying
+ * @param {Object} transcript - Original transcript
+ * @param {string} editedText - Edited text
+ * @returns {Object} Preview of changes
+ */
+function previewEdits(transcript, editedText) {
+  const result = applyTextEdits(transcript, editedText);
+
+  if (!result.success) {
+    return result;
+  }
+
+  // Generate human-readable preview
+  const preview = {
+    success: true,
+    changes: [],
+    summary: result.stats
+  };
+
+  result.operations.forEach(op => {
+    if (op.type === 'cut') {
+      preview.changes.push({
+        type: 'deletion',
+        description: `Delete "${op.words.join(' ')}"`,
+        timeRange: `${formatTime(op.start)} - ${formatTime(op.end)}`,
+        duration: op.end - op.start
+      });
+    } else if (op.type === 'reorder') {
+      preview.changes.push({
+        type: 'reorder',
+        description: `Move "${op.word}" from position ${op.originalPosition} to ${op.newPosition}`,
+        timeRange: `${formatTime(op.start)} - ${formatTime(op.end)}`
+      });
+    }
+  });
+
+  // Calculate impact
+  const totalCutDuration = result.operations
+    .filter(op => op.type === 'cut')
+    .reduce((sum, op) => sum + (op.end - op.start), 0);
+
+  preview.impact = {
+    durationRemoved: totalCutDuration,
+    percentageRemoved: transcript.duration > 0
+      ? ((totalCutDuration / transcript.duration) * 100).toFixed(1)
+      : 0
+  };
+
+  return preview;
+}
+
+/**
+ * Format time for display
+ */
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  const ms = Math.floor((seconds % 1) * 100);
+  return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+}
+
+// ============================================================================
+// UNDO/REDO SUPPORT
+// ============================================================================
+
+/**
+ * Create undo history entry
+ */
+function createHistoryEntry(transcript, operations, description) {
+  return {
+    id: `hist_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    description,
+    transcriptSnapshot: JSON.stringify(transcript),
+    operations: JSON.stringify(operations)
+  };
+}
+
+/**
+ * Get undo stack from history
+ */
+function getUndoStack(history = []) {
+  return history.map(entry => ({
+    id: entry.id,
+    description: entry.description,
+    timestamp: entry.timestamp
+  }));
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Extract words from transcript
+ */
+function extractWords(transcript) {
+  if (!transcript) return [];
+
+  if (Array.isArray(transcript.words)) {
+    return transcript.words.map(w => ({
+      word: w.word || w.text || '',
+      start: w.start || 0,
+      end: w.end || 0,
+      confidence: w.confidence,
+      speaker: w.speaker
+    }));
+  }
+
+  if (Array.isArray(transcript.segments)) {
+    const words = [];
+    transcript.segments.forEach(seg => {
+      if (Array.isArray(seg.words)) {
+        seg.words.forEach(w => {
+          words.push({
+            word: w.word || w.text || '',
+            start: w.start || 0,
+            end: w.end || 0,
+            confidence: w.confidence,
+            speaker: w.speaker || seg.speaker
+          });
+        });
+      }
+    });
+    return words;
+  }
+
+  return [];
+}
+
+/**
+ * Check if word ends with punctuation
+ */
+function isPunctuation(word) {
+  if (!word) return false;
+  return /[.!?]$/.test(word);
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+module.exports = {
+  generateEditableTranscript,
+  applyTextEdits,
+  detectDeletions,
+  detectInsertions,
+  detectReorderings,
+  generateEditCutList,
+  searchTranscript,
+  searchAndReplace,
+  previewEdits,
+  createHistoryEntry,
+  getUndoStack,
+  // Helpers for testing
+  extractWords,
+  tokenizeText,
+  computeDiff,
+  groupIntoParagraphs,
+  formatTime,
+  // Constants for testing
+  LCS_MEMORY_WARNING_THRESHOLD,
+  LCS_MAX_WORDS_LIMIT
+};

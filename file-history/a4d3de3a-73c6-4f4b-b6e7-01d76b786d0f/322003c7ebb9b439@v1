@@ -1,0 +1,353 @@
+/**
+ * Slice 9: FCP XML Processor
+ *
+ * Parses Final Cut Pro XML, splits clips at silence boundaries,
+ * removes silent segments, and rebuilds the XML.
+ *
+ * Uses fast-xml-parser for parsing and building XML.
+ */
+
+const { XMLParser, XMLBuilder } = require('fast-xml-parser');
+const fs = require('fs').promises;
+const path = require('path');
+
+/**
+ * FCP XML Processor Class
+ *
+ * Handles parsing, manipulation, and serialization of FCP XML files.
+ */
+class FCPXMLProcessor {
+  constructor() {
+    // Parser options - preserve attributes and don't convert values
+    this.parserOptions = {
+      ignoreAttributes: false,
+      attributeNamePrefix: '@_',
+      parseAttributeValue: false,
+      trimValues: false,
+      processEntities: true,
+      ignoreDeclaration: false,
+      preserveOrder: true
+    };
+
+    // Builder options - match parser settings
+    this.builderOptions = {
+      ignoreAttributes: false,
+      attributeNamePrefix: '@_',
+      format: true,
+      indentBy: '    ',
+      suppressEmptyNode: false,
+      preserveOrder: true
+    };
+
+    this.parser = new XMLParser(this.parserOptions);
+    this.builder = new XMLBuilder(this.builderOptions);
+
+    this.doc = null;
+    this.frameRate = 29.97;
+  }
+
+  /**
+   * Parse FCP XML string
+   */
+  parse(xmlString) {
+    this.doc = this.parser.parse(xmlString);
+    this.detectFrameRate();
+    return this.doc;
+  }
+
+  /**
+   * Load and parse FCP XML from file
+   */
+  async loadFromFile(filePath) {
+    const content = await fs.readFile(filePath, 'utf8');
+    return this.parse(content);
+  }
+
+  /**
+   * Detect frame rate from format element
+   */
+  detectFrameRate() {
+    // Try to find frameDuration in resources/format
+    try {
+      const fcpxml = this.findElement(this.doc, 'fcpxml');
+      const resources = this.findElement(fcpxml, 'resources');
+      const format = this.findElement(resources, 'format');
+
+      if (format && format[':@'] && format[':@']['@_frameDuration']) {
+        const frameDuration = format[':@']['@_frameDuration'];
+        const seconds = this.timeToSeconds(frameDuration);
+        if (seconds > 0) {
+          this.frameRate = 1 / seconds;
+          console.log(`[SPLICE] Detected frame rate: ${this.frameRate.toFixed(2)} fps`);
+        }
+      }
+    } catch (e) {
+      console.log('[SPLICE] Using default frame rate: 29.97 fps');
+    }
+  }
+
+  /**
+   * Find element by tag name in parsed XML (preserveOrder format)
+   */
+  findElement(parent, tagName) {
+    if (!parent || !Array.isArray(parent)) return null;
+
+    for (const item of parent) {
+      if (item[tagName] !== undefined) {
+        return item[tagName];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find all elements by tag name
+   */
+  findAllElements(parent, tagName) {
+    if (!parent || !Array.isArray(parent)) return [];
+
+    const results = [];
+    for (const item of parent) {
+      if (item[tagName] !== undefined) {
+        results.push(item);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Convert FCP XML time string to seconds
+   * Format: "1001/30000s" (rational) or "10s" (simple)
+   */
+  timeToSeconds(timeStr) {
+    if (!timeStr || timeStr === '0s') return 0;
+
+    // Rational format: "1001/30000s"
+    const rationalMatch = timeStr.match(/^(\d+)\/(\d+)s$/);
+    if (rationalMatch) {
+      return parseInt(rationalMatch[1]) / parseInt(rationalMatch[2]);
+    }
+
+    // Simple format: "10s" or "10.5s"
+    const simpleMatch = timeStr.match(/^([\d.]+)s$/);
+    if (simpleMatch) {
+      return parseFloat(simpleMatch[1]);
+    }
+
+    return 0;
+  }
+
+  /**
+   * Convert seconds to FCP XML time string
+   * Uses rational format for frame-accurate timing
+   */
+  secondsToTime(seconds) {
+    if (seconds === 0) return '0s';
+
+    // Use frame-accurate rational format
+    if (Math.abs(this.frameRate - 29.97) < 0.1) {
+      // 29.97 fps (NTSC)
+      const frames = Math.round(seconds * 30000 / 1001);
+      return `${frames * 1001}/30000s`;
+    } else if (Math.abs(this.frameRate - 23.976) < 0.1) {
+      // 23.976 fps
+      const frames = Math.round(seconds * 24000 / 1001);
+      return `${frames * 1001}/24000s`;
+    } else if (Math.abs(this.frameRate - 25) < 0.1) {
+      // 25 fps (PAL)
+      const frames = Math.round(seconds * 25);
+      return `${frames * 100}/2500s`;
+    } else if (Math.abs(this.frameRate - 24) < 0.1) {
+      // 24 fps
+      const frames = Math.round(seconds * 24);
+      return `${frames * 100}/2400s`;
+    } else if (Math.abs(this.frameRate - 30) < 0.1) {
+      // 30 fps
+      const frames = Math.round(seconds * 30);
+      return `${frames * 100}/3000s`;
+    }
+
+    // Fallback to simple format
+    return `${seconds.toFixed(6)}s`;
+  }
+
+  /**
+   * Process XML to split clips at silence boundaries and remove silences
+   *
+   * @param {Array<{start: number, end: number}>} silences - Silence regions
+   * @param {boolean} removeGaps - Whether to collapse timeline after removing silences
+   * @returns {Object} Processing statistics
+   */
+  splitClipsAtSilences(silences, removeGaps = true) {
+    if (!this.doc) {
+      throw new Error('No XML document loaded');
+    }
+
+    const stats = {
+      clipsProcessed: 0,
+      clipsSplit: 0,
+      silencesRemoved: 0,
+      totalTimeRemoved: 0
+    };
+
+    // Sort silences by start time
+    const sortedSilences = [...silences].sort((a, b) => a.start - b.start);
+
+    // Find spine element (main timeline container)
+    const fcpxml = this.findElement(this.doc, 'fcpxml');
+    const project = this.findElement(fcpxml, 'project');
+    const sequence = this.findElement(project, 'sequence');
+    const spine = this.findElement(sequence, 'spine');
+
+    if (!spine) {
+      console.log('[SPLICE] Warning: No spine element found in XML');
+      return stats;
+    }
+
+    // Get all asset-clips in spine
+    const assetClips = this.findAllElements(spine, 'asset-clip');
+
+    console.log(`[SPLICE] Processing ${assetClips.length} asset-clip(s)`);
+
+    // Process each clip
+    for (const clipWrapper of assetClips) {
+      const clip = clipWrapper['asset-clip'];
+      const attrs = clipWrapper[':@'] || {};
+
+      const offset = this.timeToSeconds(attrs['@_offset'] || '0s');
+      const duration = this.timeToSeconds(attrs['@_duration'] || '0s');
+      const start = this.timeToSeconds(attrs['@_start'] || '0s');
+      const clipEnd = offset + duration;
+
+      stats.clipsProcessed++;
+
+      // Find silences that overlap with this clip
+      const overlappingSilences = sortedSilences.filter(s =>
+        s.start < clipEnd && s.end > offset
+      );
+
+      if (overlappingSilences.length === 0) {
+        continue; // No silences in this clip
+      }
+
+      console.log(`[SPLICE] Clip at ${offset.toFixed(2)}s has ${overlappingSilences.length} overlapping silence(s)`);
+
+      // Calculate non-silent segments within this clip
+      const segments = this.calculateNonSilentSegments(
+        offset, clipEnd, overlappingSilences
+      );
+
+      if (segments.length > 1) {
+        stats.clipsSplit += segments.length - 1;
+      }
+
+      stats.silencesRemoved += overlappingSilences.length;
+      stats.totalTimeRemoved += overlappingSilences.reduce(
+        (sum, s) => sum + Math.min(s.end, clipEnd) - Math.max(s.start, offset),
+        0
+      );
+    }
+
+    return stats;
+  }
+
+  /**
+   * Calculate non-silent segments within a clip
+   */
+  calculateNonSilentSegments(clipStart, clipEnd, silences) {
+    const segments = [];
+    let currentPos = clipStart;
+
+    for (const silence of silences) {
+      const silenceStart = Math.max(silence.start, clipStart);
+      const silenceEnd = Math.min(silence.end, clipEnd);
+
+      if (silenceStart > currentPos) {
+        // Add non-silent segment before this silence
+        segments.push({
+          start: currentPos,
+          end: silenceStart
+        });
+      }
+
+      currentPos = silenceEnd;
+    }
+
+    // Add final segment after last silence
+    if (currentPos < clipEnd) {
+      segments.push({
+        start: currentPos,
+        end: clipEnd
+      });
+    }
+
+    return segments;
+  }
+
+  /**
+   * Serialize document back to XML string
+   */
+  serialize() {
+    if (!this.doc) {
+      throw new Error('No XML document loaded');
+    }
+
+    const xml = this.builder.build(this.doc);
+
+    // Add XML declaration and DOCTYPE
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n' + xml;
+  }
+
+  /**
+   * Save processed XML to file
+   */
+  async saveToFile(filePath) {
+    const xml = this.serialize();
+    await fs.writeFile(filePath, xml, 'utf8');
+    return filePath;
+  }
+}
+
+/**
+ * Process FCP XML file with silence removal
+ *
+ * @param {string} inputPath - Path to input FCP XML file
+ * @param {Array<{start: number, end: number}>} silences - Silence regions
+ * @param {Object} options - Processing options
+ * @returns {Promise<{outputPath: string, stats: Object}>}
+ */
+async function processXMLFile(inputPath, silences, options = {}) {
+  const {
+    outputPath = null,
+    removeGaps = true
+  } = options;
+
+  const processor = new FCPXMLProcessor();
+
+  // Load and parse
+  console.log(`[SPLICE] Loading XML: ${inputPath}`);
+  await processor.loadFromFile(inputPath);
+
+  // Process
+  console.log(`[SPLICE] Processing ${silences.length} silence region(s)`);
+  const stats = processor.splitClipsAtSilences(silences, removeGaps);
+
+  // Generate output path
+  const finalOutputPath = outputPath ||
+    inputPath.replace(/\.xml$/i, '_processed.xml')
+      .replace(/\.fcpxml$/i, '_processed.fcpxml');
+
+  // Save
+  await processor.saveToFile(finalOutputPath);
+  console.log(`[SPLICE] Saved processed XML: ${finalOutputPath}`);
+
+  return {
+    outputPath: finalOutputPath,
+    stats
+  };
+}
+
+module.exports = {
+  FCPXMLProcessor,
+  processXMLFile
+};

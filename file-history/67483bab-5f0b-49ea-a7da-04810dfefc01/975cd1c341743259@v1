@@ -1,0 +1,167 @@
+import * as vscode from "vscode"
+import * as path from "path"
+import { minimatch } from "minimatch"
+import { BaseTrigger, BaseTriggerOptions } from "./BaseTrigger"
+import type { FileWatcherTrigger as FileWatcherTriggerConfig, FileWatcherEvent } from "@multi-agent/types"
+
+export interface FileWatcherTriggerOptions extends BaseTriggerOptions {
+	trigger: FileWatcherTriggerConfig
+}
+
+/**
+ * File watcher trigger implementation.
+ * Watches for file system changes matching specified patterns and events.
+ */
+export class FileWatcherTrigger extends BaseTrigger {
+	private watchers: vscode.FileSystemWatcher[] = []
+	private debounceTimer?: NodeJS.Timeout
+	private pendingEvents: Map<string, FileWatcherEvent> = new Map()
+	private saveDisposable?: vscode.Disposable
+
+	constructor(options: FileWatcherTriggerOptions) {
+		super(options)
+	}
+
+	get type(): string {
+		return "file_watcher"
+	}
+
+	private get triggerConfig(): FileWatcherTriggerConfig {
+		return this.config as FileWatcherTriggerConfig
+	}
+
+	async start(): Promise<void> {
+		if (this.isRunning) {
+			return
+		}
+
+		const { patterns, events, excludePatterns } = this.triggerConfig
+
+		// Create a watcher for each pattern
+		for (const pattern of patterns) {
+			const relativePattern = new vscode.RelativePattern(this.workspacePath, pattern)
+			const watcher = vscode.workspace.createFileSystemWatcher(relativePattern)
+
+			// Only attach handlers for events we care about
+			if (events.includes("change")) {
+				watcher.onDidChange((uri) => this.handleFileEvent("change", uri, excludePatterns))
+			}
+			if (events.includes("create")) {
+				watcher.onDidCreate((uri) => this.handleFileEvent("create", uri, excludePatterns))
+			}
+			if (events.includes("delete")) {
+				watcher.onDidDelete((uri) => this.handleFileEvent("delete", uri, excludePatterns))
+			}
+
+			this.watchers.push(watcher)
+		}
+
+		// Special handling for "save" event - use onDidSaveTextDocument
+		if (events.includes("save")) {
+			this.saveDisposable = vscode.workspace.onDidSaveTextDocument((document) => {
+				const uri = document.uri
+				if (uri.scheme === "file" && this.matchesPatterns(uri, patterns, excludePatterns)) {
+					this.handleFileEvent("save", uri, excludePatterns)
+				}
+			})
+		}
+
+		this.isRunning = true
+	}
+
+	async stop(): Promise<void> {
+		if (!this.isRunning) {
+			return
+		}
+
+		// Clear debounce timer
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer)
+			this.debounceTimer = undefined
+		}
+
+		// Dispose all watchers
+		for (const watcher of this.watchers) {
+			watcher.dispose()
+		}
+		this.watchers = []
+
+		// Dispose save handler
+		this.saveDisposable?.dispose()
+		this.saveDisposable = undefined
+
+		// Clear pending events
+		this.pendingEvents.clear()
+
+		this.isRunning = false
+	}
+
+	/**
+	 * Handle a file system event
+	 */
+	private handleFileEvent(event: FileWatcherEvent, uri: vscode.Uri, excludePatterns?: string[]): void {
+		const filePath = uri.fsPath
+
+		// Check if file matches exclude patterns
+		if (excludePatterns && this.matchesAnyPattern(filePath, excludePatterns)) {
+			return
+		}
+
+		// Add to pending events (debounce)
+		this.pendingEvents.set(filePath, event)
+
+		// Debounce to prevent rapid-fire triggers
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer)
+		}
+
+		const debounceMs = this.triggerConfig.debounceMs ?? 500
+
+		this.debounceTimer = setTimeout(() => {
+			this.processPendingEvents()
+		}, debounceMs)
+	}
+
+	/**
+	 * Process all pending events after debounce period
+	 */
+	private processPendingEvents(): void {
+		const events = new Map(this.pendingEvents)
+		this.pendingEvents.clear()
+
+		for (const [filePath, event] of events) {
+			const relativePath = path.relative(this.workspacePath, filePath)
+			this.emitTrigger({
+				file: filePath,
+				event: event,
+			})
+		}
+	}
+
+	/**
+	 * Check if a file path matches any of the given patterns
+	 */
+	private matchesAnyPattern(filePath: string, patterns: string[]): boolean {
+		const relativePath = path.relative(this.workspacePath, filePath)
+		return patterns.some((pattern) => minimatch(relativePath, pattern, { dot: true }))
+	}
+
+	/**
+	 * Check if URI matches the trigger patterns and not exclude patterns
+	 */
+	private matchesPatterns(uri: vscode.Uri, patterns: string[], excludePatterns?: string[]): boolean {
+		const filePath = uri.fsPath
+
+		// Must match at least one include pattern
+		if (!this.matchesAnyPattern(filePath, patterns)) {
+			return false
+		}
+
+		// Must not match any exclude pattern
+		if (excludePatterns && this.matchesAnyPattern(filePath, excludePatterns)) {
+			return false
+		}
+
+		return true
+	}
+}

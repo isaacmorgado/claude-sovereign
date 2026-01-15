@@ -1,0 +1,516 @@
+# SPLICE Project Documentation
+
+## Overview
+
+SPLICE is a video editing enhancement platform with AI-powered music generation. The project consists of:
+- **splice-backend**: Node.js/Express API server (deployed to Railway)
+- **splice-cep**: Adobe CEP panel for Premiere Pro (legacy)
+- **splice-plugin**: UXP plugin for modern Adobe apps
+- **splice-website**: Next.js frontend application
+- **video-generator**: Video processing utilities
+
+---
+
+## Production Deployment Status
+
+**Backend**: Deployed to Railway ✅
+- **URL**: `https://splice-api-production.up.railway.app`
+- **Internal**: `splice-api.railway.internal`
+
+| Service | Status | Notes |
+|---------|--------|-------|
+| PostgreSQL | ✅ Running | Railway-managed database |
+| Redis | ✅ Running | Railway Redis (ioredis protocol) |
+| SendGrid | ✅ Configured | Email delivery production-ready |
+| Stripe | ⚠️ TEST MODE | Using `sk_test_*` key - switch to live for production |
+| Cloudflare R2 | ✅ Configured | Music file storage |
+| OpenAI | ✅ Configured | AI transcription & analysis |
+| Replicate | ✅ Configured | AI music generation |
+
+---
+
+## Project Structure
+
+```
+SPLICE/
+├── splice-backend/           # Express.js API server
+│   ├── middleware/           # Auth, CSRF, rate limiting
+│   ├── routes/               # API endpoints
+│   ├── services/             # Business logic
+│   ├── tests/                # Test suites
+│   ├── workers/              # Background job workers (BullMQ)
+│   └── utils/                # Helpers and logging
+├── splice-cep/               # Adobe CEP panel (legacy)
+│   ├── panel/                # Panel HTML/CSS/JS
+│   ├── jsx/                  # ExtendScript host scripts
+│   └── CSXS/                 # Manifest configuration
+├── splice-plugin/            # UXP Plugin (modern)
+│   ├── js/                   # Plugin JavaScript modules
+│   └── css/                  # Plugin styles
+├── splice-website/           # Next.js frontend
+│   ├── src/app/              # App router pages
+│   ├── src/components/       # React components
+│   ├── src/context/          # React contexts
+│   ├── src/hooks/            # Custom hooks
+│   └── src/lib/              # Utilities
+└── video-generator/          # Video processing
+```
+
+---
+
+## Coding Standards
+
+- Use modern JavaScript/TypeScript patterns
+- Ensure all error handling is verbose and descriptive
+- Prefer functional components for React parts
+- All async functions must be properly awaited
+- Use transactions for database operations that modify data
+
+---
+
+## Backend Architecture
+
+### Authentication Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Authentication Flow                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Client requests CSRF token: GET /auth/csrf-token            │
+│     └─> Returns token in body + HttpOnly cookie                 │
+│                                                                 │
+│  2. Client logs in: POST /auth/login                            │
+│     ├─> Validates license key via licenseService                │
+│     ├─> Generates JWT access token (24h) with jti claim         │
+│     ├─> Generates refresh token (7d)                            │
+│     └─> Returns tokens + user info                              │
+│                                                                 │
+│  3. Client accesses protected routes                            │
+│     ├─> Sends: Authorization: Bearer <token>                    │
+│     ├─> authenticateToken middleware verifies JWT               │
+│     ├─> Checks token blacklist (Redis → fallback)               │
+│     └─> Attaches user to req.stripeCustomerId                   │
+│                                                                 │
+│  4. Token refresh: POST /auth/refresh                           │
+│     ├─> Validates refresh token                                 │
+│     └─> Returns new access token                                │
+│                                                                 │
+│  5. Logout: POST /auth/logout                                   │
+│     ├─> Blacklists access token in Redis (with TTL)             │
+│     ├─> Optionally blacklists refresh token                     │
+│     └─> Tokens auto-expire from blacklist when JWT expires      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Middleware Stack
+
+| Middleware | File | Purpose |
+|------------|------|---------|
+| `authenticateToken` | `middleware/auth.js` | JWT verification + blacklist check |
+| `optionalAuthentication` | `middleware/auth.js` | Non-blocking auth for public routes |
+| `validateCsrfToken` | `middleware/csrf.js` | CSRF double-submit cookie validation |
+| `createRateLimiter` | `middleware/rateLimiter.js` | Per-user rate limiting with reservations |
+
+### Services
+
+| Service | File | Purpose |
+|---------|------|---------|
+| `redisClient` | `services/redisClient.js` | Redis client (supports ioredis + Upstash REST) |
+| `usageTracking` | `services/usageTracking.js` | Credits, usage history, tier management |
+| `licenseService` | `services/licenseService.js` | License key validation and activation |
+| `emailService` | `services/emailService.js` | SendGrid/SES email delivery |
+| `referralService` | `services/referralService.js` | Referral program management |
+| `musicGeneration` | `services/musicGeneration.js` | AI music generation via Replicate |
+| `musicQueue` | `services/musicQueue.js` | BullMQ job queue for async music tasks |
+| `r2Storage` | `services/r2Storage.js` | Cloudflare R2 file storage |
+
+### API Endpoints
+
+#### Authentication (`/auth`)
+| Method | Endpoint | Auth | CSRF | Description |
+|--------|----------|------|------|-------------|
+| GET | `/csrf-token` | No | No | Get CSRF token |
+| POST | `/login` | No | Yes | Login with license key |
+| POST | `/refresh` | No | Yes | Refresh access token |
+| POST | `/logout` | Yes | Yes | Invalidate tokens |
+| POST | `/send-verification` | No | Yes | Send email verification code |
+| POST | `/verify-email` | No | Yes | Verify email with code |
+
+#### Billing (`/billing`)
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/credits` | Yes | Get user's credit balance |
+| GET | `/usage-history` | Yes | Get usage history |
+
+---
+
+## Token Blacklist Architecture
+
+The token blacklist uses a hybrid storage approach:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Token Blacklist Flow                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Primary: Redis (ioredis or Upstash REST)                       │
+│  ├─> Key format: token:blacklist:<jti>                          │
+│  ├─> Value: token expiration timestamp                          │
+│  ├─> TTL: matches token expiry (auto-cleanup)                   │
+│  └─> Benefits: distributed, persistent, auto-expiry             │
+│                                                                 │
+│  Client Auto-Detection:                                         │
+│  ├─> UPSTASH_REDIS_URL (redis:// or rediss://) → ioredis        │
+│  ├─> UPSTASH_REDIS_REST_URL (https://) → @upstash/redis REST    │
+│  └─> Railway Redis uses standard protocol → ioredis             │
+│                                                                 │
+│  Fallback: In-Memory Map                                        │
+│  ├─> Used when Redis unavailable                                │
+│  ├─> Periodic cleanup every 15 minutes                          │
+│  └─> Migrates to Redis when connection restored                 │
+│                                                                 │
+│  Check Order:                                                   │
+│  1. Check Redis for jti                                         │
+│  2. If not in Redis, check fallback Map                         │
+│  3. If in fallback and Redis available, migrate entry           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CSRF Protection
+
+Uses the double-submit cookie pattern:
+
+1. Server generates random token → stores in HttpOnly cookie + returns in body
+2. Client stores token and sends in `X-CSRF-Token` header
+3. Server compares header token with cookie token (constant-time comparison)
+
+**Protected endpoints:**
+- Backend: `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/send-verification`, `/auth/verify-email`
+- Frontend: `/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`, `/api/contact`, `/api/checkout`
+
+---
+
+## Email Verification Flow
+
+```
+1. POST /auth/send-verification { email }
+   ├─> Rate limit: 60s cooldown between sends
+   ├─> Generates 6-digit code (crypto.randomInt)
+   ├─> Stores: email → { code, expires: 10min, attempts: 0 }
+   └─> Sends email via emailService
+
+2. POST /auth/verify-email { email, code }
+   ├─> Max 5 attempts per code
+   ├─> On success: marks email verified in database
+   └─> Deletes code after verification
+```
+
+---
+
+## Frontend Architecture
+
+### Auth Context (`src/context/AuthContext.tsx`)
+
+Provides authentication state throughout the app:
+- `user`: Current user object
+- `isAuthenticated`: Boolean auth state
+- `login(licenseKey)`: Login function
+- `logout()`: Logout function
+- `refreshToken()`: Refresh access token
+
+### CSRF Handling
+
+- `src/lib/csrf.ts`: Client-side CSRF utilities
+- `src/hooks/useCsrf.ts`: React hook for CSRF tokens
+- `src/lib/csrf-server.ts`: Server-side validation for API routes
+
+### Key Pages
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `app/page.tsx` | Landing page |
+| `/login` | `app/login/page.tsx` | License key login |
+| `/pricing` | `app/pricing/page.tsx` | Pricing tiers |
+| `/dashboard` | `app/dashboard/page.tsx` | User dashboard |
+| `/contact` | `app/contact/page.tsx` | Contact form |
+| `/download` | `app/download/page.tsx` | Download page |
+
+---
+
+## Environment Variables
+
+### Backend (`splice-backend/.env`)
+
+```bash
+# =============================================================================
+# Server
+# =============================================================================
+PORT=3847
+NODE_ENV=production
+
+# =============================================================================
+# JWT Authentication (CRITICAL - must change in production)
+# Generate with: openssl rand -hex 32
+# =============================================================================
+JWT_SECRET=your_secure_jwt_secret_here
+JWT_EXPIRES_IN=24h
+JWT_REFRESH_EXPIRES_IN=7d
+
+# =============================================================================
+# Database (PostgreSQL)
+# =============================================================================
+DATABASE_URL=postgresql://user:password@host:port/database
+
+# =============================================================================
+# Redis - Token blacklist, caching, job queues (BullMQ)
+# Supports both ioredis (standard protocol) and Upstash REST API
+# =============================================================================
+# Option 1: Standard Redis URL (Railway, local Redis, or Upstash with ioredis)
+UPSTASH_REDIS_URL=redis://default:password@host:6379
+# Option 2: Upstash REST API (HTTP-based, serverless-friendly)
+# UPSTASH_REDIS_REST_URL=https://your_endpoint.upstash.io
+# UPSTASH_REDIS_REST_TOKEN=your_rest_token_here
+
+# =============================================================================
+# Email Service
+# =============================================================================
+EMAIL_PROVIDER=sendgrid  # sendgrid | ses | console
+SENDGRID_API_KEY=SG_your_key_here
+EMAIL_FROM=SPLICE <noreply@splice.video>
+EMAIL_REPLY_TO=support@splice.video
+
+# =============================================================================
+# Stripe
+# =============================================================================
+STRIPE_SECRET_KEY=sk_test_your_key
+STRIPE_WEBHOOK_SECRET=whsec_your_secret
+STRIPE_PRICE_STARTER=price_xxx
+STRIPE_PRICE_PRO=price_xxx
+STRIPE_PRICE_TEAM=price_xxx
+
+# =============================================================================
+# AI Services
+# =============================================================================
+GROQ_API_KEY=your_key
+OPENAI_API_KEY=your_key
+REPLICATE_API_TOKEN=your_token
+MUREKA_API_KEY=your_key
+
+# =============================================================================
+# Storage (Cloudflare R2)
+# =============================================================================
+R2_ACCOUNT_ID=your_id
+R2_ACCESS_KEY_ID=your_key
+R2_SECRET_ACCESS_KEY=your_secret
+R2_BUCKET_NAME=splice-music
+```
+
+---
+
+## Security Checklist
+
+### Backend Authentication ✅
+- [x] JWT token generation with `jti` claim
+- [x] Token verification with blacklist check
+- [x] Redis-backed token blacklist with TTL
+- [x] In-memory fallback when Redis unavailable
+- [x] Async/await properly used in all auth routes
+- [x] CSRF protection on state-changing endpoints
+
+### Frontend Authentication ✅
+- [x] Login page with license key
+- [x] Token storage in localStorage
+- [x] Auth context for state management
+- [x] CSRF token handling
+
+### Database Safety ✅
+- [x] SELECT...FOR UPDATE on credit operations
+- [x] Transactions for multi-step operations
+- [x] Race condition protection
+
+### Email Security ✅
+- [x] Rate limiting on verification codes
+- [x] Attempt limiting (max 5 per code)
+- [x] 10-minute code expiry
+- [x] Secure 6-digit code generation
+
+---
+
+## Development Setup
+
+```bash
+# Backend
+cd splice-backend
+cp .env.template .env  # Edit with your values
+npm install
+npm run dev
+
+# Frontend
+cd splice-website
+npm install
+npm run dev
+```
+
+### Running Tests
+
+```bash
+cd splice-backend
+npm test                  # Run all tests
+npm run lint              # Check linting
+npm run test:users:create # Create test users in database
+npm run test:users        # Verify test users can authenticate
+```
+
+### Test Users
+
+Authenticated test users are available for testing the full authentication flow:
+
+- **Starter Tier:** `SPLICE-82CF-4ZAQ-66F6` (4h, 5 music credits)
+- **Pro Tier:** `SPLICE-7XWQ-VE7Y-MDJN` (15h + 45min isolation, 20 music credits)
+- **Team Tier:** `SPLICE-7DVR-4AEU-W8BU` (50h + 3h isolation, 100 music credits)
+- **Empty Credits:** `SPLICE-5AUT-NMS8-5SQ8` (0 credits - test exhaustion)
+- **Cancelled:** `SPLICE-9QHU-F74E-5C4R` (cancelled subscription state)
+
+📖 See [TEST_USERS.md](./TEST_USERS.md) for complete documentation and testing scenarios.
+
+---
+
+## Deployment Notes
+
+### Production Checklist
+
+1. **JWT_SECRET**: Must be set to a secure random value (not default)
+2. **Redis**: Configure Redis URL (Railway Redis or Upstash)
+3. **Email**: Set `EMAIL_PROVIDER=sendgrid` with valid API key
+4. **Database**: Ensure PostgreSQL connection string is correct
+5. **CORS**: Update allowed origins in `server.js`
+6. **Stripe**: Switch from test mode (`sk_test_*`) to live mode (`sk_live_*`)
+7. **R2 Storage**: Configure Cloudflare R2 credentials for music file storage
+
+### Railway Deployment
+
+The backend is deployed to Railway with the following services:
+- **splice-api**: Main backend service (`https://splice-api-production.up.railway.app`)
+- **PostgreSQL**: Railway-managed database
+- **Redis**: Railway Redis (standard protocol, compatible with ioredis)
+
+The backend auto-detects Railway environment and enforces:
+- JWT_SECRET must be set (exits if missing)
+- Uses `RAILWAY_ENVIRONMENT` for production detection
+
+### Railway CLI Commands
+
+```bash
+# Link to project (one-time setup)
+railway link
+
+# Deploy from local code
+railway up
+
+# View deployment logs
+railway logs
+
+# Check service status
+railway status
+
+# Set environment variable
+railway variables set KEY=value
+
+# Open Railway dashboard
+railway open
+```
+
+### Railway Environment Variables
+
+All environment variables are configured in Railway dashboard:
+- Database URL auto-injected via `DATABASE_URL`
+- Redis URL auto-injected via `UPSTASH_REDIS_URL` (Railway internal network)
+- External services (Stripe, SendGrid, OpenAI, etc.) manually configured
+
+---
+
+## Recent Changes
+
+### Railway Production Deployment (2026-01-03)
+- Deployed splice-backend to Railway platform
+- Configured Railway-managed PostgreSQL and Redis services
+- Updated `redisClient.js` to support both ioredis (standard protocol) and Upstash REST API
+- Redis client auto-detects URL scheme (`redis://` → ioredis, `https://` → REST)
+- Configured all production environment variables (SendGrid, Stripe, R2, OpenAI, Replicate)
+- **Note**: Stripe is still in TEST mode - switch to live key for production payments
+
+### Redis Client Dual-Protocol Support (2026-01-03)
+- `redisClient.js` now supports two Redis client types:
+  - **ioredis**: Standard Redis protocol (Railway Redis, local Redis, Upstash with `rediss://`)
+  - **@upstash/redis**: REST API over HTTP (serverless environments)
+- Auto-detection based on URL scheme in `UPSTASH_REDIS_URL`
+- BullMQ job queues work with both client types
+
+### Redis Token Blacklist Upgrade (2025-12-29)
+- Migrated from in-memory Map to Redis
+- Added automatic TTL-based expiry matching token lifetime
+- Implemented graceful fallback to in-memory when Redis unavailable
+- Added migration logic to move fallback entries to Redis on reconnect
+
+### Async/Await Fixes (2025-12-29)
+- Fixed `verifyToken()` not awaited in `rateLimiter.js`
+- Fixed `verifyToken()` not awaited in `billing.js` (2 places)
+- Fixed `blacklistToken()` not awaited in logout handler
+- Made logout handler async
+
+### Security Hardening (2025-12-29)
+- Added CSRF protection with double-submit cookie pattern
+- Added email verification flow with rate limiting
+- Documented all required environment variables
+- Added auth logging utility for security auditing
+
+---
+
+## Troubleshooting
+
+### "Redis not configured" warning
+Normal in development without Redis credentials. Falls back to in-memory storage.
+
+### Token blacklist not working
+1. Check Redis connection: Look for `[Redis]` logs on startup
+2. Verify async/await: All `blacklistToken()` and `isTokenBlacklisted()` calls must be awaited
+3. Check TTL: Tokens should auto-expire from blacklist
+
+### CSRF token errors
+1. Ensure `GET /auth/csrf-token` is called before protected requests
+2. Check that `X-CSRF-Token` header matches the cookie
+3. Verify cookie-parser middleware is loaded before CSRF middleware
+
+### Railway Deployment Issues
+
+**Health check failing**:
+1. Check logs: `railway logs`
+2. Verify `/health` endpoint returns 200
+3. Check Redis connection in health response
+
+**Redis connection issues on Railway**:
+1. Ensure `UPSTASH_REDIS_URL` uses `redis://` scheme (not `https://`)
+2. Railway Redis uses internal network: `redis://default:password@redis.railway.internal:6379`
+3. Check that ioredis is installed: `npm ls ioredis`
+
+**Database connection issues**:
+1. Railway auto-injects `DATABASE_URL` for PostgreSQL
+2. Use internal network URL for lower latency
+3. Check connection pool settings in high-traffic scenarios
+
+### Music Generation Issues
+
+**Jobs stuck in queue**:
+1. Check Redis connection for BullMQ
+2. Verify `musicWorker.js` is running
+3. Check Replicate API token is valid
+
+**R2 upload failures**:
+1. Verify R2 credentials (account ID, access key, secret key)
+2. Check bucket name and permissions
+3. Ensure CORS is configured on R2 bucket

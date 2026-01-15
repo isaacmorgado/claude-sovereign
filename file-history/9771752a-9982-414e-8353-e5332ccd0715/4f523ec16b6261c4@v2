@@ -1,0 +1,209 @@
+/**
+ * Stripe Usage Reporting Service
+ *
+ * Reports overage usage to Stripe meters for billing.
+ * Uses Stripe's meter event API to track usage beyond included limits.
+ */
+
+const Stripe = require('stripe');
+
+// Initialize Stripe with lazy loading
+let stripe = null;
+function getStripe() {
+  if (!stripe && process.env.STRIPE_SECRET_KEY) {
+    stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+  return stripe;
+}
+
+/**
+ * Report hours overage to Stripe meter
+ * Called when a user exceeds their included processing hours
+ *
+ * @param {string} stripeCustomerId - Stripe customer ID
+ * @param {number} overageHours - Number of hours over the limit
+ * @returns {Promise<{success: boolean, eventId?: string, error?: string}>}
+ */
+async function reportHoursOverage(stripeCustomerId, overageHours) {
+  const stripeClient = getStripe();
+  if (!stripeClient) {
+    console.warn('[StripeUsage] Stripe not configured - skipping hours overage report');
+    return { success: false, error: 'Stripe not configured' };
+  }
+
+  const meterEventName = 'splice_hours_usage';
+
+  try {
+    // Report usage to Stripe meter
+    // Value is in hours (can be decimal)
+    const meterEvent = await stripeClient.v2.billing.meterEvents.create({
+      event_name: meterEventName,
+      payload: {
+        stripe_customer_id: stripeCustomerId,
+        value: Math.ceil(overageHours * 100) / 100 // Round to 2 decimal places
+      }
+    });
+
+    console.log(`[StripeUsage] Reported ${overageHours.toFixed(2)} hours overage for ${stripeCustomerId}`);
+
+    return {
+      success: true,
+      eventId: meterEvent.identifier,
+      hoursReported: overageHours
+    };
+  } catch (err) {
+    console.error('[StripeUsage] Failed to report hours overage:', err.message);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+}
+
+/**
+ * Report music credit overage to Stripe meter
+ * Called when a user exceeds their included music generations
+ *
+ * @param {string} stripeCustomerId - Stripe customer ID
+ * @param {number} overageSongs - Number of songs over the limit
+ * @returns {Promise<{success: boolean, eventId?: string, error?: string}>}
+ */
+async function reportMusicOverage(stripeCustomerId, overageSongs = 1) {
+  const stripeClient = getStripe();
+  if (!stripeClient) {
+    console.warn('[StripeUsage] Stripe not configured - skipping music overage report');
+    return { success: false, error: 'Stripe not configured' };
+  }
+
+  const meterEventName = 'splice_music_usage';
+
+  try {
+    // Report usage to Stripe meter
+    const meterEvent = await stripeClient.v2.billing.meterEvents.create({
+      event_name: meterEventName,
+      payload: {
+        stripe_customer_id: stripeCustomerId,
+        value: overageSongs
+      }
+    });
+
+    console.log(`[StripeUsage] Reported ${overageSongs} music overage for ${stripeCustomerId}`);
+
+    return {
+      success: true,
+      eventId: meterEvent.identifier,
+      songsReported: overageSongs
+    };
+  } catch (err) {
+    console.error('[StripeUsage] Failed to report music overage:', err.message);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+}
+
+/**
+ * Check if customer has an active subscription that allows overage billing
+ *
+ * @param {string} stripeCustomerId - Stripe customer ID
+ * @returns {Promise<{hasSubscription: boolean, subscriptionId?: string}>}
+ */
+async function checkActiveSubscription(stripeCustomerId) {
+  const stripeClient = getStripe();
+  if (!stripeClient) {
+    return { hasSubscription: false };
+  }
+
+  try {
+    const subscriptions = await stripeClient.subscriptions.list({
+      customer: stripeCustomerId,
+      status: 'active',
+      limit: 1
+    });
+
+    if (subscriptions.data.length > 0) {
+      return {
+        hasSubscription: true,
+        subscriptionId: subscriptions.data[0].id
+      };
+    }
+
+    return { hasSubscription: false };
+  } catch (err) {
+    console.error('[StripeUsage] Failed to check subscription:', err.message);
+    return { hasSubscription: false };
+  }
+}
+
+/**
+ * Add overage price to customer's subscription
+ * This attaches the metered price to their existing subscription
+ * so overage charges appear on their next invoice.
+ *
+ * @param {string} stripeCustomerId - Stripe customer ID
+ * @param {string} overageType - 'hours' or 'music'
+ * @returns {Promise<{success: boolean, subscriptionItemId?: string}>}
+ */
+async function ensureOverageItemOnSubscription(stripeCustomerId, overageType) {
+  const stripeClient = getStripe();
+  if (!stripeClient) {
+    return { success: false, error: 'Stripe not configured' };
+  }
+
+  const priceId = overageType === 'hours'
+    ? process.env.STRIPE_PRICE_OVERAGE_HOURS
+    : process.env.STRIPE_PRICE_OVERAGE_MUSIC;
+
+  if (!priceId) {
+    return { success: false, error: 'Overage price not configured' };
+  }
+
+  try {
+    // Get active subscription
+    const subscriptions = await stripeClient.subscriptions.list({
+      customer: stripeCustomerId,
+      status: 'active',
+      limit: 1
+    });
+
+    if (subscriptions.data.length === 0) {
+      return { success: false, error: 'No active subscription' };
+    }
+
+    const subscription = subscriptions.data[0];
+
+    // Check if overage item already exists
+    const existingItem = subscription.items.data.find(
+      item => item.price.id === priceId
+    );
+
+    if (existingItem) {
+      return { success: true, subscriptionItemId: existingItem.id };
+    }
+
+    // Add overage price to subscription
+    const subscriptionItem = await stripeClient.subscriptionItems.create({
+      subscription: subscription.id,
+      price: priceId,
+      quantity: 0 // Metered prices don't use quantity
+    });
+
+    console.log(`[StripeUsage] Added ${overageType} overage to subscription ${subscription.id}`);
+
+    return {
+      success: true,
+      subscriptionItemId: subscriptionItem.id
+    };
+  } catch (err) {
+    console.error(`[StripeUsage] Failed to add overage item:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+module.exports = {
+  reportHoursOverage,
+  reportMusicOverage,
+  checkActiveSubscription,
+  ensureOverageItemOnSubscription
+};

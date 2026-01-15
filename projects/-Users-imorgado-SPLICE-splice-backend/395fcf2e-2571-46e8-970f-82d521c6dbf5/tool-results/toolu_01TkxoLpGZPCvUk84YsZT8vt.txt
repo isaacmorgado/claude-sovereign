@@ -1,0 +1,567 @@
+     1→/**
+     2→ * RMS-Based Silence Detection Service
+     3→ *
+     4→ * Advanced silence detection using Root Mean Square (RMS) audio analysis.
+     5→ * Based on Fireside's proven approach with enhancements.
+     6→ *
+     7→ * Features:
+     8→ * - RMS calculation from raw audio data
+     9→ * - dBFS (decibels relative to full scale) conversion
+    10→ * - Auto-threshold detection from audio histogram
+    11→ * - Gaussian blur smoothing for noise reduction
+    12→ * - Local maxima detection for speech/silence peak identification
+    13→ * - Configurable padding, seek step, min duration
+    14→ * - Silence merging for adjacent regions
+    15→ */
+    16→
+    17→const { exec } = require('child_process');
+    18→const { promisify } = require('util');
+    19→const fs = require('fs');
+    20→const fsPromises = require('fs').promises;
+    21→const path = require('path');
+    22→const crypto = require('crypto');
+    23→
+    24→const execAsync = promisify(exec);
+    25→
+    26→// =============================================================================
+    27→// Configuration
+    28→// =============================================================================
+    29→
+    30→const DEFAULT_OPTIONS = {
+    31→  threshold: -30,           // dBFS threshold (-60 to -20)
+    32→  minSilenceLength: 0.5,    // Minimum silence duration in seconds
+    33→  seekStep: 0.05,           // Analysis window step in seconds (50ms)
+    34→  paddingStart: 0.1,        // Buffer before silence cut (seconds)
+    35→  paddingEnd: 0.05,         // Buffer after silence cut (seconds)
+    36→  autoThreshold: false,     // Auto-detect optimal threshold
+    37→  mergeDistance: 0.2,       // Merge silences closer than this (seconds)
+    38→  sampleRate: 48000         // Default sample rate
+    39→};
+    40→
+    41→// =============================================================================
+    42→// Core RMS Detection
+    43→// =============================================================================
+    44→
+    45→/**
+    46→ * Detect silences using RMS-based audio analysis
+    47→ *
+    48→ * @param {string} audioPath - Path to audio file (WAV, MP3, etc.)
+    49→ * @param {Object} options - Detection options
+    50→ * @returns {Promise<Object>} Detection results with silences and metadata
+    51→ */
+    52→async function detectSilencesRMS(audioPath, options = {}) {
+    53→  const opts = { ...DEFAULT_OPTIONS, ...options };
+    54→
+    55→  console.log(`[SPLICE RMS] Analyzing: ${audioPath}`);
+    56→  console.log(`[SPLICE RMS] Options: threshold=${opts.threshold}dB, minLength=${opts.minSilenceLength}s, seekStep=${opts.seekStep}s`);
+    57→
+    58→  // Step 1: Extract raw audio data using FFmpeg
+    59→  const audioData = await extractAudioData(audioPath);
+    60→
+    61→  // Step 2: Calculate RMS values for sliding windows
+    62→  const rmsValues = calculateRMSWindows(audioData.samples, {
+    63→    windowSize: Math.floor(opts.seekStep * audioData.sampleRate),
+    64→    hopSize: Math.floor(opts.seekStep * audioData.sampleRate / 2)
+    65→  });
+    66→
+    67→  // Step 3: Convert to dBFS
+    68→  const dBFSValues = rmsValues.map(rms => rmsToDBFS(rms));
+    69→
+    70→  // Step 4: Determine threshold (auto-detect or use provided)
+    71→  let threshold = opts.threshold;
+    72→  let thresholdInfo = { method: 'manual', value: threshold };
+    73→
+    74→  if (opts.autoThreshold) {
+    75→    const autoResult = autoDetectThreshold(dBFSValues);
+    76→    threshold = autoResult.threshold;
+    77→    thresholdInfo = autoResult;
+    78→    console.log(`[SPLICE RMS] Auto-detected threshold: ${threshold.toFixed(1)}dB (${autoResult.method})`);
+    79→  }
+    80→
+    81→  // Step 5: Find silence regions
+    82→  const rawSilences = findSilenceRegions(dBFSValues, {
+    83→    threshold,
+    84→    seekStep: opts.seekStep,
+    85→    minSilenceLength: opts.minSilenceLength
+    86→  });
+    87→
+    88→  // Step 6: Merge adjacent silences
+    89→  const mergedSilences = mergeSilences(rawSilences, opts.mergeDistance);
+    90→
+    91→  // Step 7: Apply padding
+    92→  const paddedSilences = applyPadding(mergedSilences, {
+    93→    paddingStart: opts.paddingStart,
+    94→    paddingEnd: opts.paddingEnd,
+    95→    audioDuration: audioData.duration
+    96→  });
+    97→
+    98→  // Calculate statistics
+    99→  const totalSilenceDuration = paddedSilences.reduce((sum, s) => sum + s.duration, 0);
+   100→  const speechDuration = audioData.duration - totalSilenceDuration;
+   101→
+   102→  console.log(`[SPLICE RMS] Detected ${paddedSilences.length} silence(s), total ${totalSilenceDuration.toFixed(2)}s`);
+   103→
+   104→  return {
+   105→    silences: paddedSilences,
+   106→    metadata: {
+   107→      audioDuration: audioData.duration,
+   108→      sampleRate: audioData.sampleRate,
+   109→      channels: audioData.channels,
+   110→      silenceCount: paddedSilences.length,
+   111→      totalSilenceDuration,
+   112→      speechDuration,
+   113→      silencePercentage: ((totalSilenceDuration / audioData.duration) * 100).toFixed(1),
+   114→      threshold: thresholdInfo,
+   115→      rmsAnalysis: {
+   116→        windowCount: dBFSValues.length,
+   117→        minDB: Math.min(...dBFSValues).toFixed(1),
+   118→        maxDB: Math.max(...dBFSValues).toFixed(1),
+   119→        avgDB: (dBFSValues.reduce((a, b) => a + b, 0) / dBFSValues.length).toFixed(1)
+   120→      }
+   121→    }
+   122→  };
+   123→}
+   124→
+   125→// =============================================================================
+   126→// Audio Extraction
+   127→// =============================================================================
+   128→
+   129→/**
+   130→ * Extract raw audio samples from file using FFmpeg
+   131→ *
+   132→ * @param {string} audioPath - Path to audio file
+   133→ * @returns {Promise<Object>} Audio data with samples, sampleRate, channels, duration
+   134→ */
+   135→async function extractAudioData(audioPath) {
+   136→  // First, get audio info
+   137→  const infoCmd = `ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels,duration -of json "${audioPath}"`;
+   138→
+   139→  let sampleRate = 48000;
+   140→  let channels = 1;
+   141→  let duration = 0;
+   142→
+   143→  try {
+   144→    const { stdout } = await execAsync(infoCmd);
+   145→    const info = JSON.parse(stdout);
+   146→    if (info.streams && info.streams[0]) {
+   147→      sampleRate = parseInt(info.streams[0].sample_rate) || 48000;
+   148→      channels = parseInt(info.streams[0].channels) || 1;
+   149→      duration = parseFloat(info.streams[0].duration) || 0;
+   150→    }
+   151→  } catch (err) {
+   152→    console.warn('[SPLICE RMS] Could not get audio info, using defaults:', err.message);
+   153→  }
+   154→
+   155→  // If duration not available from stream, get from format
+   156→  if (!duration) {
+   157→    try {
+   158→      const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`;
+   159→      const { stdout } = await execAsync(durationCmd);
+   160→      duration = parseFloat(stdout.trim()) || 0;
+   161→    } catch (err) {
+   162→      console.warn('[SPLICE RMS] Could not get duration:', err.message);
+   163→    }
+   164→  }
+   165→
+   166→  // Extract audio as raw PCM floating point
+   167→  // Use unique temp file name with random suffix to prevent race conditions
+   168→  const uniqueId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+   169→  const tempFile = path.join('/tmp', `splice_rms_${uniqueId}.raw`);
+   170→
+   171→  try {
+   172→    // Convert to mono, 16kHz for faster processing, output as signed 16-bit PCM
+   173→    const extractCmd = `ffmpeg -y -i "${audioPath}" -ac 1 -ar 16000 -f s16le -acodec pcm_s16le "${tempFile}" 2>/dev/null`;
+   174→    await execAsync(extractCmd, { maxBuffer: 100 * 1024 * 1024 });
+   175→
+   176→    // Read the raw PCM data (async to avoid blocking event loop)
+   177→    const rawData = await fsPromises.readFile(tempFile);
+   178→
+   179→    // Convert to float samples (-1 to 1)
+   180→    const samples = new Float32Array(rawData.length / 2);
+   181→    for (let i = 0; i < samples.length; i++) {
+   182→      // Read signed 16-bit little-endian
+   183→      const int16 = rawData.readInt16LE(i * 2);
+   184→      samples[i] = int16 / 32768.0;
+   185→    }
+   186→
+   187→    // Clean up temp file (async)
+   188→    await fsPromises.unlink(tempFile);
+   189→
+   190→    return {
+   191→      samples,
+   192→      sampleRate: 16000, // We resampled to 16kHz
+   193→      channels: 1,
+   194→      duration
+   195→    };
+   196→  } catch (err) {
+   197→    // Clean up temp file if exists
+   198→    try {
+   199→      await fsPromises.access(tempFile);
+   200→      await fsPromises.unlink(tempFile);
+   201→    } catch {
+   202→      // File doesn't exist or already deleted
+   203→    }
+   204→    throw new Error(`Failed to extract audio: ${err.message}`);
+   205→  }
+   206→}
+   207→
+   208→// =============================================================================
+   209→// RMS Calculation
+   210→// =============================================================================
+   211→
+   212→/**
+   213→ * Calculate RMS values for sliding windows across audio samples
+   214→ *
+   215→ * @param {Float32Array} samples - Audio samples (-1 to 1)
+   216→ * @param {Object} options - Window and hop size
+   217→ * @returns {Float32Array} RMS values for each window
+   218→ */
+   219→function calculateRMSWindows(samples, options = {}) {
+   220→  const { windowSize = 800, hopSize = 400 } = options; // Default ~50ms at 16kHz
+   221→
+   222→  const numWindows = Math.floor((samples.length - windowSize) / hopSize) + 1;
+   223→  const rmsValues = new Float32Array(numWindows);
+   224→
+   225→  for (let i = 0; i < numWindows; i++) {
+   226→    const start = i * hopSize;
+   227→    const end = Math.min(start + windowSize, samples.length);
+   228→
+   229→    // Calculate RMS for this window
+   230→    let sumSquares = 0;
+   231→    for (let j = start; j < end; j++) {
+   232→      sumSquares += samples[j] * samples[j];
+   233→    }
+   234→
+   235→    const rms = Math.sqrt(sumSquares / (end - start));
+   236→    rmsValues[i] = rms;
+   237→  }
+   238→
+   239→  return rmsValues;
+   240→}
+   241→
+   242→/**
+   243→ * Convert RMS value to dBFS (decibels relative to full scale)
+   244→ *
+   245→ * @param {number} rms - RMS value (0 to 1)
+   246→ * @returns {number} dBFS value (negative, -inf for silence)
+   247→ */
+   248→function rmsToDBFS(rms) {
+   249→  if (rms <= 0) return -100; // Effective silence floor
+   250→  const dbfs = 20 * Math.log10(rms);
+   251→  return Math.max(-100, dbfs); // Clamp to reasonable floor
+   252→}
+   253→
+   254→// =============================================================================
+   255→// Auto-Threshold Detection
+   256→// =============================================================================
+   257→
+   258→/**
+   259→ * Auto-detect optimal silence threshold from audio histogram
+   260→ * Uses Gaussian blur + local maxima detection
+   261→ *
+   262→ * @param {Float32Array} dBFSValues - Array of dBFS values
+   263→ * @returns {Object} Detected threshold and method info
+   264→ */
+   265→function autoDetectThreshold(dBFSValues) {
+   266→  // Build histogram of dBFS values
+   267→  const histBins = 100;
+   268→  const minDB = -80;
+   269→  const maxDB = 0;
+   270→  const binWidth = (maxDB - minDB) / histBins;
+   271→
+   272→  const histogram = new Array(histBins).fill(0);
+   273→
+   274→  for (const db of dBFSValues) {
+   275→    const binIndex = Math.min(histBins - 1, Math.max(0, Math.floor((db - minDB) / binWidth)));
+   276→    histogram[binIndex]++;
+   277→  }
+   278→
+   279→  // Apply Gaussian blur to smooth histogram
+   280→  const smoothed = gaussianBlur(histogram, 5);
+   281→
+   282→  // Find local maxima (peaks)
+   283→  const peaks = findLocalMaxima(smoothed, 3);
+   284→
+   285→  // Sort peaks by value (highest first)
+   286→  peaks.sort((a, b) => b.value - a.value);
+   287→
+   288→  if (peaks.length >= 2) {
+   289→    // Interpolate between the two highest peaks
+   290→    // Assume: higher peak = speech, lower peak = silence
+   291→    const peak1DB = minDB + peaks[0].index * binWidth;
+   292→    const peak2DB = minDB + peaks[1].index * binWidth;
+   293→
+   294→    const silencePeakDB = Math.min(peak1DB, peak2DB);
+   295→    const speechPeakDB = Math.max(peak1DB, peak2DB);
+   296→
+   297→    // Set threshold between peaks (closer to silence peak)
+   298→    const threshold = silencePeakDB + (speechPeakDB - silencePeakDB) * 0.3;
+   299→
+   300→    return {
+   301→      threshold: Math.max(-60, Math.min(-20, threshold)),
+   302→      method: 'dual-peak',
+   303→      silencePeak: silencePeakDB.toFixed(1),
+   304→      speechPeak: speechPeakDB.toFixed(1)
+   305→    };
+   306→  } else if (peaks.length === 1) {
+   307→    // Single peak - use percentile-based fallback
+   308→    const sorted = [...dBFSValues].sort((a, b) => a - b);
+   309→    const percentile25 = sorted[Math.floor(sorted.length * 0.25)];
+   310→
+   311→    return {
+   312→      threshold: Math.max(-60, Math.min(-20, percentile25)),
+   313→      method: 'percentile-25',
+   314→      value: percentile25.toFixed(1)
+   315→    };
+   316→  } else {
+   317→    // No peaks found - use conservative default
+   318→    return {
+   319→      threshold: -35,
+   320→      method: 'default-fallback'
+   321→    };
+   322→  }
+   323→}
+   324→
+   325→/**
+   326→ * Apply Gaussian blur to an array
+   327→ *
+   328→ * @param {Array<number>} arr - Input array
+   329→ * @param {number} sigma - Standard deviation
+   330→ * @returns {Array<number>} Smoothed array
+   331→ */
+   332→function gaussianBlur(arr, sigma = 5) {
+   333→  const kernelSize = Math.ceil(sigma * 3) * 2 + 1;
+   334→  const kernel = [];
+   335→  const halfSize = Math.floor(kernelSize / 2);
+   336→
+   337→  // Generate Gaussian kernel
+   338→  let sum = 0;
+   339→  for (let i = 0; i < kernelSize; i++) {
+   340→    const x = i - halfSize;
+   341→    const g = Math.exp(-(x * x) / (2 * sigma * sigma));
+   342→    kernel.push(g);
+   343→    sum += g;
+   344→  }
+   345→
+   346→  // Normalize kernel
+   347→  for (let i = 0; i < kernelSize; i++) {
+   348→    kernel[i] /= sum;
+   349→  }
+   350→
+   351→  // Apply convolution
+   352→  const result = new Array(arr.length).fill(0);
+   353→  for (let i = 0; i < arr.length; i++) {
+   354→    let value = 0;
+   355→    for (let j = 0; j < kernelSize; j++) {
+   356→      const idx = i + j - halfSize;
+   357→      if (idx >= 0 && idx < arr.length) {
+   358→        value += arr[idx] * kernel[j];
+   359→      }
+   360→    }
+   361→    result[i] = value;
+   362→  }
+   363→
+   364→  return result;
+   365→}
+   366→
+   367→/**
+   368→ * Find local maxima in an array
+   369→ *
+   370→ * @param {Array<number>} arr - Input array
+   371→ * @param {number} windowSize - Neighborhood size for local maximum detection
+   372→ * @returns {Array<{index: number, value: number}>} Array of peak positions and values
+   373→ */
+   374→function findLocalMaxima(arr, windowSize = 3) {
+   375→  const peaks = [];
+   376→  const halfWindow = Math.floor(windowSize / 2);
+   377→
+   378→  for (let i = halfWindow; i < arr.length - halfWindow; i++) {
+   379→    let isMax = true;
+   380→    for (let j = i - halfWindow; j <= i + halfWindow; j++) {
+   381→      if (j !== i && arr[j] >= arr[i]) {
+   382→        isMax = false;
+   383→        break;
+   384→      }
+   385→    }
+   386→    if (isMax && arr[i] > 0) {
+   387→      peaks.push({ index: i, value: arr[i] });
+   388→    }
+   389→  }
+   390→
+   391→  return peaks;
+   392→}
+   393→
+   394→// =============================================================================
+   395→// Silence Region Detection
+   396→// =============================================================================
+   397→
+   398→/**
+   399→ * Find silence regions based on dBFS threshold
+   400→ *
+   401→ * @param {Float32Array} dBFSValues - Array of dBFS values
+   402→ * @param {Object} options - Detection options
+   403→ * @returns {Array<{start: number, end: number, duration: number}>} Silence regions
+   404→ */
+   405→function findSilenceRegions(dBFSValues, options) {
+   406→  const { threshold, seekStep, minSilenceLength } = options;
+   407→
+   408→  const silences = [];
+   409→  let silenceStart = null;
+   410→
+   411→  for (let i = 0; i < dBFSValues.length; i++) {
+   412→    const time = i * seekStep;
+   413→    const isSilent = dBFSValues[i] < threshold;
+   414→
+   415→    if (isSilent && silenceStart === null) {
+   416→      // Start of silence
+   417→      silenceStart = time;
+   418→    } else if (!isSilent && silenceStart !== null) {
+   419→      // End of silence
+   420→      const duration = time - silenceStart;
+   421→      if (duration >= minSilenceLength) {
+   422→        silences.push({
+   423→          start: silenceStart,
+   424→          end: time,
+   425→          duration
+   426→        });
+   427→      }
+   428→      silenceStart = null;
+   429→    }
+   430→  }
+   431→
+   432→  // Handle silence at end of audio
+   433→  if (silenceStart !== null) {
+   434→    const endTime = dBFSValues.length * seekStep;
+   435→    const duration = endTime - silenceStart;
+   436→    if (duration >= minSilenceLength) {
+   437→      silences.push({
+   438→        start: silenceStart,
+   439→        end: endTime,
+   440→        duration
+   441→      });
+   442→    }
+   443→  }
+   444→
+   445→  return silences;
+   446→}
+   447→
+   448→// =============================================================================
+   449→// Post-Processing
+   450→// =============================================================================
+   451→
+   452→/**
+   453→ * Merge silences that are close together
+   454→ *
+   455→ * @param {Array} silences - Array of silence regions
+   456→ * @param {number} mergeDistance - Maximum gap to merge (seconds)
+   457→ * @returns {Array} Merged silence regions
+   458→ */
+   459→function mergeSilences(silences, mergeDistance) {
+   460→  if (silences.length <= 1) return silences;
+   461→
+   462→  const merged = [];
+   463→  let current = { ...silences[0] };
+   464→
+   465→  for (let i = 1; i < silences.length; i++) {
+   466→    const next = silences[i];
+   467→
+   468→    // If gap is small enough, merge
+   469→    if (next.start - current.end <= mergeDistance) {
+   470→      current.end = next.end;
+   471→      current.duration = current.end - current.start;
+   472→    } else {
+   473→      merged.push(current);
+   474→      current = { ...next };
+   475→    }
+   476→  }
+   477→
+   478→  merged.push(current);
+   479→  return merged;
+   480→}
+   481→
+   482→/**
+   483→ * Apply padding to silence boundaries
+   484→ *
+   485→ * @param {Array} silences - Array of silence regions
+   486→ * @param {Object} options - Padding options
+   487→ * @returns {Array} Padded silence regions
+   488→ */
+   489→function applyPadding(silences, options) {
+   490→  const { paddingStart, paddingEnd, audioDuration } = options;
+   491→
+   492→  return silences
+   493→    .map(silence => {
+   494→      const paddedStart = Math.max(0, silence.start + paddingStart);
+   495→      const paddedEnd = Math.min(audioDuration, silence.end - paddingEnd);
+   496→      const duration = paddedEnd - paddedStart;
+   497→
+   498→      // Skip if padding made the silence invalid
+   499→      if (duration <= 0) return null;
+   500→
+   501→      return {
+   502→        start: parseFloat(paddedStart.toFixed(3)),
+   503→        end: parseFloat(paddedEnd.toFixed(3)),
+   504→        duration: parseFloat(duration.toFixed(3))
+   505→      };
+   506→    })
+   507→    .filter(s => s !== null);
+   508→}
+   509→
+   510→// =============================================================================
+   511→// Sensitivity Mapping
+   512→// =============================================================================
+   513→
+   514→/**
+   515→ * Map UI sensitivity (0-100) to detection parameters
+   516→ * Based on Fireside's aggressiveness mapping
+   517→ *
+   518→ * @param {number} sensitivity - UI sensitivity value (0-100)
+   519→ * @returns {Object} Detection parameters
+   520→ */
+   521→function sensitivityToParams(sensitivity) {
+   522→  // Clamp to 0-100
+   523→  const s = Math.max(0, Math.min(100, sensitivity));
+   524→
+   525→  // Linear interpolation helper
+   526→  const lerp = (min, max, t) => min + (max - min) * (t / 100);
+   527→
+   528→  return {
+   529→    // Threshold: -50dB (conservative) to -20dB (aggressive)
+   530→    threshold: lerp(-50, -20, s),
+   531→
+   532→    // Min silence length: 2.0s (conservative) to 0.3s (aggressive)
+   533→    minSilenceLength: lerp(2.0, 0.3, s),
+   534→
+   535→    // Padding start: 0.2s (conservative) to 0.05s (aggressive)
+   536→    paddingStart: lerp(0.2, 0.05, s),
+   537→
+   538→    // Padding end: 0.15s (conservative) to 0.03s (aggressive)
+   539→    paddingEnd: lerp(0.15, 0.03, s),
+   540→
+   541→    // Seek step stays constant
+   542→    seekStep: 0.05
+   543→  };
+   544→}
+   545→
+   546→// =============================================================================
+   547→// Exports
+   548→// =============================================================================
+   549→
+   550→module.exports = {
+   551→  detectSilencesRMS,
+   552→  sensitivityToParams,
+   553→  autoDetectThreshold,
+   554→  // Export internal functions for testing
+   555→  calculateRMSWindows,
+   556→  rmsToDBFS,
+   557→  gaussianBlur,
+   558→  findLocalMaxima,
+   559→  mergeSilences,
+   560→  applyPadding,
+   561→  DEFAULT_OPTIONS
+   562→};
+   563→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

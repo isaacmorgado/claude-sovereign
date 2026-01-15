@@ -1,0 +1,447 @@
+/**
+ * SPLICE Social Reframe Service
+ *
+ * Auto-crops video to vertical/square formats with face tracking.
+ * Supports TikTok (9:16), Instagram (1:1, 4:5), YouTube Shorts.
+ */
+
+const { trackFaces, identifySpeaker, calculateCropRegion, calculateCenterCrop } = require('./faceDetection');
+const fs = require('fs');
+const path = require('path');
+
+// ============================================================================
+// ASPECT RATIO PRESETS
+// ============================================================================
+
+const ASPECT_RATIOS = {
+  portrait: {
+    id: 'portrait',
+    name: 'Portrait (9:16)',
+    ratio: 9 / 16,
+    width: 1080,
+    height: 1920,
+    platforms: ['tiktok', 'reels', 'shorts']
+  },
+  square: {
+    id: 'square',
+    name: 'Square (1:1)',
+    ratio: 1,
+    width: 1080,
+    height: 1080,
+    platforms: ['instagram_feed', 'linkedin']
+  },
+  portrait_4_5: {
+    id: 'portrait_4_5',
+    name: 'Portrait (4:5)',
+    ratio: 4 / 5,
+    width: 1080,
+    height: 1350,
+    platforms: ['instagram_portrait']
+  },
+  landscape: {
+    id: 'landscape',
+    name: 'Landscape (16:9)',
+    ratio: 16 / 9,
+    width: 1920,
+    height: 1080,
+    platforms: ['youtube', 'twitter']
+  }
+};
+
+// ============================================================================
+// PLATFORM PRESETS
+// ============================================================================
+
+const PLATFORM_PRESETS = {
+  tiktok: {
+    id: 'tiktok',
+    name: 'TikTok',
+    aspectRatio: 'portrait',
+    safeZone: { top: 0.15, bottom: 0.2, left: 0.05, right: 0.05 },
+    maxDuration: 180
+  },
+  reels: {
+    id: 'reels',
+    name: 'Instagram Reels',
+    aspectRatio: 'portrait',
+    safeZone: { top: 0.1, bottom: 0.15, left: 0.05, right: 0.05 },
+    maxDuration: 90
+  },
+  shorts: {
+    id: 'shorts',
+    name: 'YouTube Shorts',
+    aspectRatio: 'portrait',
+    safeZone: { top: 0.1, bottom: 0.12, left: 0.05, right: 0.05 },
+    maxDuration: 60
+  },
+  instagram_feed: {
+    id: 'instagram_feed',
+    name: 'Instagram Feed',
+    aspectRatio: 'square',
+    safeZone: { top: 0.05, bottom: 0.05, left: 0.05, right: 0.05 },
+    maxDuration: 60
+  },
+  instagram_portrait: {
+    id: 'instagram_portrait',
+    name: 'Instagram Portrait',
+    aspectRatio: 'portrait_4_5',
+    safeZone: { top: 0.05, bottom: 0.1, left: 0.05, right: 0.05 },
+    maxDuration: 60
+  },
+  linkedin: {
+    id: 'linkedin',
+    name: 'LinkedIn',
+    aspectRatio: 'square',
+    safeZone: { top: 0.05, bottom: 0.08, left: 0.05, right: 0.05 },
+    maxDuration: 600
+  }
+};
+
+// ============================================================================
+// MAIN FUNCTIONS
+// ============================================================================
+
+/**
+ * Analyze video for reframe possibilities
+ * @param {string} videoPath - Path to video file
+ * @param {Object} options - Analysis options
+ * @returns {Promise<Object>} Analysis results with face positions
+ */
+async function analyzeForReframe(videoPath, options = {}) {
+  const {
+    sampleRate = 0.5,
+    smoothing = 0.3
+  } = options;
+
+  if (!fs.existsSync(videoPath)) {
+    return {
+      success: false,
+      error: `Video file not found: ${videoPath}`
+    };
+  }
+
+  console.log(`[SPLICE Reframe] Analyzing: ${videoPath}`);
+
+  try {
+    // Track faces in video
+    const tracking = await trackFaces(videoPath, { sampleRate, smoothing });
+
+    if (!tracking.success) {
+      return tracking;
+    }
+
+    // Identify primary speaker
+    const speaker = identifySpeaker(tracking.tracks);
+
+    // Calculate suggested crops for each aspect ratio
+    const suggestions = {};
+    for (const [key, preset] of Object.entries(ASPECT_RATIOS)) {
+      suggestions[key] = calculateReframeCrops(tracking, preset.ratio);
+    }
+
+    return {
+      success: true,
+      videoInfo: tracking.videoInfo,
+      faceTracking: {
+        tracksFound: tracking.tracks.length,
+        primarySpeaker: speaker.primarySpeaker,
+        tracks: tracking.tracks
+      },
+      suggestions,
+      metadata: {
+        analyzedAt: new Date().toISOString(),
+        sampleRate,
+        smoothing
+      }
+    };
+
+  } catch (err) {
+    console.error('[SPLICE Reframe] Analysis error:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+}
+
+/**
+ * Calculate crop positions for target aspect ratio
+ * @param {Object} tracking - Face tracking data
+ * @param {number} targetAspect - Target aspect ratio
+ * @returns {Object} Crop positions over time
+ */
+function calculateReframeCrops(tracking, targetAspect) {
+  const { videoInfo, tracks } = tracking;
+
+  if (!tracks || tracks.length === 0) {
+    // No faces - use center crop
+    const crop = calculateCenterCrop(targetAspect, videoInfo);
+    return {
+      method: 'center',
+      static: true,
+      crop,
+      keyframes: []
+    };
+  }
+
+  // Use primary track
+  const primaryTrack = tracks[0];
+  const keyframes = [];
+
+  // Generate keyframes at each tracked position
+  primaryTrack.positions.forEach((pos, index) => {
+    const crop = calculateCropRegion(pos, targetAspect, videoInfo);
+    keyframes.push({
+      time: pos.timestamp,
+      frame: Math.round(pos.timestamp * videoInfo.frameRate),
+      crop
+    });
+  });
+
+  return {
+    method: 'face-tracking',
+    static: false,
+    trackId: primaryTrack.trackId,
+    keyframes,
+    totalKeyframes: keyframes.length
+  };
+}
+
+/**
+ * Generate motion path with smoothing
+ * @param {Array} crops - Array of crop positions
+ * @param {number} duration - Video duration
+ * @param {number} frameRate - Video frame rate
+ * @returns {Object} Smooth motion path
+ */
+function generateMotionPath(crops, duration, frameRate) {
+  if (!crops || crops.length === 0) {
+    return {
+      success: false,
+      error: 'No crop data provided'
+    };
+  }
+
+  const totalFrames = Math.ceil(duration * frameRate);
+  const path = [];
+
+  // Interpolate between keyframes
+  for (let frame = 0; frame < totalFrames; frame++) {
+    const time = frame / frameRate;
+
+    // Find surrounding keyframes
+    let before = crops[0];
+    let after = crops[crops.length - 1];
+
+    for (let i = 0; i < crops.length - 1; i++) {
+      if (crops[i].time <= time && crops[i + 1].time >= time) {
+        before = crops[i];
+        after = crops[i + 1];
+        break;
+      }
+    }
+
+    // Interpolate
+    const t = after.time !== before.time
+      ? (time - before.time) / (after.time - before.time)
+      : 0;
+
+    // Ease function (smooth step)
+    const ease = t * t * (3 - 2 * t);
+
+    path.push({
+      frame,
+      time,
+      x: lerp(before.crop.x, after.crop.x, ease),
+      y: lerp(before.crop.y, after.crop.y, ease),
+      width: lerp(before.crop.width, after.crop.width, ease),
+      height: lerp(before.crop.height, after.crop.height, ease)
+    });
+  }
+
+  return {
+    success: true,
+    totalFrames,
+    duration,
+    frameRate,
+    path
+  };
+}
+
+/**
+ * Get safe zones for platform UI elements
+ * @param {string} platform - Platform ID
+ * @returns {Object} Safe zone information
+ */
+function getSafeZones(platform) {
+  const preset = PLATFORM_PRESETS[platform];
+
+  if (!preset) {
+    return {
+      success: false,
+      error: `Unknown platform: ${platform}`,
+      availablePlatforms: Object.keys(PLATFORM_PRESETS)
+    };
+  }
+
+  const aspect = ASPECT_RATIOS[preset.aspectRatio];
+
+  return {
+    success: true,
+    platform: preset.name,
+    aspectRatio: preset.aspectRatio,
+    dimensions: {
+      width: aspect.width,
+      height: aspect.height,
+      ratio: aspect.ratio
+    },
+    safeZone: preset.safeZone,
+    safeArea: {
+      top: preset.safeZone.top * aspect.height,
+      bottom: preset.safeZone.bottom * aspect.height,
+      left: preset.safeZone.left * aspect.width,
+      right: preset.safeZone.right * aspect.width,
+      contentWidth: aspect.width * (1 - preset.safeZone.left - preset.safeZone.right),
+      contentHeight: aspect.height * (1 - preset.safeZone.top - preset.safeZone.bottom)
+    },
+    maxDuration: preset.maxDuration
+  };
+}
+
+/**
+ * Generate export settings for all formats
+ * @param {string} videoPath - Source video path
+ * @param {Array} formats - Array of format IDs
+ * @param {Object} settings - Export settings
+ * @returns {Promise<Object>} Export data for each format
+ */
+async function batchExportFormats(videoPath, formats = ['portrait', 'square'], settings = {}) {
+  const {
+    quality = 'high', // high, medium, draft
+    motionSmoothing = 0.3
+  } = settings;
+
+  // Analyze video first
+  const analysis = await analyzeForReframe(videoPath, { smoothing: motionSmoothing });
+
+  if (!analysis.success) {
+    return analysis;
+  }
+
+  const exports = [];
+
+  for (const formatId of formats) {
+    const aspect = ASPECT_RATIOS[formatId];
+    if (!aspect) continue;
+
+    const crops = analysis.suggestions[formatId];
+    const motionPath = crops.static
+      ? null
+      : generateMotionPath(crops.keyframes, analysis.videoInfo.duration, analysis.videoInfo.frameRate);
+
+    exports.push({
+      format: formatId,
+      name: aspect.name,
+      dimensions: {
+        width: aspect.width,
+        height: aspect.height
+      },
+      isStatic: crops.static,
+      crop: crops.static ? crops.crop : null,
+      motionPath: motionPath?.success ? motionPath : null,
+      ffmpegFilter: generateFFmpegFilter(crops, aspect, analysis.videoInfo),
+      platforms: aspect.platforms
+    });
+  }
+
+  return {
+    success: true,
+    sourceVideo: videoPath,
+    sourceInfo: analysis.videoInfo,
+    exports,
+    totalFormats: exports.length,
+    metadata: {
+      quality,
+      motionSmoothing,
+      generatedAt: new Date().toISOString()
+    }
+  };
+}
+
+/**
+ * Generate FFmpeg filter for reframe
+ */
+function generateFFmpegFilter(crops, aspect, videoInfo) {
+  if (crops.static) {
+    // Static crop
+    const crop = crops.crop;
+    return `crop=${crop.pixelWidth}:${crop.pixelHeight}:${crop.pixelX}:${crop.pixelY},scale=${aspect.width}:${aspect.height}`;
+  }
+
+  // For motion crops, would need complex filter with keyframes
+  // Return simplified version
+  const firstCrop = crops.keyframes[0]?.crop;
+  if (firstCrop) {
+    return `crop=${firstCrop.pixelWidth}:${firstCrop.pixelHeight}:${firstCrop.pixelX}:${firstCrop.pixelY},scale=${aspect.width}:${aspect.height}`;
+  }
+
+  // Fallback center crop
+  const targetHeight = videoInfo.height;
+  const targetWidth = Math.round(targetHeight * aspect.ratio);
+  const cropX = Math.round((videoInfo.width - targetWidth) / 2);
+
+  return `crop=${targetWidth}:${targetHeight}:${cropX}:0,scale=${aspect.width}:${aspect.height}`;
+}
+
+/**
+ * Get available platforms and aspect ratios
+ */
+function getPlatformPresets() {
+  return {
+    aspectRatios: Object.values(ASPECT_RATIOS).map(a => ({
+      id: a.id,
+      name: a.name,
+      ratio: a.ratio,
+      dimensions: { width: a.width, height: a.height }
+    })),
+    platforms: Object.values(PLATFORM_PRESETS).map(p => ({
+      id: p.id,
+      name: p.name,
+      aspectRatio: p.aspectRatio,
+      maxDuration: p.maxDuration
+    })),
+    defaults: {
+      quality: 'high',
+      motionSmoothing: 0.3
+    }
+  };
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Linear interpolation
+ */
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+module.exports = {
+  analyzeForReframe,
+  calculateReframeCrops,
+  generateMotionPath,
+  getSafeZones,
+  batchExportFormats,
+  getPlatformPresets,
+  // Exposed for testing
+  ASPECT_RATIOS,
+  PLATFORM_PRESETS,
+  lerp,
+  generateFFmpegFilter
+};

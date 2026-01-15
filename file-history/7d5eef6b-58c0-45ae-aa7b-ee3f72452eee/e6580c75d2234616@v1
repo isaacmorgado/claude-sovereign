@@ -1,0 +1,216 @@
+/**
+ * Rate Limiter Middleware
+ *
+ * Checks if user has sufficient credits before processing.
+ * Uses atomic credit reservation to prevent race conditions.
+ * Returns 402 Payment Required if insufficient credits.
+ *
+ * SECURITY: Uses JWT authentication via authenticateToken middleware.
+ * Legacy x-stripe-customer-id header is DISABLED in production for security.
+ */
+
+const {
+  deductUsage,
+  getBalance,
+  reserveCredits,
+  confirmReservation,
+  releaseReservation,
+  customerExists
+} = require('../services/usageTracking');
+const { verifyToken, extractBearerToken } = require('./auth');
+
+// SECURITY: Disable legacy auth in production unless explicitly enabled
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+const ALLOW_LEGACY_AUTH = process.env.ALLOW_LEGACY_AUTH === 'true';
+
+// Rate limiting for legacy auth attempts (prevent brute force)
+const legacyAuthAttempts = new Map(); // IP -> { count, timestamp }
+const LEGACY_AUTH_WINDOW_MS = 60000; // 1 minute
+const LEGACY_AUTH_MAX_ATTEMPTS = 5; // 5 attempts per minute
+
+/**
+ * Check if IP is rate limited for legacy auth
+ */
+function isLegacyAuthRateLimited(ip) {
+  const now = Date.now();
+  const attempt = legacyAuthAttempts.get(ip);
+
+  if (!attempt || (now - attempt.timestamp) > LEGACY_AUTH_WINDOW_MS) {
+    legacyAuthAttempts.set(ip, { count: 1, timestamp: now });
+    return false;
+  }
+
+  attempt.count++;
+  if (attempt.count > LEGACY_AUTH_MAX_ATTEMPTS) {
+    console.warn(`[SECURITY] Legacy auth rate limit exceeded for IP: ${ip}`);
+    return true;
+  }
+
+  return false;
+}
+
+// Default estimated duration for reservation (1 minute = 60 seconds)
+const DEFAULT_RESERVATION_SECONDS = 60;
+
+/**
+ * Middleware to check and atomically reserve credits before processing
+ *
+ * SECURITY: Authenticates via JWT token (Authorization: Bearer <token>)
+ * Falls back to legacy x-stripe-customer-id header (deprecated)
+ *
+ * Uses req.estimatedDuration (in seconds) for pre-check, defaults to 60s
+ *
+ * This middleware uses SELECT...FOR UPDATE to prevent race conditions
+ * where multiple concurrent requests could all pass credit check.
+ */
+function requireCredits(options = {}) {
+  const { endpoint = 'unknown', estimatedSeconds = DEFAULT_RESERVATION_SECONDS } = options;
+
+  return async (req, res, next) => {
+    // SECURITY: Primary auth via JWT token
+    const authHeader = req.headers['authorization'];
+    const token = extractBearerToken(authHeader);
+
+    let stripeCustomerId = null;
+
+    if (token) {
+      const decoded = verifyToken(token);
+      if (decoded && decoded.sub) {
+        stripeCustomerId = decoded.sub;
+        req.tokenData = decoded;
+      } else {
+        // Token present but invalid
+        return res.status(401).json({
+          error: 'Invalid or expired token',
+          message: 'Please log in again to continue'
+        });
+      }
+    } else {
+      // DEPRECATED: Fallback to legacy header (will be removed in v6.0)
+      const legacyId = req.headers['x-stripe-customer-id'];
+      if (legacyId) {
+        // Validate format to prevent injection
+        if (!legacyId.match(/^cus_[a-zA-Z0-9]{14,}$/)) {
+          return res.status(401).json({
+            error: 'Invalid customer ID format',
+            message: 'Customer ID must be a valid Stripe customer ID'
+          });
+        }
+        stripeCustomerId = legacyId;
+        req.isLegacyAuth = true;
+        console.warn(`[RateLimiter] DEPRECATED: Legacy auth header used for ${endpoint}`);
+      }
+    }
+
+    if (!stripeCustomerId) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Missing Stripe customer ID'
+      });
+    }
+
+    // Store for later use
+    req.stripeCustomerId = stripeCustomerId;
+
+    // Determine estimated duration - use request value, option value, or default
+    const estSeconds = req.estimatedDuration || estimatedSeconds;
+
+    try {
+      // Atomically reserve credits using SELECT...FOR UPDATE
+      const reservation = await reserveCredits(stripeCustomerId, estSeconds, endpoint);
+
+      if (!reservation.success) {
+        // Reservation failed - not enough credits
+        const balance = await getBalance(stripeCustomerId);
+        return res.status(402).json({
+          error: 'Insufficient credits',
+          message: 'Please upgrade your plan or wait for your next billing cycle',
+          balance: {
+            hoursRemaining: balance.hoursRemaining,
+            tier: balance.tier
+          }
+        });
+      }
+
+      // Store reservation info for confirmation/release
+      req.reservation = {
+        id: reservation.reservationId,
+        seconds: estSeconds,
+        hoursReserved: reservation.hoursReserved
+      };
+
+      // Attach helper function to confirm usage with actual duration
+      // This adjusts the reservation if actual duration differs
+      req.deductUsage = async (actualDurationSeconds) => {
+        return await confirmReservation(
+          stripeCustomerId,
+          actualDurationSeconds,
+          estSeconds,
+          endpoint
+        );
+      };
+
+      // Attach helper function to release reservation on failure
+      req.releaseReservation = async (reason = 'processing_failed') => {
+        return await releaseReservation(stripeCustomerId, estSeconds, endpoint, reason);
+      };
+
+      // Hook into response to auto-release on error responses
+      const originalSend = res.send.bind(res);
+      res.send = function(body) {
+        // If response is an error (4xx/5xx) and no usage was confirmed, release reservation
+        if (res.statusCode >= 400 && req.reservation && !req.usageConfirmed) {
+          releaseReservation(stripeCustomerId, estSeconds, endpoint, `error_${res.statusCode}`)
+            .catch(err => console.error('[RateLimiter] Failed to release reservation:', err));
+        }
+        return originalSend(body);
+      };
+
+      next();
+    } catch (err) {
+      console.error('[RateLimiter] Error reserving credits:', err);
+      return res.status(500).json({
+        error: 'Credit check failed',
+        message: err.message
+      });
+    }
+  };
+}
+
+/**
+ * Middleware to track usage after successful response
+ *
+ * Call this after processing to deduct actual usage
+ */
+function trackUsage(endpoint = 'unknown') {
+  return async (req, res, next) => {
+    // Store original json method
+    const originalJson = res.json.bind(res);
+
+    // Override json to track usage on success
+    res.json = async (data) => {
+      // Only deduct on successful responses
+      if (res.statusCode >= 200 && res.statusCode < 300 && req.audioDuration) {
+        try {
+          const balance = await deductUsage(
+            req.stripeCustomerId,
+            req.audioDuration,
+            endpoint
+          );
+          // Attach updated balance to response
+          data.balance = balance;
+        } catch (err) {
+          console.error('[RateLimiter] Error deducting usage:', err);
+        }
+      }
+      return originalJson(data);
+    };
+
+    next();
+  };
+}
+
+module.exports = {
+  requireCredits,
+  trackUsage
+};

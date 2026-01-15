@@ -1,0 +1,622 @@
+     1→/**
+     2→ * Phase 6 License Key Tests
+     3→ *
+     4→ * Tests license key generation, activation, and validation:
+     5→ * - License key format validation
+     6→ * - License key generation
+     7→ * - License key activation
+     8→ * - License key lookup by customer
+     9→ * - Webhook integration (license key generation on subscription)
+    10→ * - UI validation patterns
+    11→ */
+    12→
+    13→const https = require('https');
+    14→const licenseService = require('../services/licenseService');
+    15→
+    16→const BASE_URL = 'https://127.0.0.1:3847';
+    17→const TEST_CUSTOMER_ID = 'cus_test_phase6_license';
+    18→
+    19→// Allow self-signed certs
+    20→const agent = new https.Agent({ rejectUnauthorized: false });
+    21→
+    22→/**
+    23→ * Helper: Make HTTPS request
+    24→ */
+    25→function request(method, path, body = null, headers = {}) {
+    26→  return new Promise((resolve, reject) => {
+    27→    const url = new URL(path, BASE_URL);
+    28→    const options = {
+    29→      method,
+    30→      hostname: url.hostname,
+    31→      port: url.port,
+    32→      path: url.pathname,
+    33→      headers: {
+    34→        'Content-Type': 'application/json',
+    35→        ...headers
+    36→      },
+    37→      agent
+    38→    };
+    39→
+    40→    const req = https.request(options, (res) => {
+    41→      let data = '';
+    42→      res.on('data', (chunk) => data += chunk);
+    43→      res.on('end', () => {
+    44→        try {
+    45→          resolve({ status: res.statusCode, data: JSON.parse(data) });
+    46→        } catch (e) {
+    47→          resolve({ status: res.statusCode, data: data });
+    48→        }
+    49→      });
+    50→    });
+    51→
+    52→    req.on('error', reject);
+    53→    if (body) req.write(JSON.stringify(body));
+    54→    req.end();
+    55→  });
+    56→}
+    57→
+    58→// =============================================================================
+    59→// Test: License Key Format Validation (Unit Tests)
+    60→// =============================================================================
+    61→
+    62→function testLicenseKeyFormat() {
+    63→  console.log('\n=== Test: License Key Format Validation ===');
+    64→  let passed = 0;
+    65→  let failed = 0;
+    66→
+    67→  // Test valid format
+    68→  const validKeys = [
+    69→    'SPLICE-ABCD-EFGH-JKLM',
+    70→    'SPLICE-2345-6789-NPQR',
+    71→    'splice-abcd-efgh-jklm', // lowercase should be normalized
+    72→    'SPLICE-A2B3-C4D5-E6F7'
+    73→  ];
+    74→
+    75→  for (const key of validKeys) {
+    76→    if (licenseService.isValidKeyFormat(key)) {
+    77→      console.log(`  ✓ Valid key accepted: ${key}`);
+    78→      passed++;
+    79→    } else {
+    80→      console.log(`  ✗ Valid key rejected: ${key}`);
+    81→      failed++;
+    82→    }
+    83→  }
+    84→
+    85→  // Test invalid formats
+    86→  const invalidKeys = [
+    87→    'SPLICE-ABC-DEF-GHI',         // Too short
+    88→    'SPLICE-ABCDE-FGHI-JKLM',     // Too long
+    89→    'PREFIX-ABCD-EFGH-JKLM',      // Wrong prefix
+    90→    'SPLICEABCDEFGHJKLM',         // No dashes
+    91→    'SPLICE-ABCD-EFGH',           // Missing segment
+    92→    'SPLICE-0000-1111-OOOO',      // Contains O and 0/1 (confusing)
+    93→    '',                            // Empty
+    94→    null,                          // Null
+    95→    123456                         // Number
+    96→  ];
+    97→
+    98→  for (const key of invalidKeys) {
+    99→    if (!licenseService.isValidKeyFormat(key)) {
+   100→      console.log(`  ✓ Invalid key rejected: ${key}`);
+   101→      passed++;
+   102→    } else {
+   103→      console.log(`  ✗ Invalid key accepted: ${key}`);
+   104→      failed++;
+   105→    }
+   106→  }
+   107→
+   108→  // Test key generation format
+   109→  console.log('\nTesting generated key format...');
+   110→  for (let i = 0; i < 10; i++) {
+   111→    const generatedKey = licenseService.generateKeyString();
+   112→    if (licenseService.isValidKeyFormat(generatedKey)) {
+   113→      passed++;
+   114→    } else {
+   115→      console.log(`  ✗ Generated key invalid: ${generatedKey}`);
+   116→      failed++;
+   117→    }
+   118→  }
+   119→  console.log(`  ✓ 10 generated keys have valid format`);
+   120→
+   121→  // Test key normalization
+   122→  console.log('\nTesting key normalization...');
+   123→  const testCases = [
+   124→    { input: 'splice-abcd-efgh-jklm', expected: 'SPLICE-ABCD-EFGH-JKLM' },
+   125→    { input: '  SPLICE-ABCD-EFGH-JKLM  ', expected: 'SPLICE-ABCD-EFGH-JKLM' },
+   126→    { input: 'Splice-Abcd-Efgh-Jklm', expected: 'SPLICE-ABCD-EFGH-JKLM' }
+   127→  ];
+   128→
+   129→  for (const tc of testCases) {
+   130→    const normalized = licenseService.normalizeKey(tc.input);
+   131→    if (normalized === tc.expected) {
+   132→      console.log(`  ✓ Normalized correctly: "${tc.input}" → "${normalized}"`);
+   133→      passed++;
+   134→    } else {
+   135→      console.log(`  ✗ Normalization failed: expected "${tc.expected}", got "${normalized}"`);
+   136→      failed++;
+   137→    }
+   138→  }
+   139→
+   140→  console.log(`\nFormat validation: ${passed} passed, ${failed} failed`);
+   141→  return { passed, failed };
+   142→}
+   143→
+   144→// =============================================================================
+   145→// Test: License Key Generation (Unit Tests - No DB)
+   146→// =============================================================================
+   147→
+   148→function testLicenseKeyGeneration() {
+   149→  console.log('\n=== Test: License Key Generation (Unit) ===');
+   150→  let passed = 0;
+   151→  let failed = 0;
+   152→
+   153→  // Test key uniqueness
+   154→  console.log('Testing key uniqueness...');
+   155→  const generatedKeys = new Set();
+   156→  const iterations = 100;
+   157→
+   158→  for (let i = 0; i < iterations; i++) {
+   159→    const key = licenseService.generateKeyString();
+   160→    generatedKeys.add(key);
+   161→  }
+   162→
+   163→  if (generatedKeys.size === iterations) {
+   164→    console.log(`  ✓ All ${iterations} generated keys are unique`);
+   165→    passed++;
+   166→  } else {
+   167→    console.log(`  ✗ Only ${generatedKeys.size}/${iterations} keys unique`);
+   168→    failed++;
+   169→  }
+   170→
+   171→  // Test key character set (only in the random segments, not the prefix)
+   172→  console.log('Testing key character set...');
+   173→  const randomCharsOnly = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+   174→  let allCharsValid = true;
+   175→
+   176→  for (const key of generatedKeys) {
+   177→    // Extract random segments (skip "SPLICE-" prefix and dashes)
+   178→    const segments = key.split('-').slice(1); // Skip "SPLICE"
+   179→    for (const segment of segments) {
+   180→      for (const char of segment) {
+   181→        if (!randomCharsOnly.includes(char)) {
+   182→          console.log(`  ✗ Invalid character found: ${char} in segment ${segment}`);
+   183→          allCharsValid = false;
+   184→          break;
+   185→        }
+   186→      }
+   187→    }
+   188→  }
+   189→
+   190→  if (allCharsValid) {
+   191→    console.log(`  ✓ All characters in allowed set`);
+   192→    passed++;
+   193→  } else {
+   194→    failed++;
+   195→  }
+   196→
+   197→  // Test key length
+   198→  console.log('Testing key length...');
+   199→  let allCorrectLength = true;
+   200→  for (const key of generatedKeys) {
+   201→    if (key.length !== 21) { // SPLICE-XXXX-XXXX-XXXX = 6+1+4+1+4+1+4 = 21
+   202→      console.log(`  ✗ Incorrect length: ${key} (${key.length})`);
+   203→      allCorrectLength = false;
+   204→    }
+   205→  }
+   206→
+   207→  if (allCorrectLength) {
+   208→    console.log(`  ✓ All keys have correct length (21 chars)`);
+   209→    passed++;
+   210→  } else {
+   211→    failed++;
+   212→  }
+   213→
+   214→  console.log(`\nKey generation: ${passed} passed, ${failed} failed`);
+   215→  return { passed, failed };
+   216→}
+   217→
+   218→// =============================================================================
+   219→// Test: License Activation API (E2E Tests)
+   220→// =============================================================================
+   221→
+   222→async function testLicenseActivationAPI() {
+   223→  console.log('\n=== Test: License Activation API ===');
+   224→  let passed = 0;
+   225→  let failed = 0;
+   226→
+   227→  // Test 1: Missing key
+   228→  console.log('Testing missing key...');
+   229→  try {
+   230→    const res = await request('POST', '/license/activate', {});
+   231→    if (res.status === 400 && res.data.error) {
+   232→      console.log('  ✓ Returns 400 for missing key');
+   233→      passed++;
+   234→    } else {
+   235→      console.log(`  ✗ Expected 400, got ${res.status}`);
+   236→      failed++;
+   237→    }
+   238→  } catch (err) {
+   239→    console.log(`  ✗ Error: ${err.message}`);
+   240→    failed++;
+   241→  }
+   242→
+   243→  // Test 2: Invalid format
+   244→  console.log('Testing invalid key format...');
+   245→  try {
+   246→    const res = await request('POST', '/license/activate', { key: 'INVALID-KEY' });
+   247→    if (res.status === 400 && res.data.error.includes('format')) {
+   248→      console.log('  ✓ Returns 400 for invalid format');
+   249→      passed++;
+   250→    } else {
+   251→      console.log(`  ✗ Expected 400 with format error, got ${res.status}: ${res.data.error}`);
+   252→      failed++;
+   253→    }
+   254→  } catch (err) {
+   255→    console.log(`  ✗ Error: ${err.message}`);
+   256→    failed++;
+   257→  }
+   258→
+   259→  // Test 3: Non-existent key
+   260→  console.log('Testing non-existent key...');
+   261→  try {
+   262→    const res = await request('POST', '/license/activate', { key: 'SPLICE-XXXX-YYYY-ZZZZ' });
+   263→    if (res.status === 400 && res.data.error.includes('not found')) {
+   264→      console.log('  ✓ Returns 400 for non-existent key');
+   265→      passed++;
+   266→    } else {
+   267→      console.log(`  ✗ Expected 400 with not found error, got ${res.status}: ${res.data.error}`);
+   268→      failed++;
+   269→    }
+   270→  } catch (err) {
+   271→    console.log(`  ✗ Error: ${err.message}`);
+   272→    failed++;
+   273→  }
+   274→
+   275→  console.log(`\nActivation API: ${passed} passed, ${failed} failed`);
+   276→  return { passed, failed };
+   277→}
+   278→
+   279→// =============================================================================
+   280→// Test: License Key Lookup API (E2E Tests)
+   281→// =============================================================================
+   282→
+   283→async function testLicenseKeyLookupAPI() {
+   284→  console.log('\n=== Test: License Key Lookup API ===');
+   285→  let passed = 0;
+   286→  let failed = 0;
+   287→
+   288→  // Test 1: Missing customer ID header
+   289→  console.log('Testing missing customer ID...');
+   290→  try {
+   291→    const res = await request('GET', '/license/key');
+   292→    if (res.status === 401 && res.data.error.includes('Authentication')) {
+   293→      console.log('  ✓ Returns 401 for missing customer ID');
+   294→      passed++;
+   295→    } else {
+   296→      console.log(`  ✗ Expected 401, got ${res.status}`);
+   297→      failed++;
+   298→    }
+   299→  } catch (err) {
+   300→    console.log(`  ✗ Error: ${err.message}`);
+   301→    failed++;
+   302→  }
+   303→
+   304→  // Test 2: Non-existent customer
+   305→  console.log('Testing non-existent customer...');
+   306→  try {
+   307→    const res = await request('GET', '/license/key', null, {
+   308→      'x-stripe-customer-id': 'cus_nonexistent_12345'
+   309→    });
+   310→    if (res.status === 404) {
+   311→      console.log('  ✓ Returns 404 for non-existent customer');
+   312→      passed++;
+   313→    } else {
+   314→      console.log(`  ✗ Expected 404, got ${res.status}`);
+   315→      failed++;
+   316→    }
+   317→  } catch (err) {
+   318→    console.log(`  ✗ Error: ${err.message}`);
+   319→    failed++;
+   320→  }
+   321→
+   322→  console.log(`\nLookup API: ${passed} passed, ${failed} failed`);
+   323→  return { passed, failed };
+   324→}
+   325→
+   326→// =============================================================================
+   327→// Test: License Service Database Operations (Integration Tests)
+   328→// =============================================================================
+   329→
+   330→async function testLicenseServiceDB() {
+   331→  console.log('\n=== Test: License Service Database Operations ===');
+   332→  let passed = 0;
+   333→  let failed = 0;
+   334→
+   335→  const testCustomerId = `cus_test_${Date.now()}`;
+   336→
+   337→  // Test 1: Generate license key for new customer
+   338→  console.log('Testing license key generation...');
+   339→  try {
+   340→    const result = await licenseService.generateLicenseKey(testCustomerId);
+   341→    if (result.success && result.key && licenseService.isValidKeyFormat(result.key)) {
+   342→      console.log(`  ✓ Generated key: ${result.key}`);
+   343→      passed++;
+   344→
+   345→      // Test 2: Get existing key (should return same key)
+   346→      console.log('Testing duplicate key generation returns existing...');
+   347→      const result2 = await licenseService.generateLicenseKey(testCustomerId);
+   348→      if (result2.success && result2.key === result.key && result2.existing === true) {
+   349→        console.log('  ✓ Returns existing key for same customer');
+   350→        passed++;
+   351→      } else {
+   352→        console.log(`  ✗ Expected same key, got different: ${result2.key}`);
+   353→        failed++;
+   354→      }
+   355→
+   356→      // Test 3: Activate the key
+   357→      console.log('Testing license key activation...');
+   358→      const activateResult = await licenseService.activateLicenseKey(result.key);
+   359→      if (activateResult.success && activateResult.customerId === testCustomerId) {
+   360→        console.log('  ✓ Key activated successfully');
+   361→        passed++;
+   362→      } else {
+   363→        console.log(`  ✗ Activation failed: ${activateResult.error}`);
+   364→        failed++;
+   365→      }
+   366→
+   367→      // Test 4: Lookup by customer ID
+   368→      console.log('Testing license lookup by customer ID...');
+   369→      const lookupResult = await licenseService.getLicenseByCustomerId(testCustomerId);
+   370→      if (lookupResult.success && lookupResult.key === result.key && lookupResult.activated === true) {
+   371→        console.log('  ✓ Lookup returned correct key and activation status');
+   372→        passed++;
+   373→      } else {
+   374→        console.log(`  ✗ Lookup failed or incorrect: ${JSON.stringify(lookupResult)}`);
+   375→        failed++;
+   376→      }
+   377→
+   378→      // Test 5: Deactivate the key
+   379→      console.log('Testing license key deactivation...');
+   380→      const deactivateResult = await licenseService.deactivateLicenseKey(result.key);
+   381→      if (deactivateResult.success) {
+   382→        console.log('  ✓ Key deactivated successfully');
+   383→        passed++;
+   384→
+   385→        // Test 6: Try to activate deactivated key
+   386→        console.log('Testing activation of deactivated key...');
+   387→        const reactivateAttempt = await licenseService.activateLicenseKey(result.key);
+   388→        if (!reactivateAttempt.success && reactivateAttempt.error.includes('deactivated')) {
+   389→          console.log('  ✓ Deactivated key correctly rejected');
+   390→          passed++;
+   391→        } else {
+   392→          console.log(`  ✗ Expected deactivated error: ${JSON.stringify(reactivateAttempt)}`);
+   393→          failed++;
+   394→        }
+   395→
+   396→        // Test 7: Reactivate the key
+   397→        console.log('Testing license key reactivation...');
+   398→        const reactivateResult = await licenseService.reactivateLicenseKey(result.key);
+   399→        if (reactivateResult.success) {
+   400→          console.log('  ✓ Key reactivated successfully');
+   401→          passed++;
+   402→
+   403→          // Verify it can be activated again
+   404→          const finalActivate = await licenseService.activateLicenseKey(result.key);
+   405→          if (finalActivate.success) {
+   406→            console.log('  ✓ Reactivated key can be used');
+   407→            passed++;
+   408→          } else {
+   409→            console.log(`  ✗ Reactivated key still rejected: ${finalActivate.error}`);
+   410→            failed++;
+   411→          }
+   412→        } else {
+   413→          console.log(`  ✗ Reactivation failed: ${reactivateResult.error}`);
+   414→          failed++;
+   415→        }
+   416→      } else {
+   417→        console.log(`  ✗ Deactivation failed: ${deactivateResult.error}`);
+   418→        failed++;
+   419→      }
+   420→    } else {
+   421→      console.log(`  ✗ Generation failed: ${result.error}`);
+   422→      failed++;
+   423→    }
+   424→  } catch (err) {
+   425→    console.log(`  ✗ Error: ${err.message}`);
+   426→    failed++;
+   427→  }
+   428→
+   429→  // Test: Missing customer ID
+   430→  console.log('Testing missing customer ID...');
+   431→  try {
+   432→    const result = await licenseService.generateLicenseKey(null);
+   433→    if (!result.success && result.error.includes('required')) {
+   434→      console.log('  ✓ Rejects null customer ID');
+   435→      passed++;
+   436→    } else {
+   437→      console.log(`  ✗ Expected error for null customer ID`);
+   438→      failed++;
+   439→    }
+   440→  } catch (err) {
+   441→    console.log(`  ✗ Error: ${err.message}`);
+   442→    failed++;
+   443→  }
+   444→
+   445→  console.log(`\nDatabase operations: ${passed} passed, ${failed} failed`);
+   446→  return { passed, failed };
+   447→}
+   448→
+   449→// =============================================================================
+   450→// Test: UI Validation Pattern (Unit Tests)
+   451→// =============================================================================
+   452→
+   453→function testUIValidationPattern() {
+   454→  console.log('\n=== Test: UI Validation Pattern ===');
+   455→  let passed = 0;
+   456→  let failed = 0;
+   457→
+   458→  // Simulate the frontend validation regex
+   459→  const uiPattern = /^SPLICE-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/;
+   460→
+   461→  const testCases = [
+   462→    { key: 'SPLICE-ABCD-EFGH-JKLM', expected: true },
+   463→    { key: 'SPLICE-2345-6789-NPQR', expected: true },
+   464→    { key: 'SPLICE-A2B3-C4D5-E6F7', expected: true },
+   465→    { key: 'splice-abcd-efgh-jklm', expected: false }, // Must be uppercase
+   466→    { key: 'SPLICE-ABCD-EFGH', expected: false },       // Too short
+   467→    { key: 'SPLICE-ABCDE-FGHI-JKLM', expected: false }, // Segment too long
+   468→    { key: 'PREFIX-ABCD-EFGH-JKLM', expected: false },  // Wrong prefix
+   469→    { key: 'SPLICE-0000-1111-LLLL', expected: false },  // Contains O, 0, 1, L
+   470→  ];
+   471→
+   472→  for (const tc of testCases) {
+   473→    const matches = uiPattern.test(tc.key);
+   474→    if (matches === tc.expected) {
+   475→      console.log(`  ✓ "${tc.key}" → ${tc.expected}`);
+   476→      passed++;
+   477→    } else {
+   478→      console.log(`  ✗ "${tc.key}" expected ${tc.expected}, got ${matches}`);
+   479→      failed++;
+   480→    }
+   481→  }
+   482→
+   483→  console.log(`\nUI validation: ${passed} passed, ${failed} failed`);
+   484→  return { passed, failed };
+   485→}
+   486→
+   487→// =============================================================================
+   488→// Test: Performance (Key Generation Speed)
+   489→// =============================================================================
+   490→
+   491→function testPerformance() {
+   492→  console.log('\n=== Test: Performance ===');
+   493→  let passed = 0;
+   494→  let failed = 0;
+   495→
+   496→  // Test key generation speed
+   497→  console.log('Testing key generation speed...');
+   498→  const iterations = 1000;
+   499→  const start = process.hrtime.bigint();
+   500→
+   501→  for (let i = 0; i < iterations; i++) {
+   502→    licenseService.generateKeyString();
+   503→  }
+   504→
+   505→  const end = process.hrtime.bigint();
+   506→  const durationMs = Number(end - start) / 1e6;
+   507→  const avgPerKey = durationMs / iterations;
+   508→
+   509→  if (avgPerKey < 1) { // Should be less than 1ms per key
+   510→    console.log(`  ✓ Generated ${iterations} keys in ${durationMs.toFixed(2)}ms (${avgPerKey.toFixed(4)}ms avg)`);
+   511→    passed++;
+   512→  } else {
+   513→    console.log(`  ✗ Key generation too slow: ${avgPerKey.toFixed(4)}ms avg`);
+   514→    failed++;
+   515→  }
+   516→
+   517→  // Test validation speed
+   518→  console.log('Testing validation speed...');
+   519→  const testKey = 'SPLICE-ABCD-EFGH-JKLM';
+   520→  const validationStart = process.hrtime.bigint();
+   521→
+   522→  for (let i = 0; i < iterations; i++) {
+   523→    licenseService.isValidKeyFormat(testKey);
+   524→  }
+   525→
+   526→  const validationEnd = process.hrtime.bigint();
+   527→  const validationMs = Number(validationEnd - validationStart) / 1e6;
+   528→  const avgValidation = validationMs / iterations;
+   529→
+   530→  if (avgValidation < 0.1) { // Should be less than 0.1ms per validation
+   531→    console.log(`  ✓ Validated ${iterations} keys in ${validationMs.toFixed(2)}ms (${avgValidation.toFixed(4)}ms avg)`);
+   532→    passed++;
+   533→  } else {
+   534→    console.log(`  ✗ Validation too slow: ${avgValidation.toFixed(4)}ms avg`);
+   535→    failed++;
+   536→  }
+   537→
+   538→  console.log(`\nPerformance: ${passed} passed, ${failed} failed`);
+   539→  return { passed, failed };
+   540→}
+   541→
+   542→// =============================================================================
+   543→// Run All Tests
+   544→// =============================================================================
+   545→
+   546→async function runAllTests() {
+   547→  console.log('╔════════════════════════════════════════════════════════════════╗');
+   548→  console.log('║         SPLICE Phase 6 - License Key System Tests              ║');
+   549→  console.log('╚════════════════════════════════════════════════════════════════╝');
+   550→
+   551→  let totalPassed = 0;
+   552→  let totalFailed = 0;
+   553→
+   554→  // Unit tests (no server required)
+   555→  const formatResult = testLicenseKeyFormat();
+   556→  totalPassed += formatResult.passed;
+   557→  totalFailed += formatResult.failed;
+   558→
+   559→  const genResult = testLicenseKeyGeneration();
+   560→  totalPassed += genResult.passed;
+   561→  totalFailed += genResult.failed;
+   562→
+   563→  const uiResult = testUIValidationPattern();
+   564→  totalPassed += uiResult.passed;
+   565→  totalFailed += uiResult.failed;
+   566→
+   567→  const perfResult = testPerformance();
+   568→  totalPassed += perfResult.passed;
+   569→  totalFailed += perfResult.failed;
+   570→
+   571→  // E2E tests (require server)
+   572→  console.log('\n--- E2E Tests (require server running at ' + BASE_URL + ') ---');
+   573→
+   574→  try {
+   575→    const activationResult = await testLicenseActivationAPI();
+   576→    totalPassed += activationResult.passed;
+   577→    totalFailed += activationResult.failed;
+   578→
+   579→    const lookupResult = await testLicenseKeyLookupAPI();
+   580→    totalPassed += lookupResult.passed;
+   581→    totalFailed += lookupResult.failed;
+   582→  } catch (err) {
+   583→    console.log(`\n⚠ E2E tests skipped - server not running: ${err.message}`);
+   584→  }
+   585→
+   586→  // Integration tests (require database)
+   587→  console.log('\n--- Integration Tests (require database) ---');
+   588→
+   589→  if (process.env.DATABASE_URL) {
+   590→    try {
+   591→      // Initialize tables first
+   592→      await licenseService.initLicenseTables();
+   593→
+   594→      const dbResult = await testLicenseServiceDB();
+   595→      totalPassed += dbResult.passed;
+   596→      totalFailed += dbResult.failed;
+   597→    } catch (err) {
+   598→      console.log(`\n⚠ Integration tests failed: ${err.message}`);
+   599→    }
+   600→  } else {
+   601→    console.log('⚠ DATABASE_URL not set - skipping integration tests');
+   602→  }
+   603→
+   604→  // Summary
+   605→  console.log('\n╔════════════════════════════════════════════════════════════════╗');
+   606→  console.log(`║  TOTAL: ${totalPassed} passed, ${totalFailed} failed                                     ║`);
+   607→  if (totalFailed === 0) {
+   608→    console.log('║  ✓ All tests passed!                                           ║');
+   609→  } else {
+   610→    console.log('║  ✗ Some tests failed                                           ║');
+   611→  }
+   612→  console.log('╚════════════════════════════════════════════════════════════════╝');
+   613→
+   614→  process.exit(totalFailed > 0 ? 1 : 0);
+   615→}
+   616→
+   617→runAllTests().catch(console.error);
+   618→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

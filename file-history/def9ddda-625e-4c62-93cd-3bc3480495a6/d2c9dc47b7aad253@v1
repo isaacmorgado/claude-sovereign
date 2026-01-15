@@ -1,0 +1,371 @@
+/**
+ * Google OAuth 2.0 Authentication for Gemini
+ * Based on claudish implementation (PR #28)
+ *
+ * Provides browser-based OAuth login flow for Google Gemini API access
+ * Uses public gemini-cli OAuth credentials
+ */
+
+import http from 'http';
+import { randomBytes, createHash } from 'crypto';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import { existsSync, chmodSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
+// Public OAuth credentials from gemini-cli
+const CLIENT_ID = process.env.OAUTH_CLIENT_ID ||
+  '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com';
+const CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET ||
+  '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';
+
+// OAuth endpoints
+const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+
+// Required scopes
+const SCOPES = [
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/generative-language.retriever',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile'
+];
+
+// Token storage path
+const TOKEN_PATH = join(homedir(), '.claude', 'gemini-oauth.json');
+
+/**
+ * Generate PKCE code verifier and challenge
+ */
+function generatePKCE() {
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256')
+    .update(verifier)
+    .digest('base64url');
+
+  return { verifier, challenge };
+}
+
+/**
+ * Generate random state for CSRF protection
+ */
+function generateState() {
+  return randomBytes(16).toString('hex');
+}
+
+/**
+ * Build authorization URL
+ */
+function buildAuthUrl(redirectUri, codeChallenge, state) {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: CLIENT_ID,
+    redirect_uri: redirectUri,
+    scope: SCOPES.join(' '),
+    access_type: 'offline',
+    prompt: 'consent',
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state: state
+  });
+
+  return `${AUTH_URL}?${params.toString()}`;
+}
+
+/**
+ * Exchange authorization code for tokens
+ */
+async function exchangeCodeForTokens(code, codeVerifier, redirectUri) {
+  const response = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      code_verifier: codeVerifier
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token exchange failed: ${error}`);
+  }
+
+  const tokens = await response.json();
+
+  // Calculate expiry date
+  tokens.expiry_date = Date.now() + (tokens.expires_in * 1000);
+
+  return tokens;
+}
+
+/**
+ * Refresh access token using refresh token
+ */
+async function refreshAccessToken(refreshToken) {
+  const response = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token'
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token refresh failed: ${error}`);
+  }
+
+  const tokens = await response.json();
+
+  // Calculate expiry date
+  tokens.expiry_date = Date.now() + (tokens.expires_in * 1000);
+
+  return tokens;
+}
+
+/**
+ * Save tokens to disk with secure permissions
+ */
+async function saveTokens(tokens) {
+  // Ensure directory exists
+  const dir = join(homedir(), '.claude');
+  if (!existsSync(dir)) {
+    await mkdir(dir, { recursive: true });
+  }
+
+  // Write tokens
+  await writeFile(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+
+  // Set secure permissions (owner read/write only)
+  chmodSync(TOKEN_PATH, 0o600);
+}
+
+/**
+ * Load tokens from disk
+ */
+async function loadTokens() {
+  try {
+    if (!existsSync(TOKEN_PATH)) {
+      return null;
+    }
+
+    const data = await readFile(TOKEN_PATH, 'utf-8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('Error loading tokens:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Check if token needs refresh (5 minute buffer)
+ */
+function needsRefresh(expiryDate) {
+  return Date.now() > (expiryDate - 5 * 60 * 1000);
+}
+
+/**
+ * Get valid access token (refresh if needed)
+ */
+export async function getAccessToken() {
+  let tokens = await loadTokens();
+
+  if (!tokens) {
+    return null;
+  }
+
+  // Refresh if expired or close to expiring
+  if (needsRefresh(tokens.expiry_date)) {
+    console.log('🔄 Refreshing Google OAuth token...');
+    try {
+      const newTokens = await refreshAccessToken(tokens.refresh_token);
+
+      // Preserve refresh token if not returned
+      if (!newTokens.refresh_token) {
+        newTokens.refresh_token = tokens.refresh_token;
+      }
+
+      await saveTokens(newTokens);
+      tokens = newTokens;
+      console.log('✓ Token refreshed successfully');
+    } catch (error) {
+      console.error('❌ Token refresh failed:', error.message);
+      console.error('   Please run: clauded --gemini-login');
+      return null;
+    }
+  }
+
+  return tokens.access_token;
+}
+
+/**
+ * Start OAuth login flow
+ */
+export async function startOAuthLogin() {
+  return new Promise((resolve, reject) => {
+    const { verifier, challenge } = generatePKCE();
+    const state = generateState();
+    let server;
+
+    // Create callback server on random port
+    server = http.createServer(async (req, res) => {
+      if (!req.url?.startsWith('/oauth2callback')) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+
+      try {
+        const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`);
+        const code = url.searchParams.get('code');
+        const returnedState = url.searchParams.get('state');
+        const error = url.searchParams.get('error');
+
+        // Handle error from OAuth provider
+        if (error) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <head><title>Authentication Failed</title></head>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1 style="color: #dc2626;">❌ Authentication Failed</h1>
+                <p>Error: ${error}</p>
+                <p style="color: #6b7280; margin-top: 20px;">You can close this window.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(new Error(`OAuth error: ${error}`));
+          return;
+        }
+
+        // Validate state
+        if (returnedState !== state) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <head><title>Security Error</title></head>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1 style="color: #dc2626;">❌ Security Error</h1>
+                <p>Invalid state parameter. Possible CSRF attack.</p>
+                <p style="color: #6b7280; margin-top: 20px;">You can close this window.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(new Error('Invalid state parameter'));
+          return;
+        }
+
+        // Exchange code for tokens
+        const redirectUri = `http://127.0.0.1:${server.address().port}/oauth2callback`;
+        console.log('🔄 Exchanging authorization code for tokens...');
+        const tokens = await exchangeCodeForTokens(code, verifier, redirectUri);
+
+        // Save tokens
+        await saveTokens(tokens);
+        console.log('✓ Tokens saved to:', TOKEN_PATH);
+
+        // Show success page
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+          <html>
+            <head><title>Authentication Successful</title></head>
+            <body style="font-family: system-ui; padding: 40px; text-align: center;">
+              <h1 style="color: #00FF41;">✅ Authentication Successful!</h1>
+              <p>You can now close this window and return to your terminal.</p>
+              <p style="color: #6b7280; margin-top: 20px;">
+                Your Google Gemini authentication is configured.
+              </p>
+            </body>
+          </html>
+        `);
+
+        server.close();
+        resolve(tokens);
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'text/html' });
+        res.end(`
+          <html>
+            <head><title>Error</title></head>
+            <body style="font-family: system-ui; padding: 40px; text-align: center;">
+              <h1 style="color: #dc2626;">❌ Error</h1>
+              <p>${error.message}</p>
+              <p style="color: #6b7280; margin-top: 20px;">You can close this window.</p>
+            </body>
+          </html>
+        `);
+        server.close();
+        reject(error);
+      }
+    });
+
+    // Listen on random port
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
+      const authUrl = buildAuthUrl(redirectUri, challenge, state);
+
+      console.log('');
+      console.log('🔐 Google OAuth Login');
+      console.log('━'.repeat(60));
+      console.log('');
+      console.log('Opening browser for authentication...');
+      console.log('');
+      console.log('If browser does not open, visit this URL:');
+      console.log(authUrl);
+      console.log('');
+      console.log('Waiting for authentication...');
+      console.log('');
+
+      // Open browser
+      const open = async () => {
+        const { exec } = await import('child_process');
+        const command = process.platform === 'darwin' ? 'open' :
+                       process.platform === 'win32' ? 'start' : 'xdg-open';
+        exec(`${command} "${authUrl}"`);
+      };
+      open().catch(() => {
+        // Silently fail if we can't open browser
+      });
+    });
+
+    // Handle server errors
+    server.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+/**
+ * Check if OAuth is configured
+ */
+export async function isOAuthConfigured() {
+  const tokens = await loadTokens();
+  return tokens !== null;
+}
+
+/**
+ * Clear saved OAuth tokens
+ */
+export async function clearTokens() {
+  const { unlink } = await import('fs/promises');
+  try {
+    if (existsSync(TOKEN_PATH)) {
+      await unlink(TOKEN_PATH);
+      console.log('✓ OAuth tokens cleared');
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error clearing tokens:', error.message);
+    return false;
+  }
+}

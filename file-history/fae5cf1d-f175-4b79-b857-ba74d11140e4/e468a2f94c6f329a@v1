@@ -1,0 +1,360 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { TaskOutputTool, ListTasksTool } from './task-output-tool.js';
+import {
+  AgentTaskManager,
+  type AgentTask,
+  resetTaskManager,
+} from './task-manager.js';
+import { makeFakeConfig } from '../test-utils/config.js';
+import type { Config } from '../config/config.js';
+import { AgentTerminateMode } from './types.js';
+import { TASK_OUTPUT_TOOL_NAME } from '../tools/tool-names.js';
+
+// Mock the task manager
+vi.mock('./task-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./task-manager.js')>();
+  return {
+    ...actual,
+    AgentTaskManager: vi.fn().mockImplementation(() => ({
+      getOutput: vi.fn(),
+      listTasks: vi.fn(),
+    })),
+    resetTaskManager: vi.fn(),
+  };
+});
+
+const createMockTask = (overrides: Partial<AgentTask> = {}): AgentTask => ({
+  id: 'task-123',
+  agentName: 'test-agent',
+  agentDisplayName: 'Test Agent',
+  status: 'completed',
+  createdAt: new Date('2025-01-01T10:00:00Z'),
+  startedAt: new Date('2025-01-01T10:00:01Z'),
+  completedAt: new Date('2025-01-01T10:00:10Z'),
+  result: {
+    terminate_reason: AgentTerminateMode.GOAL,
+    result: 'Task completed successfully',
+  },
+  inputs: { query: 'test query' },
+  ...overrides,
+});
+
+describe('TaskOutputTool', () => {
+  let config: Config;
+  let mockTaskManager: AgentTaskManager;
+  let tool: TaskOutputTool;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    config = makeFakeConfig();
+    mockTaskManager = new AgentTaskManager(config);
+    tool = new TaskOutputTool(mockTaskManager);
+  });
+
+  describe('metadata', () => {
+    it('should have correct name and description', () => {
+      expect(tool.name).toBe(TASK_OUTPUT_TOOL_NAME);
+      expect(tool.displayName).toBe('Task Output');
+      expect(tool.description).toContain('background agent task');
+    });
+
+    it('should have correct schema', () => {
+      const schema = tool.inputSchema;
+      expect(schema).toBeDefined();
+      expect(schema.properties).toHaveProperty('task_id');
+      expect(schema.properties).toHaveProperty('block');
+      expect(schema.properties).toHaveProperty('timeout');
+    });
+  });
+
+  describe('execute', () => {
+    it('should return completed task output', async () => {
+      const mockTask = createMockTask();
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+        block: true,
+        timeout: 30000,
+      });
+
+      const result = await invocation.execute();
+
+      expect(mockTaskManager.getOutput).toHaveBeenCalledWith('task-123', {
+        block: true,
+        timeout: 30000,
+      });
+
+      expect(result.llmContent).toBeDefined();
+      const llmText =
+        typeof result.llmContent === 'string'
+          ? result.llmContent
+          : result.llmContent?.[0]?.text;
+      expect(llmText).toContain('task-123');
+      expect(llmText).toContain('completed');
+
+      expect(result.returnDisplay).toContain('## Task: task-123');
+      expect(result.returnDisplay).toContain('**Status**: completed');
+      expect(result.returnDisplay).toContain('Task completed successfully');
+    });
+
+    it('should return running task status', async () => {
+      const mockTask = createMockTask({
+        status: 'running',
+        completedAt: undefined,
+        result: undefined,
+      });
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+        block: false,
+      });
+
+      const result = await invocation.execute();
+
+      expect(result.returnDisplay).toContain('**Status**: running');
+      expect(result.returnDisplay).toContain('*Task is running...*');
+    });
+
+    it('should return error task output', async () => {
+      const mockTask = createMockTask({
+        status: 'error',
+        result: undefined,
+        error: 'Something went wrong',
+      });
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+      });
+
+      const result = await invocation.execute();
+
+      expect(result.returnDisplay).toContain('**Status**: error');
+      expect(result.returnDisplay).toContain('### Error');
+      expect(result.returnDisplay).toContain('Something went wrong');
+    });
+
+    it('should return cancelled task output', async () => {
+      const mockTask = createMockTask({
+        status: 'cancelled',
+        result: undefined,
+        error: 'Task was cancelled',
+      });
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+      });
+
+      const result = await invocation.execute();
+
+      expect(result.returnDisplay).toContain('**Status**: cancelled');
+      expect(result.returnDisplay).toContain('*Task was cancelled.*');
+    });
+
+    it('should handle task not found error', async () => {
+      vi.mocked(mockTaskManager.getOutput).mockRejectedValue(
+        new Error("Task 'unknown' not found"),
+      );
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'unknown',
+      });
+
+      const result = await invocation.execute();
+
+      expect(result.error).toBeDefined();
+      expect(result.error?.message).toContain('not found');
+      expect(result.returnDisplay).toContain('**Error**');
+    });
+
+    it('should include duration for completed tasks', async () => {
+      const mockTask = createMockTask({
+        startedAt: new Date('2025-01-01T10:00:00Z'),
+        completedAt: new Date('2025-01-01T10:00:15Z'), // 15 seconds later
+      });
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+      });
+
+      const result = await invocation.execute();
+
+      expect(result.returnDisplay).toContain('**Duration**: 15.0s');
+    });
+
+    it('should use default values for block and timeout', async () => {
+      const mockTask = createMockTask();
+      vi.mocked(mockTaskManager.getOutput).mockResolvedValue(mockTask);
+
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-123',
+      });
+
+      await invocation.execute();
+
+      expect(mockTaskManager.getOutput).toHaveBeenCalledWith('task-123', {
+        block: true,
+        timeout: 30000,
+      });
+    });
+  });
+
+  describe('invocation description', () => {
+    it('should provide a meaningful description', () => {
+      const invocation = tool.createInvocationForTest({
+        task_id: 'task-456',
+      });
+
+      expect(invocation.getDescription()).toBe(
+        "Getting output for task 'task-456'",
+      );
+    });
+  });
+});
+
+describe('ListTasksTool', () => {
+  let config: Config;
+  let mockTaskManager: AgentTaskManager;
+  let tool: ListTasksTool;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    config = makeFakeConfig();
+    mockTaskManager = new AgentTaskManager(config);
+    tool = new ListTasksTool(mockTaskManager);
+  });
+
+  describe('metadata', () => {
+    it('should have correct name and description', () => {
+      expect(tool.name).toBe('list_tasks');
+      expect(tool.displayName).toBe('List Tasks');
+      expect(tool.description).toContain('background agent tasks');
+    });
+
+    it('should have empty schema (no parameters)', () => {
+      const schema = tool.inputSchema;
+      expect(schema.type).toBe('object');
+      expect(schema.properties).toEqual({});
+    });
+  });
+
+  describe('execute', () => {
+    it('should list all tasks', async () => {
+      const mockTasks = [
+        createMockTask({ id: 'task-1', agentName: 'agent-1', status: 'completed' }),
+        createMockTask({ id: 'task-2', agentName: 'agent-2', status: 'running' }),
+        createMockTask({ id: 'task-3', agentName: 'agent-3', status: 'error' }),
+      ];
+      vi.mocked(mockTaskManager.listTasks).mockReturnValue(mockTasks);
+
+      const invocation = tool.createInvocationForTest({});
+
+      const result = await invocation.execute();
+
+      expect(mockTaskManager.listTasks).toHaveBeenCalled();
+
+      // Check display output
+      expect(result.returnDisplay).toContain('## Background Tasks');
+      expect(result.returnDisplay).toContain('task-1');
+      expect(result.returnDisplay).toContain('agent-1');
+      expect(result.returnDisplay).toContain('COMPLETED');
+      expect(result.returnDisplay).toContain('RUNNING');
+      expect(result.returnDisplay).toContain('ERROR');
+
+      // Check LLM output (JSON)
+      const llmText =
+        typeof result.llmContent === 'string'
+          ? result.llmContent
+          : result.llmContent?.[0]?.text;
+      const parsed = JSON.parse(llmText || '[]');
+      expect(parsed).toHaveLength(3);
+      expect(parsed[0].id).toBe('task-1');
+      expect(parsed[1].status).toBe('running');
+    });
+
+    it('should handle empty task list', async () => {
+      vi.mocked(mockTaskManager.listTasks).mockReturnValue([]);
+
+      const invocation = tool.createInvocationForTest({});
+
+      const result = await invocation.execute();
+
+      expect(result.llmContent).toBe('No background tasks found.');
+      expect(result.returnDisplay).toContain('*No background tasks.*');
+    });
+
+    it('should show truncated task IDs in display', async () => {
+      const mockTasks = [
+        createMockTask({
+          id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+          agentName: 'test-agent',
+        }),
+      ];
+      vi.mocked(mockTaskManager.listTasks).mockReturnValue(mockTasks);
+
+      const invocation = tool.createInvocationForTest({});
+
+      const result = await invocation.execute();
+
+      // Should show first 8 characters + "..."
+      expect(result.returnDisplay).toContain('a1b2c3d4...');
+    });
+
+    it('should use display name when available', async () => {
+      const mockTasks = [
+        createMockTask({
+          agentName: 'internal-name',
+          agentDisplayName: 'Friendly Display Name',
+        }),
+      ];
+      vi.mocked(mockTaskManager.listTasks).mockReturnValue(mockTasks);
+
+      const invocation = tool.createInvocationForTest({});
+
+      const result = await invocation.execute();
+
+      expect(result.returnDisplay).toContain('Friendly Display Name');
+    });
+  });
+
+  describe('invocation description', () => {
+    it('should provide a meaningful description', () => {
+      const invocation = tool.createInvocationForTest({});
+
+      expect(invocation.getDescription()).toBe('Listing all background tasks');
+    });
+  });
+});
+
+// Helper method extension for testing
+declare module './task-output-tool.js' {
+  interface TaskOutputTool {
+    createInvocationForTest(
+      params: { task_id: string; block?: boolean; timeout?: number },
+    ): ReturnType<TaskOutputTool['createInvocation']>;
+  }
+  interface ListTasksTool {
+    createInvocationForTest(
+      params: object,
+    ): ReturnType<ListTasksTool['createInvocation']>;
+  }
+}
+
+// Add test helper methods to the classes
+TaskOutputTool.prototype.createInvocationForTest = function (params) {
+  return this['createInvocation'](params);
+};
+
+ListTasksTool.prototype.createInvocationForTest = function (params) {
+  return this['createInvocation'](params);
+};

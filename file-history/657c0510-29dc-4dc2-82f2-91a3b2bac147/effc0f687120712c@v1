@@ -1,0 +1,586 @@
+#!/usr/bin/env node
+/**
+ * Multi-Model Delegation MCP Server
+ * Allows Claude to delegate tasks to other AI models (Gemini, GLM, Featherless)
+ *
+ * This MCP server exposes AI models as callable tools, enabling:
+ * - Model delegation (Claude can ask other models for help)
+ * - Multi-modal capabilities (vision, extended thinking)
+ * - Cost optimization (route simple tasks to cheaper models)
+ *
+ * Based on research from:
+ * - BeehiveInnovations/pal-mcp-server (orchestration pattern)
+ * - philschmid/gemini-mcp-server (vision capabilities)
+ * - yiwenlu66/mu-mcp (intelligent model selection)
+ */
+
+const http = require('http');
+const https = require('https');
+
+// Configuration
+const PROXY_URL = process.env.PROXY_URL || 'http://127.0.0.1:3000';
+
+// Model capabilities and cost profiles
+const MODELS = {
+  // Featherless - Unrestricted, Fast
+  'dolphin-3': {
+    id: 'featherless/dphn/Dolphin-Mistral-24B-Venice-Edition',
+    name: 'Dolphin-3 Venice',
+    capabilities: ['coding', 'security', 'reverse-engineering', 'unrestricted'],
+    cost: 'low',
+    speed: 'fast',
+    quality: 'high',
+    vision: false
+  },
+  'qwen-72b': {
+    id: 'featherless/huihui-ai/Qwen2.5-72B-Instruct-abliterated',
+    name: 'Qwen 2.5 72B',
+    capabilities: ['reasoning', 'coding', 'writing', 'unrestricted'],
+    cost: 'medium',
+    speed: 'medium',
+    quality: 'exceptional',
+    vision: false
+  },
+  'whiterabbit': {
+    id: 'featherless/WhiteRabbitNeo/Llama-3-WhiteRabbitNeo-8B-v2.0',
+    name: 'WhiteRabbitNeo 8B',
+    capabilities: ['coding', 'creative', 'unrestricted'],
+    cost: 'very-low',
+    speed: 'very-fast',
+    quality: 'good',
+    vision: false
+  },
+  'llama-fast': {
+    id: 'featherless/mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated',
+    name: 'Llama 3.1 8B',
+    capabilities: ['general', 'fast-response', 'unrestricted'],
+    cost: 'very-low',
+    speed: 'very-fast',
+    quality: 'good',
+    vision: false
+  },
+  'llama-70b': {
+    id: 'featherless/huihui-ai/Llama-3.3-70B-Instruct-abliterated',
+    name: 'Llama 3.3 70B',
+    capabilities: ['reasoning', 'coding', 'writing', 'unrestricted'],
+    cost: 'medium',
+    speed: 'medium',
+    quality: 'exceptional',
+    vision: false
+  },
+  'kimi-k2': {
+    id: 'featherless/moonshotai/Kimi-K2-Instruct',
+    name: 'Kimi K2',
+    capabilities: ['agentic', 'coding', 'autonomous', 'reasoning', 'unrestricted'],
+    cost: 'medium',
+    speed: 'fast',
+    quality: 'exceptional',
+    vision: false
+  },
+
+  // GLM - Chinese models, good for multilingual
+  'glm-4.7': {
+    id: 'glm/glm-4.7',
+    name: 'GLM-4.7',
+    capabilities: ['reasoning', 'coding', 'chinese', 'multilingual'],
+    cost: 'low',
+    speed: 'fast',
+    quality: 'high',
+    vision: false
+  }
+};
+
+// Simple MCP Server implementation
+class SimpleMCPServer {
+  constructor() {
+    this.handlers = new Map();
+    this.buffer = '';
+  }
+
+  setRequestHandler(method, handler) {
+    this.handlers.set(method, handler);
+  }
+
+  async handleMessage(message) {
+    try {
+      const request = JSON.parse(message);
+      const handler = this.handlers.get(request.method);
+
+      if (!handler) {
+        return this.createError(request.id, -32601, `Method not found: ${request.method}`);
+      }
+
+      const result = await handler(request);
+      return this.createResponse(request.id, result);
+    } catch (error) {
+      console.error('Error handling message:', error);
+      return this.createError(null, -32603, error.message);
+    }
+  }
+
+  createResponse(id, result) {
+    return JSON.stringify({
+      jsonrpc: '2.0',
+      id,
+      result
+    });
+  }
+
+  createError(id, code, message) {
+    return JSON.stringify({
+      jsonrpc: '2.0',
+      id,
+      error: { code, message }
+    });
+  }
+
+  start() {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', async (chunk) => {
+      this.buffer += chunk;
+      const lines = this.buffer.split('\n');
+      this.buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.trim()) {
+          const response = await this.handleMessage(line);
+          process.stdout.write(response + '\n');
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Call a model via the proxy server
+ */
+async function callModel(modelId, prompt, systemPrompt = null, imageData = null) {
+  return new Promise((resolve, reject) => {
+    const messages = [];
+
+    // Add system message if provided
+    if (systemPrompt) {
+      messages.push({ role: 'system', content: systemPrompt });
+    }
+
+    // Add user message
+    const userMessage = { role: 'user', content: [] };
+
+    // Add text
+    if (typeof prompt === 'string') {
+      userMessage.content.push({ type: 'text', text: prompt });
+    }
+
+    // Add image if provided (base64 or URL)
+    if (imageData) {
+      if (imageData.startsWith('http')) {
+        userMessage.content.push({
+          type: 'image',
+          source: { type: 'url', url: imageData }
+        });
+      } else {
+        // Assume base64
+        userMessage.content.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: imageData
+          }
+        });
+      }
+    }
+
+    // Flatten content if only text
+    if (userMessage.content.length === 1 && userMessage.content[0].type === 'text') {
+      userMessage.content = userMessage.content[0].text;
+    }
+
+    messages.push(userMessage);
+
+    const requestBody = JSON.stringify({
+      model: modelId,
+      messages: messages,
+      max_tokens: 2048,
+      stream: false
+    });
+
+    const url = new URL('/v1/messages', PROXY_URL);
+    const options = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(requestBody),
+        'anthropic-version': '2023-06-01'
+      },
+      timeout: 60000
+    };
+
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          if (response.error) {
+            reject(new Error(response.error.message || JSON.stringify(response.error)));
+          } else {
+            const text = response.content?.find(b => b.type === 'text')?.text || '';
+            resolve({
+              model: modelId,
+              response: text,
+              usage: response.usage
+            });
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+/**
+ * Select best model for task based on requirements
+ */
+function selectModel(params) {
+  const {
+    task_type = 'general',
+    priority = 'balanced', // 'speed', 'quality', 'cost', 'balanced'
+    requires_unrestricted = false,
+    requires_chinese = false,
+    requires_vision = false
+  } = params;
+
+  // Filter models by requirements
+  let candidates = Object.entries(MODELS);
+
+  if (requires_unrestricted) {
+    candidates = candidates.filter(([_, m]) =>
+      m.capabilities.includes('unrestricted')
+    );
+  }
+
+  if (requires_chinese) {
+    candidates = candidates.filter(([_, m]) =>
+      m.capabilities.includes('chinese') || m.capabilities.includes('multilingual')
+    );
+  }
+
+  if (requires_vision) {
+    candidates = candidates.filter(([_, m]) => m.vision);
+  }
+
+  if (candidates.length === 0) {
+    // No models match requirements, return best general model
+    return 'qwen-72b';
+  }
+
+  // Score candidates based on priority
+  const scored = candidates.map(([key, model]) => {
+    let score = 0;
+
+    // Task type matching
+    if (model.capabilities.includes(task_type)) {
+      score += 10;
+    }
+
+    // Priority scoring
+    if (priority === 'speed') {
+      const speedScores = { 'very-fast': 10, 'fast': 7, 'medium': 4, 'slow': 0 };
+      score += speedScores[model.speed] || 0;
+    } else if (priority === 'quality') {
+      const qualityScores = { 'exceptional': 10, 'high': 7, 'good': 4, 'basic': 0 };
+      score += qualityScores[model.quality] || 0;
+    } else if (priority === 'cost') {
+      const costScores = { 'very-low': 10, 'low': 7, 'medium': 4, 'high': 0 };
+      score += costScores[model.cost] || 0;
+    } else {
+      // Balanced - average of all factors
+      const speedScores = { 'very-fast': 10, 'fast': 7, 'medium': 4, 'slow': 0 };
+      const qualityScores = { 'exceptional': 10, 'high': 7, 'good': 4, 'basic': 0 };
+      const costScores = { 'very-low': 10, 'low': 7, 'medium': 4, 'high': 0 };
+      score += (speedScores[model.speed] + qualityScores[model.quality] + costScores[model.cost]) / 3;
+    }
+
+    return { key, score };
+  });
+
+  // Sort by score and return top model
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].key;
+}
+
+// Initialize MCP server
+const server = new SimpleMCPServer();
+
+// Handle initialize
+server.setRequestHandler('initialize', async (request) => {
+  return {
+    protocolVersion: '2024-11-05',
+    capabilities: {
+      tools: {}
+    },
+    serverInfo: {
+      name: 'multi-model-mcp-server',
+      version: '1.0.0'
+    }
+  };
+});
+
+// Handle tools/list
+server.setRequestHandler('tools/list', async (request) => {
+  return {
+    tools: [
+      {
+        name: 'ask_model',
+        description: 'Ask another AI model for help with a task. Useful when you want a second opinion, need unrestricted responses, or want to delegate to a specialized model.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model: {
+              type: 'string',
+              description: 'Model to use. Options: dolphin-3 (security/RE), qwen-72b (reasoning), whiterabbit (creative coding), llama-fast (quick tasks), llama-70b (quality), glm-4.7 (multilingual)',
+              enum: Object.keys(MODELS)
+            },
+            prompt: {
+              type: 'string',
+              description: 'The question or task to ask the model'
+            },
+            system_prompt: {
+              type: 'string',
+              description: 'Optional system prompt to set context/behavior'
+            },
+            image_url: {
+              type: 'string',
+              description: 'Optional image URL for vision-capable models'
+            }
+          },
+          required: ['model', 'prompt']
+        }
+      },
+      {
+        name: 'auto_select_model',
+        description: 'Automatically select the best model for a task based on requirements. The system will choose the optimal model considering speed, quality, cost, and capabilities.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'The question or task'
+            },
+            task_type: {
+              type: 'string',
+              description: 'Type of task',
+              enum: ['general', 'coding', 'security', 'reasoning', 'creative', 'writing', 'chinese', 'reverse-engineering']
+            },
+            priority: {
+              type: 'string',
+              description: 'What to optimize for',
+              enum: ['speed', 'quality', 'cost', 'balanced'],
+              default: 'balanced'
+            },
+            requires_unrestricted: {
+              type: 'boolean',
+              description: 'Whether task requires unrestricted/uncensored responses',
+              default: false
+            },
+            requires_chinese: {
+              type: 'boolean',
+              description: 'Whether task requires Chinese language support',
+              default: false
+            },
+            system_prompt: {
+              type: 'string',
+              description: 'Optional system prompt'
+            }
+          },
+          required: ['prompt']
+        }
+      },
+      {
+        name: 'compare_models',
+        description: 'Get multiple perspectives by asking the same question to different models and comparing their responses.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'The question to ask all models'
+            },
+            models: {
+              type: 'array',
+              description: 'List of models to compare (2-4 models recommended)',
+              items: {
+                type: 'string',
+                enum: Object.keys(MODELS)
+              }
+            },
+            system_prompt: {
+              type: 'string',
+              description: 'Optional system prompt applied to all models'
+            }
+          },
+          required: ['prompt', 'models']
+        }
+      },
+      {
+        name: 'list_models',
+        description: 'List all available models with their capabilities and characteristics.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          required: []
+        }
+      }
+    ]
+  };
+});
+
+// Handle tools/call
+server.setRequestHandler('tools/call', async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    if (name === 'ask_model') {
+      const { model, prompt, system_prompt, image_url } = args;
+
+      if (!MODELS[model]) {
+        throw new Error(`Unknown model: ${model}. Available: ${Object.keys(MODELS).join(', ')}`);
+      }
+
+      const modelInfo = MODELS[model];
+      const result = await callModel(modelInfo.id, prompt, system_prompt, image_url);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `**Model:** ${modelInfo.name}\n**Response:**\n\n${result.response}\n\n**Usage:** ${result.usage?.input_tokens || 0} input tokens, ${result.usage?.output_tokens || 0} output tokens`
+          }
+        ]
+      };
+    }
+
+    if (name === 'auto_select_model') {
+      const { prompt, task_type, priority, requires_unrestricted, requires_chinese, system_prompt } = args;
+
+      const selectedModel = selectModel({
+        task_type,
+        priority,
+        requires_unrestricted,
+        requires_chinese
+      });
+
+      const modelInfo = MODELS[selectedModel];
+      const result = await callModel(modelInfo.id, prompt, system_prompt);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `**Auto-Selected Model:** ${modelInfo.name} (${selectedModel})\n**Reason:** ${priority} priority for ${task_type} task\n**Capabilities:** ${modelInfo.capabilities.join(', ')}\n\n**Response:**\n\n${result.response}\n\n**Usage:** ${result.usage?.input_tokens || 0} input tokens, ${result.usage?.output_tokens || 0} output tokens`
+          }
+        ]
+      };
+    }
+
+    if (name === 'compare_models') {
+      const { prompt, models, system_prompt } = args;
+
+      if (models.length < 2) {
+        throw new Error('Need at least 2 models to compare');
+      }
+
+      if (models.length > 4) {
+        throw new Error('Maximum 4 models for comparison');
+      }
+
+      const results = await Promise.all(
+        models.map(async (model) => {
+          const modelInfo = MODELS[model];
+          const result = await callModel(modelInfo.id, prompt, system_prompt);
+          return {
+            model: modelInfo.name,
+            key: model,
+            response: result.response,
+            usage: result.usage
+          };
+        })
+      );
+
+      let comparison = '# Model Comparison\n\n';
+      comparison += `**Question:** ${prompt}\n\n`;
+      comparison += `---\n\n`;
+
+      results.forEach((r, i) => {
+        comparison += `## ${i + 1}. ${r.model}\n\n`;
+        comparison += `${r.response}\n\n`;
+        comparison += `*Tokens: ${r.usage?.input_tokens || 0} in, ${r.usage?.output_tokens || 0} out*\n\n`;
+        comparison += `---\n\n`;
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: comparison
+          }
+        ]
+      };
+    }
+
+    if (name === 'list_models') {
+      let list = '# Available Models\n\n';
+
+      Object.entries(MODELS).forEach(([key, model]) => {
+        list += `## ${model.name} (\`${key}\`)\n`;
+        list += `- **Capabilities:** ${model.capabilities.join(', ')}\n`;
+        list += `- **Speed:** ${model.speed}\n`;
+        list += `- **Quality:** ${model.quality}\n`;
+        list += `- **Cost:** ${model.cost}\n`;
+        list += `- **Vision:** ${model.vision ? 'Yes' : 'No'}\n`;
+        list += `\n`;
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: list
+          }
+        ]
+      };
+    }
+
+    throw new Error(`Unknown tool: ${name}`);
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error.message}`
+        }
+      ],
+      isError: true
+    };
+  }
+});
+
+// Start server
+console.error('Multi-Model MCP Server starting...');
+console.error(`Proxy URL: ${PROXY_URL}`);
+console.error(`Available models: ${Object.keys(MODELS).length}`);
+server.start();
+console.error('Server ready!');

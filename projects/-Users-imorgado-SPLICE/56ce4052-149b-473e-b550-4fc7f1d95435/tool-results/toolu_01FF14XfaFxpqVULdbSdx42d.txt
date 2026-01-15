@@ -1,0 +1,278 @@
+     1→/**
+     2→ * Multitrack Routes
+     3→ *
+     4→ * Multitrack/Multicam analysis endpoints
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const fs = require('fs');
+     9→const { isFFprobeInstalled } = require('../services/ffprobeSilence');
+    10→const {
+    11→  analyzeMultitrack,
+    12→  autoBalanceMultitrack,
+    13→  advancedBalanceMultitrack
+    14→} = require('../services/multitrackAnalysis');
+    15→
+    16→/**
+    17→ * Create multitrack routes
+    18→ * @param {Object} options - Route configuration options
+    19→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    20→ * @returns {express.Router}
+    21→ */
+    22→function createMultitrackRoutes(options = {}) {
+    23→  const router = express.Router();
+    24→  const { requireCredits } = options.middleware || {};
+    25→
+    26→  /**
+    27→   * POST / - Analyze multiple audio tracks for multicam editing
+    28→   *
+    29→   * Analyzes audio levels across multiple tracks to determine optimal
+    30→   * video angle selection based on who is speaking.
+    31→   *
+    32→   * Options:
+    33→   * - audioPaths: Array of paths to audio files (one per speaker) - required
+    34→   * - speakerNames: Array of speaker names (optional)
+    35→   * - videoTrackMapping: Object mapping speaker index to video track { 0: 0, 1: 1 }
+    36→   * - minShotDuration: Minimum seconds before next cut (default: 2.0)
+    37→   * - switchingFrequency: How often to allow cuts 0-100 (default: 50)
+    38→   * - wideShotEnabled: Enable wide shot detection (default: true)
+    39→   * - wideShotPercentage: Target % of wide shots (default: 20)
+    40→   * - wideShotTracks: Video track indices for wide shots
+    41→   * - cutawayEnabled: Enable cutaway insertion (default: false)
+    42→   * - cutawayTracks: Video track indices for cutaways
+    43→   * - speakerBoosts: Per-speaker dB adjustments { "Speaker 1": 5 }
+    44→   */
+    45→  router.post('/', requireCredits({ endpoint: 'multitrack' }), async (req, res) => {
+    46→    const {
+    47→      audioPaths,
+    48→      speakerNames,
+    49→      videoTrackMapping = {},
+    50→      minShotDuration = 2.0,
+    51→      switchingFrequency = 50,
+    52→      wideShotEnabled = true,
+    53→      wideShotPercentage = 20,
+    54→      wideShotTracks = [],
+    55→      cutawayEnabled = false,
+    56→      cutawayTracks = [],
+    57→      speakerBoosts = {},
+    58→      frameRate = 30
+    59→    } = req.body;
+    60→
+    61→    // Validate audioPaths
+    62→    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length === 0) {
+    63→      return res.status(400).json({ error: 'audioPaths array is required (at least 1 path)' });
+    64→    }
+    65→
+    66→    // Validate all files exist
+    67→    for (const audioPath of audioPaths) {
+    68→      if (!fs.existsSync(audioPath)) {
+    69→        return res.status(404).json({ error: `File not found: ${audioPath}` });
+    70→      }
+    71→    }
+    72→
+    73→    // Check FFprobe availability
+    74→    const ffprobeAvailable = await isFFprobeInstalled();
+    75→    if (!ffprobeAvailable) {
+    76→      return res.status(500).json({
+    77→        error: 'FFprobe not installed. Run: brew install ffmpeg'
+    78→      });
+    79→    }
+    80→
+    81→    console.log(`[SPLICE] Multitrack analysis: ${audioPaths.length} track(s)`);
+    82→
+    83→    try {
+    84→      const result = await analyzeMultitrack(audioPaths, {
+    85→        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+    86→        videoTrackMapping,
+    87→        minShotDuration,
+    88→        switchingFrequency,
+    89→        wideShotEnabled,
+    90→        wideShotPercentage,
+    91→        wideShotTracks,
+    92→        cutawayEnabled,
+    93→        cutawayTracks,
+    94→        speakerBoosts,
+    95→        frameRate
+    96→      });
+    97→
+    98→      // Deduct usage based on total duration (use longest track)
+    99→      const audioDuration = result.metadata?.totalDuration || 0;
+   100→      let balance = null;
+   101→      if (audioDuration > 0 && req.deductUsage) {
+   102→        balance = await req.deductUsage(audioDuration);
+   103→      }
+   104→
+   105→      res.json({
+   106→        success: true,
+   107→        ...result,
+   108→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   109→      });
+   110→    } catch (err) {
+   111→      console.error('[SPLICE] Multitrack analysis error:', err);
+   112→      res.status(500).json({ error: err.message });
+   113→    }
+   114→  });
+   115→
+   116→  /**
+   117→   * POST /auto-balance - Auto-balance speaker screentime
+   118→   *
+   119→   * Automatically adjusts speaker boosts to achieve equal screentime distribution.
+   120→   * Runs multiple iterations to find optimal parameters.
+   121→   */
+   122→  router.post('/auto-balance', requireCredits({ endpoint: 'multitrack-auto-balance' }), async (req, res) => {
+   123→    const {
+   124→      audioPaths,
+   125→      speakerNames,
+   126→      videoTrackMapping = {},
+   127→      minShotDuration = 2.0,
+   128→      switchingFrequency = 50,
+   129→      wideShotEnabled = false, // Disable wide shots for balance calc
+   130→      frameRate = 30
+   131→    } = req.body;
+   132→
+   133→    // Validate audioPaths
+   134→    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length < 2) {
+   135→      return res.status(400).json({ error: 'audioPaths array requires at least 2 tracks for balancing' });
+   136→    }
+   137→
+   138→    // Validate all files exist
+   139→    for (const audioPath of audioPaths) {
+   140→      if (!fs.existsSync(audioPath)) {
+   141→        return res.status(404).json({ error: `File not found: ${audioPath}` });
+   142→      }
+   143→    }
+   144→
+   145→    // Check FFprobe availability
+   146→    const ffprobeAvailable = await isFFprobeInstalled();
+   147→    if (!ffprobeAvailable) {
+   148→      return res.status(500).json({
+   149→        error: 'FFprobe not installed. Run: brew install ffmpeg'
+   150→      });
+   151→    }
+   152→
+   153→    console.log(`[SPLICE] Auto-balancing multitrack: ${audioPaths.length} track(s)`);
+   154→
+   155→    try {
+   156→      const result = await autoBalanceMultitrack(audioPaths, {
+   157→        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+   158→        videoTrackMapping,
+   159→        minShotDuration,
+   160→        switchingFrequency,
+   161→        wideShotEnabled,
+   162→        frameRate
+   163→      });
+   164→
+   165→      // Deduct usage based on total duration
+   166→      const audioDuration = result.metadata?.totalDuration || 0;
+   167→      let balance = null;
+   168→      if (audioDuration > 0 && req.deductUsage) {
+   169→        balance = await req.deductUsage(audioDuration);
+   170→      }
+   171→
+   172→      res.json({
+   173→        success: true,
+   174→        ...result,
+   175→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   176→      });
+   177→    } catch (err) {
+   178→      console.error('[SPLICE] Auto-balance error:', err);
+   179→      res.status(500).json({ error: err.message });
+   180→    }
+   181→  });
+   182→
+   183→  /**
+   184→   * POST /advanced-balance - Advanced GA-optimized balancing
+   185→   *
+   186→   * Uses genetic algorithm optimization with constraints:
+   187→   * - maxConsecutiveSeconds: Prevent single speaker dominating too long
+   188→   * - momentumFactor: Reduce rapid switching between speakers
+   189→   * - targetDistribution: Custom target percentages per speaker
+   190→   */
+   191→  router.post('/advanced-balance', requireCredits({ endpoint: 'multitrack-advanced' }), async (req, res) => {
+   192→    const {
+   193→      audioPaths,
+   194→      speakerNames,
+   195→      videoTrackMapping = {},
+   196→      minShotDuration = 2.0,
+   197→      switchingFrequency = 50,
+   198→      frameRate = 30,
+   199→      // Advanced options
+   200→      maxConsecutiveSeconds = 30,
+   201→      momentumFactor = 0.7,
+   202→      populationSize = 20,
+   203→      generations = 10,
+   204→      targetDistribution = null
+   205→    } = req.body;
+   206→
+   207→    // Validate audioPaths
+   208→    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length < 2) {
+   209→      return res.status(400).json({ error: 'audioPaths array requires at least 2 tracks for balancing' });
+   210→    }
+   211→
+   212→    // Validate all files exist
+   213→    for (const audioPath of audioPaths) {
+   214→      if (!fs.existsSync(audioPath)) {
+   215→        return res.status(404).json({ error: `File not found: ${audioPath}` });
+   216→      }
+   217→    }
+   218→
+   219→    // Validate constraints
+   220→    if (maxConsecutiveSeconds < 5 || maxConsecutiveSeconds > 120) {
+   221→      return res.status(400).json({ error: 'maxConsecutiveSeconds must be between 5 and 120' });
+   222→    }
+   223→    if (momentumFactor < 0 || momentumFactor > 1) {
+   224→      return res.status(400).json({ error: 'momentumFactor must be between 0 and 1' });
+   225→    }
+   226→
+   227→    // Check FFprobe availability
+   228→    const ffprobeAvailable = await isFFprobeInstalled();
+   229→    if (!ffprobeAvailable) {
+   230→      return res.status(500).json({
+   231→        error: 'FFprobe not installed. Run: brew install ffmpeg'
+   232→      });
+   233→    }
+   234→
+   235→    console.log(`[SPLICE] Advanced balancing multitrack: ${audioPaths.length} track(s)`);
+   236→    console.log(`  - Max consecutive: ${maxConsecutiveSeconds}s, Momentum: ${momentumFactor}`);
+   237→
+   238→    try {
+   239→      const result = await advancedBalanceMultitrack(audioPaths, {
+   240→        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+   241→        videoTrackMapping,
+   242→        minShotDuration,
+   243→        switchingFrequency,
+   244→        frameRate,
+   245→        maxConsecutiveSeconds,
+   246→        momentumFactor,
+   247→        populationSize,
+   248→        generations,
+   249→        targetDistribution
+   250→      });
+   251→
+   252→      // Deduct usage based on total duration
+   253→      const audioDuration = result.metadata?.totalDuration || 0;
+   254→      let balance = null;
+   255→      if (audioDuration > 0 && req.deductUsage) {
+   256→        balance = await req.deductUsage(audioDuration);
+   257→      }
+   258→
+   259→      res.json({
+   260→        success: true,
+   261→        ...result,
+   262→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   263→      });
+   264→    } catch (err) {
+   265→      console.error('[SPLICE] Advanced balance error:', err);
+   266→      res.status(500).json({ error: err.message });
+   267→    }
+   268→  });
+   269→
+   270→  return router;
+   271→}
+   272→
+   273→module.exports = createMultitrackRoutes;
+   274→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

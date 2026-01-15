@@ -1,0 +1,326 @@
+     1→"""
+     2→Users router - User forum profiles and activity
+     3→
+     4→Endpoints:
+     5→- GET /users/{user_id}/profile - Get user forum profile
+     6→- GET /users/{user_id}/posts - Get user's posts (paginated)
+     7→- GET /users/{user_id}/comments - Get user's comments (paginated)
+     8→"""
+     9→
+    10→from fastapi import APIRouter, Depends, HTTPException, Query
+    11→from sqlalchemy.ext.asyncio import AsyncSession
+    12→from sqlalchemy import select, func
+    13→from sqlalchemy.orm import selectinload
+    14→from uuid import UUID
+    15→from typing import Optional, List
+    16→
+    17→from app.database import get_db
+    18→from app.models.user import User
+    19→from app.models.forum import (
+    20→    ForumPost, ForumComment, ForumVote, ForumSubForum,
+    21→    ForumIssueCategory, VoteType, TargetType
+    22→)
+    23→from app.services.auth import get_current_user_optional
+    24→from app.schemas.user import (
+    25→    ForumUserProfileResponse, UserPostListResponse, UserCommentListResponse,
+    26→    UserPostItem, UserCommentItem, UserSearchResult, UserSearchResponse
+    27→)
+    28→
+    29→router = APIRouter(prefix="/users", tags=["users"])
+    30→
+    31→PAGE_SIZE = 20
+    32→
+    33→
+    34→# === USER SEARCH (for @mention autocomplete) ===
+    35→
+    36→@router.get("/search", response_model=UserSearchResponse)
+    37→async def search_users(
+    38→    q: str = Query(..., min_length=1, max_length=30, description="Username prefix to search"),
+    39→    limit: int = Query(10, ge=1, le=20, description="Maximum number of results"),
+    40→    db: AsyncSession = Depends(get_db),
+    41→):
+    42→    """Search for users by username prefix for @mention autocomplete.
+    43→
+    44→    Returns users whose username starts with the search query.
+    45→    Results are limited and sorted by username.
+    46→    """
+    47→    # Case-insensitive prefix search
+    48→    search_pattern = f"{q.lower()}%"
+    49→
+    50→    # Query users with prefix match
+    51→    query = (
+    52→        select(User)
+    53→        .where(
+    54→            func.lower(User.username).like(search_pattern),
+    55→            User.is_banned == False
+    56→        )
+    57→        .order_by(User.username)
+    58→        .limit(limit)
+    59→    )
+    60→
+    61→    result = await db.execute(query)
+    62→    users = result.scalars().all()
+    63→
+    64→    # Get total count (for info, limited to 100 to avoid expensive count)
+    65→    count_query = (
+    66→        select(func.count(User.id))
+    67→        .where(
+    68→            func.lower(User.username).like(search_pattern),
+    69→            User.is_banned == False
+    70→        )
+    71→    )
+    72→    count_result = await db.execute(count_query)
+    73→    total_count = min(count_result.scalar() or 0, 100)
+    74→
+    75→    return UserSearchResponse(
+    76→        users=[UserSearchResult(id=u.id, username=u.username) for u in users],
+    77→        total_count=total_count
+    78→    )
+    79→
+    80→
+    81→@router.get("/{user_id}/profile", response_model=ForumUserProfileResponse)
+    82→async def get_user_profile(
+    83→    user_id: UUID,
+    84→    db: AsyncSession = Depends(get_db),
+    85→):
+    86→    """Get a user's forum profile with activity stats.
+    87→
+    88→    Returns username, karma, post/comment counts, and member since date.
+    89→    """
+    90→    # Get user
+    91→    user_result = await db.execute(
+    92→        select(User).where(User.id == user_id, User.is_banned == False)
+    93→    )
+    94→    user = user_result.scalar_one_or_none()
+    95→
+    96→    if not user:
+    97→        raise HTTPException(status_code=404, detail="User not found")
+    98→
+    99→    # Calculate karma and counts from actual data (more accurate than cached)
+   100→    # This also serves as a fallback if cached fields aren't populated
+   101→
+   102→    # Count posts
+   103→    posts_count_result = await db.execute(
+   104→        select(func.count(ForumPost.id))
+   105→        .where(ForumPost.author_id == user_id, ForumPost.is_deleted == False)
+   106→    )
+   107→    posts_count = posts_count_result.scalar() or 0
+   108→
+   109→    # Count comments
+   110→    comments_count_result = await db.execute(
+   111→        select(func.count(ForumComment.id))
+   112→        .where(ForumComment.author_id == user_id, ForumComment.is_deleted == False)
+   113→    )
+   114→    comments_count = comments_count_result.scalar() or 0
+   115→
+   116→    # Calculate total karma (sum of vote_count on all posts + comments)
+   117→    posts_karma_result = await db.execute(
+   118→        select(func.coalesce(func.sum(ForumPost.vote_count), 0))
+   119→        .where(ForumPost.author_id == user_id, ForumPost.is_deleted == False)
+   120→    )
+   121→    posts_karma = posts_karma_result.scalar() or 0
+   122→
+   123→    comments_karma_result = await db.execute(
+   124→        select(func.coalesce(func.sum(ForumComment.vote_count), 0))
+   125→        .where(ForumComment.author_id == user_id, ForumComment.is_deleted == False)
+   126→    )
+   127→    comments_karma = comments_karma_result.scalar() or 0
+   128→
+   129→    total_karma = posts_karma + comments_karma
+   130→
+   131→    return ForumUserProfileResponse(
+   132→        id=user.id,
+   133→        username=user.username,
+   134→        forum_posts_count=posts_count,
+   135→        forum_comments_count=comments_count,
+   136→        forum_karma=total_karma,
+   137→        member_since=user.created_at,
+   138→    )
+   139→
+   140→
+   141→@router.get("/{user_id}/posts", response_model=UserPostListResponse)
+   142→async def get_user_posts(
+   143→    user_id: UUID,
+   144→    limit: int = Query(PAGE_SIZE, ge=1, le=50),
+   145→    offset: int = Query(0, ge=0),
+   146→    current_user: Optional[User] = Depends(get_current_user_optional),
+   147→    db: AsyncSession = Depends(get_db),
+   148→):
+   149→    """Get a user's forum posts with pagination.
+   150→
+   151→    Returns posts sorted by creation date (newest first).
+   152→    """
+   153→    # Verify user exists and isn't banned
+   154→    user_result = await db.execute(
+   155→        select(User).where(User.id == user_id, User.is_banned == False)
+   156→    )
+   157→    user = user_result.scalar_one_or_none()
+   158→
+   159→    if not user:
+   160→        raise HTTPException(status_code=404, detail="User not found")
+   161→
+   162→    # Get posts with sub-forum and category info
+   163→    query = (
+   164→        select(ForumPost)
+   165→        .options(
+   166→            selectinload(ForumPost.sub_forum).selectinload(ForumSubForum.issue_category)
+   167→        )
+   168→        .where(
+   169→            ForumPost.author_id == user_id,
+   170→            ForumPost.is_deleted == False,
+   171→            ForumPost.is_approved == True
+   172→        )
+   173→        .order_by(ForumPost.created_at.desc())
+   174→    )
+   175→
+   176→    # Get total count
+   177→    count_query = (
+   178→        select(func.count(ForumPost.id))
+   179→        .where(
+   180→            ForumPost.author_id == user_id,
+   181→            ForumPost.is_deleted == False,
+   182→            ForumPost.is_approved == True
+   183→        )
+   184→    )
+   185→    total_result = await db.execute(count_query)
+   186→    total_count = total_result.scalar() or 0
+   187→
+   188→    # Paginate
+   189→    query = query.offset(offset).limit(limit)
+   190→    result = await db.execute(query)
+   191→    posts = result.scalars().all()
+   192→
+   193→    # Get user votes if authenticated
+   194→    user_votes = {}
+   195→    if current_user:
+   196→        post_ids = [p.id for p in posts]
+   197→        if post_ids:
+   198→            votes_query = select(ForumVote).where(
+   199→                ForumVote.user_id == current_user.id,
+   200→                ForumVote.target_type == TargetType.POST,
+   201→                ForumVote.target_id.in_(post_ids)
+   202→            )
+   203→            votes_result = await db.execute(votes_query)
+   204→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   205→
+   206→    # Transform to response
+   207→    post_items = []
+   208→    for post in posts:
+   209→        sub_forum = post.sub_forum
+   210→        category = sub_forum.issue_category if sub_forum else None
+   211→
+   212→        post_items.append(UserPostItem(
+   213→            id=post.id,
+   214→            title=post.title,
+   215→            content_preview=post.content[:200] + "..." if len(post.content) > 200 else post.content,
+   216→            sub_forum_slug=sub_forum.slug if sub_forum else "",
+   217→            category_slug=category.slug if category else "",
+   218→            is_pinned=post.is_pinned,
+   219→            is_guide=post.is_guide,
+   220→            vote_count=post.vote_count,
+   221→            comment_count=post.comment_count,
+   222→            user_vote=user_votes.get(post.id),
+   223→            created_at=post.created_at,
+   224→        ))
+   225→
+   226→    return UserPostListResponse(
+   227→        posts=post_items,
+   228→        total_count=total_count,
+   229→        has_more=offset + limit < total_count
+   230→    )
+   231→
+   232→
+   233→@router.get("/{user_id}/comments", response_model=UserCommentListResponse)
+   234→async def get_user_comments(
+   235→    user_id: UUID,
+   236→    limit: int = Query(PAGE_SIZE, ge=1, le=50),
+   237→    offset: int = Query(0, ge=0),
+   238→    current_user: Optional[User] = Depends(get_current_user_optional),
+   239→    db: AsyncSession = Depends(get_db),
+   240→):
+   241→    """Get a user's forum comments with pagination.
+   242→
+   243→    Returns comments sorted by creation date (newest first).
+   244→    Includes post title and link info for context.
+   245→    """
+   246→    # Verify user exists and isn't banned
+   247→    user_result = await db.execute(
+   248→        select(User).where(User.id == user_id, User.is_banned == False)
+   249→    )
+   250→    user = user_result.scalar_one_or_none()
+   251→
+   252→    if not user:
+   253→        raise HTTPException(status_code=404, detail="User not found")
+   254→
+   255→    # Get comments with post info
+   256→    query = (
+   257→        select(ForumComment)
+   258→        .options(
+   259→            selectinload(ForumComment.post).selectinload(ForumPost.sub_forum).selectinload(ForumSubForum.issue_category)
+   260→        )
+   261→        .where(
+   262→            ForumComment.author_id == user_id,
+   263→            ForumComment.is_deleted == False,
+   264→            ForumComment.is_approved == True
+   265→        )
+   266→        .order_by(ForumComment.created_at.desc())
+   267→    )
+   268→
+   269→    # Get total count
+   270→    count_query = (
+   271→        select(func.count(ForumComment.id))
+   272→        .where(
+   273→            ForumComment.author_id == user_id,
+   274→            ForumComment.is_deleted == False,
+   275→            ForumComment.is_approved == True
+   276→        )
+   277→    )
+   278→    total_result = await db.execute(count_query)
+   279→    total_count = total_result.scalar() or 0
+   280→
+   281→    # Paginate
+   282→    query = query.offset(offset).limit(limit)
+   283→    result = await db.execute(query)
+   284→    comments = result.scalars().all()
+   285→
+   286→    # Get user votes if authenticated
+   287→    user_votes = {}
+   288→    if current_user:
+   289→        comment_ids = [c.id for c in comments]
+   290→        if comment_ids:
+   291→            votes_query = select(ForumVote).where(
+   292→                ForumVote.user_id == current_user.id,
+   293→                ForumVote.target_type == TargetType.COMMENT,
+   294→                ForumVote.target_id.in_(comment_ids)
+   295→            )
+   296→            votes_result = await db.execute(votes_query)
+   297→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   298→
+   299→    # Transform to response
+   300→    comment_items = []
+   301→    for comment in comments:
+   302→        post = comment.post
+   303→        sub_forum = post.sub_forum if post else None
+   304→        category = sub_forum.issue_category if sub_forum else None
+   305→
+   306→        comment_items.append(UserCommentItem(
+   307→            id=comment.id,
+   308→            content=comment.content[:300] + "..." if len(comment.content) > 300 else comment.content,
+   309→            post_id=comment.post_id,
+   310→            post_title=post.title if post else "[Deleted]",
+   311→            category_slug=category.slug if category else "",
+   312→            vote_count=comment.vote_count,
+   313→            user_vote=user_votes.get(comment.id),
+   314→            created_at=comment.created_at,
+   315→        ))
+   316→
+   317→    return UserCommentListResponse(
+   318→        comments=comment_items,
+   319→        total_count=total_count,
+   320→        has_more=offset + limit < total_count
+   321→    )
+   322→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,218 @@
+     1→/**
+     2→ * Cut List Routes
+     3→ *
+     4→ * Cut list generation endpoints for v3.5 DOM building
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const path = require('path');
+     9→const { generateCutList, generateTakesCutList, validateCutList } = require('../services/cutListGenerator');
+    10→const { processXMLFile } = require('../services/xmlProcessor');
+    11→const { validatePath } = require('../services/securityUtils');
+    12→
+    13→/**
+    14→ * Create cut list routes
+    15→ * @param {Object} options - Route configuration options
+    16→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    17→ * @returns {express.Router}
+    18→ */
+    19→function createCutListRoutes(options = {}) {
+    20→  const router = express.Router();
+    21→  const { requireCredits } = options.middleware || {};
+    22→
+    23→  /**
+    24→   * POST / - Generate a JSON cut list for direct DOM building (v3.5)
+    25→   *
+    26→   * Takes silences and optionally takes, returns a cut list that the
+    27→   * plugin can use to build sequences directly via UXP APIs.
+    28→   *
+    29→   * Body:
+    30→   * - sourceName: Name of the source clip
+    31→   * - sourcePath: Full path to the source file
+    32→   * - duration: Total duration in seconds
+    33→   * - silences: Array of silence segments [{start, end, duration}]
+    34→   * - takes: (optional) Array of detected takes
+    35→   * - settings: (optional) Generation settings
+    36→   *
+    37→   * Requires authentication via x-stripe-customer-id header
+    38→   */
+    39→  router.post('/', requireCredits({ endpoint: 'cut-list' }), async (req, res) => {
+    40→    const {
+    41→      sourceName,
+    42→      sourcePath,
+    43→      duration,
+    44→      silences,
+    45→      takes = [],
+    46→      settings = {}
+    47→    } = req.body;
+    48→
+    49→    // Validate required fields
+    50→    if (!sourceName && !sourcePath) {
+    51→      return res.status(400).json({ error: 'sourceName or sourcePath is required' });
+    52→    }
+    53→
+    54→    if (typeof duration !== 'number' || duration <= 0) {
+    55→      return res.status(400).json({ error: 'duration must be a positive number' });
+    56→    }
+    57→
+    58→    if (!silences || !Array.isArray(silences)) {
+    59→      return res.status(400).json({ error: 'silences array is required' });
+    60→    }
+    61→
+    62→    console.log(`[SPLICE] Generating cut list for ${sourceName || sourcePath} (${silences.length} silences)`);
+    63→
+    64→    try {
+    65→      const cutList = generateCutList({
+    66→        sourceName: sourceName || path.basename(sourcePath),
+    67→        sourcePath,
+    68→        duration,
+    69→        silences,
+    70→        takes,
+    71→        settings
+    72→      });
+    73→
+    74→      // Validate the generated cut list
+    75→      const validation = validateCutList(cutList);
+    76→      if (!validation.valid) {
+    77→        return res.status(500).json({
+    78→          error: 'Generated cut list is invalid',
+    79→          validationErrors: validation.errors
+    80→        });
+    81→      }
+    82→
+    83→      res.json({
+    84→        success: true,
+    85→        cutList
+    86→      });
+    87→    } catch (err) {
+    88→      console.error('[SPLICE] Cut list generation error:', err);
+    89→      res.status(500).json({ error: err.message });
+    90→    }
+    91→  });
+    92→
+    93→  /**
+    94→   * POST /takes - Generate a cut list that keeps only takes
+    95→   *
+    96→   * Alternative endpoint for "keep best takes only" workflow.
+    97→   *
+    98→   * Requires authentication via x-stripe-customer-id header
+    99→   */
+   100→  router.post('/takes', requireCredits({ endpoint: 'cut-list-takes' }), async (req, res) => {
+   101→    const {
+   102→      sourceName,
+   103→      sourcePath,
+   104→      duration,
+   105→      takes,
+   106→      settings = {}
+   107→    } = req.body;
+   108→
+   109→    // Validate required fields
+   110→    if (!sourceName && !sourcePath) {
+   111→      return res.status(400).json({ error: 'sourceName or sourcePath is required' });
+   112→    }
+   113→
+   114→    if (typeof duration !== 'number' || duration <= 0) {
+   115→      return res.status(400).json({ error: 'duration must be a positive number' });
+   116→    }
+   117→
+   118→    if (!takes || !Array.isArray(takes) || takes.length === 0) {
+   119→      return res.status(400).json({ error: 'takes array is required and must not be empty' });
+   120→    }
+   121→
+   122→    console.log(`[SPLICE] Generating takes cut list for ${sourceName || sourcePath} (${takes.length} takes)`);
+   123→
+   124→    try {
+   125→      const cutList = generateTakesCutList({
+   126→        sourceName: sourceName || path.basename(sourcePath),
+   127→        sourcePath,
+   128→        duration,
+   129→        takes,
+   130→        settings
+   131→      });
+   132→
+   133→      res.json({
+   134→        success: true,
+   135→        cutList
+   136→      });
+   137→    } catch (err) {
+   138→      console.error('[SPLICE] Takes cut list generation error:', err);
+   139→      res.status(500).json({ error: err.message });
+   140→    }
+   141→  });
+   142→
+   143→  /**
+   144→   * POST /process-xml - Process FCP XML to split clips at silences
+   145→   *
+   146→   * Takes an FCP XML file and silence timestamps, splits clips
+   147→   * at silence boundaries, and optionally removes gaps.
+   148→   *
+   149→   * Note: Mounted at /cut-list/process-xml but also available at /process-xml
+   150→   * for backwards compatibility (handled in server.js)
+   151→   */
+   152→  router.post('/process-xml', requireCredits({ endpoint: 'process-xml' }), async (req, res) => {
+   153→    const {
+   154→      xmlPath,
+   155→      silences,
+   156→      removeGaps = true,
+   157→      outputPath = null
+   158→    } = req.body;
+   159→
+   160→    if (!xmlPath) {
+   161→      return res.status(400).json({ error: 'xmlPath is required' });
+   162→    }
+   163→
+   164→    if (!silences || !Array.isArray(silences)) {
+   165→      return res.status(400).json({ error: 'silences array is required' });
+   166→    }
+   167→
+   168→    // SECURITY: Validate xmlPath to prevent path traversal attacks
+   169→    const xmlValidation = await validatePath(xmlPath, {
+   170→      mustExist: true,
+   171→      allowedExtensions: ['.xml', '.xmeml']
+   172→    });
+   173→
+   174→    if (!xmlValidation.valid) {
+   175→      return res.status(400).json({ error: `Invalid XML path: ${xmlValidation.error}` });
+   176→    }
+   177→
+   178→    // SECURITY: Validate outputPath if provided
+   179→    if (outputPath) {
+   180→      const outputValidation = await validatePath(outputPath, {
+   181→        mustExist: false,
+   182→        allowedExtensions: ['.xml', '.xmeml']
+   183→      });
+   184→
+   185→      if (!outputValidation.valid) {
+   186→        return res.status(400).json({ error: `Invalid output path: ${outputValidation.error}` });
+   187→      }
+   188→    }
+   189→
+   190→    console.log(`[SPLICE] Processing XML: ${xmlValidation.path} with ${silences.length} silence(s)`);
+   191→
+   192→    try {
+   193→      const result = await processXMLFile(xmlValidation.path, silences, {
+   194→        outputPath: outputPath || null,
+   195→        removeGaps
+   196→      });
+   197→
+   198→      res.json({
+   199→        success: true,
+   200→        inputPath: xmlValidation.path,
+   201→        outputPath: result.outputPath,
+   202→        stats: result.stats
+   203→      });
+   204→    } catch (err) {
+   205→      console.error('[SPLICE] XML processing error:', err);
+   206→      res.status(500).json({ error: err.message });
+   207→    }
+   208→  });
+   209→
+   210→  return router;
+   211→}
+   212→
+   213→module.exports = createCutListRoutes;
+   214→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

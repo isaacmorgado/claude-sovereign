@@ -1,0 +1,211 @@
+#!/bin/bash
+# Auto-Continue Hook - Fully automated context management with quality awareness
+# When context hits threshold:
+# 1. Checks if build is in progress
+# 2. Runs validation before checkpoint
+# 3. Saves state and creates continuation prompt
+# 4. Feeds prompt back to keep running
+
+set -euo pipefail
+
+THRESHOLD=${CLAUDE_CONTEXT_THRESHOLD:-40}
+LOG_FILE="${HOME}/.claude/auto-continue.log"
+STATE_FILE=".claude/auto-continue.local.md"
+BUILD_STATE=".claude/current-build.local.md"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Read hook input
+HOOK_INPUT=$(cat)
+
+# Extract context info
+CONTEXT_SIZE=$(echo "$HOOK_INPUT" | jq -r '.context_window.context_window_size // 200000')
+USAGE=$(echo "$HOOK_INPUT" | jq '.context_window.current_usage // null')
+TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // ""')
+
+if [[ "$USAGE" == "null" ]]; then
+    log "No usage data - allowing stop"
+    exit 0
+fi
+
+# Calculate percentage
+INPUT_TOKENS=$(echo "$USAGE" | jq -r '.input_tokens // 0')
+CACHE_CREATE=$(echo "$USAGE" | jq -r '.cache_creation_input_tokens // 0')
+CACHE_READ=$(echo "$USAGE" | jq -r '.cache_read_input_tokens // 0')
+CURRENT_TOKENS=$((INPUT_TOKENS + CACHE_CREATE + CACHE_READ))
+PERCENT=$((CURRENT_TOKENS * 100 / CONTEXT_SIZE))
+
+log "Context: ${PERCENT}% (${CURRENT_TOKENS}/${CONTEXT_SIZE})"
+
+# Check if auto-continue is disabled
+if [[ -f ".claude/auto-continue-disabled" ]]; then
+    log "Auto-continue disabled - allowing stop"
+    exit 0
+fi
+
+# Check for stop words in last message
+if [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+    LAST_USER=$(grep '"role":"user"' "$TRANSCRIPT_PATH" | tail -1 | jq -r '.message.content[0].text // ""' 2>/dev/null || echo "")
+    if echo "$LAST_USER" | grep -qiE '\b(stop|pause|hold|wait|quit)\b'; then
+        log "Stop word detected - allowing stop"
+        exit 0
+    fi
+fi
+
+# Below threshold - allow normal stop
+if [[ $PERCENT -lt $THRESHOLD ]]; then
+    exit 0
+fi
+
+log "Threshold reached (${PERCENT}% >= ${THRESHOLD}%) - triggering auto-continue"
+
+# PHASE 1 INTEGRATION: Create memory checkpoint before compacting
+log "Creating memory checkpoint before compact..."
+MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+
+if [[ -x "$MEMORY_MANAGER" ]]; then
+    # Create checkpoint with context percentage in description
+    CHECKPOINT_ID=$("$MEMORY_MANAGER" checkpoint "Auto-checkpoint at ${PERCENT}% context before compact" 2>/dev/null || echo "")
+
+    if [[ -n "$CHECKPOINT_ID" ]]; then
+        log "✅ Memory checkpoint created: $CHECKPOINT_ID"
+    else
+        log "⚠️  Failed to create memory checkpoint"
+    fi
+else
+    log "⚠️  memory-manager.sh not found - skipping checkpoint"
+fi
+
+# Also run /checkpoint skill for full session save
+CHECKPOINT_INSTRUCTION="⚠️ Context at ${PERCENT}% - Creating checkpoint before compacting.
+
+Run: /checkpoint
+
+After checkpoint completes, context will auto-compact and you'll continue working."
+
+# Output checkpoint instruction and block
+jq -n \
+    --arg prompt "$CHECKPOINT_INSTRUCTION" \
+    --arg msg "🔄 Auto-checkpoint triggered at ${PERCENT}% (memory snapshot saved)" \
+    '{
+        "decision": "block",
+        "reason": $prompt,
+        "systemMessage": $msg
+    }'
+
+log "Checkpoint instruction sent - memory checkpoint: $CHECKPOINT_ID"
+exit 0
+
+# NOTE: The code below will run AFTER /checkpoint completes and context compacts
+# This happens in the next cycle when context is checked again
+
+# Get current working directory info
+PROJECT_NAME=$(basename "$(pwd)")
+PROJECT_DIR=$(pwd)
+
+# Check if build is in progress
+BUILD_CONTEXT=""
+if [[ -f "$BUILD_STATE" ]]; then
+    BUILD_FEATURE=$(grep '^feature:' "$BUILD_STATE" | sed 's/feature: *//' || echo "")
+    BUILD_PHASE=$(grep '^phase:' "$BUILD_STATE" | sed 's/phase: *//' || echo "")
+    BUILD_ITERATION=$(grep '^iteration:' "$BUILD_STATE" | sed 's/iteration: *//' || echo "1")
+
+    if [[ -n "$BUILD_FEATURE" ]] && [[ "$BUILD_PHASE" != "complete" ]]; then
+        BUILD_CONTEXT="
+**Active Build**: $BUILD_FEATURE (phase: $BUILD_PHASE, iteration: $BUILD_ITERATION)
+Continue implementing this feature. Check .claude/current-build.local.md for progress."
+    fi
+fi
+
+# Read CLAUDE.md if exists
+CLAUDE_MD_CONTENT=""
+if [[ -f "CLAUDE.md" ]]; then
+    CLAUDE_MD_CONTENT=$(head -50 CLAUDE.md 2>/dev/null || echo "")
+fi
+
+# Read buildguide.md next section if exists
+NEXT_SECTION=""
+NEXT_SECTION_DETAIL=""
+if [[ -f "buildguide.md" ]]; then
+    # Get first unchecked section
+    NEXT_SECTION=$(grep -m1 '^\- \[ \]' buildguide.md 2>/dev/null | sed 's/- \[ \] //' || echo "")
+
+    # Try to get the section details
+    if [[ -n "$NEXT_SECTION" ]]; then
+        # Find the section header and get content until next section
+        SECTION_CONTENT=$(awk "/^## .*${NEXT_SECTION}/,/^## /" buildguide.md 2>/dev/null | head -30 || echo "")
+        if [[ -n "$SECTION_CONTENT" ]]; then
+            NEXT_SECTION_DETAIL="
+**Next Section from buildguide.md**: $NEXT_SECTION
+$SECTION_CONTENT"
+        fi
+    fi
+fi
+
+# Check for architecture docs
+ARCH_CONTEXT=""
+for arch_file in "ARCHITECTURE.md" "docs/architecture.md" ".claude/docs/architecture.md"; do
+    if [[ -f "$arch_file" ]]; then
+        ARCH_CONTEXT="
+**Architecture**: See $arch_file for system design."
+        break
+    fi
+done
+
+# Check for stuck issues in debug-log
+STUCK_ISSUES=""
+if [[ -f ".claude/docs/debug-log.md" ]]; then
+    STUCK=$(grep -c "STUCK" ".claude/docs/debug-log.md" 2>/dev/null || echo "0")
+    if [[ "$STUCK" -gt 0 ]]; then
+        STUCK_ISSUES="
+⚠️ $STUCK stuck issues in debug-log.md - may need review."
+    fi
+fi
+
+# Build continuation prompt (token-effective per Ken Kai principles)
+# Short, focused, no essays - agent is smart
+CONTINUATION_PROMPT="Continue ${PROJECT_NAME}. Context compacted at ${PERCENT}%.
+${BUILD_CONTEXT:-No active build.}
+${NEXT_SECTION:+Next: $NEXT_SECTION}
+${STUCK_ISSUES}
+
+Action: ${BUILD_CONTEXT:+Continue build from .claude/current-build.local.md}${BUILD_CONTEXT:-Run /build for next section}
+
+Remember: Short prompts > long ones. Reference docs, don't dump. Work focused."
+
+# Track iteration
+ITERATION=1
+if [[ -f "$STATE_FILE" ]]; then
+    ITERATION=$(grep '^iteration:' "$STATE_FILE" | sed 's/iteration: *//' || echo "1")
+    ITERATION=$((ITERATION + 1))
+fi
+
+# Create/update state file
+mkdir -p .claude
+cat > "$STATE_FILE" <<EOF
+---
+active: true
+iteration: $ITERATION
+threshold: $THRESHOLD
+last_percent: $PERCENT
+last_compact: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+build_active: $(if [[ -n "$BUILD_CONTEXT" ]]; then echo "true"; else echo "false"; fi)
+---
+
+Auto-continue active. Iteration ${ITERATION}.
+EOF
+
+# Output JSON to block stop and feed continuation prompt
+jq -n \
+    --arg prompt "$CONTINUATION_PROMPT" \
+    --arg msg "🔄 Auto-continue: Context ${PERCENT}% → compacted (iteration ${ITERATION})${BUILD_CONTEXT:+ | Build: $BUILD_FEATURE}" \
+    '{
+        "decision": "block",
+        "reason": $prompt,
+        "systemMessage": $msg
+    }'
+
+log "Auto-continue triggered - iteration $ITERATION"
+exit 0

@@ -1,0 +1,232 @@
+import { Anthropic } from "@anthropic-ai/sdk"
+import { execa } from "execa"
+
+import type { ModelInfo } from "@multi-agent/types"
+
+import type { ApiHandlerOptions } from "../../shared/api"
+
+import { ApiStream } from "../transform/stream"
+
+import { BaseProvider } from "./base-provider"
+import type { ApiHandlerCreateMessageMetadata } from "../index"
+
+// Model info for Claude subscription models
+const claudeSubscriptionModels: Record<string, ModelInfo> = {
+	sonnet: {
+		maxTokens: 8192,
+		contextWindow: 200000,
+		supportsImages: true,
+		supportsPromptCache: false,
+		description: "Claude Sonnet via subscription",
+	},
+	opus: {
+		maxTokens: 8192,
+		contextWindow: 200000,
+		supportsImages: true,
+		supportsPromptCache: false,
+		description: "Claude Opus via subscription",
+	},
+	haiku: {
+		maxTokens: 8192,
+		contextWindow: 200000,
+		supportsImages: true,
+		supportsPromptCache: false,
+		description: "Claude Haiku via subscription",
+	},
+}
+
+export interface ClaudeCliStatus {
+	installed: boolean
+	authenticated: boolean
+	error?: string
+}
+
+export class ClaudeSubscriptionHandler extends BaseProvider {
+	private options: ApiHandlerOptions
+	private model: "sonnet" | "opus" | "haiku"
+	private timeout: number
+
+	constructor(options: ApiHandlerOptions) {
+		super()
+		this.options = options
+		this.model = options.claudeSubscriptionModel ?? "sonnet"
+		this.timeout = options.claudeSubscriptionTimeout ?? 120000
+	}
+
+	/**
+	 * Check if Claude CLI is installed and authenticated
+	 */
+	static async checkCliStatus(): Promise<ClaudeCliStatus> {
+		try {
+			// Check if CLI is installed
+			const versionResult = await execa("claude", ["--version"], {
+				reject: false,
+				timeout: 5000,
+			})
+
+			if (versionResult.exitCode !== 0) {
+				return {
+					installed: false,
+					authenticated: false,
+					error: "Claude CLI not found. Install with: npm i -g @anthropic-ai/claude-code",
+				}
+			}
+
+			// Check authentication by making a minimal request with budget limit
+			const authCheck = await execa("claude", ["-p", "hi", "--output-format", "text", "--max-budget-usd", "0.001"], {
+				reject: false,
+				timeout: 30000,
+			})
+
+			if (authCheck.stderr?.toLowerCase().includes("not authenticated") || authCheck.exitCode === 1) {
+				return {
+					installed: true,
+					authenticated: false,
+					error: "Not authenticated. Run 'claude' in terminal to login.",
+				}
+			}
+
+			return { installed: true, authenticated: true }
+		} catch (error) {
+			return {
+				installed: false,
+				authenticated: false,
+				error: `CLI check failed: ${error instanceof Error ? error.message : String(error)}`,
+			}
+		}
+	}
+
+	override async *createMessage(
+		systemPrompt: string,
+		messages: Anthropic.Messages.MessageParam[],
+		_metadata?: ApiHandlerCreateMessageMetadata,
+	): ApiStream {
+		// Convert messages to a single prompt string for CLI
+		const prompt = this.formatPrompt(systemPrompt, messages)
+
+		// Build CLI arguments
+		const args = ["-p", prompt, "--output-format", "text"]
+
+		// Add model if not default
+		if (this.model !== "sonnet") {
+			args.push("--model", this.model)
+		}
+
+		// Spawn the CLI process
+		const subprocess = execa("claude", args, {
+			timeout: this.timeout,
+			reject: false,
+			buffer: false, // Stream output instead of buffering
+		})
+
+		if (!subprocess.stdout) {
+			throw new Error("Failed to get stdout from Claude CLI process")
+		}
+
+		let fullOutput = ""
+
+		// Stream chunks from CLI stdout
+		try {
+			for await (const chunk of subprocess.stdout) {
+				const text = typeof chunk === "string" ? chunk : chunk.toString("utf-8")
+				fullOutput += text
+				yield { type: "text", text }
+			}
+		} catch (error) {
+			// Handle stream errors
+			if (error instanceof Error && error.message.includes("TIMEOUT")) {
+				throw new Error(`Claude CLI timed out after ${this.timeout / 1000}s`)
+			}
+			throw error
+		}
+
+		// Wait for process to complete
+		const result = await subprocess
+
+		// Check for errors
+		if (result.exitCode !== 0) {
+			const errorMsg = result.stderr || "Unknown error"
+
+			if (errorMsg.toLowerCase().includes("rate limit")) {
+				throw new Error(`Rate limited: ${errorMsg}`)
+			}
+
+			if (errorMsg.toLowerCase().includes("not authenticated")) {
+				throw new Error("Not authenticated. Run 'claude' in terminal to login.")
+			}
+
+			throw new Error(`Claude CLI error (exit code ${result.exitCode}): ${errorMsg}`)
+		}
+
+		// Estimate token usage (we don't have exact counts from CLI)
+		const estimatedInputTokens = Math.ceil(prompt.length / 4)
+		const estimatedOutputTokens = Math.ceil(fullOutput.length / 4)
+
+		yield {
+			type: "usage",
+			inputTokens: estimatedInputTokens,
+			outputTokens: estimatedOutputTokens,
+		}
+	}
+
+	override getModel() {
+		return {
+			id: `claude-subscription-${this.model}`,
+			info: claudeSubscriptionModels[this.model] ?? claudeSubscriptionModels.sonnet,
+		}
+	}
+
+	/**
+	 * Format Anthropic messages into a single prompt string for the CLI
+	 */
+	private formatPrompt(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): string {
+		let prompt = ""
+
+		// Add system prompt
+		if (systemPrompt) {
+			prompt += `<system>\n${systemPrompt}\n</system>\n\n`
+		}
+
+		// Convert messages
+		for (const msg of messages) {
+			const role = msg.role === "user" ? "Human" : "Assistant"
+			const content = this.extractTextContent(msg.content)
+			prompt += `${role}: ${content}\n\n`
+		}
+
+		return prompt.trim()
+	}
+
+	/**
+	 * Extract text content from message content which can be string or array
+	 */
+	private extractTextContent(content: string | Anthropic.Messages.ContentBlockParam[]): string {
+		if (typeof content === "string") {
+			return content
+		}
+
+		return content
+			.map((block) => {
+				if (block.type === "text") {
+					return block.text
+				}
+				if (block.type === "image") {
+					return "[image]"
+				}
+				if (block.type === "tool_use") {
+					return `[tool_use: ${block.name}]`
+				}
+				if (block.type === "tool_result") {
+					const resultContent =
+						typeof block.content === "string"
+							? block.content
+							: Array.isArray(block.content)
+								? block.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("")
+								: ""
+					return `[tool_result: ${resultContent}]`
+				}
+				return ""
+			})
+			.join("")
+	}
+}

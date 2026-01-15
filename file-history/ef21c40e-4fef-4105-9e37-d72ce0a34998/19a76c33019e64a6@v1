@@ -1,0 +1,341 @@
+/**
+ * Workflow Execution Engine
+ *
+ * Sequential execution of workflow steps with non-blocking error handling
+ * Based on FireCut's workflow automation system
+ *
+ * Date: 2026-01-12
+ */
+
+const { Pool } = require('pg');
+const logger = require('../utils/logger');
+
+// PostgreSQL connection pool
+const sslConfig = process.env.NODE_ENV === 'production' ? {
+  rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === 'true',
+  ca: process.env.DATABASE_SSL_CA || undefined
+} : false;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: sslConfig,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  statement_timeout: 30000,
+  query_timeout: 30000
+});
+
+// Import existing services
+const silenceService = require('./silenceDetection');
+const musicService = require('./musicGeneration');
+// TODO: Import additional services as they're implemented:
+// const zoomService = require('./zoomAutomation');
+// const brollService = require('./brollSearch');
+// const captionService = require('./captionGeneration');
+// const chapterService = require('./chapterDetection');
+// const profanityService = require('./profanityRemoval');
+
+/**
+ * Execute workflow asynchronously
+ *
+ * @param {Object} workflow - Workflow object from database
+ * @param {string} executionId - UUID of workflow_executions row
+ * @param {string} userId - User ID
+ * @param {string} sequenceId - Premiere Pro sequence ID
+ */
+async function executeWorkflowAsync(workflow, executionId, userId, sequenceId) {
+  const startTime = Date.now();
+
+  try {
+    logger.info(`Starting workflow execution: ${workflow.name} (${executionId})`);
+
+    // Parse steps array
+    const steps = Array.isArray(workflow.steps) ? workflow.steps : JSON.parse(workflow.steps);
+
+    // Filter enabled steps and sort by order
+    const enabledSteps = steps
+      .filter(step => step.enabled !== false)
+      .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+    if (enabledSteps.length === 0) {
+      throw new Error('No enabled steps in workflow');
+    }
+
+    // Update execution status to running
+    await db.query(
+      `UPDATE workflow_executions
+       SET status = $1, total_steps = $2
+       WHERE id = $3`,
+      ['running', enabledSteps.length, executionId]
+    );
+
+    // Execute steps sequentially
+    const results = [];
+
+    for (let i = 0; i < enabledSteps.length; i++) {
+      const step = enabledSteps[i];
+      const stepNumber = i + 1;
+
+      logger.info(`Executing step ${stepNumber}/${enabledSteps.length}: ${step.type}`);
+
+      try {
+        // Execute step based on type
+        const result = await executeStep(step, workflow.scope, sequenceId, userId);
+
+        results.push({
+          step: step.type,
+          status: result.status || 'completed',
+          message: result.message || 'Step completed successfully',
+          data: result.data || null
+        });
+
+        logger.info(`Step ${stepNumber} completed: ${step.type}`);
+
+      } catch (error) {
+        // Non-blocking error handling - log and continue
+        logger.error(`Step ${stepNumber} failed: ${step.type}`, error);
+
+        results.push({
+          step: step.type,
+          status: 'failed',
+          message: error.message || 'Unknown error',
+          error: error.stack
+        });
+      }
+
+      // Update progress after each step
+      const progress = Math.round((stepNumber / enabledSteps.length) * 100);
+      await db.query(
+        `UPDATE workflow_executions
+         SET results = $1, progress = $2, current_step = $3
+         WHERE id = $4`,
+        [JSON.stringify(results), progress, stepNumber, executionId]
+      );
+    }
+
+    // Mark execution as completed
+    const duration = Date.now() - startTime;
+    await db.query(
+      `UPDATE workflow_executions
+       SET status = $1, completed_at = NOW(), results = $2
+       WHERE id = $3`,
+      ['completed', JSON.stringify(results), executionId]
+    );
+
+    logger.info(`Workflow execution completed: ${workflow.name} (${duration}ms)`);
+
+  } catch (error) {
+    // Fatal error - mark execution as failed
+    logger.error('Workflow execution fatal error:', error);
+
+    await db.query(
+      `UPDATE workflow_executions
+       SET status = $1, completed_at = NOW(), error_message = $2
+       WHERE id = $3`,
+      ['failed', error.message, executionId]
+    );
+  }
+}
+
+/**
+ * Execute a single workflow step
+ *
+ * @param {Object} step - Step configuration
+ * @param {string} scope - Workflow scope (entire_sequence, selection, in_out)
+ * @param {string} sequenceId - Sequence ID
+ * @param {string} userId - User ID
+ * @returns {Promise<Object>} Result object with status and message
+ */
+async function executeStep(step, scope, sequenceId, userId) {
+  const { type, settings = {} } = step;
+
+  // Merge workflow scope with step settings
+  const mergedSettings = {
+    ...settings,
+    scope,
+    sequenceId,
+    userId
+  };
+
+  // Execute based on step type
+  switch (type) {
+    case 'silenceCutting':
+      return await executeSilenceCutting(mergedSettings);
+
+    case 'musicGeneration':
+      return await executeMusicGeneration(mergedSettings);
+
+    case 'zooms':
+      return await executeZooms(mergedSettings);
+
+    case 'broll':
+      return await executeBroll(mergedSettings);
+
+    case 'captions':
+      return await executeCaptions(mergedSettings);
+
+    case 'chapters':
+      return await executeChapters(mergedSettings);
+
+    case 'removeProfanity':
+      return await executeRemoveProfanity(mergedSettings);
+
+    default:
+      throw new Error(`Unknown step type: ${type}`);
+  }
+}
+
+/**
+ * Execute silence cutting step
+ */
+async function executeSilenceCutting(settings) {
+  const {
+    tightness = 65,
+    algorithm = 'rms',
+    format = 'delete',
+    inPoint,
+    outPoint
+  } = settings;
+
+  // Call existing silence detection service
+  const result = await silenceService.detectAndRemoveSilence({
+    tightness,
+    algorithm,
+    format,
+    inPoint,
+    outPoint
+  });
+
+  return {
+    status: 'completed',
+    message: `Removed ${result.regionsRemoved || 0} silence regions`,
+    data: result
+  };
+}
+
+/**
+ * Execute music generation step
+ */
+async function executeMusicGeneration(settings) {
+  const {
+    prompt,
+    duration,
+    model = 'musicgen'
+  } = settings;
+
+  // Call existing music generation service
+  const result = await musicService.generateMusic({
+    prompt,
+    duration,
+    model
+  });
+
+  return {
+    status: 'completed',
+    message: 'Music generated successfully',
+    data: result
+  };
+}
+
+/**
+ * Execute zoom automation step
+ * TODO: Implement when zoom service is ready
+ */
+async function executeZooms(settings) {
+  // Placeholder for zoom automation
+  logger.warn('Zoom automation not yet implemented');
+
+  return {
+    status: 'skipped',
+    message: 'Zoom automation feature not yet implemented'
+  };
+}
+
+/**
+ * Execute B-roll search and insertion step
+ * TODO: Implement when broll service is ready
+ */
+async function executeBroll(settings) {
+  // Placeholder for B-roll automation
+  logger.warn('B-roll automation not yet implemented');
+
+  return {
+    status: 'skipped',
+    message: 'B-roll automation feature not yet implemented'
+  };
+}
+
+/**
+ * Execute caption generation step
+ * TODO: Implement when caption service is ready
+ */
+async function executeCaptions(settings) {
+  // Placeholder for caption generation
+  logger.warn('Caption generation not yet implemented');
+
+  return {
+    status: 'skipped',
+    message: 'Caption generation feature not yet implemented'
+  };
+}
+
+/**
+ * Execute chapter detection step
+ * TODO: Implement when chapter service is ready
+ */
+async function executeChapters(settings) {
+  // Placeholder for chapter detection
+  logger.warn('Chapter detection not yet implemented');
+
+  return {
+    status: 'skipped',
+    message: 'Chapter detection feature not yet implemented'
+  };
+}
+
+/**
+ * Execute profanity removal step
+ * TODO: Implement when profanity service is ready
+ */
+async function executeRemoveProfanity(settings) {
+  // Placeholder for profanity removal
+  logger.warn('Profanity removal not yet implemented');
+
+  return {
+    status: 'skipped',
+    message: 'Profanity removal feature not yet implemented'
+  };
+}
+
+/**
+ * Get workflow execution status
+ *
+ * @param {string} executionId - UUID of workflow execution
+ * @param {string} userId - User ID for authorization
+ * @returns {Promise<Object>} Execution status object
+ */
+async function getExecutionStatus(executionId, userId) {
+  const result = await db.query(
+    `SELECT * FROM workflow_executions WHERE id = $1 AND user_id = $2`,
+    [executionId, userId]
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error('Execution not found');
+  }
+
+  const execution = result.rows[0];
+
+  // Parse JSON fields
+  if (execution.results && typeof execution.results === 'string') {
+    execution.results = JSON.parse(execution.results);
+  }
+
+  return execution;
+}
+
+module.exports = {
+  executeWorkflowAsync,
+  getExecutionStatus
+};

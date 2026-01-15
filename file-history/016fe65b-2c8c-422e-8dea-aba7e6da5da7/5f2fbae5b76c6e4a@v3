@@ -1,0 +1,145 @@
+import { NextResponse } from 'next/server';
+import { analyzeHarmony, analyzeFrontProfile, analyzeSideProfile } from '@/lib/scoring/analyzer';
+import { calculatePSL } from '@/lib/psl-calculator';
+import { classifyFromRatios } from '@/lib/archetype-classifier';
+
+// Greek Substitution Cipher Map
+const GREEK_MAP: Record<string, string> = {
+    '0': 'θ',
+    '1': 'ι',
+    '2': 'κ',
+    '3': 'λ',
+    '4': 'μ',
+    '5': 'ν',
+    '6': 'ξ',
+    '7': 'ο',
+    '8': 'π',
+    '9': 'ρ',
+    '.': '·',
+    '-': '–',
+};
+
+// Helper: Obfuscate a number or string value
+function obfuscateValue(value: unknown): unknown {
+    if (typeof value === 'number') {
+        const str = value.toFixed(2);
+        return str.split('').map(char => GREEK_MAP[char] || char).join('');
+    }
+    if (typeof value === 'string') {
+        return value;
+    }
+    return value;
+}
+
+// Recursive function to walk through the JSON object and obfuscate numbers
+function obfuscateObject(obj: unknown): unknown {
+    if (Array.isArray(obj)) {
+        return obj.map(item => obfuscateObject(item));
+    }
+
+    if (typeof obj === 'object' && obj !== null) {
+        const newObj: Record<string, unknown> = {};
+        for (const key in obj as Record<string, unknown>) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                const val = (obj as Record<string, unknown>)[key];
+                if (typeof val === 'object') {
+                    newObj[key] = obfuscateObject(val);
+                } else if (typeof val === 'number') {
+                    newObj[key] = obfuscateValue(val);
+                } else {
+                    newObj[key] = val;
+                }
+            }
+        }
+        return newObj;
+    }
+
+    return obj;
+}
+
+export async function POST(request: Request) {
+    try {
+        const body = await request.json();
+        const {
+            frontLandmarks,
+            sideLandmarks,
+            gender,
+            ethnicity,
+            isPaid,
+            // New optional fields for PSL
+            heightCm,
+            weightKg,
+            bodyFat,
+            muscleLevel
+        } = body;
+
+        if (!frontLandmarks || !sideLandmarks) {
+            return NextResponse.json(
+                { error: 'Missing landmarks' },
+                { status: 400 }
+            );
+        }
+
+        // 1. Calculate Full Analysis (Server-Side)
+        const frontAnalysis = analyzeFrontProfile(frontLandmarks, gender, ethnicity);
+        const sideAnalysis = sideLandmarks.length > 0
+            ? analyzeSideProfile(sideLandmarks, gender, ethnicity)
+            : { measurements: [], overallScore: 0, standardizedScore: 0, qualityTier: 'average', categoryScores: {} };
+
+        const harmony = analyzeHarmony(frontLandmarks, sideLandmarks, gender, ethnicity);
+
+        // 2. Calculate Archetypes
+        // Map measurements (MetricScoreResult) to simple Ratio shape { id, value } expected by classifier
+        // Note: The classifier only needs 'id' and 'value' from the Ratio type
+        const frontRatios = frontAnalysis.measurements.map(m => ({ ...m, id: m.metricId }));
+        // Ensure sideAnalysis is not null/mock for classifier if empty
+        const sideRatios = sideAnalysis && sideAnalysis.measurements
+            ? sideAnalysis.measurements.map(m => ({ ...m, id: m.metricId }))
+            : [];
+
+        // @ts-expect-error - Expected partial mismatch between MetricScoreResult and Ratio but id/value are compatible
+        const archetype = classifyFromRatios(frontRatios, sideRatios, gender, ethnicity);
+
+        // 3. Calculate PSL
+        // Extract failos from harmony analysis (flaws)
+        const failos = harmony.flaws.map(f => f.metricId);
+
+        const psl = calculatePSL({
+            faceScore: harmony.overallScore, // Use the raw 0-10 score
+            heightCm: heightCm || (gender === 'male' ? 178 : 165), // Default height if missing
+            gender,
+            weightKg,
+            bodyAnalysis: bodyFat ? {
+                bodyFatPercent: bodyFat,
+                muscleLevel: muscleLevel || 'average'
+            } : undefined,
+            failos
+        });
+
+        // 4. Prepare Response
+        let responseData: Record<string, unknown> = {
+            frontAnalysis,
+            sideAnalysis,
+            harmony,
+            archetype,
+            psl
+        };
+
+        // 5. Obfuscate if not paid
+        if (!isPaid) {
+            // Apply Greek Cipher to scores
+            responseData = obfuscateObject(responseData) as Record<string, unknown>;
+            // Add a flag so frontend knows it's obfuscated
+            responseData.isObfuscated = true;
+        }
+
+        return NextResponse.json(responseData);
+
+    } catch (error) {
+        console.error('Analysis API Error:', error);
+        return NextResponse.json(
+            { error: 'Internal Server Error' },
+            { status: 500 }
+        );
+    }
+}

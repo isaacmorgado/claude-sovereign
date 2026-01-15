@@ -1,0 +1,213 @@
+/**
+ * Cut List Routes
+ *
+ * Cut list generation endpoints for v3.5 DOM building
+ */
+
+const express = require('express');
+const path = require('path');
+const { generateCutList, generateTakesCutList, validateCutList } = require('../services/cutListGenerator');
+const { processXMLFile } = require('../services/xmlProcessor');
+const { validatePath } = require('../services/securityUtils');
+
+/**
+ * Create cut list routes
+ * @param {Object} options - Route configuration options
+ * @param {Object} options.middleware - Shared middleware (requireCredits)
+ * @returns {express.Router}
+ */
+function createCutListRoutes(options = {}) {
+  const router = express.Router();
+  const { requireCredits } = options.middleware || {};
+
+  /**
+   * POST / - Generate a JSON cut list for direct DOM building (v3.5)
+   *
+   * Takes silences and optionally takes, returns a cut list that the
+   * plugin can use to build sequences directly via UXP APIs.
+   *
+   * Body:
+   * - sourceName: Name of the source clip
+   * - sourcePath: Full path to the source file
+   * - duration: Total duration in seconds
+   * - silences: Array of silence segments [{start, end, duration}]
+   * - takes: (optional) Array of detected takes
+   * - settings: (optional) Generation settings
+   *
+   * Requires authentication via x-stripe-customer-id header
+   */
+  router.post('/', requireCredits({ endpoint: 'cut-list' }), async (req, res) => {
+    const {
+      sourceName,
+      sourcePath,
+      duration,
+      silences,
+      takes = [],
+      settings = {}
+    } = req.body;
+
+    // Validate required fields
+    if (!sourceName && !sourcePath) {
+      return res.status(400).json({ error: 'sourceName or sourcePath is required' });
+    }
+
+    if (typeof duration !== 'number' || duration <= 0) {
+      return res.status(400).json({ error: 'duration must be a positive number' });
+    }
+
+    if (!silences || !Array.isArray(silences)) {
+      return res.status(400).json({ error: 'silences array is required' });
+    }
+
+    console.log(`[SPLICE] Generating cut list for ${sourceName || sourcePath} (${silences.length} silences)`);
+
+    try {
+      const cutList = generateCutList({
+        sourceName: sourceName || path.basename(sourcePath),
+        sourcePath,
+        duration,
+        silences,
+        takes,
+        settings
+      });
+
+      // Validate the generated cut list
+      const validation = validateCutList(cutList);
+      if (!validation.valid) {
+        return res.status(500).json({
+          error: 'Generated cut list is invalid',
+          validationErrors: validation.errors
+        });
+      }
+
+      res.json({
+        success: true,
+        cutList
+      });
+    } catch (err) {
+      console.error('[SPLICE] Cut list generation error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /takes - Generate a cut list that keeps only takes
+   *
+   * Alternative endpoint for "keep best takes only" workflow.
+   *
+   * Requires authentication via x-stripe-customer-id header
+   */
+  router.post('/takes', requireCredits({ endpoint: 'cut-list-takes' }), async (req, res) => {
+    const {
+      sourceName,
+      sourcePath,
+      duration,
+      takes,
+      settings = {}
+    } = req.body;
+
+    // Validate required fields
+    if (!sourceName && !sourcePath) {
+      return res.status(400).json({ error: 'sourceName or sourcePath is required' });
+    }
+
+    if (typeof duration !== 'number' || duration <= 0) {
+      return res.status(400).json({ error: 'duration must be a positive number' });
+    }
+
+    if (!takes || !Array.isArray(takes) || takes.length === 0) {
+      return res.status(400).json({ error: 'takes array is required and must not be empty' });
+    }
+
+    console.log(`[SPLICE] Generating takes cut list for ${sourceName || sourcePath} (${takes.length} takes)`);
+
+    try {
+      const cutList = generateTakesCutList({
+        sourceName: sourceName || path.basename(sourcePath),
+        sourcePath,
+        duration,
+        takes,
+        settings
+      });
+
+      res.json({
+        success: true,
+        cutList
+      });
+    } catch (err) {
+      console.error('[SPLICE] Takes cut list generation error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /process-xml - Process FCP XML to split clips at silences
+   *
+   * Takes an FCP XML file and silence timestamps, splits clips
+   * at silence boundaries, and optionally removes gaps.
+   *
+   * Note: Mounted at /cut-list/process-xml but also available at /process-xml
+   * for backwards compatibility (handled in server.js)
+   */
+  router.post('/process-xml', requireCredits({ endpoint: 'process-xml' }), async (req, res) => {
+    const {
+      xmlPath,
+      silences,
+      removeGaps = true,
+      outputPath = null
+    } = req.body;
+
+    if (!xmlPath) {
+      return res.status(400).json({ error: 'xmlPath is required' });
+    }
+
+    if (!silences || !Array.isArray(silences)) {
+      return res.status(400).json({ error: 'silences array is required' });
+    }
+
+    // SECURITY: Validate xmlPath to prevent path traversal attacks
+    const xmlValidation = await validatePath(xmlPath, {
+      mustExist: true,
+      allowedExtensions: ['.xml', '.xmeml']
+    });
+
+    if (!xmlValidation.valid) {
+      return res.status(400).json({ error: `Invalid XML path: ${xmlValidation.error}` });
+    }
+
+    // SECURITY: Validate outputPath if provided
+    if (outputPath) {
+      const outputValidation = await validatePath(outputPath, {
+        mustExist: false,
+        allowedExtensions: ['.xml', '.xmeml']
+      });
+
+      if (!outputValidation.valid) {
+        return res.status(400).json({ error: `Invalid output path: ${outputValidation.error}` });
+      }
+    }
+
+    console.log(`[SPLICE] Processing XML: ${xmlValidation.path} with ${silences.length} silence(s)`);
+
+    try {
+      const result = await processXMLFile(xmlValidation.path, silences, {
+        outputPath: outputPath || null,
+        removeGaps
+      });
+
+      res.json({
+        success: true,
+        inputPath: xmlValidation.path,
+        outputPath: result.outputPath,
+        stats: result.stats
+      });
+    } catch (err) {
+      console.error('[SPLICE] XML processing error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  return router;
+}
+
+module.exports = createCutListRoutes;

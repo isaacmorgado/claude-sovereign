@@ -1,0 +1,677 @@
+     1→/**
+     2→ * Referral Code Service
+     3→ *
+     4→ * Manages referral codes for user acquisition and rewards.
+     5→ * Each user gets a unique referral code that gives:
+     6→ * - Referee: 10% discount on first purchase
+     7→ * - Referrer: 1 hour credit bonus when code is used
+     8→ */
+     9→
+    10→const { Pool } = require('pg');
+    11→const crypto = require('crypto');
+    12→
+    13→// Use the same pool configuration as usageTracking
+    14→const pool = new Pool({
+    15→  connectionString: process.env.DATABASE_URL,
+    16→  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    17→  max: 20,
+    18→  idleTimeoutMillis: 30000,
+    19→  connectionTimeoutMillis: 5000
+    20→});
+    21→
+    22→// Default referral rewards
+    23→const DEFAULT_REFEREE_DISCOUNT = 10;    // 10% discount for new users
+    24→const DEFAULT_REFERRER_CREDIT = 1.0;    // 1 hour credit for referrer
+    25→
+    26→// Pre-defined influencer/affiliate codes with commissions
+    27→const AFFILIATE_CODES = {
+    28→  'JIMMYN': {
+    29→    discount: 30,              // 30% discount first month only
+    30→    duration: 'once',          // First month only
+    31→    commission: 20,            // 20% commission on first payment
+    32→    payoutEmail: 'lifeofjimmynick@gmail.com',
+    33→    description: 'JIMMYN Influencer - 30% Off First Month',
+    34→    stripeCouponId: 'JIMMYN'
+    35→  }
+    36→};
+    37→
+    38→/**
+    39→ * Initialize referral tables
+    40→ */
+    41→async function initReferralTables() {
+    42→  const client = await pool.connect();
+    43→  try {
+    44→    // Create referral_codes table
+    45→    await client.query(`
+    46→      CREATE TABLE IF NOT EXISTS referral_codes (
+    47→        id SERIAL PRIMARY KEY,
+    48→        code VARCHAR(12) UNIQUE NOT NULL,
+    49→        owner_customer_id VARCHAR(255) NOT NULL,
+    50→        referee_discount_percent INTEGER DEFAULT ${DEFAULT_REFEREE_DISCOUNT},
+    51→        referrer_credit_hours DECIMAL(10,2) DEFAULT ${DEFAULT_REFERRER_CREDIT},
+    52→        times_used INTEGER DEFAULT 0,
+    53→        is_active BOOLEAN DEFAULT TRUE,
+    54→        created_at TIMESTAMP DEFAULT NOW()
+    55→      )
+    56→    `);
+    57→
+    58→    // Create referral_uses table to track who used which code
+    59→    await client.query(`
+    60→      CREATE TABLE IF NOT EXISTS referral_uses (
+    61→        id SERIAL PRIMARY KEY,
+    62→        code_id INTEGER REFERENCES referral_codes(id),
+    63→        referee_customer_id VARCHAR(255) NOT NULL,
+    64→        used_at TIMESTAMP DEFAULT NOW(),
+    65→        credit_awarded BOOLEAN DEFAULT FALSE,
+    66→        stripe_coupon_id VARCHAR(255)
+    67→      )
+    68→    `);
+    69→
+    70→    // Create affiliate_commissions table for influencer payouts
+    71→    await client.query(`
+    72→      CREATE TABLE IF NOT EXISTS affiliate_commissions (
+    73→        id SERIAL PRIMARY KEY,
+    74→        affiliate_code VARCHAR(20) NOT NULL,
+    75→        customer_id VARCHAR(255) NOT NULL,
+    76→        payment_amount DECIMAL(10,2) NOT NULL,
+    77→        commission_percent INTEGER NOT NULL,
+    78→        commission_amount DECIMAL(10,2) NOT NULL,
+    79→        plan VARCHAR(50),
+    80→        paid_out BOOLEAN DEFAULT FALSE,
+    81→        paid_out_at TIMESTAMP,
+    82→        created_at TIMESTAMP DEFAULT NOW()
+    83→      )
+    84→    `);
+    85→
+    86→    await client.query(`
+    87→      CREATE INDEX IF NOT EXISTS idx_affiliate_commissions_code
+    88→      ON affiliate_commissions(affiliate_code)
+    89→    `);
+    90→
+    91→    // Add indexes for efficient lookups
+    92→    await client.query(`
+    93→      CREATE INDEX IF NOT EXISTS idx_referral_codes_owner
+    94→      ON referral_codes(owner_customer_id)
+    95→    `);
+    96→
+    97→    await client.query(`
+    98→      CREATE INDEX IF NOT EXISTS idx_referral_codes_code
+    99→      ON referral_codes(code)
+   100→    `);
+   101→
+   102→    await client.query(`
+   103→      CREATE INDEX IF NOT EXISTS idx_referral_uses_code
+   104→      ON referral_uses(code_id)
+   105→    `);
+   106→
+   107→    await client.query(`
+   108→      CREATE INDEX IF NOT EXISTS idx_referral_uses_referee
+   109→      ON referral_uses(referee_customer_id)
+   110→    `);
+   111→
+   112→    console.log('[Referral] Database tables initialized');
+   113→  } finally {
+   114→    client.release();
+   115→  }
+   116→}
+   117→
+   118→/**
+   119→ * Generate a unique referral code
+   120→ * Format: SPLICE-XXXX (8 random alphanumeric chars)
+   121→ */
+   122→function generateCode() {
+   123→  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars
+   124→  let code = 'SPLICE-';
+   125→  for (let i = 0; i < 6; i++) {
+   126→    code += chars.charAt(crypto.randomInt(chars.length));
+   127→  }
+   128→  return code;
+   129→}
+   130→
+   131→/**
+   132→ * Get or create referral code for a customer
+   133→ *
+   134→ * @param {string} customerId - Stripe customer ID
+   135→ * @returns {Promise<Object>} Referral code info
+   136→ */
+   137→async function getOrCreateCode(customerId) {
+   138→  if (!customerId) {
+   139→    throw new Error('Customer ID is required');
+   140→  }
+   141→
+   142→  const client = await pool.connect();
+   143→  try {
+   144→    // Check for existing code
+   145→    let result = await client.query(
+   146→      'SELECT * FROM referral_codes WHERE owner_customer_id = $1',
+   147→      [customerId]
+   148→    );
+   149→
+   150→    if (result.rows.length > 0) {
+   151→      return {
+   152→        code: result.rows[0].code,
+   153→        discountPercent: result.rows[0].referee_discount_percent,
+   154→        creditHours: parseFloat(result.rows[0].referrer_credit_hours),
+   155→        timesUsed: result.rows[0].times_used,
+   156→        isActive: result.rows[0].is_active,
+   157→        createdAt: result.rows[0].created_at
+   158→      };
+   159→    }
+   160→
+   161→    // Generate unique code with retry logic
+   162→    let code;
+   163→    let attempts = 0;
+   164→    const maxAttempts = 10;
+   165→
+   166→    while (attempts < maxAttempts) {
+   167→      code = generateCode();
+   168→      try {
+   169→        result = await client.query(
+   170→          `INSERT INTO referral_codes (code, owner_customer_id)
+   171→           VALUES ($1, $2)
+   172→           RETURNING *`,
+   173→          [code, customerId]
+   174→        );
+   175→        break;
+   176→      } catch (err) {
+   177→        if (err.code === '23505') { // Unique violation
+   178→          attempts++;
+   179→          continue;
+   180→        }
+   181→        throw err;
+   182→      }
+   183→    }
+   184→
+   185→    if (attempts >= maxAttempts) {
+   186→      throw new Error('Failed to generate unique referral code');
+   187→    }
+   188→
+   189→    return {
+   190→      code: result.rows[0].code,
+   191→      discountPercent: result.rows[0].referee_discount_percent,
+   192→      creditHours: parseFloat(result.rows[0].referrer_credit_hours),
+   193→      timesUsed: 0,
+   194→      isActive: true,
+   195→      createdAt: result.rows[0].created_at
+   196→    };
+   197→  } finally {
+   198→    client.release();
+   199→  }
+   200→}
+   201→
+   202→/**
+   203→ * Validate a referral or affiliate code
+   204→ *
+   205→ * @param {string} code - Referral code to validate
+   206→ * @param {string} refereeCustomerId - The customer trying to use the code (optional)
+   207→ * @returns {Promise<Object>} Validation result
+   208→ */
+   209→async function validateCode(code, refereeCustomerId = null) {
+   210→  if (!code || typeof code !== 'string') {
+   211→    return {
+   212→      valid: false,
+   213→      error: 'Invalid code format'
+   214→    };
+   215→  }
+   216→
+   217→  // Normalize code
+   218→  const normalizedCode = code.toUpperCase().trim();
+   219→
+   220→  // Check if it's a pre-defined affiliate code (like JIMMYN)
+   221→  if (AFFILIATE_CODES[normalizedCode]) {
+   222→    const affiliate = AFFILIATE_CODES[normalizedCode];
+   223→    return {
+   224→      valid: true,
+   225→      code: normalizedCode,
+   226→      discountPercent: affiliate.discount,
+   227→      isAffiliate: true,
+   228→      stripeCouponId: affiliate.stripeCouponId,
+   229→      description: affiliate.description
+   230→    };
+   231→  }
+   232→
+   233→  const client = await pool.connect();
+   234→  try {
+   235→    const result = await client.query(
+   236→      'SELECT * FROM referral_codes WHERE code = $1',
+   237→      [normalizedCode]
+   238→    );
+   239→
+   240→    if (result.rows.length === 0) {
+   241→      return {
+   242→        valid: false,
+   243→        error: 'Code not found'
+   244→      };
+   245→    }
+   246→
+   247→    const codeRow = result.rows[0];
+   248→
+   249→    // Check if code is active
+   250→    if (!codeRow.is_active) {
+   251→      return {
+   252→        valid: false,
+   253→        error: 'Code is no longer active'
+   254→      };
+   255→    }
+   256→
+   257→    // Check if user is trying to use their own code
+   258→    if (refereeCustomerId && codeRow.owner_customer_id === refereeCustomerId) {
+   259→      return {
+   260→        valid: false,
+   261→        error: 'Cannot use your own referral code'
+   262→      };
+   263→    }
+   264→
+   265→    // Check if referee has already used a code
+   266→    if (refereeCustomerId) {
+   267→      const usageCheck = await client.query(
+   268→        'SELECT id FROM referral_uses WHERE referee_customer_id = $1',
+   269→        [refereeCustomerId]
+   270→      );
+   271→      if (usageCheck.rows.length > 0) {
+   272→        return {
+   273→          valid: false,
+   274→          error: 'You have already used a referral code'
+   275→        };
+   276→      }
+   277→    }
+   278→
+   279→    return {
+   280→      valid: true,
+   281→      code: codeRow.code,
+   282→      discountPercent: codeRow.referee_discount_percent,
+   283→      ownerCustomerId: codeRow.owner_customer_id,
+   284→      isAffiliate: false
+   285→    };
+   286→  } finally {
+   287→    client.release();
+   288→  }
+   289→}
+   290→
+   291→/**
+   292→ * Apply a referral or affiliate code for a new signup
+   293→ *
+   294→ * @param {string} code - Referral code
+   295→ * @param {string} refereeCustomerId - New customer's Stripe ID
+   296→ * @param {Object} stripe - Stripe instance for creating coupons (optional)
+   297→ * @returns {Promise<Object>} Application result with coupon info
+   298→ */
+   299→async function applyCode(code, refereeCustomerId, stripe = null) {
+   300→  if (!code || !refereeCustomerId) {
+   301→    throw new Error('Code and referee customer ID are required');
+   302→  }
+   303→
+   304→  // Validate the code first
+   305→  const validation = await validateCode(code, refereeCustomerId);
+   306→  if (!validation.valid) {
+   307→    throw new Error(validation.error);
+   308→  }
+   309→
+   310→  // Handle affiliate codes (like JIMMYN) - use pre-defined Stripe coupon
+   311→  if (validation.isAffiliate) {
+   312→    console.log(`[Referral] Applying affiliate code ${validation.code} for ${refereeCustomerId}`);
+   313→    return {
+   314→      success: true,
+   315→      discountPercent: validation.discountPercent,
+   316→      stripeCouponId: validation.stripeCouponId,
+   317→      isAffiliate: true,
+   318→      affiliateDescription: validation.description,
+   319→      referrerCustomerId: null,
+   320→      creditHoursToAward: 0
+   321→    };
+   322→  }
+   323→
+   324→  // Handle regular referral codes
+   325→  const client = await pool.connect();
+   326→  try {
+   327→    await client.query('BEGIN');
+   328→
+   329→    // Get the code details
+   330→    const codeResult = await client.query(
+   331→      'SELECT * FROM referral_codes WHERE code = $1',
+   332→      [validation.code]
+   333→    );
+   334→    const codeRow = codeResult.rows[0];
+   335→
+   336→    // Create Stripe coupon if Stripe instance provided
+   337→    let stripeCouponId = null;
+   338→    if (stripe) {
+   339→      try {
+   340→        const coupon = await stripe.coupons.create({
+   341→          percent_off: codeRow.referee_discount_percent,
+   342→          duration: 'once',
+   343→          metadata: {
+   344→            referral_code: codeRow.code,
+   345→            referrer: codeRow.owner_customer_id
+   346→          }
+   347→        });
+   348→        stripeCouponId = coupon.id;
+   349→      } catch (err) {
+   350→        console.warn(`[Referral] Failed to create Stripe coupon: ${err.message}`);
+   351→        // Continue without coupon - user still gets tracking
+   352→      }
+   353→    }
+   354→
+   355→    // Record the usage
+   356→    await client.query(
+   357→      `INSERT INTO referral_uses (code_id, referee_customer_id, stripe_coupon_id)
+   358→       VALUES ($1, $2, $3)`,
+   359→      [codeRow.id, refereeCustomerId, stripeCouponId]
+   360→    );
+   361→
+   362→    // Increment usage count
+   363→    await client.query(
+   364→      'UPDATE referral_codes SET times_used = times_used + 1 WHERE id = $1',
+   365→      [codeRow.id]
+   366→    );
+   367→
+   368→    await client.query('COMMIT');
+   369→
+   370→    return {
+   371→      success: true,
+   372→      discountPercent: codeRow.referee_discount_percent,
+   373→      stripeCouponId,
+   374→      isAffiliate: false,
+   375→      referrerCustomerId: codeRow.owner_customer_id,
+   376→      creditHoursToAward: parseFloat(codeRow.referrer_credit_hours)
+   377→    };
+   378→  } catch (err) {
+   379→    await client.query('ROLLBACK');
+   380→    throw err;
+   381→  } finally {
+   382→    client.release();
+   383→  }
+   384→}
+   385→
+   386→/**
+   387→ * Award credit to referrer when a referred user completes first payment
+   388→ *
+   389→ * @param {string} refereeCustomerId - The new customer who was referred
+   390→ * @param {Object} usageTracking - Usage tracking service for adding credits
+   391→ * @returns {Promise<Object>} Award result
+   392→ */
+   393→async function awardReferrerCredit(refereeCustomerId, usageTracking) {
+   394→  const client = await pool.connect();
+   395→  try {
+   396→    // Find the referral use record
+   397→    const useResult = await client.query(
+   398→      `SELECT ru.*, rc.owner_customer_id, rc.referrer_credit_hours
+   399→       FROM referral_uses ru
+   400→       JOIN referral_codes rc ON ru.code_id = rc.id
+   401→       WHERE ru.referee_customer_id = $1 AND ru.credit_awarded = FALSE`,
+   402→      [refereeCustomerId]
+   403→    );
+   404→
+   405→    if (useResult.rows.length === 0) {
+   406→      return { awarded: false, reason: 'No pending referral credit' };
+   407→    }
+   408→
+   409→    const useRow = useResult.rows[0];
+   410→    const creditHours = parseFloat(useRow.referrer_credit_hours);
+   411→
+   412→    // Add credit to referrer's balance
+   413→    if (usageTracking) {
+   414→      // Add bonus hours to existing balance
+   415→      await pool.query(
+   416→        `UPDATE users
+   417→         SET hours_remaining = hours_remaining + $1,
+   418→             hours_total = hours_total + $1,
+   419→             updated_at = CURRENT_TIMESTAMP
+   420→         WHERE stripe_customer_id = $2`,
+   421→        [creditHours, useRow.owner_customer_id]
+   422→      );
+   423→    }
+   424→
+   425→    // Mark as awarded
+   426→    await client.query(
+   427→      'UPDATE referral_uses SET credit_awarded = TRUE WHERE id = $1',
+   428→      [useRow.id]
+   429→    );
+   430→
+   431→    return {
+   432→      awarded: true,
+   433→      referrerCustomerId: useRow.owner_customer_id,
+   434→      creditHours
+   435→    };
+   436→  } finally {
+   437→    client.release();
+   438→  }
+   439→}
+   440→
+   441→/**
+   442→ * Get referral statistics for a customer
+   443→ *
+   444→ * @param {string} customerId - Stripe customer ID
+   445→ * @returns {Promise<Object>} Referral statistics
+   446→ */
+   447→async function getStats(customerId) {
+   448→  if (!customerId) {
+   449→    throw new Error('Customer ID is required');
+   450→  }
+   451→
+   452→  const client = await pool.connect();
+   453→  try {
+   454→    // Get the customer's referral code
+   455→    const codeResult = await client.query(
+   456→      'SELECT * FROM referral_codes WHERE owner_customer_id = $1',
+   457→      [customerId]
+   458→    );
+   459→
+   460→    if (codeResult.rows.length === 0) {
+   461→      return {
+   462→        hasCode: false,
+   463→        code: null,
+   464→        stats: null
+   465→      };
+   466→    }
+   467→
+   468→    const codeRow = codeResult.rows[0];
+   469→
+   470→    // Get usage details
+   471→    const usesResult = await client.query(
+   472→      `SELECT ru.*, ru.credit_awarded
+   473→       FROM referral_uses ru
+   474→       WHERE ru.code_id = $1
+   475→       ORDER BY ru.used_at DESC`,
+   476→      [codeRow.id]
+   477→    );
+   478→
+   479→    const uses = usesResult.rows;
+   480→    const totalUses = uses.length;
+   481→    const creditsAwarded = uses.filter(u => u.credit_awarded).length;
+   482→    const pendingCredits = totalUses - creditsAwarded;
+   483→
+   484→    return {
+   485→      hasCode: true,
+   486→      code: codeRow.code,
+   487→      stats: {
+   488→        totalReferrals: totalUses,
+   489→        successfulReferrals: creditsAwarded,
+   490→        pendingReferrals: pendingCredits,
+   491→        totalCreditsEarned: creditsAwarded * parseFloat(codeRow.referrer_credit_hours),
+   492→        discountPercent: codeRow.referee_discount_percent,
+   493→        creditHoursPerReferral: parseFloat(codeRow.referrer_credit_hours),
+   494→        isActive: codeRow.is_active,
+   495→        recentReferrals: uses.slice(0, 10).map(u => ({
+   496→          usedAt: u.used_at,
+   497→          creditAwarded: u.credit_awarded
+   498→        }))
+   499→      }
+   500→    };
+   501→  } finally {
+   502→    client.release();
+   503→  }
+   504→}
+   505→
+   506→/**
+   507→ * Check if a customer has used a referral code
+   508→ *
+   509→ * @param {string} customerId - Stripe customer ID
+   510→ * @returns {Promise<boolean>}
+   511→ */
+   512→async function hasUsedReferralCode(customerId) {
+   513→  const result = await pool.query(
+   514→    'SELECT id FROM referral_uses WHERE referee_customer_id = $1',
+   515→    [customerId]
+   516→  );
+   517→  return result.rows.length > 0;
+   518→}
+   519→
+   520→/**
+   521→ * Record affiliate commission when a payment is made with an affiliate code
+   522→ *
+   523→ * @param {string} affiliateCode - The affiliate code (e.g., 'JIMMYN')
+   524→ * @param {string} customerId - Customer who made the payment
+   525→ * @param {number} paymentAmount - Amount paid in dollars
+   526→ * @param {string} plan - Plan purchased (starter/pro/team)
+   527→ * @returns {Promise<Object>} Commission record
+   528→ */
+   529→async function recordAffiliateCommission(affiliateCode, customerId, paymentAmount, plan = null) {
+   530→  const normalizedCode = affiliateCode.toUpperCase().trim();
+   531→  const affiliate = AFFILIATE_CODES[normalizedCode];
+   532→
+   533→  if (!affiliate) {
+   534→    return { recorded: false, reason: 'Not an affiliate code' };
+   535→  }
+   536→
+   537→  const commissionPercent = affiliate.commission;
+   538→  const commissionAmount = (paymentAmount * commissionPercent / 100).toFixed(2);
+   539→
+   540→  const result = await pool.query(
+   541→    `INSERT INTO affiliate_commissions
+   542→     (affiliate_code, customer_id, payment_amount, commission_percent, commission_amount, plan)
+   543→     VALUES ($1, $2, $3, $4, $5, $6)
+   544→     RETURNING *`,
+   545→    [normalizedCode, customerId, paymentAmount, commissionPercent, commissionAmount, plan]
+   546→  );
+   547→
+   548→  console.log(`[Referral] Recorded $${commissionAmount} commission for ${normalizedCode} from ${customerId}`);
+   549→
+   550→  return {
+   551→    recorded: true,
+   552→    commissionId: result.rows[0].id,
+   553→    affiliateCode: normalizedCode,
+   554→    paymentAmount,
+   555→    commissionPercent,
+   556→    commissionAmount: parseFloat(commissionAmount),
+   557→    payoutEmail: affiliate.payoutEmail
+   558→  };
+   559→}
+   560→
+   561→/**
+   562→ * Get affiliate earnings and statistics
+   563→ *
+   564→ * @param {string} affiliateCode - The affiliate code
+   565→ * @returns {Promise<Object>} Earnings summary
+   566→ */
+   567→async function getAffiliateEarnings(affiliateCode) {
+   568→  const normalizedCode = affiliateCode.toUpperCase().trim();
+   569→  const affiliate = AFFILIATE_CODES[normalizedCode];
+   570→
+   571→  if (!affiliate) {
+   572→    return { valid: false, error: 'Not an affiliate code' };
+   573→  }
+   574→
+   575→  const result = await pool.query(
+   576→    `SELECT
+   577→       COUNT(*) as total_referrals,
+   578→       SUM(commission_amount) as total_earned,
+   579→       SUM(CASE WHEN paid_out = FALSE THEN commission_amount ELSE 0 END) as pending_payout,
+   580→       SUM(CASE WHEN paid_out = TRUE THEN commission_amount ELSE 0 END) as paid_out
+   581→     FROM affiliate_commissions
+   582→     WHERE affiliate_code = $1`,
+   583→    [normalizedCode]
+   584→  );
+   585→
+   586→  const stats = result.rows[0];
+   587→
+   588→  // Get recent commissions
+   589→  const recentResult = await pool.query(
+   590→    `SELECT customer_id, payment_amount, commission_amount, plan, paid_out, created_at
+   591→     FROM affiliate_commissions
+   592→     WHERE affiliate_code = $1
+   593→     ORDER BY created_at DESC
+   594→     LIMIT 20`,
+   595→    [normalizedCode]
+   596→  );
+   597→
+   598→  return {
+   599→    valid: true,
+   600→    affiliateCode: normalizedCode,
+   601→    payoutEmail: affiliate.payoutEmail,
+   602→    commissionPercent: affiliate.commission,
+   603→    stats: {
+   604→      totalReferrals: parseInt(stats.total_referrals) || 0,
+   605→      totalEarned: parseFloat(stats.total_earned) || 0,
+   606→      pendingPayout: parseFloat(stats.pending_payout) || 0,
+   607→      paidOut: parseFloat(stats.paid_out) || 0
+   608→    },
+   609→    recentCommissions: recentResult.rows.map(r => ({
+   610→      paymentAmount: parseFloat(r.payment_amount),
+   611→      commissionAmount: parseFloat(r.commission_amount),
+   612→      plan: r.plan,
+   613→      paidOut: r.paid_out,
+   614→      createdAt: r.created_at
+   615→    }))
+   616→  };
+   617→}
+   618→
+   619→/**
+   620→ * Mark commissions as paid out
+   621→ *
+   622→ * @param {string} affiliateCode - The affiliate code
+   623→ * @param {Array<number>} commissionIds - Optional specific IDs to mark paid
+   624→ * @returns {Promise<Object>} Payout result
+   625→ */
+   626→async function markCommissionsPaid(affiliateCode, commissionIds = null) {
+   627→  const normalizedCode = affiliateCode.toUpperCase().trim();
+   628→
+   629→  let result;
+   630→  if (commissionIds && commissionIds.length > 0) {
+   631→    result = await pool.query(
+   632→      `UPDATE affiliate_commissions
+   633→       SET paid_out = TRUE, paid_out_at = NOW()
+   634→       WHERE affiliate_code = $1 AND id = ANY($2) AND paid_out = FALSE
+   635→       RETURNING *`,
+   636→      [normalizedCode, commissionIds]
+   637→    );
+   638→  } else {
+   639→    result = await pool.query(
+   640→      `UPDATE affiliate_commissions
+   641→       SET paid_out = TRUE, paid_out_at = NOW()
+   642→       WHERE affiliate_code = $1 AND paid_out = FALSE
+   643→       RETURNING *`,
+   644→      [normalizedCode]
+   645→    );
+   646→  }
+   647→
+   648→  const totalPaid = result.rows.reduce((sum, r) => sum + parseFloat(r.commission_amount), 0);
+   649→
+   650→  return {
+   651→    success: true,
+   652→    commissionsMarkedPaid: result.rows.length,
+   653→    totalAmountPaid: totalPaid
+   654→  };
+   655→}
+   656→
+   657→module.exports = {
+   658→  initReferralTables,
+   659→  getOrCreateCode,
+   660→  validateCode,
+   661→  applyCode,
+   662→  awardReferrerCredit,
+   663→  getStats,
+   664→  hasUsedReferralCode,
+   665→  generateCode,
+   666→  recordAffiliateCommission,
+   667→  getAffiliateEarnings,
+   668→  markCommissionsPaid,
+   669→  DEFAULT_REFEREE_DISCOUNT,
+   670→  DEFAULT_REFERRER_CREDIT,
+   671→  AFFILIATE_CODES
+   672→};
+   673→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

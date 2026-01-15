@@ -1,0 +1,280 @@
+     1→/**
+     2→ * Security Utilities
+     3→ *
+     4→ * Provides secure path validation and command execution
+     5→ * to prevent command injection and path traversal attacks.
+     6→ */
+     7→
+     8→const { execFile } = require('child_process');
+     9→const { promisify } = require('util');
+    10→const path = require('path');
+    11→const fs = require('fs').promises;
+    12→
+    13→const execFileAsync = promisify(execFile);
+    14→
+    15→// Allowed base directories for audio file access
+    16→const ALLOWED_BASE_DIRS = [
+    17→  '/tmp',
+    18→  '/var/tmp',
+    19→  '/private/tmp',                    // macOS temp
+    20→  '/Users',                          // macOS user dirs
+    21→  '/home',                           // Linux user dirs
+    22→  '/Volumes',                        // macOS mounted volumes
+    23→  '/mnt',                            // Linux mounts
+    24→  '/media',                          // Linux removable media
+    25→  process.env.HOME,                  // User's home directory
+    26→  process.cwd()                      // Current working directory
+    27→].filter(Boolean);
+    28→
+    29→/**
+    30→ * Validate and sanitize a file path
+    31→ *
+    32→ * @param {string} inputPath - Path to validate
+    33→ * @param {Object} options - Validation options
+    34→ * @param {boolean} options.mustExist - Check if file exists (default: true)
+    35→ * @param {string[]} options.allowedExtensions - Allowed file extensions (optional)
+    36→ * @returns {Promise<{valid: boolean, path?: string, error?: string}>}
+    37→ */
+    38→async function validatePath(inputPath, options = {}) {
+    39→  const { mustExist = true, allowedExtensions = null } = options;
+    40→
+    41→  // Reject empty or non-string paths
+    42→  if (!inputPath || typeof inputPath !== 'string') {
+    43→    return { valid: false, error: 'Path must be a non-empty string' };
+    44→  }
+    45→
+    46→  // Reject paths with null bytes (can bypass checks)
+    47→  if (inputPath.includes('\0')) {
+    48→    return { valid: false, error: 'Path contains null bytes' };
+    49→  }
+    50→
+    51→  // Reject command injection characters
+    52→  const dangerousChars = /[`$();|&<>]/;
+    53→  if (dangerousChars.test(inputPath)) {
+    54→    return { valid: false, error: 'Path contains potentially dangerous characters' };
+    55→  }
+    56→
+    57→  // Normalize the path to resolve .. and .
+    58→  const normalizedPath = path.resolve(inputPath);
+    59→
+    60→  // Check for directory traversal attempts
+    61→  // After normalization, the path should be under an allowed directory
+    62→  const isUnderAllowedDir = ALLOWED_BASE_DIRS.some(baseDir => {
+    63→    if (!baseDir) return false;
+    64→    const normalizedBase = path.resolve(baseDir);
+    65→    return normalizedPath.startsWith(normalizedBase + path.sep) ||
+    66→           normalizedPath === normalizedBase;
+    67→  });
+    68→
+    69→  if (!isUnderAllowedDir) {
+    70→    return {
+    71→      valid: false,
+    72→      error: `Path is not under an allowed directory`
+    73→    };
+    74→  }
+    75→
+    76→  // Check extension if specified
+    77→  if (allowedExtensions) {
+    78→    const ext = path.extname(normalizedPath).toLowerCase();
+    79→    if (!allowedExtensions.includes(ext)) {
+    80→      return {
+    81→        valid: false,
+    82→        error: `File extension '${ext}' not allowed. Allowed: ${allowedExtensions.join(', ')}`
+    83→      };
+    84→    }
+    85→  }
+    86→
+    87→  // Check if file exists if required
+    88→  if (mustExist) {
+    89→    try {
+    90→      await fs.access(normalizedPath, fs.constants.R_OK);
+    91→    } catch {
+    92→      return { valid: false, error: 'File does not exist or is not readable' };
+    93→    }
+    94→  }
+    95→
+    96→  return { valid: true, path: normalizedPath };
+    97→}
+    98→
+    99→/**
+   100→ * Validate audio file path with common audio extensions
+   101→ *
+   102→ * @param {string} audioPath - Path to audio file
+   103→ * @returns {Promise<{valid: boolean, path?: string, error?: string}>}
+   104→ */
+   105→async function validateAudioPath(audioPath) {
+   106→  const audioExtensions = [
+   107→    '.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac',
+   108→    '.wma', '.aiff', '.aif', '.opus', '.webm', '.mp4',
+   109→    '.mov', '.mkv', '.avi'  // Video files with audio tracks
+   110→  ];
+   111→
+   112→  return validatePath(audioPath, {
+   113→    mustExist: true,
+   114→    allowedExtensions: audioExtensions
+   115→  });
+   116→}
+   117→
+   118→/**
+   119→ * Safe FFprobe execution using execFile with array arguments
+   120→ *
+   121→ * @param {string[]} args - FFprobe arguments as array
+   122→ * @param {Object} options - execFile options
+   123→ * @returns {Promise<{stdout: string, stderr: string}>}
+   124→ */
+   125→async function safeFFprobe(args, options = {}) {
+   126→  const defaultOptions = {
+   127→    maxBuffer: 10 * 1024 * 1024,
+   128→    timeout: 60000
+   129→  };
+   130→
+   131→  const execOptions = { ...defaultOptions, ...options };
+   132→
+   133→  try {
+   134→    return await execFileAsync('ffprobe', args, execOptions);
+   135→  } catch (_e) {
+   136→    // FFprobe often outputs to stderr even on success
+   137→    if (_e.stderr) {
+   138→      return { stdout: _e.stdout || '', stderr: _e.stderr };
+   139→    }
+   140→    throw _e;
+   141→  }
+   142→}
+   143→
+   144→/**
+   145→ * Safe FFmpeg execution using execFile with array arguments
+   146→ *
+   147→ * @param {string[]} args - FFmpeg arguments as array
+   148→ * @param {Object} options - execFile options
+   149→ * @returns {Promise<{stdout: string, stderr: string}>}
+   150→ */
+   151→async function safeFFmpeg(args, options = {}) {
+   152→  const defaultOptions = {
+   153→    maxBuffer: 100 * 1024 * 1024,
+   154→    timeout: 300000  // 5 minutes
+   155→  };
+   156→
+   157→  const execOptions = { ...defaultOptions, ...options };
+   158→
+   159→  try {
+   160→    return await execFileAsync('ffmpeg', args, execOptions);
+   161→  } catch (error) {
+   162→    // FFmpeg outputs to stderr even on success
+   163→    if (error.stderr && !error.killed) {
+   164→      return { stdout: error.stdout || '', stderr: error.stderr };
+   165→    }
+   166→    throw error;
+   167→  }
+   168→}
+   169→
+   170→/**
+   171→ * Get audio duration using safe FFprobe execution
+   172→ *
+   173→ * @param {string} audioPath - Validated audio file path
+   174→ * @returns {Promise<number>} Duration in seconds
+   175→ */
+   176→async function getAudioDurationSafe(audioPath) {
+   177→  const args = [
+   178→    '-v', 'error',
+   179→    '-show_entries', 'format=duration',
+   180→    '-of', 'default=noprint_wrappers=1:nokey=1',
+   181→    audioPath
+   182→  ];
+   183→
+   184→  const { stdout } = await safeFFprobe(args);
+   185→  return parseFloat(stdout.trim()) || 0;
+   186→}
+   187→
+   188→/**
+   189→ * Detect silences using safe FFprobe execution
+   190→ *
+   191→ * @param {string} audioPath - Validated audio file path
+   192→ * @param {number} threshold - dB threshold
+   193→ * @param {number} minDuration - Minimum silence duration
+   194→ * @returns {Promise<string>} FFprobe output
+   195→ */
+   196→async function detectSilencesSafe(audioPath, threshold, minDuration) {
+   197→  // Build lavfi filter string
+   198→  const filter = `amovie='${audioPath.replace(/'/g, "'\\''")}',silencedetect=n=${threshold}dB:d=${minDuration}`;
+   199→
+   200→  const args = [
+   201→    '-f', 'lavfi',
+   202→    '-i', filter,
+   203→    '-show_entries', 'frame_tags=lavfi.silence_start,lavfi.silence_end',
+   204→    '-of', 'default=nw=1'
+   205→  ];
+   206→
+   207→  const { stdout, stderr } = await safeFFprobe(args);
+   208→  return stderr || stdout;
+   209→}
+   210→
+   211→/**
+   212→ * Extract audio to raw PCM using safe FFmpeg execution
+   213→ *
+   214→ * @param {string} inputPath - Validated input audio path
+   215→ * @param {string} outputPath - Output path (should be in /tmp)
+   216→ * @param {Object} options - Extraction options
+   217→ * @returns {Promise<void>}
+   218→ */
+   219→async function extractAudioSafe(inputPath, outputPath, options = {}) {
+   220→  const {
+   221→    startTime = null,
+   222→    duration = null,
+   223→    sampleRate = 16000,
+   224→    channels = 1
+   225→  } = options;
+   226→
+   227→  const args = ['-y'];
+   228→
+   229→  // Add seek if specified
+   230→  if (startTime !== null) {
+   231→    args.push('-ss', String(startTime));
+   232→  }
+   233→
+   234→  // Add duration if specified
+   235→  if (duration !== null) {
+   236→    args.push('-t', String(duration));
+   237→  }
+   238→
+   239→  // Input file
+   240→  args.push('-i', inputPath);
+   241→
+   242→  // Output format
+   243→  args.push(
+   244→    '-ac', String(channels),
+   245→    '-ar', String(sampleRate),
+   246→    '-f', 's16le',
+   247→    '-acodec', 'pcm_s16le',
+   248→    outputPath
+   249→  );
+   250→
+   251→  await safeFFmpeg(args);
+   252→}
+   253→
+   254→/**
+   255→ * Generate a safe temp file path
+   256→ *
+   257→ * @param {string} prefix - File prefix
+   258→ * @param {string} extension - File extension (including dot)
+   259→ * @returns {string} Safe temp file path
+   260→ */
+   261→function safeTempPath(prefix, extension = '.raw') {
+   262→  const crypto = require('crypto');
+   263→  const uniqueId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+   264→  return path.join('/tmp', `${prefix}_${uniqueId}${extension}`);
+   265→}
+   266→
+   267→module.exports = {
+   268→  validatePath,
+   269→  validateAudioPath,
+   270→  safeFFprobe,
+   271→  safeFFmpeg,
+   272→  getAudioDurationSafe,
+   273→  detectSilencesSafe,
+   274→  extractAudioSafe,
+   275→  safeTempPath,
+   276→  ALLOWED_BASE_DIRS
+   277→};
+   278→
+
+</system-reminder>

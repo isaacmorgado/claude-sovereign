@@ -1,0 +1,684 @@
+// Backend API client for UXP plugin
+// Connects to Splice backend for auth, billing, and audio processing
+
+// Configurable API base URL - defaults to localhost for development
+// In production, set window.SPLICE_API_URL before loading the plugin
+declare global {
+  interface Window {
+    SPLICE_API_URL?: string
+  }
+}
+
+// Default request timeout in milliseconds
+const DEFAULT_TIMEOUT_MS = 30000
+
+function getApiBase(): string {
+  if (typeof window !== 'undefined' && window.SPLICE_API_URL) {
+    return window.SPLICE_API_URL
+  }
+  return 'http://localhost:3001/api'
+}
+
+interface ApiResponse<T> {
+  success: boolean
+  data?: T
+  error?: string
+  message?: string
+}
+
+export interface AuthTokens {
+  accessToken: string
+  refreshToken: string
+}
+
+export interface User {
+  id: string
+  email: string
+  name?: string
+  plan: 'free' | 'pro' | 'enterprise'
+  createdAt: string
+}
+
+// Matches backend UsageStats from usage-controller.ts
+export interface UsageStats {
+  currentUsage: number
+  limit: number
+  remaining: number
+  percentUsed: number
+  tier: string
+  resetAt: string
+}
+
+// Matches backend AudioJobPublic from types/audio.ts
+export type AudioJobType = 'transcription' | 'vocal_isolation'
+export type AudioJobStatus = 'pending' | 'processing' | 'completed' | 'failed'
+
+export interface AudioJob {
+  id: string
+  jobType: AudioJobType
+  status: AudioJobStatus
+  audioDurationMinutes: number
+  progress: number
+  resultUrl: string | null
+  resultData: TranscriptionResult | VocalIsolationResult | null
+  errorMessage: string | null
+  createdAt: string
+  completedAt: string | null
+}
+
+export interface TranscriptionResult {
+  text: string
+  segments: TranscriptionSegment[]
+  language: string
+  confidence: number
+}
+
+export interface TranscriptionSegment {
+  start: number
+  end: number
+  text: string
+  confidence: number
+}
+
+export interface VocalIsolationResult {
+  vocalsUrl: string
+  instrumentalUrl: string
+}
+
+export interface PresignedUrlResponse {
+  uploadUrl: string
+  fileKey: string
+  publicUrl: string
+}
+
+export interface UploadResult {
+  publicUrl: string
+  fileKey: string
+}
+
+// Matches backend SubscriptionStatus from types/billing.ts
+export interface SubscriptionStatus {
+  tier: 'free' | 'pro' | 'enterprise'
+  status: 'active' | 'canceled' | 'past_due' | 'none'
+  currentPeriodEnd: string | null
+  cancelAtPeriodEnd: boolean
+}
+
+// Matches backend CheckoutSession from types/billing.ts
+export interface CheckoutSession {
+  sessionId: string
+  url: string
+}
+
+// Options for pollJobUntilComplete with cancellation support
+export interface PollOptions {
+  intervalMs?: number
+  maxAttempts?: number
+  signal?: AbortSignal
+}
+
+type AuthChangeCallback = (user: User | null) => void
+
+class BackendClient {
+  private accessToken: string | null = null
+  private refreshToken: string | null = null
+  private currentUser: User | null = null
+  private authChangeCallbacks: AuthChangeCallback[] = []
+  private initPromise: Promise<void>
+
+  // Mutex for token refresh to prevent concurrent refresh attempts
+  private refreshPromise: Promise<boolean> | null = null
+
+  constructor() {
+    this.initPromise = this.loadTokensFromStorage()
+  }
+
+  // Wait for initialization to complete (token loading)
+  async waitForInit(): Promise<void> {
+    return this.initPromise
+  }
+
+  private async loadTokensFromStorage(): Promise<void> {
+    // Check if we're in a UXP environment (Adobe plugin)
+    // Use globalThis to check without triggering Vite's import analysis
+    const isUXP = typeof globalThis !== 'undefined' && 'uxp' in globalThis
+
+    if (!isUXP) {
+      // Browser dev mode - try localStorage fallback
+      try {
+        const stored = localStorage.getItem('splice-tokens')
+        if (stored) {
+          const data = JSON.parse(stored)
+          this.accessToken = data.accessToken || null
+          this.refreshToken = data.refreshToken || null
+        }
+      } catch {
+        console.log('[BackendClient] Running in browser dev mode, using localStorage')
+      }
+      return
+    }
+
+    try {
+      // UXP storage API - dynamic import to avoid Vite analysis
+      const uxpModule = 'uxp'
+      const uxp = await (Function('m', 'return import(m)')(uxpModule) as Promise<
+        typeof import('uxp')
+      >)
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      try {
+        const tokenFile = await dataFolder.getEntry('splice-tokens.json')
+        if (tokenFile) {
+          const contents = await tokenFile.read()
+          try {
+            const data = JSON.parse(contents)
+            this.accessToken = data.accessToken || null
+            this.refreshToken = data.refreshToken || null
+          } catch {
+            // Invalid JSON - delete corrupted token file
+            console.warn('[BackendClient] Corrupted token file, deleting')
+            await tokenFile.delete()
+          }
+        }
+      } catch {
+        // File doesn't exist yet, that's fine
+      }
+    } catch {
+      // Not in UXP environment (dev mode), use memory only
+      console.log('[BackendClient] Running outside UXP, tokens will not persist')
+    }
+  }
+
+  private async saveTokensToStorage(): Promise<void> {
+    const isUXP = typeof globalThis !== 'undefined' && 'uxp' in globalThis
+
+    if (!isUXP) {
+      // Browser dev mode - use localStorage
+      try {
+        localStorage.setItem(
+          'splice-tokens',
+          JSON.stringify({
+            accessToken: this.accessToken,
+            refreshToken: this.refreshToken,
+          })
+        )
+      } catch {
+        // localStorage not available
+      }
+      return
+    }
+
+    try {
+      const uxpModule = 'uxp'
+      const uxp = await (Function('m', 'return import(m)')(uxpModule) as Promise<
+        typeof import('uxp')
+      >)
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      const tokenFile = await dataFolder.createFile('splice-tokens.json', { overwrite: true })
+      await tokenFile.write(
+        JSON.stringify({
+          accessToken: this.accessToken,
+          refreshToken: this.refreshToken,
+        })
+      )
+    } catch {
+      // Not in UXP environment
+    }
+  }
+
+  private async clearTokensFromStorage(): Promise<void> {
+    const isUXP = typeof globalThis !== 'undefined' && 'uxp' in globalThis
+
+    if (!isUXP) {
+      // Browser dev mode - use localStorage
+      try {
+        localStorage.removeItem('splice-tokens')
+      } catch {
+        // localStorage not available
+      }
+      return
+    }
+
+    try {
+      const uxpModule = 'uxp'
+      const uxp = await (Function('m', 'return import(m)')(uxpModule) as Promise<
+        typeof import('uxp')
+      >)
+      const storage = uxp.storage
+      const fs = storage.localFileSystem
+      const dataFolder = await fs.getDataFolder()
+
+      try {
+        const tokenFile = await dataFolder.getEntry('splice-tokens.json')
+        if (tokenFile) {
+          await tokenFile.delete()
+        }
+      } catch {
+        // File doesn't exist
+      }
+    } catch {
+      // Not in UXP environment
+    }
+  }
+
+  async setTokens(tokens: AuthTokens): Promise<void> {
+    this.accessToken = tokens.accessToken
+    this.refreshToken = tokens.refreshToken
+    await this.saveTokensToStorage()
+  }
+
+  async clearTokens(): Promise<void> {
+    this.accessToken = null
+    this.refreshToken = null
+    this.currentUser = null
+    await this.clearTokensFromStorage()
+    this.notifyAuthChange(null)
+  }
+
+  onAuthChange(callback: AuthChangeCallback): () => void {
+    this.authChangeCallbacks.push(callback)
+    return () => {
+      this.authChangeCallbacks = this.authChangeCallbacks.filter((cb) => cb !== callback)
+    }
+  }
+
+  private notifyAuthChange(user: User | null): void {
+    this.currentUser = user
+    this.authChangeCallbacks.forEach((cb) => cb(user))
+  }
+
+  /**
+   * Fetch with timeout support
+   */
+  private async fetchWithTimeout(
+    url: string,
+    options: RequestInit = {},
+    timeoutMs: number = DEFAULT_TIMEOUT_MS
+  ): Promise<Response> {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      })
+      return response
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {},
+    timeoutMs: number = DEFAULT_TIMEOUT_MS
+  ): Promise<T> {
+    const apiBase = getApiBase()
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string>),
+    }
+
+    if (this.accessToken) {
+      headers['Authorization'] = `Bearer ${this.accessToken}`
+    }
+
+    const response = await this.fetchWithTimeout(
+      `${apiBase}${endpoint}`,
+      {
+        ...options,
+        headers,
+      },
+      timeoutMs
+    )
+
+    // Handle 401 with token refresh
+    if (response.status === 401 && this.refreshToken) {
+      const refreshed = await this.refreshTokens()
+      if (refreshed) {
+        headers['Authorization'] = `Bearer ${this.accessToken}`
+        const retryResponse = await this.fetchWithTimeout(
+          `${apiBase}${endpoint}`,
+          {
+            ...options,
+            headers,
+          },
+          timeoutMs
+        )
+        return this.handleResponse<T>(retryResponse)
+      }
+    }
+
+    return this.handleResponse<T>(response)
+  }
+
+  private async handleResponse<T>(response: Response): Promise<T> {
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ message: response.statusText }))
+      throw new Error(error.error || error.message || 'Request failed')
+    }
+
+    const result: ApiResponse<T> = await response.json()
+    if (!result.success || result.data === undefined) {
+      throw new Error(result.error || result.message || 'Request failed')
+    }
+    return result.data
+  }
+
+  /**
+   * Refresh tokens with mutex to prevent concurrent refresh attempts.
+   * If a refresh is already in progress, wait for it instead of starting a new one.
+   */
+  private async refreshTokens(): Promise<boolean> {
+    // If a refresh is already in progress, wait for it
+    if (this.refreshPromise) {
+      return this.refreshPromise
+    }
+
+    // Start new refresh and store the promise
+    this.refreshPromise = this.doRefreshTokens()
+
+    try {
+      return await this.refreshPromise
+    } finally {
+      // Clear the mutex when done
+      this.refreshPromise = null
+    }
+  }
+
+  private async doRefreshTokens(): Promise<boolean> {
+    try {
+      const apiBase = getApiBase()
+      const response = await this.fetchWithTimeout(
+        `${apiBase}/auth/refresh`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: this.refreshToken }),
+        },
+        DEFAULT_TIMEOUT_MS
+      )
+
+      if (!response.ok) {
+        await this.clearTokens()
+        return false
+      }
+
+      const result: ApiResponse<AuthTokens> = await response.json()
+      if (!result.success || !result.data) {
+        await this.clearTokens()
+        return false
+      }
+      await this.setTokens(result.data)
+      return true
+    } catch {
+      await this.clearTokens()
+      return false
+    }
+  }
+
+  // ==================== Auth ====================
+
+  async login(email: string, password: string): Promise<{ user: User; tokens: AuthTokens }> {
+    const data = await this.request<{ user: User; tokens: AuthTokens }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    })
+    await this.setTokens(data.tokens)
+    this.notifyAuthChange(data.user)
+    return data
+  }
+
+  async register(
+    email: string,
+    password: string,
+    name?: string
+  ): Promise<{ user: User; tokens: AuthTokens }> {
+    const data = await this.request<{ user: User; tokens: AuthTokens }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, name }),
+    })
+    await this.setTokens(data.tokens)
+    this.notifyAuthChange(data.user)
+    return data
+  }
+
+  async logout(): Promise<void> {
+    try {
+      const apiBase = getApiBase()
+      await this.fetchWithTimeout(
+        `${apiBase}/auth/logout`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+          },
+          body: JSON.stringify({ refreshToken: this.refreshToken }),
+        },
+        DEFAULT_TIMEOUT_MS
+      )
+    } finally {
+      await this.clearTokens()
+    }
+  }
+
+  async getMe(): Promise<User> {
+    const user = await this.request<User>('/auth/me')
+    this.notifyAuthChange(user)
+    return user
+  }
+
+  isAuthenticated(): boolean {
+    return Boolean(this.accessToken)
+  }
+
+  getUser(): User | null {
+    return this.currentUser
+  }
+
+  // ==================== Usage ====================
+
+  async getUsage(): Promise<UsageStats> {
+    return this.request<UsageStats>('/usage')
+  }
+
+  // Check if user can submit a job with given duration
+  // Uses /usage/check which returns remaining minutes
+  async checkUsageLimit(minutes: number): Promise<{ allowed: boolean; remaining: number }> {
+    return this.request<{ allowed: boolean; remaining: number }>(`/usage/check?minutes=${minutes}`)
+  }
+
+  // Check if user can submit audio job (considers pending jobs too)
+  // Uses /audio/check which returns reason if not allowed
+  async canSubmitAudioJob(minutes: number): Promise<{ allowed: boolean; reason?: string }> {
+    return this.request<{ allowed: boolean; reason?: string }>(`/audio/check?minutes=${minutes}`)
+  }
+
+  // ==================== File Upload ====================
+
+  // Get a presigned URL for uploading a file to S3
+  async getPresignedUploadUrl(
+    filename: string,
+    contentType: string,
+    fileSize: number
+  ): Promise<PresignedUrlResponse> {
+    return this.request<PresignedUrlResponse>('/audio/presigned-url', {
+      method: 'POST',
+      body: JSON.stringify({ filename, contentType, fileSize }),
+    })
+  }
+
+  // Upload a file to S3 using a presigned URL
+  // Returns the public URL of the uploaded file
+  async uploadFileToS3(file: File, presignedUrl: string): Promise<void> {
+    const response = await fetch(presignedUrl, {
+      method: 'PUT',
+      body: file,
+      headers: {
+        'Content-Type': file.type,
+      },
+    })
+
+    if (!response.ok) {
+      throw new Error(`Upload failed: ${response.statusText}`)
+    }
+  }
+
+  // Convenience method: get presigned URL and upload file in one call
+  async uploadFile(file: File): Promise<UploadResult> {
+    const presigned = await this.getPresignedUploadUrl(file.name, file.type, file.size)
+
+    await this.uploadFileToS3(file, presigned.uploadUrl)
+
+    return {
+      publicUrl: presigned.publicUrl,
+      fileKey: presigned.fileKey,
+    }
+  }
+
+  // ==================== Audio Jobs ====================
+
+  // Submit a transcription job
+  // audioUrl: URL to the audio file (must be pre-uploaded)
+  // audioDurationMinutes: duration of the audio in minutes
+  async submitTranscription(audioUrl: string, audioDurationMinutes: number): Promise<AudioJob> {
+    return this.request<AudioJob>('/audio/transcribe', {
+      method: 'POST',
+      body: JSON.stringify({ audioUrl, audioDurationMinutes }),
+    })
+  }
+
+  // Submit a vocal isolation job
+  // audioUrl: URL to the audio file (must be pre-uploaded)
+  // audioDurationMinutes: duration of the audio in minutes
+  async submitVocalIsolation(audioUrl: string, audioDurationMinutes: number): Promise<AudioJob> {
+    return this.request<AudioJob>('/audio/isolate-vocals', {
+      method: 'POST',
+      body: JSON.stringify({ audioUrl, audioDurationMinutes }),
+    })
+  }
+
+  async getJobs(limit: number = 20, offset: number = 0): Promise<AudioJob[]> {
+    return this.request<AudioJob[]>(`/audio/jobs?limit=${limit}&offset=${offset}`)
+  }
+
+  async getJob(jobId: string): Promise<AudioJob> {
+    return this.request<AudioJob>(`/audio/jobs/${jobId}`)
+  }
+
+  /**
+   * Poll a job until it completes or fails.
+   * Supports cancellation via AbortSignal.
+   *
+   * @param jobId - The job ID to poll
+   * @param onProgress - Optional callback for progress updates
+   * @param options - Polling options including intervalMs, maxAttempts, and signal for cancellation
+   * @returns The completed job
+   * @throws Error if job fails, times out, or is cancelled
+   */
+  async pollJobUntilComplete(
+    jobId: string,
+    onProgress?: (job: AudioJob) => void,
+    options: PollOptions = {}
+  ): Promise<AudioJob> {
+    const { intervalMs = 2000, maxAttempts = 300, signal } = options // Default 10 min timeout
+
+    return new Promise((resolve, reject) => {
+      let attempts = 0
+      let timeoutId: ReturnType<typeof setTimeout> | null = null
+
+      // Handle abort signal
+      const abortHandler = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId)
+        }
+        reject(new Error('Polling cancelled'))
+      }
+
+      if (signal) {
+        if (signal.aborted) {
+          reject(new Error('Polling cancelled'))
+          return
+        }
+        signal.addEventListener('abort', abortHandler)
+      }
+
+      const cleanup = () => {
+        if (signal) {
+          signal.removeEventListener('abort', abortHandler)
+        }
+      }
+
+      const poll = async () => {
+        // Check if aborted before making request
+        if (signal?.aborted) {
+          cleanup()
+          reject(new Error('Polling cancelled'))
+          return
+        }
+
+        try {
+          attempts++
+          const job = await this.getJob(jobId)
+          onProgress?.(job)
+
+          if (job.status === 'completed') {
+            cleanup()
+            resolve(job)
+          } else if (job.status === 'failed') {
+            cleanup()
+            reject(new Error(job.errorMessage || 'Job failed'))
+          } else if (attempts >= maxAttempts) {
+            cleanup()
+            reject(new Error('Job polling timed out'))
+          } else {
+            // Schedule next poll
+            timeoutId = setTimeout(poll, intervalMs)
+          }
+        } catch (error) {
+          cleanup()
+          reject(error)
+        }
+      }
+
+      poll()
+    })
+  }
+
+  // ==================== Billing ====================
+
+  async createCheckout(
+    tier: 'pro' | 'enterprise',
+    interval: 'monthly' | 'yearly' = 'monthly'
+  ): Promise<CheckoutSession> {
+    return this.request<CheckoutSession>('/billing/checkout', {
+      method: 'POST',
+      body: JSON.stringify({ tier, interval }),
+    })
+  }
+
+  async createPortal(): Promise<{ url: string }> {
+    return this.request<{ url: string }>('/billing/portal', {
+      method: 'POST',
+    })
+  }
+
+  async getBillingStatus(): Promise<SubscriptionStatus> {
+    return this.request<SubscriptionStatus>('/billing/status')
+  }
+}
+
+// Singleton instance
+export const backendClient = new BackendClient()

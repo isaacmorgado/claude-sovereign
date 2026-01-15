@@ -1,0 +1,104 @@
+import * as jose from 'jose';
+import { v4 as uuidv4 } from 'uuid';
+import { env } from '../config/env.js';
+import { redis } from '../config/redis.js';
+import type { JWTPayload, TokenPair } from '../types/auth.js';
+import type { UserPublic } from '../types/user.js';
+
+const secret = new TextEncoder().encode(env.JWT_SECRET);
+const REFRESH_TOKEN_PREFIX = 'refresh_token:';
+
+function parseExpiration(exp: string): number {
+  const match = /^(\d+)([smhd])$/.exec(exp);
+  if (!match) throw new Error(`Invalid expiration format: ${exp}`);
+
+  const value = parseInt(match[1]!, 10);
+  const unit = match[2];
+
+  switch (unit) {
+    case 's':
+      return value;
+    case 'm':
+      return value * 60;
+    case 'h':
+      return value * 60 * 60;
+    case 'd':
+      return value * 60 * 60 * 24;
+    default:
+      throw new Error(`Invalid time unit: ${unit}`);
+  }
+}
+
+export async function generateTokenPair(user: UserPublic): Promise<TokenPair> {
+  const accessToken = await new jose.SignJWT({
+    sub: user.id,
+    email: user.email,
+    tier: user.subscription_tier,
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(env.JWT_EXPIRES_IN)
+    .sign(secret);
+
+  const refreshTokenId = uuidv4();
+  const refreshExpSeconds = parseExpiration(env.JWT_REFRESH_EXPIRES_IN);
+
+  const refreshToken = await new jose.SignJWT({
+    sub: user.id,
+    jti: refreshTokenId,
+    type: 'refresh',
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(env.JWT_REFRESH_EXPIRES_IN)
+    .sign(secret);
+
+  await redis.setex(
+    `${REFRESH_TOKEN_PREFIX}${refreshTokenId}`,
+    refreshExpSeconds,
+    user.id
+  );
+
+  return { accessToken, refreshToken };
+}
+
+export async function verifyAccessToken(token: string): Promise<JWTPayload> {
+  const { payload } = await jose.jwtVerify(token, secret);
+  return payload as unknown as JWTPayload;
+}
+
+export async function verifyRefreshToken(
+  token: string
+): Promise<{ userId: string; tokenId: string }> {
+  const { payload } = await jose.jwtVerify(token, secret);
+
+  if (payload['type'] !== 'refresh') {
+    throw new Error('Invalid token type');
+  }
+
+  const tokenId = payload.jti;
+  if (!tokenId) {
+    throw new Error('Missing token ID');
+  }
+
+  const storedUserId = await redis.get(`${REFRESH_TOKEN_PREFIX}${tokenId}`);
+  if (!storedUserId || storedUserId !== payload.sub) {
+    throw new Error('Refresh token revoked or invalid');
+  }
+
+  return { userId: payload.sub as string, tokenId };
+}
+
+export async function revokeRefreshToken(tokenId: string): Promise<void> {
+  await redis.del(`${REFRESH_TOKEN_PREFIX}${tokenId}`);
+}
+
+export async function revokeAllUserTokens(userId: string): Promise<void> {
+  const keys = await redis.keys(`${REFRESH_TOKEN_PREFIX}*`);
+  for (const key of keys) {
+    const storedUserId = await redis.get(key);
+    if (storedUserId === userId) {
+      await redis.del(key);
+    }
+  }
+}

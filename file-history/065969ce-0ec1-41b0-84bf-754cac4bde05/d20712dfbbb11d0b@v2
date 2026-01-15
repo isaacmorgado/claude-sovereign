@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+Deep scraper for kenkais.com agency courses
+Closes modals, enters code, navigates to each course, extracts full content
+"""
+
+import asyncio
+import time
+import json
+from playwright.async_api import async_playwright
+from crawl4ai import LLMConfig
+from crawl4ai.extraction_strategy import LLMExtractionStrategy
+
+# API Key
+ZHIPUAI_API_KEY = "9a58c7331504f3cbaef3f2f95cb375b.BrfNpV8TbeF5tCaK"
+
+# Site info
+SITE_URL = "https://www.kenkais.com/agency"
+ACCESS_CODE = "9111"
+
+
+async def scrape_kenkais_deep():
+    """
+    Deep scrape: closes modals, enters code, navigates to each course
+    """
+
+    print("=" * 70)
+    print("Kenkais.com Deep Course Scraper")
+    print("=" * 70)
+    print()
+    print(f"🔐 Site: {SITE_URL}")
+    print(f"🔑 Access Code: {ACCESS_CODE}")
+    print("🤖 Model: GLM-4-Long (1M context)")
+    print("🔍 Mode: DEEP EXTRACTION")
+    print()
+
+    # GLM-4-Long config for comprehensive extraction
+    llm_config = LLMConfig(
+        provider="zhipu/glm-4-long",
+        api_token=ZHIPUAI_API_KEY,
+        temperature=0.7,
+    )
+
+    extraction_strategy = LLMExtractionStrategy(
+        llm_config=llm_config,
+        instruction="""
+        Extract ALL course information from this page in detail.
+
+        For each course/section, provide:
+        - **Title**
+        - **Full Description**
+        - **All Topics/Modules** (list every single one)
+        - **Learning Objectives**
+        - **Prerequisites** (if any)
+        - **Project Details** (if applicable)
+        - **Code Examples** (if visible)
+        - **Resources/Links**
+        - **Any Additional Content**
+
+        Be comprehensive and extract EVERYTHING visible on the page.
+        Format clearly with markdown headers and bullet points.
+        """,
+    )
+
+    async with async_playwright() as p:
+        # Launch browser with stealth
+        print("[1/7] Launching browser with stealth mode...")
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+
+        page = await context.new_page()
+
+        # Apply stealth scripts
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}};
+        """)
+
+        try:
+            # Navigate to site
+            print("[2/7] Navigating to site...")
+            await page.goto(SITE_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+
+            # Take initial screenshot
+            await page.screenshot(path="kenkais_deep_initial.png")
+            print("    ✓ Initial screenshot saved")
+
+            # First, extract course links from the "What's New" modal before closing it
+            print("[3/7] Extracting courses from What's New modal...")
+
+            # Get course cards from modal
+            modal_courses = await page.evaluate("""
+                () => {
+                    // Find all clickable course cards in the modal
+                    const courseCards = [];
+
+                    // Look for various selectors that might be course cards
+                    const selectors = [
+                        '.modal-body [role="button"]',
+                        '.modal [class*="card"]',
+                        '.modal [class*="course"]',
+                        '.modal div[onclick]',
+                        '.modal a[href*="course"]',
+                        '.modal button',
+                    ];
+
+                    const seen = new Set();
+
+                    selectors.forEach(selector => {
+                        try {
+                            const elements = document.querySelectorAll(selector);
+                            elements.forEach(el => {
+                                // Get text and make sure it's substantial
+                                const text = el.textContent.trim();
+                                const title = text.split('\\n')[0].trim();
+
+                                if (title && title.length > 5 && !seen.has(title)) {
+                                    seen.add(title);
+
+                                    // Try to find if it's clickable or has a link
+                                    const link = el.href || el.getAttribute('data-href') || '';
+                                    const onClick = el.getAttribute('onclick') || '';
+
+                                    if (title && (link || onClick || el.tagName === 'BUTTON' || el.role === 'button')) {
+                                        courseCards.push({
+                                            title: title,
+                                            text: text,
+                                            href: link,
+                                            className: el.className,
+                                            hasOnClick: !!onClick
+                                        });
+                                    }
+                                }
+                            });
+                        } catch(e) {}
+                    });
+
+                    return courseCards;
+                }
+            """)
+
+            print(f"    ✓ Found {len(modal_courses)} courses in modal")
+
+            if modal_courses:
+                with open("kenkais_modal_courses.json", "w") as f:
+                    json.dump(modal_courses, f, indent=2)
+                print("    ✓ Modal courses saved to kenkais_modal_courses.json")
+
+            # Now close the modal
+            print("    → Closing What's New modal...")
+            modal_closed = False
+
+            close_selectors = [
+                'button[aria-label*="close" i]',
+                'button:has-text("×")',
+                ".modal-close",
+                '[class*="close"]',
+                'button[class*="close" i]',
+            ]
+
+            for selector in close_selectors:
+                try:
+                    close_btn = await page.wait_for_selector(selector, timeout=2000)
+                    if close_btn:
+                        await close_btn.click()
+                        modal_closed = True
+                        print(f"    ✓ Closed modal using: {selector}")
+                        await page.wait_for_timeout(1500)
+                        break
+                except:
+                    continue
+
+            if not modal_closed:
+                print("    ℹ️  Could not close modal, will try to work with it")
+
+            # Check for restricted access code entry
+            print("[4/7] Checking for access code prompt...")
+            code_entered = False
+
+            # Look for code input field
+            code_selectors = [
+                'input[type="text"]',
+                'input[type="number"]',
+                'input[placeholder*="code" i]',
+                'input[placeholder*="digit" i]',
+            ]
+
+            for selector in code_selectors:
+                try:
+                    code_input = await page.wait_for_selector(
+                        selector, timeout=2000, state="visible"
+                    )
+                    if code_input:
+                        print(f"    ✓ Found code input: {selector}")
+
+                        # Enter code digit by digit
+                        for digit in ACCESS_CODE:
+                            await code_input.type(digit)
+                            await page.wait_for_timeout(300)
+
+                        print(f"    → Entered code: {ACCESS_CODE}")
+
+                        # Look for submit button
+                        await page.wait_for_timeout(1000)
+
+                        # Try clicking submit or pressing Enter
+                        try:
+                            submit_btn = await page.wait_for_selector(
+                                'button[type="submit"]', timeout=2000
+                            )
+                            if submit_btn:
+                                await submit_btn.click()
+                        except:
+                            await page.keyboard.press("Enter")
+
+                        await page.wait_for_timeout(2000)
+                        code_entered = True
+                        print("    ✓ Code submitted")
+                        break
+                except:
+                    continue
+
+            if not code_entered:
+                print(
+                    "    ℹ️  No code prompt found - full access may already be granted"
+                )
+
+            # Take screenshot after modal/code handling
+            await page.screenshot(path="kenkais_deep_after_auth.png")
+            print("    ✓ Post-auth screenshot saved")
+
+            # Expand all dropdowns on main page
+            print("[4.5/7] Expanding all dropdowns on main page...")
+            expanded_count = await page.evaluate("""
+                () => {
+                    let count = 0;
+
+                    // Find and expand collapsed elements
+                    const expandSelectors = [
+                        '[aria-expanded="false"]',
+                        '.collapsed',
+                        '[class*="collapse"]:not(.show)',
+                        'details:not([open])',
+                        '[data-state="closed"]',
+                        'button[aria-expanded="false"]',
+                        '.accordion-button.collapsed',
+                    ];
+
+                    expandSelectors.forEach(selector => {
+                        const elements = document.querySelectorAll(selector);
+                        elements.forEach(el => {
+                            try {
+                                if (el.tagName === 'DETAILS') {
+                                    el.open = true;
+                                } else {
+                                    el.click();
+                                }
+                                count++;
+                            } catch(e) {
+                                // Ignore click errors
+                            }
+                        });
+                    });
+
+                    return count;
+                }
+            """)
+
+            if expanded_count > 0:
+                print(f"    ✓ Expanded {expanded_count} dropdowns")
+                await page.wait_for_timeout(1500)
+            else:
+                print("    ℹ️  No dropdowns found on main page")
+
+            # Find all course links
+            print("[5/7] Finding all course links...")
+            await page.wait_for_timeout(1000)
+
+            # Get all links that might be courses (after modal is closed)
+            additional_links = await page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    return links
+                        .map(link => ({
+                            href: link.href,
+                            text: link.textContent.trim(),
+                            className: link.className
+                        }))
+                        .filter(link =>
+                            link.text &&
+                            link.text.length > 3 &&
+                            !link.href.includes('javascript:') &&
+                            (link.href.includes('/agency/') ||
+                             link.href.includes('/course/') ||
+                             link.text.toLowerCase().includes('course'))
+                        );
+                }
+            """)
+
+            print(f"    ✓ Found {len(additional_links)} additional course links")
+
+            # Combine modal courses (if they have hrefs) with additional links
+            course_links = []
+
+            # Add modal courses that have actual links
+            for course in modal_courses:
+                if (
+                    course.get("href")
+                    and course["href"]
+                    and not course["href"].startswith("javascript:")
+                ):
+                    course_links.append(
+                        {
+                            "href": course["href"],
+                            "text": course["title"],
+                            "className": course.get("className", ""),
+                            "source": "modal",
+                        }
+                    )
+
+            # Add additional links from main page
+            for link in additional_links:
+                # Avoid duplicates
+                if link["href"] not in [c["href"] for c in course_links]:
+                    link["source"] = "main_page"
+                    course_links.append(link)
+
+            print(f"    ✓ Total unique course links: {len(course_links)}")
+
+            if course_links:
+                # Save course links for reference
+                with open("kenkais_course_links.json", "w") as f:
+                    json.dump(course_links, f, indent=2)
+                print("    ✓ Course links saved to kenkais_course_links.json")
+
+            # Extract content from main page
+            print("[6/7] Extracting main page content...")
+
+            page_content = await page.evaluate("""
+                () => {
+                    return document.body.innerText;
+                }
+            """)
+
+            print(f"    ✓ Extracted {len(page_content)} characters from main page")
+
+            # Save main page content
+            with open("kenkais_deep_main_page.txt", "w", encoding="utf-8") as f:
+                f.write(page_content)
+            print("    ✓ Main page content saved")
+
+            # Navigate to each course and extract
+            print("[7/7] Navigating to individual courses...")
+            all_courses_data = []
+
+            # Limit to first 10 courses to avoid too long execution
+            max_courses = min(10, len(course_links))
+
+            for idx, link in enumerate(course_links[:max_courses], 1):
+                try:
+                    print(f"\n    Course {idx}/{max_courses}: {link['text']}")
+                    print(f"    URL: {link['href']}")
+
+                    # Navigate to course
+                    await page.goto(link["href"], wait_until="domcontentloaded")
+                    await page.wait_for_timeout(2000)
+
+                    # Expand all dropdowns/accordions
+                    print("    → Expanding dropdowns and accordions...")
+                    expanded_count = await page.evaluate("""
+                        () => {
+                            let count = 0;
+
+                            // Find and click collapsed elements
+                            const expandSelectors = [
+                                '[aria-expanded="false"]',
+                                '.collapsed',
+                                '[class*="collapse"]:not(.show)',
+                                'details:not([open])',
+                                '[data-state="closed"]',
+                                'button[aria-expanded="false"]',
+                                '.accordion-button.collapsed',
+                            ];
+
+                            expandSelectors.forEach(selector => {
+                                const elements = document.querySelectorAll(selector);
+                                elements.forEach(el => {
+                                    try {
+                                        if (el.tagName === 'DETAILS') {
+                                            el.open = true;
+                                        } else {
+                                            el.click();
+                                        }
+                                        count++;
+                                    } catch(e) {
+                                        // Ignore click errors
+                                    }
+                                });
+                            });
+
+                            return count;
+                        }
+                    """)
+
+                    if expanded_count > 0:
+                        print(f"    ✓ Expanded {expanded_count} dropdowns/accordions")
+                        await page.wait_for_timeout(1000)
+                    else:
+                        print("    ℹ️  No dropdowns found to expand")
+
+                    # Extract course content
+                    course_content = await page.evaluate("""
+                        () => {
+                            return document.body.innerText;
+                        }
+                    """)
+
+                    print(f"    ✓ Extracted {len(course_content)} characters")
+
+                    # Take screenshot
+                    screenshot_filename = f"kenkais_course_{idx}.png"
+                    await page.screenshot(path=screenshot_filename)
+                    print(f"    ✓ Screenshot saved: {screenshot_filename}")
+
+                    # Save individual course data
+                    course_data = {
+                        "title": link["text"],
+                        "url": link["href"],
+                        "content": course_content,
+                        "extracted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+
+                    all_courses_data.append(course_data)
+
+                    # Save to individual file
+                    safe_filename = "".join(
+                        c for c in link["text"] if c.isalnum() or c in (" ", "-", "_")
+                    ).strip()
+                    safe_filename = safe_filename.replace(" ", "_")[:50]
+                    course_filename = f"kenkais_course_{safe_filename}.txt"
+
+                    with open(course_filename, "w", encoding="utf-8") as f:
+                        f.write(f"# {link['text']}\n\n")
+                        f.write(f"URL: {link['href']}\n")
+                        f.write(f"Extracted: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        f.write("---\n\n")
+                        f.write(course_content)
+
+                    print(f"    ✓ Saved to: {course_filename}")
+
+                    # Brief delay between courses
+                    await page.wait_for_timeout(1000)
+
+                except Exception as e:
+                    print(f"    ⚠️  Error extracting course: {e}")
+                    continue
+
+            # Save comprehensive summary
+            print("\n" + "=" * 70)
+            print("Creating comprehensive summary...")
+            print("=" * 70)
+
+            summary_file = "kenkais_deep_extraction_summary.md"
+            with open(summary_file, "w", encoding="utf-8") as f:
+                f.write("# Kenkais.com Agency Courses - Deep Extraction\n\n")
+                f.write(f"**Extracted**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"**Source**: {SITE_URL}\n")
+                f.write("**Method**: Deep Playwright Navigation + GLM-4-Long\n")
+                f.write(f"**Courses Extracted**: {len(all_courses_data)}\n\n")
+                f.write("---\n\n")
+
+                f.write("## Courses Found\n\n")
+                for idx, course in enumerate(all_courses_data, 1):
+                    f.write(f"{idx}. **{course['title']}**\n")
+                    f.write(f"   - URL: {course['url']}\n")
+                    f.write(
+                        f"   - Content Length: {len(course['content'])} characters\n"
+                    )
+                    f.write(f"   - File: kenkais_course_{idx}.png (screenshot)\n\n")
+
+                f.write("\n---\n\n")
+                f.write("## Files Created\n\n")
+                f.write("- `kenkais_deep_initial.png` - Initial page screenshot\n")
+                f.write("- `kenkais_deep_after_auth.png` - After authentication\n")
+                f.write("- `kenkais_course_links.json` - All course links found\n")
+                f.write("- `kenkais_deep_main_page.txt` - Main page content\n")
+                f.write("- Individual course files (text + screenshots)\n")
+                f.write("- `kenkais_deep_extraction_summary.md` - This file\n\n")
+
+                f.write("---\n\n")
+                f.write("## Next Steps\n\n")
+                f.write("1. Review individual course files for detailed content\n")
+                f.write("2. Check screenshots to verify content extraction\n")
+                f.write("3. Use GLM-4-Long to structure the extracted content\n")
+
+            print(f"\n💾 Summary saved to: {summary_file}")
+            print()
+
+            # Final statistics
+            print("=" * 70)
+            print("✅ DEEP EXTRACTION COMPLETE!")
+            print("=" * 70)
+            print()
+            print("📊 Statistics:")
+            print(f"   - Courses extracted: {len(all_courses_data)}")
+            print(f"   - Total course links found: {len(course_links)}")
+            print(f"   - Main page content: {len(page_content)} characters")
+            print()
+            print("📁 Files created in current directory:")
+            print("   - Individual course text files")
+            print("   - Course screenshots (1 per course)")
+            print("   - kenkais_deep_extraction_summary.md")
+            print("   - kenkais_course_links.json")
+            print()
+
+            return all_courses_data
+
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
+        finally:
+            # Keep browser open for 10 seconds to review
+            print("\nBrowser will close in 10 seconds...")
+            await asyncio.sleep(10)
+            await browser.close()
+
+
+if __name__ == "__main__":
+    print()
+    result = asyncio.run(scrape_kenkais_deep())
+    print()
+
+    if result and len(result) > 0:
+        print("=" * 70)
+        print("🎉 SUCCESS - All courses extracted!")
+        print("=" * 70)
+        print()
+        print("Check the individual course files and screenshots for details.")
+        print()
+    else:
+        print("=" * 70)
+        print("⚠️  EXTRACTION INCOMPLETE")
+        print("=" * 70)
+        print()
+        print("Check error messages above for details.")
+        print()

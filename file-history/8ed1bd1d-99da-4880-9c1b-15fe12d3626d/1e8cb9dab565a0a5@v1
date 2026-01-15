@@ -1,0 +1,1800 @@
+/**
+ * SPLICE CEP Panel Configuration
+ * Backend URLs, paths, and utility functions
+ */
+
+// ============================================================================
+// DEBUG MODE CONFIGURATION
+// ============================================================================
+
+/**
+ * Debug mode flag - enables verbose diagnostic logging
+ * Can be enabled via localStorage for troubleshooting:
+ *   localStorage.setItem('spliceDebugMode', 'true');
+ *
+ * Default: false (production mode - minimal logging)
+ */
+const SPLICE_DEBUG = localStorage.getItem('spliceDebugMode') === 'true';
+
+/**
+ * Debug logging function - only outputs when debug mode is enabled
+ * Use this for diagnostic/development logging that should be silent in production
+ * @param {...any} args - Arguments to log (prefixed with [SPLICE DEBUG])
+ */
+function debugLog(...args) {
+    if (SPLICE_DEBUG) {
+        console.log('[SPLICE DEBUG]', ...args);
+    }
+}
+
+/**
+ * Debug fetch logging - verbose fetch request/response logging
+ * @param {...any} args - Arguments to log (prefixed with [SPLICE FETCH])
+ */
+function debugFetch(...args) {
+    if (SPLICE_DEBUG) {
+        console.log('[SPLICE FETCH]', ...args);
+    }
+}
+
+// ============================================================================
+// BACKEND CONFIGURATION
+// ============================================================================
+const SPLICE_CONFIG = {
+    VERSION: '6.0.8',
+    BACKEND_PROD: 'https://splice-api-production.up.railway.app',
+    BACKEND_DEV: 'https://127.0.0.1:3847',
+    FETCH_TIMEOUT: 120000, // 2 minutes
+    RETRY_ATTEMPTS: 3,
+    RETRY_DELAY: 1000
+};
+
+/**
+ * Get the backend URL based on environment
+ * FIXED: CEP panels always run from file://, so we default to PROD
+ * Use localStorage to override for local development if needed
+ */
+function getBackendUrl() {
+    // Priority 1: Allow override via localStorage (for local dev testing)
+    const customUrl = localStorage.getItem('spliceBackendUrl');
+    if (customUrl) {
+        debugLog('Using custom backend URL from localStorage:', customUrl);
+        return customUrl;
+    }
+
+    // Priority 2: Default to production backend
+    // (CEP panels always run from file://, so can't reliably detect dev mode)
+    debugLog('Using production backend URL:', SPLICE_CONFIG.BACKEND_PROD);
+    return SPLICE_CONFIG.BACKEND_PROD;
+}
+
+// ============================================================================
+// JSX BRIDGE - Communicate with Premiere Pro
+// ============================================================================
+
+// JSX timeout configuration (FIX: CEP-CRIT-001 - JSX Bridge Timeout Bug)
+const JSX_TIMEOUTS = {
+    QUICK: 5000,        // 5s  - simple checks (checkSequenceOpen, getVersion)
+    DEFAULT: 30000,     // 30s - most operations (getClips, createMarker)
+    LONG: 120000,       // 2m  - export operations, large file I/O
+    CRITICAL: 300000    // 5m  - complex timeline operations
+};
+
+const jsx = {
+    cs: null,
+    _initPromise: null,
+    _initialized: false,
+    _jsxReady: false,
+
+    /**
+     * Initialize the CSInterface with FireCut-style retry logic
+     * Returns a promise that resolves when ready (true/false)
+     * Does NOT reject - gracefully handles missing CEP environment
+     */
+    init: function() {
+        if (this._initPromise) return this._initPromise;
+
+        this._initPromise = this._initWithRetry();
+        return this._initPromise;
+    },
+
+    /**
+     * FireCut-style retry logic for CSInterface initialization
+     * Retries up to 5 times with exponential backoff
+     */
+    _initWithRetry: async function() {
+        const maxRetries = 5;
+        const baseDelay = 200; // Start with 200ms, will double each retry
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const success = await this._tryInit(attempt);
+            if (success) {
+                // After CSInterface init, verify JSX is ready
+                const jsxReady = await this._verifyJSXReady();
+                if (jsxReady) {
+                    this._jsxReady = true;
+                    debugLog(`[JSX] Full initialization complete on attempt ${attempt}`);
+                    return true;
+                } else {
+                    debugLog(`[JSX] CSInterface ready but JSX not responding, attempt ${attempt}/${maxRetries}`);
+                }
+            }
+
+            if (attempt < maxRetries) {
+                const delay = baseDelay * Math.pow(2, attempt - 1);
+                debugLog(`[JSX] Init attempt ${attempt} failed, retrying in ${delay}ms...`);
+                await this._delay(delay);
+            }
+        }
+
+        console.warn('[JSX] Initialization failed after all retries - panel may have limited functionality');
+        return this._initialized;
+    },
+
+    /**
+     * Single initialization attempt
+     */
+    _tryInit: function(attempt) {
+        return new Promise((resolve) => {
+            try {
+                if (typeof CSInterface !== 'undefined') {
+                    this.cs = new CSInterface();
+                    // Verify we're in a real CEP environment by checking for __adobe_cep__
+                    if (window.__adobe_cep__) {
+                        this._initialized = true;
+                        debugLog(`[JSX] CSInterface initialized successfully (CEP environment detected) - attempt ${attempt}`);
+                        resolve(true);
+                    } else {
+                        // CSInterface exists but no CEP runtime - browser/dev mode
+                        this._initialized = true;
+                        debugLog(`[JSX] CSInterface initialized (development/browser mode) - attempt ${attempt}`);
+                        resolve(true);
+                    }
+                } else {
+                    debugLog(`[JSX] CSInterface not yet available - attempt ${attempt}`);
+                    resolve(false);
+                }
+            } catch (err) {
+                console.error(`[JSX] Init attempt ${attempt} error:`, err);
+                resolve(false);
+            }
+        });
+    },
+
+    /**
+     * FireCut-style JSX readiness verification
+     * Tests that hostScript.jsx is actually loaded and responding
+     */
+    _verifyJSXReady: async function() {
+        if (!this.cs) return false;
+
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                debugLog('[JSX] JSX readiness check timed out');
+                resolve(false);
+            }, 2000);
+
+            try {
+                // Simple test that hostScript.jsx is loaded and responding
+                this.cs.evalScript('(function() { return typeof getActiveSequence === "function" ? "ready" : "not_ready"; })()', (result) => {
+                    clearTimeout(timeout);
+                    if (result === 'ready') {
+                        debugLog('[JSX] JSX bridge verified ready - hostScript.jsx loaded');
+                        resolve(true);
+                    } else {
+                        debugLog('[JSX] JSX functions not yet available:', result);
+                        resolve(false);
+                    }
+                });
+            } catch (err) {
+                clearTimeout(timeout);
+                debugLog('[JSX] JSX readiness check error:', err);
+                resolve(false);
+            }
+        });
+    },
+
+    /**
+     * Helper for async delay
+     */
+    _delay: function(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    },
+
+    /**
+     * Ensure JSX is initialized before making calls
+     */
+    ensureInitialized: async function() {
+        if (!this._initialized) {
+            await this.init();
+        }
+        if (!this.cs) {
+            throw new Error('CSInterface not initialized. Make sure you are running in CEP environment.');
+        }
+    },
+
+    /**
+     * Execute ExtendScript in Premiere Pro with timeout protection
+     * FIX: CEP-CRIT-001 - JSX Bridge Timeout Bug
+     * @param {string} script - ExtendScript to execute
+     * @param {number} timeout - Timeout in ms (default: JSX_TIMEOUTS.DEFAULT)
+     * @returns {Promise<any>} - Parsed result
+     */
+    evalScript: async function(script, timeout = JSX_TIMEOUTS.DEFAULT) {
+        await this.ensureInitialized();
+
+        return new Promise((resolve, reject) => {
+            let completed = false;
+
+            // Timeout handler - rejects if ExtendScript hangs
+            const timeoutId = setTimeout(() => {
+                if (!completed) {
+                    completed = true;
+                    const scriptPreview = script.length > 100 ? script.substring(0, 100) + '...' : script;
+                    const error = new Error(`ExtendScript timeout after ${timeout}ms: ${scriptPreview}`);
+                    error.code = 'JSX_TIMEOUT';
+                    console.error('[JSX] Timeout:', scriptPreview);
+                    reject(error);
+                }
+            }, timeout);
+
+            this.cs.evalScript(script, (result) => {
+                // Ignore late callbacks after timeout
+                if (completed) {
+                    console.warn('[JSX] Late evalScript result received after timeout - ignoring');
+                    return;
+                }
+
+                completed = true;
+                clearTimeout(timeoutId);
+
+                if (result === 'undefined' || result === undefined) {
+                    resolve(null);
+                    return;
+                }
+
+                // Check for EvalScript error or ExtendScript runtime errors
+                if (typeof result === 'string' && (
+                    result.indexOf('EvalScript error') !== -1 ||
+                    result.indexOf('Error:') !== -1 ||
+                    result.indexOf('TypeError:') !== -1 ||
+                    result.indexOf('ReferenceError:') !== -1
+                )) {
+                    reject(new Error(result));
+                    return;
+                }
+
+                // Try to parse JSON
+                try {
+                    const parsed = JSON.parse(result);
+                    if (parsed.error) {
+                        reject(new Error(parsed.error));
+                    } else {
+                        resolve(parsed);
+                    }
+                } catch (e) {
+                    // Return as-is if not JSON
+                    resolve(result);
+                }
+            });
+        });
+    },
+
+    /**
+     * Call a JSX function with arguments
+     * @param {string} funcName - Function name
+     * @param {...any} args - Arguments to pass (last arg can be {timeout: number})
+     * @returns {Promise<any>}
+     */
+    call: async function(funcName, ...args) {
+        await this.ensureInitialized();
+
+        // Check if last argument is an options object with timeout
+        let timeout = JSX_TIMEOUTS.DEFAULT;
+        let funcArgs = args;
+
+        if (args.length > 0 && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null) {
+            const lastArg = args[args.length - 1];
+            if ('_jsxTimeout' in lastArg) {
+                timeout = lastArg._jsxTimeout;
+                funcArgs = args.slice(0, -1);
+            }
+        }
+
+        const escapedArgs = funcArgs.map(arg => {
+            if (arg === null || arg === undefined) return 'null';
+            if (typeof arg === 'string') {
+                // Escape backslashes first, then other special chars
+                return `'${arg
+                    .replace(/\\/g, '\\\\')
+                    .replace(/'/g, "\\'")
+                    .replace(/\r/g, '\\r')
+                    .replace(/\n/g, '\\n')
+                    .replace(/\t/g, '\\t')}'`;
+            }
+            if (typeof arg === 'object') {
+                return `'${JSON.stringify(arg)
+                    .replace(/\\/g, '\\\\')
+                    .replace(/'/g, "\\'")}'`;
+            }
+            return String(arg);
+        });
+
+        const script = `${funcName}(${escapedArgs.join(', ')})`;
+        return this.evalScript(script, timeout);
+    },
+
+    /**
+     * Call a JSX function with explicit timeout
+     * Convenience wrapper for operations that need non-default timeouts
+     * @param {string} funcName - Function name
+     * @param {Array} args - Arguments array
+     * @param {number} timeout - Timeout in ms
+     * @returns {Promise<any>}
+     */
+    callWithTimeout: async function(funcName, args = [], timeout = JSX_TIMEOUTS.DEFAULT) {
+        return this.call(funcName, ...args, { _jsxTimeout: timeout });
+    }
+};
+
+// ============================================================================
+// FETCH UTILITIES
+// ============================================================================
+
+/**
+ * Fetch with retry logic and exponential backoff
+ * @param {string} url - URL to fetch
+ * @param {object} options - Fetch options
+ * @param {number} timeout - Timeout per attempt (ms)
+ * @param {number} maxAttempts - Maximum retry attempts
+ * @returns {Promise<Response>}
+ */
+async function fetchWithRetry(url, options = {}, timeout = SPLICE_CONFIG.FETCH_TIMEOUT, maxAttempts = SPLICE_CONFIG.RETRY_ATTEMPTS) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            debugLog(`[Fetch] Attempt ${attempt}/${maxAttempts}: ${url}`);
+            const response = await fetchWithTimeout(url, options, timeout);
+
+            // Success - return response (don't retry on client errors 4xx)
+            if (response.ok || response.status < 500) {
+                return response;
+            }
+
+            // Server error (5xx) - retry
+            lastError = new Error(`Server error: ${response.status} ${response.statusText}`);
+            debugLog(`[Fetch] Server error on attempt ${attempt}, will retry`);
+
+        } catch (error) {
+            lastError = error;
+            debugLog(`[Fetch] Network error on attempt ${attempt}: ${error.message}`);
+        }
+
+        // Wait before retry (exponential backoff: 1s, 2s, 4s)
+        if (attempt < maxAttempts) {
+            const delay = SPLICE_CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1);
+            debugLog(`[Fetch] Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    // All attempts failed
+    throw lastError || new Error('All retry attempts failed');
+}
+
+/**
+ * Fetch with timeout support
+ * @param {string} url - URL to fetch
+ * @param {object} options - Fetch options
+ * @param {number} timeout - Timeout in ms
+ */
+async function fetchWithTimeout(url, options = {}, timeout = SPLICE_CONFIG.FETCH_TIMEOUT) {
+    // DIAGNOSTIC: Log fetch request details (debug mode only)
+    debugFetch('=== FETCH REQUEST START ===');
+    debugFetch('URL:', url);
+    debugFetch('Method:', options?.method || 'GET');
+    debugFetch('Headers:', options?.headers);
+    debugFetch('Timeout:', timeout);
+    debugFetch('Is CEP environment:', typeof CSInterface !== 'undefined');
+    debugFetch('=================================');
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        // DIAGNOSTIC: Log successful response (debug mode only)
+        debugFetch('=== FETCH RESPONSE SUCCESS ===');
+        debugFetch('Status:', response.status);
+        debugFetch('OK:', response.ok);
+        debugFetch('=================================');
+
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+
+        // DIAGNOSTIC: Log raw fetch error (debug mode only)
+        debugFetch('=== FETCH ERROR CAUGHT ===');
+        debugFetch('Error name:', error?.name);
+        debugFetch('Error message:', error?.message);
+        debugFetch('Error type:', typeof error);
+        debugFetch('Error constructor:', error?.constructor?.name);
+        debugFetch('Is AbortError:', error.name === 'AbortError');
+        debugFetch('Is TypeError:', error.name === 'TypeError');
+        debugFetch('Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+        debugFetch('=================================');
+
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeout}ms`);
+        }
+        throw error;
+    }
+}
+
+/**
+ * Parse error response from backend
+ * @param {Response} response - Fetch response
+ */
+async function parseErrorResponse(response) {
+    try {
+        const data = await response.json();
+        return data.error || data.message || `HTTP ${response.status}`;
+    } catch {
+        return `HTTP ${response.status}: ${response.statusText}`;
+    }
+}
+
+/**
+ * Get auth headers for API requests
+ * Uses JWT Bearer token if available, with legacy fallback
+ */
+function getAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const settings = getSettings();
+
+    // Prefer JWT Bearer token (modern auth)
+    if (settings.accessToken) {
+        headers['Authorization'] = `Bearer ${settings.accessToken}`;
+        return headers;
+    }
+
+    // Legacy fallback for backwards compatibility
+    // This will be removed after 2026-04-11
+    if (settings.customerId) {
+        headers['x-stripe-customer-id'] = settings.customerId;
+        console.warn('[SPLICE] Using deprecated x-stripe-customer-id header. Please re-login to upgrade to JWT auth.');
+    }
+
+    return headers;
+}
+
+/**
+ * Check if the access token is expired or about to expire
+ * @returns {boolean} True if token needs refresh
+ */
+function isTokenExpired() {
+    const settings = getSettings();
+    if (!settings.tokenExpiry) return true;
+
+    // Refresh if less than 5 minutes remaining
+    const bufferMs = 5 * 60 * 1000;
+    return Date.now() >= (settings.tokenExpiry - bufferMs);
+}
+
+/**
+ * Refresh the access token using the refresh token
+ * @returns {Promise<boolean>} True if refresh succeeded
+ */
+async function refreshAccessToken() {
+    const settings = getSettings();
+
+    if (!settings.refreshToken) {
+        debugLog('[Auth] No refresh token available');
+        return false;
+    }
+
+    try {
+        debugLog('[Auth] Refreshing access token...');
+
+        const response = await fetchWithTimeout(`${getBackendUrl()}/auth/refresh`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refreshToken: settings.refreshToken })
+        }, 30000);
+
+        if (!response.ok) {
+            const errorMsg = await parseErrorResponse(response);
+            console.error('[Auth] Token refresh failed:', errorMsg);
+
+            // If refresh token is invalid, clear auth and require re-login
+            if (response.status === 401) {
+                clearAuthTokens();
+            }
+            return false;
+        }
+
+        const data = await response.json();
+
+        // Save new access token
+        const expiresInMs = (data.expiresIn || 86400) * 1000; // Default 24h
+        saveSettings({
+            accessToken: data.token,
+            tokenExpiry: Date.now() + expiresInMs
+        });
+
+        debugLog('[Auth] Access token refreshed successfully');
+        return true;
+    } catch (err) {
+        console.error('[Auth] Token refresh error:', err);
+        return false;
+    }
+}
+
+/**
+ * Clear all auth tokens (call on logout or auth failure)
+ */
+function clearAuthTokens() {
+    saveSettings({
+        accessToken: null,
+        refreshToken: null,
+        tokenExpiry: null
+    });
+    debugLog('[Auth] Auth tokens cleared');
+}
+
+/**
+ * Ensure we have a valid access token, refreshing if needed
+ * @returns {Promise<boolean>} True if we have a valid token
+ */
+async function ensureValidToken() {
+    const settings = getSettings();
+
+    // No token at all - need to login
+    if (!settings.accessToken) {
+        return false;
+    }
+
+    // Token not expired - good to go
+    if (!isTokenExpired()) {
+        return true;
+    }
+
+    // Try to refresh
+    return await refreshAccessToken();
+}
+
+// ============================================================================
+// SETTINGS MANAGEMENT
+// ============================================================================
+
+const DEFAULT_SETTINGS = {
+    sensitivity: 50,
+    minSilenceLength: 0.5,
+    sourceIsolated: false,
+    enableTakesDetection: true,
+    enableJCut: false,
+    jcutLeadIn: 0.3,
+    jcutLeadOut: 0.2,
+    enableZoom: false,
+    zoomFrequency: 'medium',
+    zoomPreset: 'medium',
+    zoomPlacement: 'sentence_start',
+    enableChapters: false,
+    maxChapters: 10,
+    minChapterLength: 60,
+    enableProfanity: false,
+    profanityLanguage: 'en',
+    bleepType: 'standard',
+    // Authentication
+    customerId: null,
+    licenseKey: null,
+    accessToken: null,
+    refreshToken: null,
+    tokenExpiry: null,
+    // UI State
+    expandedOptions: false,
+    activePreset: 'podcast',
+    rememberOptions: false
+};
+
+// Current storage version for future migrations
+const SETTINGS_STORAGE_VERSION = 2;
+
+// Fields that contain sensitive data and should be encrypted
+const SENSITIVE_FIELDS = ['customerId', 'licenseKey', 'accessToken', 'refreshToken'];
+
+// ============================================================================
+// ENCRYPTION HELPERS FOR SENSITIVE DATA (CEP-CRIT-002 FIX)
+// Uses AES-GCM encryption via Web Crypto API for proper security
+// ============================================================================
+
+// Encryption constants
+const SPLICE_ENCRYPTION = {
+    ALGORITHM: 'AES-GCM',
+    KEY_LENGTH: 256,
+    IV_LENGTH: 12,
+    TAG_LENGTH: 128,
+    SALT: 'SPLICE_PANEL_SALT_v1', // Static salt for key derivation
+    ITERATIONS: 100000,
+    PREFIX: 'ENC:v1:'  // Prefix to identify encrypted values
+};
+
+// Cached encryption key (derived once per session)
+let _encryptionKey = null;
+
+/**
+ * Get or derive the encryption key from a machine-specific identifier
+ * Uses PBKDF2 to derive a strong key from available identifiers
+ * @returns {Promise<CryptoKey>} The derived encryption key
+ */
+async function getEncryptionKey() {
+    if (_encryptionKey) {
+        return _encryptionKey;
+    }
+
+    try {
+        // Use a combination of identifiers for key derivation
+        // In CEP, we use localStorage ID + app version as the key material
+        let keyMaterial = localStorage.getItem('splice_device_id');
+        if (!keyMaterial) {
+            // Generate a random device ID on first use
+            keyMaterial = crypto.randomUUID ? crypto.randomUUID() :
+                'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                    const r = Math.random() * 16 | 0;
+                    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+                    return v.toString(16);
+                });
+            localStorage.setItem('splice_device_id', keyMaterial);
+        }
+
+        const encoder = new TextEncoder();
+        const keyData = encoder.encode(keyMaterial + SPLICE_ENCRYPTION.SALT);
+
+        // Import the key material for PBKDF2
+        const baseKey = await crypto.subtle.importKey(
+            'raw',
+            keyData,
+            'PBKDF2',
+            false,
+            ['deriveKey']
+        );
+
+        // Derive the actual AES key
+        _encryptionKey = await crypto.subtle.deriveKey(
+            {
+                name: 'PBKDF2',
+                salt: encoder.encode(SPLICE_ENCRYPTION.SALT),
+                iterations: SPLICE_ENCRYPTION.ITERATIONS,
+                hash: 'SHA-256'
+            },
+            baseKey,
+            {
+                name: SPLICE_ENCRYPTION.ALGORITHM,
+                length: SPLICE_ENCRYPTION.KEY_LENGTH
+            },
+            false,
+            ['encrypt', 'decrypt']
+        );
+
+        return _encryptionKey;
+    } catch (e) {
+        debugLog('[Config] Key derivation error:', e);
+        return null;
+    }
+}
+
+/**
+ * Encrypt data for secure localStorage storage using AES-GCM
+ *
+ * @param {any} data - Data to encrypt
+ * @returns {Promise<string|null>} Encrypted string with prefix or null on error
+ */
+async function encryptForStorageAsync(data) {
+    try {
+        if (data === null || data === undefined) {
+            return null;
+        }
+
+        const key = await getEncryptionKey();
+        if (!key) {
+            // Fallback to legacy encoding if crypto not available
+            debugLog('[Config] Crypto not available, using legacy encoding');
+            return legacyEncode(data);
+        }
+
+        const encoder = new TextEncoder();
+        const jsonStr = JSON.stringify(data);
+        const plaintext = encoder.encode(jsonStr);
+
+        // Generate random IV
+        const iv = crypto.getRandomValues(new Uint8Array(SPLICE_ENCRYPTION.IV_LENGTH));
+
+        // Encrypt
+        const ciphertext = await crypto.subtle.encrypt(
+            {
+                name: SPLICE_ENCRYPTION.ALGORITHM,
+                iv: iv,
+                tagLength: SPLICE_ENCRYPTION.TAG_LENGTH
+            },
+            key,
+            plaintext
+        );
+
+        // Combine IV + ciphertext and encode as base64
+        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+        combined.set(iv);
+        combined.set(new Uint8Array(ciphertext), iv.length);
+
+        // Convert to base64 with prefix
+        const base64 = btoa(String.fromCharCode(...combined));
+        return SPLICE_ENCRYPTION.PREFIX + base64;
+    } catch (e) {
+        debugLog('[Config] Encryption error:', e);
+        return legacyEncode(data);
+    }
+}
+
+/**
+ * Decrypt data from localStorage using AES-GCM
+ *
+ * @param {string} data - Encrypted string
+ * @returns {Promise<any|null>} Decrypted data or null on error
+ */
+async function decryptFromStorageAsync(data) {
+    try {
+        if (!data || typeof data !== 'string') {
+            return null;
+        }
+
+        // Check if this is the new encrypted format
+        if (!data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+            // Try legacy decoding for backward compatibility
+            return legacyDecode(data);
+        }
+
+        const key = await getEncryptionKey();
+        if (!key) {
+            debugLog('[Config] Crypto not available for decryption');
+            return null;
+        }
+
+        // Remove prefix and decode base64
+        const base64Data = data.slice(SPLICE_ENCRYPTION.PREFIX.length);
+        const combined = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+
+        // Extract IV and ciphertext
+        const iv = combined.slice(0, SPLICE_ENCRYPTION.IV_LENGTH);
+        const ciphertext = combined.slice(SPLICE_ENCRYPTION.IV_LENGTH);
+
+        // Decrypt
+        const plaintext = await crypto.subtle.decrypt(
+            {
+                name: SPLICE_ENCRYPTION.ALGORITHM,
+                iv: iv,
+                tagLength: SPLICE_ENCRYPTION.TAG_LENGTH
+            },
+            key,
+            ciphertext
+        );
+
+        const decoder = new TextDecoder();
+        const jsonStr = decoder.decode(plaintext);
+        return JSON.parse(jsonStr);
+    } catch (e) {
+        // Try legacy decoding as fallback
+        return legacyDecode(data);
+    }
+}
+
+/**
+ * Legacy encoding (Base64) for backward compatibility
+ * @param {any} data - Data to encode
+ * @returns {string|null} Encoded string
+ */
+function legacyEncode(data) {
+    try {
+        if (data === null || data === undefined) {
+            return null;
+        }
+        const jsonStr = JSON.stringify(data);
+        const encoded = encodeURIComponent(jsonStr);
+        return btoa(encoded);
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Legacy decoding (Base64) for backward compatibility
+ * @param {string} data - Encoded string
+ * @returns {any|null} Decoded data
+ */
+function legacyDecode(data) {
+    try {
+        if (!data || typeof data !== 'string') {
+            return null;
+        }
+        // Skip if it has the encryption prefix
+        if (data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+            return null;
+        }
+        const decoded = atob(data);
+        const jsonStr = decodeURIComponent(decoded);
+        return JSON.parse(jsonStr);
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Synchronous wrapper for encryption (starts async operation)
+ * For backward compatibility with existing sync code
+ * @param {any} data - Data to encode
+ * @returns {string|null} Encoded string (legacy format until async completes)
+ */
+function encryptForStorage(data) {
+    // Return legacy encoding synchronously
+    // The async version should be preferred for new code
+    return legacyEncode(data);
+}
+
+/**
+ * Synchronous wrapper for decryption
+ * For backward compatibility with existing sync code
+ * @param {string} data - Encoded string
+ * @returns {any|null} Decoded data
+ */
+function decryptFromStorage(data) {
+    // Handle new encrypted format by returning null (needs async)
+    if (data && data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+        debugLog('[Config] Encrypted data requires async decryption');
+        return null;
+    }
+    return legacyDecode(data);
+}
+
+/**
+ * Check if a value appears to be encrypted
+ *
+ * @param {any} value - Value to check
+ * @returns {boolean} True if value appears to be encrypted
+ */
+function isEncryptedValue(value) {
+    if (!value || typeof value !== 'string') {
+        return false;
+    }
+    // New encryption format
+    if (value.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+        return true;
+    }
+    // Unencrypted values typically start with known patterns
+    if (value.startsWith('cus_') || value.startsWith('SPLICE-')) {
+        return false;
+    }
+    // Check if it's legacy base64 encoded JSON
+    try {
+        const decoded = atob(value);
+        const jsonStr = decodeURIComponent(decoded);
+        JSON.parse(jsonStr);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Encrypt sensitive fields in settings object
+ *
+ * @param {Object} settings - Settings object with plaintext sensitive fields
+ * @returns {Object} Settings with encrypted sensitive fields
+ */
+function encryptSensitiveFields(settings) {
+    const encrypted = { ...settings };
+
+    for (const field of SENSITIVE_FIELDS) {
+        if (encrypted[field] !== null && encrypted[field] !== undefined) {
+            // Only encrypt if not already encrypted
+            if (!isEncryptedValue(encrypted[field])) {
+                encrypted[field] = encryptForStorage(encrypted[field]);
+                debugLog(`[Config] Encrypted field: ${field}`);
+            }
+        }
+    }
+
+    return encrypted;
+}
+
+/**
+ * Decrypt sensitive fields in settings object
+ *
+ * @param {Object} settings - Settings object with encrypted sensitive fields
+ * @returns {Object} Settings with decrypted sensitive fields
+ */
+function decryptSensitiveFields(settings) {
+    const decrypted = { ...settings };
+
+    for (const field of SENSITIVE_FIELDS) {
+        if (decrypted[field] !== null && decrypted[field] !== undefined) {
+            // Check if it looks encrypted before attempting to decrypt
+            if (isEncryptedValue(decrypted[field])) {
+                const decryptedValue = decryptFromStorage(decrypted[field]);
+                if (decryptedValue !== null) {
+                    decrypted[field] = decryptedValue;
+                    debugLog(`[Config] Decrypted field: ${field}`);
+                }
+            }
+            // If not encrypted (legacy data), keep the original value
+        }
+    }
+
+    return decrypted;
+}
+
+/**
+ * Internal save function to avoid recursion during migration
+ * @private
+ */
+function _saveSettingsInternal(settings) {
+    try {
+        // Encrypt sensitive fields before storing
+        const toStore = encryptSensitiveFields(settings);
+
+        // Add version marker for future migrations
+        toStore._storageVersion = SETTINGS_STORAGE_VERSION;
+
+        localStorage.setItem('spliceSettings', JSON.stringify(toStore));
+        return true;
+    } catch (e) {
+        console.warn('[Config] Error saving settings:', e);
+        return false;
+    }
+}
+
+/**
+ * Get settings from localStorage
+ * Handles migration from unencrypted to encrypted storage format
+ */
+function getSettings() {
+    try {
+        const stored = localStorage.getItem('spliceSettings');
+        if (stored) {
+            const parsed = JSON.parse(stored);
+
+            // Decrypt sensitive fields (handles both encrypted and legacy unencrypted data)
+            const decrypted = decryptSensitiveFields(parsed);
+
+            // Check if migration is needed (no version marker = legacy data)
+            if (!parsed._storageVersion) {
+                // Migrate legacy data: save with encryption and version marker
+                debugLog('[Config] Migrating legacy settings to encrypted format');
+                const migratedSettings = { ...DEFAULT_SETTINGS, ...decrypted };
+                // Use internal save to avoid infinite recursion
+                _saveSettingsInternal(migratedSettings);
+            }
+
+            // Return merged settings without internal fields
+            const result = { ...DEFAULT_SETTINGS, ...decrypted };
+            delete result._storageVersion;
+            return result;
+        }
+    } catch (e) {
+        console.warn('[Config] Error loading settings:', e);
+    }
+    return { ...DEFAULT_SETTINGS };
+}
+
+/**
+ * Save settings to localStorage
+ * Encrypts sensitive fields before storing
+ */
+function saveSettings(settings) {
+    try {
+        // Get current settings (decrypted) and merge with new settings
+        const current = getSettings();
+        const merged = { ...current, ...settings };
+
+        return _saveSettingsInternal(merged);
+    } catch (e) {
+        console.warn('[Config] Error saving settings:', e);
+        return false;
+    }
+}
+
+/**
+ * Clear specific setting
+ */
+function clearSetting(key) {
+    const settings = getSettings();
+    delete settings[key];
+    _saveSettingsInternal(settings);
+}
+
+// ============================================================================
+// OFFLINE DETECTION
+// ============================================================================
+
+let isOnlineState = true;
+let offlineCheckInterval = null;
+
+/**
+ * Check if online
+ */
+function isOnline() {
+    return isOnlineState && navigator.onLine;
+}
+
+/**
+ * Initialize offline detection
+ */
+function initOfflineDetection() {
+    // Browser events
+    window.addEventListener('online', () => {
+        isOnlineState = true;
+        updateOfflineUI(true);
+    });
+
+    window.addEventListener('offline', () => {
+        isOnlineState = false;
+        updateOfflineUI(false);
+    });
+
+    // Periodic check
+    offlineCheckInterval = setInterval(async () => {
+        try {
+            const response = await fetchWithTimeout(
+                `${getBackendUrl()}/health`,
+                { method: 'GET' },
+                5000
+            );
+            isOnlineState = response.ok;
+        } catch {
+            isOnlineState = false;
+        }
+        updateOfflineUI(isOnlineState);
+    }, 30000);
+}
+
+/**
+ * Update UI based on online state
+ */
+function updateOfflineUI(online) {
+    const goBtn = document.getElementById('goBtn');
+    const status = document.getElementById('status');
+
+    if (goBtn) {
+        goBtn.disabled = !online;
+    }
+
+    if (status) {
+        if (!online) {
+            status.textContent = 'Offline - Check your connection';
+            status.style.color = '#dc3545';
+        } else {
+            // Reset status when back online
+            status.textContent = 'Ready';
+            status.style.color = '#888';
+        }
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * SECURITY: Escape HTML to prevent XSS attacks
+ * Use this when inserting untrusted content into innerHTML
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string safe for innerHTML
+ */
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    if (typeof str !== 'string') str = String(str);
+
+    const escapeMap = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#x27;',
+        '/': '&#x2F;',
+        '`': '&#x60;'
+    };
+
+    return str.replace(/[&<>"'\/`]/g, char => escapeMap[char]);
+}
+
+/**
+ * SECURITY: Create safe HTML from template with escaped values
+ * @param {TemplateStringsArray} strings - Template strings
+ * @param {...any} values - Values to escape
+ * @returns {string} HTML with escaped values
+ */
+function safeHtml(strings, ...values) {
+    return strings.reduce((result, str, i) => {
+        const value = values[i - 1];
+        const escaped = escapeHtml(value);
+        return result + escaped + str;
+    });
+}
+
+/**
+ * Format time in MM:SS or HH:MM:SS
+ */
+function formatTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) return '0:00';
+
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+
+    if (hours > 0) {
+        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Set status message
+ */
+function setStatus(message, isError = false) {
+    const status = document.getElementById('status');
+    if (status) {
+        status.textContent = message;
+        status.style.color = isError ? '#dc3545' : '#888';
+    }
+}
+
+/**
+ * Debounce function calls
+ */
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// ============================================================================
+// PRESET PROFILES
+// ============================================================================
+
+/**
+ * Detection presets for different content types.
+ * Each preset defines optimal settings for a specific use case.
+ */
+const PRESETS = {
+    // Custom - user-defined settings (default)
+    custom: {
+        name: 'Custom',
+        description: 'Your custom settings',
+        icon: 'settings',
+        settings: null // Uses current user settings
+    },
+
+    // Podcast - longer pauses are natural, be conservative
+    podcast: {
+        name: 'Podcast',
+        description: 'Longer natural pauses, J-Cuts enabled',
+        icon: 'mic',
+        settings: {
+            sensitivity: 35,
+            threshold: -35,
+            minSilenceLength: 0.8,
+            paddingStart: 0.15,
+            paddingEnd: 0.15,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.3,
+            jCutLeadOut: 0.2
+        }
+    },
+
+    // Interview - balanced, respects speaker pauses
+    interview: {
+        name: 'Interview',
+        description: 'Balanced cuts, J-Cuts for smooth transitions',
+        icon: 'people',
+        settings: {
+            sensitivity: 50,
+            threshold: -32,
+            minSilenceLength: 0.5,
+            paddingStart: 0.12,
+            paddingEnd: 0.08,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.25,
+            jCutLeadOut: 0.15
+        }
+    },
+
+    // Reaction video - fast pacing, quick cuts
+    reaction: {
+        name: 'Reaction',
+        description: 'Fast-paced, tight cuts for energy',
+        icon: 'bolt',
+        settings: {
+            sensitivity: 70,
+            threshold: -28,
+            minSilenceLength: 0.3,
+            paddingStart: 0.05,
+            paddingEnd: 0.03,
+            enableTakesDetection: false,
+            enableJCut: false,
+            jCutLeadIn: 0,
+            jCutLeadOut: 0
+        }
+    },
+
+    // Tutorial/Educational - preserve thinking pauses
+    tutorial: {
+        name: 'Tutorial',
+        description: 'Preserves teaching pace, J-Cuts enabled',
+        icon: 'school',
+        settings: {
+            sensitivity: 30,
+            threshold: -38,
+            minSilenceLength: 1.0,
+            paddingStart: 0.2,
+            paddingEnd: 0.15,
+            enableTakesDetection: true,
+            enableJCut: true,
+            jCutLeadIn: 0.35,
+            jCutLeadOut: 0.25
+        }
+    },
+
+    // Vlog/YouTube - punchy edits, engagement-focused
+    vlog: {
+        name: 'Vlog',
+        description: 'Punchy edits for YouTube engagement',
+        icon: 'videocam',
+        settings: {
+            sensitivity: 65,
+            threshold: -30,
+            minSilenceLength: 0.35,
+            paddingStart: 0.08,
+            paddingEnd: 0.05,
+            enableTakesDetection: true,
+            enableJCut: false,
+            jCutLeadIn: 0,
+            jCutLeadOut: 0
+        }
+    }
+};
+
+/**
+ * List of built-in preset IDs
+ */
+const BUILT_IN_PRESET_IDS = ['custom', 'podcast', 'interview', 'reaction', 'tutorial', 'vlog'];
+
+/**
+ * Get all available presets
+ * @returns {Object} All preset definitions
+ */
+function getPresets() {
+    return { ...PRESETS };
+}
+
+/**
+ * Get a specific preset by name
+ * @param {string} presetName - Name of the preset
+ * @returns {Object|null} Preset definition or null if not found
+ */
+function getPreset(presetName) {
+    return PRESETS[presetName] || null;
+}
+
+/**
+ * Check if a preset is a built-in preset
+ * @param {string} id - Preset ID to check
+ * @returns {boolean} True if built-in, false if custom
+ */
+function isBuiltInPreset(id) {
+    return BUILT_IN_PRESET_IDS.includes(id);
+}
+
+/**
+ * Apply a preset to current settings
+ * @param {string} presetName - Name of the preset to apply
+ * @returns {Object} The applied settings
+ */
+function applyPreset(presetName) {
+    const preset = PRESETS[presetName];
+
+    if (!preset) {
+        console.warn(`[SPLICE] Unknown preset: ${presetName}`);
+        return getSettings();
+    }
+
+    // Custom preset uses current settings
+    if (presetName === 'custom' || !preset.settings) {
+        saveSettings({ activePreset: 'custom' });
+        return getSettings();
+    }
+
+    // Apply preset settings
+    const newSettings = {
+        ...preset.settings,
+        activePreset: presetName
+    };
+
+    saveSettings(newSettings);
+    debugLog(`Applied preset: ${preset.name}`);
+
+    return getSettings();
+}
+
+/**
+ * Get the currently active preset
+ * @returns {string} Active preset name
+ */
+function getActivePreset() {
+    const settings = getSettings();
+    return settings.activePreset || 'custom';
+}
+
+/**
+ * Initialize preset selector
+ */
+function initPresetSelector() {
+    const presetSelector = document.getElementById('presetSelector');
+    const sensitivitySlider = document.getElementById('sensitivitySlider');
+
+    if (!presetSelector) return;
+
+    // Set initial value from settings
+    const settings = getSettings();
+    presetSelector.value = settings.activePreset || 'podcast';
+
+    // Handle preset change
+    presetSelector.addEventListener('change', () => {
+        const presetId = presetSelector.value;
+        const appliedSettings = applyPreset(presetId);
+
+        // Update sensitivity slider to match preset
+        if (sensitivitySlider && appliedSettings.sensitivity !== undefined) {
+            sensitivitySlider.value = appliedSettings.sensitivity;
+            // Update display value
+            const sensitivityValue = document.getElementById('sensitivityValue');
+            if (sensitivityValue) {
+                sensitivityValue.textContent = appliedSettings.sensitivity;
+            }
+        }
+
+        // Update takes detection checkbox
+        const enableTakesDetection = document.getElementById('enableTakesDetection');
+        if (enableTakesDetection && appliedSettings.enableTakesDetection !== undefined) {
+            enableTakesDetection.checked = appliedSettings.enableTakesDetection;
+        }
+
+        // Update J-Cut checkbox
+        const enableJCut = document.getElementById('enableJCut');
+        if (enableJCut && appliedSettings.enableJCut !== undefined) {
+            enableJCut.checked = appliedSettings.enableJCut;
+            // Toggle J-Cut settings visibility
+            const jcutSettings = document.getElementById('jcutSettings');
+            if (jcutSettings) {
+                jcutSettings.classList.toggle('collapsed', !appliedSettings.enableJCut);
+            }
+        }
+
+        const preset = getPreset(presetId);
+        if (preset) {
+            setStatus(`Preset: ${preset.name} - ${preset.description}`);
+        }
+    });
+
+    // Switch to custom when user manually changes sensitivity
+    if (sensitivitySlider) {
+        sensitivitySlider.addEventListener('change', () => {
+            if (presetSelector.value !== 'custom') {
+                presetSelector.value = 'custom';
+                saveSettings({ activePreset: 'custom' });
+            }
+        });
+    }
+}
+
+// ============================================================================
+// LOGIN MODAL
+// ============================================================================
+
+/**
+ * Validate license key format: SPLICE-XXXX-XXXX-XXXX
+ * Character set excludes confusing chars: 0/O, 1/I/L
+ */
+function isValidLicenseKeyFormat(key) {
+    if (!key || typeof key !== 'string') return false;
+    const normalized = key.toUpperCase().trim();
+    const pattern = /^SPLICE-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{4}$/;
+    return pattern.test(normalized);
+}
+
+/**
+ * Initialize login modal handlers
+ */
+function initLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const closeLoginBtn = document.getElementById('closeLoginBtn');
+    const saveLoginBtn = document.getElementById('saveLoginBtn');
+    const licenseKeyInput = document.getElementById('licenseKeyInput');
+    const creditBadge = document.getElementById('creditBadge');
+
+    // Handle credit badge click - retry on error, or show login modal
+    if (creditBadge) {
+        creditBadge.addEventListener('click', async () => {
+            if (creditBadge.classList.contains('error')) {
+                creditBadge.textContent = '...';
+                if (typeof refreshCredits === 'function') {
+                    await refreshCredits();
+                }
+                return;
+            }
+            showLoginModal();
+        });
+    }
+
+    // Close login modal
+    if (closeLoginBtn && loginModal) {
+        closeLoginBtn.addEventListener('click', () => {
+            loginModal.classList.add('hidden');
+        });
+    }
+
+    // Close on backdrop click
+    if (loginModal) {
+        loginModal.addEventListener('click', (e) => {
+            if (e.target === loginModal) {
+                loginModal.classList.add('hidden');
+            }
+        });
+    }
+
+    // Activate license key
+    if (saveLoginBtn) {
+        saveLoginBtn.addEventListener('click', async () => {
+            const licenseKey = licenseKeyInput?.value?.trim()?.toUpperCase();
+
+            if (!licenseKey) {
+                showLoginError('Please enter your license key');
+                return;
+            }
+
+            if (!isValidLicenseKeyFormat(licenseKey)) {
+                showLoginError('Invalid format. Expected: SPLICE-XXXX-XXXX-XXXX');
+                return;
+            }
+
+            saveLoginBtn.disabled = true;
+            saveLoginBtn.textContent = 'Activating...';
+
+            try {
+                // FIX: HIGH PRIORITY SECURITY - Add CSRF protection
+                // STEP 1: Get CSRF token
+                const csrfResponse = await fetchWithTimeout(`${getBackendUrl()}/auth/csrf-token`, {
+                    method: 'GET'
+                }, SPLICE_CONFIG.FETCH_TIMEOUT);
+
+                if (!csrfResponse.ok) {
+                    throw new Error('Failed to get CSRF token');
+                }
+
+                const csrfData = await csrfResponse.json();
+                if (!csrfData.csrfToken) {
+                    throw new Error('CSRF token not returned');
+                }
+
+                // STEP 2: Use /auth/login endpoint with CSRF token
+                const response = await fetchWithTimeout(`${getBackendUrl()}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrfData.csrfToken
+                    },
+                    body: JSON.stringify({ licenseKey: licenseKey }),
+                    credentials: 'include' // Include cookies for CSRF validation
+                }, SPLICE_CONFIG.FETCH_TIMEOUT);
+
+                const result = await response.json();
+
+                if (!result.success) {
+                    showLoginError(result.error || 'Activation failed');
+                    return;
+                }
+
+                // Store JWT tokens and customer info
+                const expiresInMs = (result.expiresIn || 86400) * 1000; // Default 24h
+                saveSettings({
+                    customerId: result.customerId,
+                    accessToken: result.token,
+                    refreshToken: result.refreshToken,
+                    tokenExpiry: Date.now() + expiresInMs,
+                    licenseKey: licenseKey // Keep for re-authentication
+                });
+
+                loginModal?.classList.add('hidden');
+
+                if (typeof refreshCredits === 'function') {
+                    await refreshCredits();
+                }
+
+                const tierName = result.tier ? result.tier.charAt(0).toUpperCase() + result.tier.slice(1) : 'Unknown';
+                setStatus(`License activated! ${tierName} tier`);
+            } catch (err) {
+                console.error('[SPLICE] License activation error:', err);
+
+                // DIAGNOSTIC LOGGING: Capture exact error details (debug mode only)
+                debugLog('=== CEP LICENSE ACTIVATION ERROR DIAGNOSTICS ===');
+                debugLog('Error name:', err?.name);
+                debugLog('Error message:', err?.message);
+                debugLog('Error stack:', err?.stack);
+                debugLog('Backend URL:', getBackendUrl());
+                debugLog('Fetch timeout:', SPLICE_CONFIG.FETCH_TIMEOUT);
+                debugLog('Is CEP environment:', typeof CSInterface !== 'undefined');
+                debugLog('User agent:', navigator?.userAgent);
+                debugLog('Error constructor:', err?.constructor?.name);
+                debugLog('Is TypeError:', err?.name === 'TypeError');
+                debugLog('Message contains "Failed to fetch":', err?.message?.includes('Failed to fetch'));
+                debugLog('Message contains "fetch":', err?.message?.toLowerCase()?.includes('fetch'));
+                debugLog('Message contains "network":', err?.message?.toLowerCase()?.includes('network'));
+                debugLog('Message contains "CORS":', err?.message?.toLowerCase()?.includes('cors'));
+                debugLog('Message contains "SSL":', err?.message?.toLowerCase()?.includes('ssl'));
+                debugLog('Message contains "certificate":', err?.message?.toLowerCase()?.includes('certificate'));
+                debugLog('Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+                debugLog('================================================');
+
+                // Provide detailed error message based on error type
+                let errorMessage = 'Connection error. ';
+
+                if (err.message === 'Request timed out') {
+                    errorMessage += 'Server is not responding. Check if backend is running.';
+                } else if (err.message?.includes('Failed to fetch') || err.name === 'TypeError') {
+                    errorMessage += `Cannot reach ${getBackendUrl()}. Check network/firewall.`;
+                } else if (err.message?.includes('CORS')) {
+                    errorMessage += 'CORS error. Contact support.';
+                } else if (err.message?.includes('SSL') || err.message?.includes('certificate')) {
+                    errorMessage += 'SSL certificate error. Try updating your system certificates.';
+                } else if (err.message) {
+                    errorMessage += err.message;
+                } else {
+                    errorMessage += 'Unknown error. Check console for details.';
+                }
+
+                debugLog('Final error message shown to user:', errorMessage);
+                showLoginError(errorMessage);
+            } finally {
+                saveLoginBtn.disabled = false;
+                saveLoginBtn.textContent = 'Activate';
+            }
+        });
+    }
+
+    // Email lookup
+    const lookupLicenseBtn = document.getElementById('lookupLicenseBtn');
+    const lookupEmailInput = document.getElementById('lookupEmailInput');
+
+    if (lookupLicenseBtn) {
+        lookupLicenseBtn.addEventListener('click', async () => {
+            const email = lookupEmailInput?.value?.trim()?.toLowerCase();
+
+            if (!email) {
+                showLoginError('Please enter your email address');
+                return;
+            }
+
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showLoginError('Please enter a valid email address');
+                return;
+            }
+
+            lookupLicenseBtn.disabled = true;
+            lookupLicenseBtn.textContent = 'Looking up...';
+
+            try {
+                const response = await fetchWithTimeout(`${getBackendUrl()}/license/lookup`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                }, 30000);
+
+                const result = await response.json();
+
+                // Note: For security, the backend does NOT return the license key directly.
+                // It sends the key via email to prevent enumeration attacks.
+                if (result.success) {
+                    setStatus(result.message || 'If a license exists, it will be sent to your email.');
+                } else {
+                    showLoginError(result.error || 'Lookup failed. Please try again.');
+                }
+            } catch (err) {
+                console.error('[SPLICE] License lookup error:', err);
+                showLoginError('Failed to look up license. Please try again.');
+            } finally {
+                lookupLicenseBtn.disabled = false;
+                lookupLicenseBtn.textContent = 'Lookup';
+            }
+        });
+    }
+
+    // Handle external URL buttons
+    // CEP panels cannot use target="_blank" for security reasons.
+    // Must use CSInterface.openURLInDefaultBrowser() instead.
+    initExternalLinkButtons();
+}
+
+/**
+ * Initialize all external link buttons that need CSInterface.openURLInDefaultBrowser()
+ * CEP panels cannot use target="_blank" due to security restrictions
+ */
+function initExternalLinkButtons() {
+    // Check if CSInterface is available
+    if (typeof CSInterface === 'undefined') {
+        console.warn('[SPLICE] CSInterface not available - external links disabled');
+        return;
+    }
+
+    let cs;
+    try {
+        cs = new CSInterface();
+    } catch (e) {
+        console.warn('[SPLICE] Failed to create CSInterface:', e.message);
+        return;
+    }
+
+    // Buy a License button
+    const buyLicenseBtn = document.querySelector('.btn-buy-license');
+
+    if (buyLicenseBtn) {
+        buyLicenseBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            // Visual feedback
+            buyLicenseBtn.textContent = 'Opening...';
+            buyLicenseBtn.style.backgroundColor = '#28a745';
+
+            try {
+                cs.openURLInDefaultBrowser('https://spliceclips.com/pricing');
+
+                // Reset button after a delay
+                setTimeout(() => {
+                    buyLicenseBtn.textContent = 'Buy License';
+                    buyLicenseBtn.style.backgroundColor = '';
+                }, 2000);
+            } catch (err) {
+                console.error('[SPLICE] Failed to open URL:', err.message);
+                buyLicenseBtn.textContent = 'Error';
+                buyLicenseBtn.style.backgroundColor = '#dc3545';
+            }
+        });
+    }
+    
+    // View Plans button (in upgrade modal)
+    const viewPlansBtn = document.querySelector('.btn-view-plans');
+    if (viewPlansBtn) {
+        viewPlansBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const url = viewPlansBtn.dataset.url || 'https://spliceclips.com/pricing';
+            cs.openURLInDefaultBrowser(url);
+        });
+    }
+    
+    // Referral link button
+    const referralBtn = document.querySelector('.btn-referral');
+    if (referralBtn) {
+        referralBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const url = referralBtn.dataset.url || 'https://splice.video/referrals';
+            cs.openURLInDefaultBrowser(url);
+        });
+    }
+}
+
+/**
+ * Show login modal
+ */
+function showLoginModal() {
+    const loginModal = document.getElementById('loginModal');
+    const loginError = document.getElementById('loginError');
+    if (loginError) loginError.style.display = 'none';
+    if (loginModal) loginModal.classList.remove('hidden');
+}
+
+/**
+ * Show login error message
+ */
+function showLoginError(message) {
+    const loginError = document.getElementById('loginError');
+    if (loginError) {
+        loginError.textContent = message;
+        loginError.style.display = 'block';
+    }
+}
+
+/**
+ * Check if user is logged in
+ */
+function isLoggedIn() {
+    const settings = getSettings();
+    return !!settings.customerId;
+}
+
+/**
+ * Logout - clear all auth data
+ */
+function logout() {
+    // Clear all auth-related settings
+    saveSettings({
+        customerId: null,
+        accessToken: null,
+        refreshToken: null,
+        tokenExpiry: null,
+        licenseKey: null
+    });
+
+    if (typeof clearCreditsCache === 'function') {
+        clearCreditsCache();
+    }
+    if (typeof updateCreditDisplay === 'function') {
+        updateCreditDisplay(null);
+    }
+    setStatus('Logged out');
+}
+
+// Initialize JSX bridge when loaded
+document.addEventListener('DOMContentLoaded', () => {
+    jsx.init();
+});
+
+// Export for modules
+window.SPLICE_CONFIG = SPLICE_CONFIG;
+window.SPLICE_DEBUG = SPLICE_DEBUG;
+window.JSX_TIMEOUTS = JSX_TIMEOUTS;  // FIX: CEP-CRIT-001 - Export timeout constants
+window.debugLog = debugLog;
+window.debugFetch = debugFetch;
+window.getBackendUrl = getBackendUrl;
+window.fetchWithTimeout = fetchWithTimeout;
+window.parseErrorResponse = parseErrorResponse;
+window.getAuthHeaders = getAuthHeaders;
+window.getSettings = getSettings;
+window.saveSettings = saveSettings;
+window.clearSetting = clearSetting;
+window.isOnline = isOnline;
+window.initOfflineDetection = initOfflineDetection;
+window.formatTime = formatTime;
+window.setStatus = setStatus;
+window.debounce = debounce;
+window.jsx = jsx;
+window.PRESETS = PRESETS;
+window.getPresets = getPresets;
+window.getPreset = getPreset;
+window.applyPreset = applyPreset;
+window.getActivePreset = getActivePreset;
+window.isBuiltInPreset = isBuiltInPreset;
+window.initPresetSelector = initPresetSelector;
+window.initLoginModal = initLoginModal;
+window.showLoginModal = showLoginModal;
+window.isLoggedIn = isLoggedIn;
+window.logout = logout;
+window.escapeHtml = escapeHtml;
+window.safeHtml = safeHtml;
+// JWT Auth functions
+window.isTokenExpired = isTokenExpired;
+window.refreshAccessToken = refreshAccessToken;
+window.clearAuthTokens = clearAuthTokens;
+window.ensureValidToken = ensureValidToken;

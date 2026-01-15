@@ -1,0 +1,190 @@
+     1→/**
+     2→ * Rate Limiter Middleware
+     3→ *
+     4→ * Checks if user has sufficient credits before processing.
+     5→ * Uses atomic credit reservation to prevent race conditions.
+     6→ * Returns 402 Payment Required if insufficient credits.
+     7→ *
+     8→ * SECURITY: Uses JWT authentication via authenticateToken middleware.
+     9→ * Legacy x-stripe-customer-id header is supported but deprecated.
+    10→ */
+    11→
+    12→const {
+    13→  deductUsage,
+    14→  getBalance,
+    15→  reserveCredits,
+    16→  confirmReservation,
+    17→  releaseReservation
+    18→} = require('../services/usageTracking');
+    19→const { verifyToken, extractBearerToken } = require('./auth');
+    20→
+    21→// Default estimated duration for reservation (1 minute = 60 seconds)
+    22→const DEFAULT_RESERVATION_SECONDS = 60;
+    23→
+    24→/**
+    25→ * Middleware to check and atomically reserve credits before processing
+    26→ *
+    27→ * SECURITY: Authenticates via JWT token (Authorization: Bearer <token>)
+    28→ * Falls back to legacy x-stripe-customer-id header (deprecated)
+    29→ *
+    30→ * Uses req.estimatedDuration (in seconds) for pre-check, defaults to 60s
+    31→ *
+    32→ * This middleware uses SELECT...FOR UPDATE to prevent race conditions
+    33→ * where multiple concurrent requests could all pass credit check.
+    34→ */
+    35→function requireCredits(options = {}) {
+    36→  const { endpoint = 'unknown', estimatedSeconds = DEFAULT_RESERVATION_SECONDS } = options;
+    37→
+    38→  return async (req, res, next) => {
+    39→    // SECURITY: Primary auth via JWT token
+    40→    const authHeader = req.headers['authorization'];
+    41→    const token = extractBearerToken(authHeader);
+    42→
+    43→    let stripeCustomerId = null;
+    44→
+    45→    if (token) {
+    46→      const decoded = verifyToken(token);
+    47→      if (decoded && decoded.sub) {
+    48→        stripeCustomerId = decoded.sub;
+    49→        req.tokenData = decoded;
+    50→      } else {
+    51→        // Token present but invalid
+    52→        return res.status(401).json({
+    53→          error: 'Invalid or expired token',
+    54→          message: 'Please log in again to continue'
+    55→        });
+    56→      }
+    57→    } else {
+    58→      // DEPRECATED: Fallback to legacy header (will be removed in v6.0)
+    59→      const legacyId = req.headers['x-stripe-customer-id'];
+    60→      if (legacyId) {
+    61→        // Validate format to prevent injection
+    62→        if (!legacyId.match(/^cus_[a-zA-Z0-9]{14,}$/)) {
+    63→          return res.status(401).json({
+    64→            error: 'Invalid customer ID format',
+    65→            message: 'Customer ID must be a valid Stripe customer ID'
+    66→          });
+    67→        }
+    68→        stripeCustomerId = legacyId;
+    69→        req.isLegacyAuth = true;
+    70→        console.warn(`[RateLimiter] DEPRECATED: Legacy auth header used for ${endpoint}`);
+    71→      }
+    72→    }
+    73→
+    74→    if (!stripeCustomerId) {
+    75→      return res.status(401).json({
+    76→        error: 'Authentication required',
+    77→        message: 'Missing Stripe customer ID'
+    78→      });
+    79→    }
+    80→
+    81→    // Store for later use
+    82→    req.stripeCustomerId = stripeCustomerId;
+    83→
+    84→    // Determine estimated duration - use request value, option value, or default
+    85→    const estSeconds = req.estimatedDuration || estimatedSeconds;
+    86→
+    87→    try {
+    88→      // Atomically reserve credits using SELECT...FOR UPDATE
+    89→      const reservation = await reserveCredits(stripeCustomerId, estSeconds, endpoint);
+    90→
+    91→      if (!reservation.success) {
+    92→        // Reservation failed - not enough credits
+    93→        const balance = await getBalance(stripeCustomerId);
+    94→        return res.status(402).json({
+    95→          error: 'Insufficient credits',
+    96→          message: 'Please upgrade your plan or wait for your next billing cycle',
+    97→          balance: {
+    98→            hoursRemaining: balance.hoursRemaining,
+    99→            tier: balance.tier
+   100→          }
+   101→        });
+   102→      }
+   103→
+   104→      // Store reservation info for confirmation/release
+   105→      req.reservation = {
+   106→        id: reservation.reservationId,
+   107→        seconds: estSeconds,
+   108→        hoursReserved: reservation.hoursReserved
+   109→      };
+   110→
+   111→      // Attach helper function to confirm usage with actual duration
+   112→      // This adjusts the reservation if actual duration differs
+   113→      req.deductUsage = async (actualDurationSeconds) => {
+   114→        return await confirmReservation(
+   115→          stripeCustomerId,
+   116→          actualDurationSeconds,
+   117→          estSeconds,
+   118→          endpoint
+   119→        );
+   120→      };
+   121→
+   122→      // Attach helper function to release reservation on failure
+   123→      req.releaseReservation = async (reason = 'processing_failed') => {
+   124→        return await releaseReservation(stripeCustomerId, estSeconds, endpoint, reason);
+   125→      };
+   126→
+   127→      // Hook into response to auto-release on error responses
+   128→      const originalSend = res.send.bind(res);
+   129→      res.send = function(body) {
+   130→        // If response is an error (4xx/5xx) and no usage was confirmed, release reservation
+   131→        if (res.statusCode >= 400 && req.reservation && !req.usageConfirmed) {
+   132→          releaseReservation(stripeCustomerId, estSeconds, endpoint, `error_${res.statusCode}`)
+   133→            .catch(err => console.error('[RateLimiter] Failed to release reservation:', err));
+   134→        }
+   135→        return originalSend(body);
+   136→      };
+   137→
+   138→      next();
+   139→    } catch (err) {
+   140→      console.error('[RateLimiter] Error reserving credits:', err);
+   141→      return res.status(500).json({
+   142→        error: 'Credit check failed',
+   143→        message: err.message
+   144→      });
+   145→    }
+   146→  };
+   147→}
+   148→
+   149→/**
+   150→ * Middleware to track usage after successful response
+   151→ *
+   152→ * Call this after processing to deduct actual usage
+   153→ */
+   154→function trackUsage(endpoint = 'unknown') {
+   155→  return async (req, res, next) => {
+   156→    // Store original json method
+   157→    const originalJson = res.json.bind(res);
+   158→
+   159→    // Override json to track usage on success
+   160→    res.json = async (data) => {
+   161→      // Only deduct on successful responses
+   162→      if (res.statusCode >= 200 && res.statusCode < 300 && req.audioDuration) {
+   163→        try {
+   164→          const balance = await deductUsage(
+   165→            req.stripeCustomerId,
+   166→            req.audioDuration,
+   167→            endpoint
+   168→          );
+   169→          // Attach updated balance to response
+   170→          data.balance = balance;
+   171→        } catch (err) {
+   172→          console.error('[RateLimiter] Error deducting usage:', err);
+   173→        }
+   174→      }
+   175→      return originalJson(data);
+   176→    };
+   177→
+   178→    next();
+   179→  };
+   180→}
+   181→
+   182→module.exports = {
+   183→  requireCredits,
+   184→  trackUsage
+   185→};
+   186→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

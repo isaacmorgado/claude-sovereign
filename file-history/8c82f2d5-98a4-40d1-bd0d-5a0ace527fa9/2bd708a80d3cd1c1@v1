@@ -1,0 +1,455 @@
+/**
+ * SPLICE CEP Credits Display Module
+ *
+ * Fetches and displays user's remaining hours from the billing backend.
+ * Port of UXP credits.js for CEP compatibility.
+ */
+
+// Track fetch error state for retry UI
+let lastCreditsError = null;
+let creditsRetryCount = 0;
+const MAX_CREDITS_RETRIES = 3;
+
+// Store current credits globally for access checks
+let currentCredits = null;
+
+// Store interval reference for cleanup
+let creditsRefreshInterval = null;
+
+// FIX: CEP-CRIT-016 - Token refresh race condition prevention
+let tokenRefreshPromise = null;  // Deduplicate concurrent refresh attempts
+
+/**
+ * Fetch user's credit balance from backend
+ * @returns {Promise<Object | null>} Credit data including isolation hours, or error object
+ */
+async function fetchCredits() {
+    const settings = getSettings();
+    const customerId = settings.customerId;
+
+    if (!customerId) {
+        console.log('[SPLICE] No customerId configured - credits display disabled');
+        lastCreditsError = null;
+        return null;
+    }
+
+    try {
+        // Ensure we have a valid token before making the request
+        if (typeof ensureValidToken === 'function') {
+            const hasValidToken = await ensureValidToken();
+            if (!hasValidToken && !settings.accessToken) {
+                // No JWT token - will fall back to legacy auth in getAuthHeaders()
+                debugLog('[Credits] No JWT token, using legacy auth');
+            }
+        }
+
+        const response = await fetchWithTimeout(`${getBackendUrl()}/credits`, {
+            method: 'GET',
+            headers: getAuthHeaders()
+        }, SPLICE_CONFIG.FETCH_TIMEOUT);
+
+        if (!response.ok) {
+            const errorMsg = await parseErrorResponse(response);
+
+            // If unauthorized, try refreshing token and retry once
+            if (response.status === 401 && typeof refreshAccessToken === 'function') {
+                debugLog('[Credits] Got 401, attempting token refresh...');
+
+                // FIX: CEP-CRIT-016 - Deduplicate concurrent token refresh attempts
+                if (!tokenRefreshPromise) {
+                    tokenRefreshPromise = refreshAccessToken().finally(() => {
+                        tokenRefreshPromise = null;
+                    });
+                }
+                const refreshed = await tokenRefreshPromise;
+
+                if (refreshed) {
+                    // FIX: CEP-CRIT-017 - Retry uses 30s timeout (not full 120s)
+                    // Retry with new token
+                    const retryResponse = await fetchWithTimeout(`${getBackendUrl()}/credits`, {
+                        method: 'GET',
+                        headers: getAuthHeaders()
+                    }, 30000);
+
+                    if (retryResponse.ok) {
+                        const data = await retryResponse.json();
+                        lastCreditsError = null;
+                        creditsRetryCount = 0;
+                        return {
+                            hoursRemaining: data.hoursRemaining || 0,
+                            hoursTotal: data.hoursTotal || 0,
+                            tierName: data.tierName || 'Free',
+                            tier: data.tier || 'starter',
+                            isolationHoursRemaining: data.isolationHoursRemaining || 0,
+                            isolationHoursTotal: data.isolationHoursTotal || 0,
+                            hasIsolationAccess: data.hasIsolationAccess || false,
+                            isolationOverageRate: data.isolationOverageRate || 0.08,
+                            featureAccess: data.featureAccess || [],
+                            trialDaysRemaining: data.trialDaysRemaining || null,
+                            isOnTrial: data.isOnTrial || false
+                        };
+                    }
+                }
+
+                // Token refresh failed - user needs to re-login
+                console.warn('[SPLICE] Token refresh failed, user needs to re-login');
+                if (typeof clearAuthTokens === 'function') {
+                    clearAuthTokens();
+                }
+                return { _error: true, message: 'Session expired. Please log in again.' };
+            }
+
+            console.error('[SPLICE] Credits fetch failed:', errorMsg);
+            lastCreditsError = errorMsg;
+            return { _error: true, message: errorMsg };
+        }
+
+        const data = await response.json();
+        lastCreditsError = null;
+        creditsRetryCount = 0;
+        return {
+            hoursRemaining: data.hoursRemaining || 0,
+            hoursTotal: data.hoursTotal || 0,
+            tierName: data.tierName || 'Free',
+            tier: data.tier || 'starter',
+            // Isolation hours
+            isolationHoursRemaining: data.isolationHoursRemaining || 0,
+            isolationHoursTotal: data.isolationHoursTotal || 0,
+            hasIsolationAccess: data.hasIsolationAccess || false,
+            isolationOverageRate: data.isolationOverageRate || 0.08,
+            // Feature access
+            featureAccess: data.featureAccess || [],
+            // Trial info
+            trialDaysRemaining: data.trialDaysRemaining || null,
+            isOnTrial: data.isOnTrial || false
+        };
+    } catch (err) {
+        console.error('[SPLICE] Credits fetch error:', err);
+        lastCreditsError = err.message || 'Connection failed';
+        return { _error: true, message: lastCreditsError };
+    }
+}
+
+/**
+ * Clear the credits cache (call on logout)
+ */
+function clearCreditsCache() {
+    currentCredits = null;
+    lastCreditsError = null;
+    creditsRetryCount = 0;
+    console.log('[SPLICE] Credits cache cleared');
+}
+
+/**
+ * Update the credit display in the UI
+ * @param {Object|null} credits - Credit data, error object, or null if unavailable
+ */
+function updateCreditDisplay(credits) {
+    const creditBadge = document.getElementById('creditBadge');
+    if (!creditBadge) return;
+
+    // Handle no customer ID configured
+    if (!credits) {
+        currentCredits = null;
+        creditBadge.style.display = 'flex';
+        creditBadge.textContent = 'Login';
+        creditBadge.title = 'Click to enter license key';
+        creditBadge.classList.remove('ok', 'low');
+        creditBadge.classList.add('login');
+        return;
+    }
+
+    // Handle error state - show error badge with retry
+    if (credits._error) {
+        currentCredits = null;
+        creditBadge.style.display = 'flex';
+        creditBadge.textContent = 'Retry';
+        creditBadge.title = `Error: ${credits.message}\nClick to retry`;
+        creditBadge.classList.remove('ok', 'low', 'login');
+        creditBadge.classList.add('error');
+        return;
+    }
+
+    // Normal credit display
+    currentCredits = credits;
+    creditBadge.style.display = 'flex';
+
+    // Show referral promo when logged in
+    const referralPromo = document.getElementById('referralPromo');
+    if (referralPromo) {
+        referralPromo.classList.remove('hidden');
+    }
+
+    // Show trial status if on trial
+    if (credits.isOnTrial && credits.trialDaysRemaining) {
+        creditBadge.textContent = `Trial: ${credits.trialDaysRemaining}d`;
+        creditBadge.classList.remove('error', 'login', 'ok', 'low');
+        creditBadge.classList.add('trial');
+    } else {
+        creditBadge.textContent = `${credits.hoursRemaining.toFixed(1)} hrs`;
+        creditBadge.classList.remove('error', 'login', 'trial');
+    }
+
+    // Build tooltip with isolation info if available
+    let tooltip = `${credits.tierName}: ${credits.hoursRemaining.toFixed(1)} / ${credits.hoursTotal} hours`;
+    if (credits.isOnTrial && credits.trialDaysRemaining) {
+        tooltip = `Trial: ${credits.trialDaysRemaining} days remaining\n` + tooltip;
+    }
+    if (credits.hasIsolationAccess) {
+        tooltip += `\nIsolation: ${(credits.isolationHoursRemaining * 60).toFixed(0)} / ${(credits.isolationHoursTotal * 60).toFixed(0)} min`;
+    }
+    creditBadge.title = tooltip;
+
+    // Color based on remaining hours
+    if (credits.hoursRemaining <= 1) {
+        creditBadge.classList.add('low');
+        creditBadge.classList.remove('ok');
+    } else {
+        creditBadge.classList.add('ok');
+        creditBadge.classList.remove('low');
+    }
+
+    // Update isolation checkbox state based on tier access
+    updateIsolationCheckboxState(credits);
+}
+
+/**
+ * Update the isolation checkbox based on tier access
+ */
+function updateIsolationCheckboxState(credits) {
+    const isolatedCheckbox = document.getElementById('sourceIsolated');
+    const tierBadge = isolatedCheckbox?.parentElement?.querySelector('.tier-badge');
+
+    if (!isolatedCheckbox) return;
+
+    if (!credits || !credits.hasIsolationAccess) {
+        // Disable isolation for non-Pro/Team users
+        isolatedCheckbox.disabled = true;
+        isolatedCheckbox.checked = false;
+        if (tierBadge) {
+            tierBadge.textContent = 'Pro+';
+            tierBadge.style.opacity = '1';
+        }
+    } else {
+        // Enable isolation for Pro/Team users
+        isolatedCheckbox.disabled = false;
+        if (tierBadge) {
+            // Show remaining isolation time
+            const minsRemaining = (credits.isolationHoursRemaining * 60).toFixed(0);
+            tierBadge.textContent = `${minsRemaining} min`;
+            tierBadge.style.opacity = credits.isolationHoursRemaining > 0 ? '1' : '0.6';
+        }
+    }
+}
+
+/**
+ * Check if user can use isolation and get cost estimate
+ * @param {number} estimatedMinutes - Estimated audio duration in minutes
+ * @returns {Object} Access info with allowed, message, overageCost
+ */
+function checkIsolationAccess(estimatedMinutes = 0) {
+    if (!currentCredits) {
+        return { allowed: false, message: 'Credits not loaded', overageCost: 0 };
+    }
+
+    if (!currentCredits.hasIsolationAccess) {
+        return {
+            allowed: false,
+            message: 'Vocal isolation requires Pro or Team tier',
+            upgradeRequired: true,
+            overageCost: 0
+        };
+    }
+
+    const estimatedHours = estimatedMinutes / 60;
+    const remaining = currentCredits.isolationHoursRemaining;
+
+    if (remaining >= estimatedHours) {
+        return {
+            allowed: true,
+            message: `Using ${estimatedMinutes.toFixed(1)} min of included isolation time`,
+            overageCost: 0
+        };
+    }
+
+    // Calculate overage
+    const overageMinutes = estimatedMinutes - (remaining * 60);
+    const overageCost = overageMinutes * currentCredits.isolationOverageRate;
+
+    return {
+        allowed: true,
+        message: `${remaining > 0 ? `${(remaining * 60).toFixed(0)} included + ` : ''}${overageMinutes.toFixed(0)} min overage ($${overageCost.toFixed(2)})`,
+        overageCost,
+        overageMinutes
+    };
+}
+
+/**
+ * Get current credits (for access checks)
+ */
+function getCurrentCredits() {
+    return currentCredits;
+}
+
+/**
+ * Check if user has access to a specific feature based on their tier
+ * @param {string} featureName - The feature to check (e.g., 'social_reframe', 'text_editing', 'multitrack')
+ * @returns {boolean} - True if user has access
+ */
+function hasFeatureAccess(featureName) {
+    if (!currentCredits || !currentCredits.featureAccess) {
+        return false; // Not logged in = no premium features
+    }
+    return currentCredits.featureAccess.includes(featureName);
+}
+
+/**
+ * Get the required tier for a feature
+ * @param {string} featureName - The feature name
+ * @returns {string} - Required tier name
+ */
+function getRequiredTier(featureName) {
+    const teamOnlyFeatures = ['multitrack', 'music_to_cut', 'mood_timeline', 'youtube_metadata', 'profanity_bleeping'];
+    const proFeatures = ['vocal_isolation', 'social_reframe', 'text_editing', 'all_captions', 'profanity_detection', 'chapter_detection'];
+
+    if (teamOnlyFeatures.includes(featureName)) {
+        return 'Team';
+    } else if (proFeatures.includes(featureName)) {
+        return 'Pro';
+    }
+    return 'Starter';
+}
+
+/**
+ * Initialize credits display
+ * Fetches credits on load and sets up periodic refresh
+ * NON-BLOCKING: Shows loading state, fetches in background
+ */
+function initCredits() {
+    // Clear any existing interval to prevent duplicates
+    if (creditsRefreshInterval) {
+        clearInterval(creditsRefreshInterval);
+    }
+
+    // Show loading state immediately
+    const creditBadge = document.getElementById('creditBadge');
+    if (creditBadge) {
+        creditBadge.style.display = 'flex';
+        creditBadge.textContent = '...';
+        creditBadge.title = 'Loading credits...';
+        creditBadge.classList.remove('ok', 'low', 'login', 'error');
+        creditBadge.classList.add('loading');
+    }
+
+    // Fetch credits in background (non-blocking)
+    fetchCredits().then(credits => {
+        updateCreditDisplay(credits);
+    }).catch(error => {
+        console.error('[SPLICE] Failed to fetch credits during init:', error);
+        // updateCreditDisplay handles error state via credits._error
+    });
+
+    // Refresh credits every 5 minutes
+    creditsRefreshInterval = setInterval(async () => {
+        const refreshedCredits = await fetchCredits();
+        updateCreditDisplay(refreshedCredits);
+    }, 5 * 60 * 1000);
+}
+
+/**
+ * Cleanup credits module - call on plugin unload
+ */
+function cleanupCredits() {
+    if (creditsRefreshInterval) {
+        clearInterval(creditsRefreshInterval);
+        creditsRefreshInterval = null;
+    }
+}
+
+/**
+ * Manually refresh credits (e.g., after a processing operation)
+ */
+async function refreshCredits() {
+    const credits = await fetchCredits();
+    updateCreditDisplay(credits);
+    return credits;
+}
+
+/**
+ * Retry fetching credits with exponential backoff
+ * Called when user clicks the "Retry" badge
+ */
+async function retryFetchCredits() {
+    if (creditsRetryCount >= MAX_CREDITS_RETRIES) {
+        console.warn('[SPLICE] Max retry attempts reached for credits fetch');
+        updateCreditDisplay({
+            _error: true,
+            message: 'Max retries exceeded. Check your connection and try again later.'
+        });
+        creditsRetryCount = 0; // Reset for next attempt
+        return null;
+    }
+
+    creditsRetryCount++;
+    console.log(`[SPLICE] Retrying credits fetch (attempt ${creditsRetryCount}/${MAX_CREDITS_RETRIES})`);
+
+    // Exponential backoff: 1s, 2s, 4s
+    const delay = Math.pow(2, creditsRetryCount - 1) * 1000;
+
+    // Show retrying state
+    const creditBadge = document.getElementById('creditBadge');
+    if (creditBadge) {
+        creditBadge.textContent = `Retry ${creditsRetryCount}...`;
+        creditBadge.classList.add('retrying');
+    }
+
+    await new Promise(resolve => setTimeout(resolve, delay));
+
+    const credits = await fetchCredits();
+
+    if (creditBadge) {
+        creditBadge.classList.remove('retrying');
+    }
+
+    updateCreditDisplay(credits);
+    return credits;
+}
+
+/**
+ * Handle click on credit badge
+ * - If error state: retry fetching
+ * - If login state: open login modal
+ * - Otherwise: refresh credits
+ */
+function handleCreditBadgeClick() {
+    const creditBadge = document.getElementById('creditBadge');
+    if (!creditBadge) return;
+
+    if (creditBadge.classList.contains('error')) {
+        retryFetchCredits();
+    } else if (creditBadge.classList.contains('login')) {
+        // Open login modal (handled in main.js)
+        const loginModal = document.getElementById('loginModal');
+        if (loginModal) {
+            loginModal.classList.remove('hidden');
+        }
+    } else {
+        // Normal state - just refresh
+        refreshCredits();
+    }
+}
+
+// Export for window access
+window.fetchCredits = fetchCredits;
+window.clearCreditsCache = clearCreditsCache;
+window.updateCreditDisplay = updateCreditDisplay;
+window.checkIsolationAccess = checkIsolationAccess;
+window.getCurrentCredits = getCurrentCredits;
+window.hasFeatureAccess = hasFeatureAccess;
+window.getRequiredTier = getRequiredTier;
+window.initCredits = initCredits;
+window.cleanupCredits = cleanupCredits;
+window.refreshCredits = refreshCredits;
+window.retryFetchCredits = retryFetchCredits;
+window.handleCreditBadgeClick = handleCreditBadgeClick;
+

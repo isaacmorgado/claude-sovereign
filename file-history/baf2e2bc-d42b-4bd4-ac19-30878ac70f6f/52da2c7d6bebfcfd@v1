@@ -1,0 +1,266 @@
+#!/bin/bash
+# Enhanced Error Handler - Smart retry with backoff and error classification
+# Based on patterns from: Discord.js, Cypress, Uniswap, neo4j, midday-ai
+
+set -euo pipefail
+
+LOG_FILE="${HOME}/.claude/error-handler.log"
+DEBUG_LOG=".claude/docs/debug-log.md"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Error Classification (from neo4j/midday-ai patterns)
+classify_error() {
+    local error_msg="$1"
+
+    # Transient errors - should retry
+    if echo "$error_msg" | grep -qiE "timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|network|socket hang up|ENOTFOUND|503|502|504"; then
+        echo "TRANSIENT"
+        return
+    fi
+
+    # Rate limit errors - should retry with longer backoff
+    if echo "$error_msg" | grep -qiE "rate.?limit|429|too many requests|quota exceeded"; then
+        echo "RATE_LIMIT"
+        return
+    fi
+
+    # Client errors - should NOT retry (fix needed)
+    if echo "$error_msg" | grep -qiE "syntax.?error|type.?error|reference.?error|400|401|403|404|validation|invalid"; then
+        echo "CLIENT_ERROR"
+        return
+    fi
+
+    # Build/compile errors - should NOT retry (fix needed)
+    if echo "$error_msg" | grep -qiE "cannot find|not found|undefined|null|compilation|build failed|lint|typecheck"; then
+        echo "BUILD_ERROR"
+        return
+    fi
+
+    # Database errors - may retry
+    if echo "$error_msg" | grep -qiE "database|postgres|mysql|sqlite|connection|deadlock"; then
+        echo "DATABASE_ERROR"
+        return
+    fi
+
+    echo "UNKNOWN"
+}
+
+# Determine if error should trigger retry (from Discord.js/Uniswap patterns)
+should_retry() {
+    local classification="$1"
+    local attempt="$2"
+    local max_retries="${3:-3}"
+
+    if [[ $attempt -ge $max_retries ]]; then
+        echo "false"
+        return
+    fi
+
+    case "$classification" in
+        TRANSIENT|RATE_LIMIT|DATABASE_ERROR)
+            echo "true"
+            ;;
+        CLIENT_ERROR|BUILD_ERROR)
+            echo "false"
+            ;;
+        UNKNOWN)
+            # Retry unknown errors once
+            if [[ $attempt -lt 1 ]]; then
+                echo "true"
+            else
+                echo "false"
+            fi
+            ;;
+        *)
+            echo "false"
+            ;;
+    esac
+}
+
+# Calculate retry delay with exponential backoff (from Cypress/Uniswap patterns)
+calculate_backoff() {
+    local attempt="$1"
+    local classification="$2"
+    local base_delay=1000  # 1 second
+    local max_delay=30000  # 30 seconds
+
+    # Rate limits get longer backoff
+    if [[ "$classification" == "RATE_LIMIT" ]]; then
+        base_delay=5000
+        max_delay=60000
+    fi
+
+    # Exponential backoff: base * 2^attempt
+    local delay=$((base_delay * (2 ** attempt)))
+
+    # Cap at max delay
+    if [[ $delay -gt $max_delay ]]; then
+        delay=$max_delay
+    fi
+
+    echo $delay
+}
+
+# Parse error message to extract key info (from Continue/Novu patterns)
+parse_error() {
+    local error_msg="$1"
+
+    # Extract file:line if present
+    local file_line=$(echo "$error_msg" | grep -oE '[a-zA-Z0-9_/.-]+\.(ts|js|tsx|jsx|py|go|rs):[0-9]+' | head -1 || echo "")
+
+    # Extract error code if present
+    local error_code=$(echo "$error_msg" | grep -oE '(E[0-9]+|TS[0-9]+|error\[[a-zA-Z0-9_]+\])' | head -1 || echo "")
+
+    # Extract the core error message (first meaningful line)
+    local core_msg=$(echo "$error_msg" | head -5 | grep -iE "error|failed|cannot|invalid" | head -1 || echo "$error_msg" | head -1)
+
+    echo "FILE_LINE=$file_line"
+    echo "ERROR_CODE=$error_code"
+    echo "CORE_MSG=$core_msg"
+}
+
+# Log error to debug-log.md with classification
+log_error_to_debug() {
+    local error_msg="$1"
+    local classification="$2"
+    local attempt="$3"
+    local context="${4:-}"
+
+    mkdir -p .claude/docs 2>/dev/null || true
+
+    # Create debug-log if doesn't exist
+    if [[ ! -f "$DEBUG_LOG" ]]; then
+        cat > "$DEBUG_LOG" << 'EOFLOG'
+# Debug Log
+
+## Active Issues
+
+## Session Log
+
+---
+
+## Resolved Issues
+
+## Patterns Discovered
+
+## Research Cache
+EOFLOG
+    fi
+
+    # Extract file:line if present
+    local file_line
+    file_line=$(echo "$error_msg" | grep -oE '[a-zA-Z0-9_/.-]+\.(ts|js|tsx|jsx|py|go|rs):[0-9]+' | head -1 2>/dev/null || echo "unknown")
+
+    # Extract error code if present
+    local error_code
+    error_code=$(echo "$error_msg" | grep -oE '(E[0-9]+|TS[0-9]+)' | head -1 2>/dev/null || echo "none")
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    local retry_status
+    retry_status=$(should_retry "$classification" "$attempt")
+
+    # Append to debug log (simpler than sed insertion)
+    cat >> "$DEBUG_LOG" << EOFENTRY
+
+### Issue: $classification (Attempt $attempt)
+**Time**: $timestamp
+**Classification**: $classification
+**File**: $file_line
+**Code**: $error_code
+**Error**: \`$error_msg\`
+**Context**: ${context:-none}
+**Retryable**: $retry_status
+EOFENTRY
+
+    log "Logged $classification error (attempt $attempt)"
+}
+
+# Main handler - called from other hooks/scripts
+handle_error() {
+    local error_msg="${1:-}"
+    local attempt="${2:-0}"
+    local max_retries="${3:-3}"
+    local context="${4:-}"
+
+    local classification
+    classification=$(classify_error "$error_msg")
+
+    # NEW: Query memory for known fixes BEFORE deciding to retry
+    local known_fix=""
+    local MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+    if [[ -x "$MEMORY_MANAGER" && "$attempt" -eq 0 ]]; then
+        local patterns
+        patterns=$("$MEMORY_MANAGER" find-patterns "$error_msg" 3 2>/dev/null || echo "[]")
+
+        if [[ -n "$patterns" && "$patterns" != "[]" && "$patterns" != "null" ]]; then
+            # Get the best matching pattern
+            known_fix=$(echo "$patterns" | jq -r '.[0].solution // empty' 2>/dev/null || echo "")
+
+            if [[ -n "$known_fix" && "$known_fix" != "null" ]]; then
+                log "Found known fix in memory: $known_fix"
+
+                # Return the fix suggestion
+                jq -n \
+                    --arg classification "$classification" \
+                    --arg fix "$known_fix" \
+                    --arg error "$error_msg" \
+                    '{
+                        classification: $classification,
+                        shouldRetry: false,
+                        hasKnownFix: true,
+                        knownFix: $fix,
+                        recommendation: "Apply known fix from memory",
+                        error: $error
+                    }'
+                return
+            fi
+        fi
+    fi
+
+    local retry
+    retry=$(should_retry "$classification" "$attempt" "$max_retries")
+
+    local backoff
+    backoff=$(calculate_backoff "$attempt" "$classification")
+
+    # Log to debug-log.md
+    log_error_to_debug "$error_msg" "$classification" "$attempt" "$context"
+
+    # Output JSON for caller
+    jq -n \
+        --arg classification "$classification" \
+        --arg retry "$retry" \
+        --argjson backoff "$backoff" \
+        --argjson attempt "$attempt" \
+        --arg error "$error_msg" \
+        '{
+            classification: $classification,
+            shouldRetry: ($retry == "true"),
+            backoffMs: $backoff,
+            attempt: $attempt,
+            error: $error,
+            hasKnownFix: false
+        }'
+}
+
+# NEW: Record successful fix to memory
+record_fix_to_memory() {
+    local error_msg="$1"
+    local fix_applied="$2"
+
+    local MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" add-pattern "error_fix" "$error_msg" "$fix_applied" 1.0 2>/dev/null || true
+        log "Recorded successful fix to memory"
+    fi
+}
+
+# If called directly with error message
+if [[ $# -gt 0 ]]; then
+    handle_error "$1" "${2:-0}" "${3:-3}" "${4:-}"
+fi

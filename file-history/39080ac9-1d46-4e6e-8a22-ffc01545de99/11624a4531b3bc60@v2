@@ -1,0 +1,95 @@
+---
+description: Log a fix attempt to debug-log.md
+argument-hint: "<success|fail> <description>"
+allowed-tools: ["Read", "Write", "Edit"]
+---
+
+# Log Fix Command
+
+Quickly log a fix attempt to the debug-log.md file.
+
+## Usage
+
+```
+/log-fix fail "Tried adding null check but error persists"
+/log-fix success "Fixed by updating dependency version"
+```
+
+## Instructions
+
+Parse arguments: $ARGUMENTS
+
+Extract:
+- `result`: "success" or "fail" (first word)
+- `description`: Everything after the result
+
+### Step 1: Ensure debug-log.md exists
+
+Check if `.claude/docs/debug-log.md` exists.
+
+If not, create it from the template:
+- Copy structure from `~/.claude/templates/debug-log.md`
+- Set project name from current directory
+- Set date to today
+
+### Step 2: Find or Create Current Session
+
+Look for a session header matching today's date.
+
+If no session for today:
+```markdown
+---
+
+## Session: [TODAY'S DATE]
+```
+
+### Step 3: Find Current Issue
+
+Look for the most recent `### Issue:` that doesn't have a `### Resolution` section.
+
+If no open issue, create one:
+```markdown
+### Issue: Debugging in progress
+
+**Context:** Auto-logged fix attempts
+```
+
+### Step 4: Append Fix Attempt
+
+Under the current issue's `### Attempted Fixes` section, add:
+
+```markdown
+#### Attempt [N]: [first 50 chars of description]
+**Time:** [HH:MM]
+**Result:** [❌ Failed | ✅ Success]
+**Details:** [full description]
+```
+
+### Step 5: If Success, Add Resolution
+
+If result is "success":
+
+```markdown
+### Resolution
+
+**Final Fix:** [description]
+**Time:** [timestamp]
+
+---
+```
+
+Then move the issue to `## Resolved Issues` section.
+
+### Step 6: Update Statistics
+
+Increment counters at bottom of file:
+- If fail: No change to resolved count
+- If success: Increment resolved count
+
+### Output
+
+```
+[✅|❌] Logged to .claude/docs/debug-log.md
+Issue: [issue title]
+Attempt: #[N]
+```

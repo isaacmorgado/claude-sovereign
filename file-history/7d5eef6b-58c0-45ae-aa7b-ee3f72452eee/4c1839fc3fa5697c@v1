@@ -1,0 +1,561 @@
+/**
+ * Centralized Error Handling Middleware
+ *
+ * Provides unified error handling across all endpoints:
+ * - Custom error classes for different error types
+ * - Consistent JSON response format
+ * - Error codes enum for client-side handling
+ * - Async handler wrapper to eliminate try-catch boilerplate
+ *
+ * @module middleware/errorHandler
+ */
+
+// =============================================================================
+// Error Codes Enum
+// =============================================================================
+
+/**
+ * Standardized error codes for client-side handling
+ */
+const ErrorCodes = {
+  // Authentication errors (401)
+  AUTH_REQUIRED: 'AUTH_REQUIRED',
+  AUTH_INVALID: 'AUTH_INVALID',
+  AUTH_EXPIRED: 'AUTH_EXPIRED',
+
+  // Validation errors (400)
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  MISSING_FIELD: 'MISSING_FIELD',
+  INVALID_FORMAT: 'INVALID_FORMAT',
+
+  // Resource errors (404)
+  NOT_FOUND: 'NOT_FOUND',
+  RESOURCE_NOT_FOUND: 'RESOURCE_NOT_FOUND',
+  FILE_NOT_FOUND: 'FILE_NOT_FOUND',
+
+  // Rate limiting / billing (402, 429)
+  RATE_LIMITED: 'RATE_LIMITED',
+  CREDITS_EXHAUSTED: 'CREDITS_EXHAUSTED',
+  PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',
+
+  // Permission errors (403)
+  ACCESS_DENIED: 'ACCESS_DENIED',
+  OWNERSHIP_REQUIRED: 'OWNERSHIP_REQUIRED',
+
+  // External service errors (502, 503)
+  EXTERNAL_SERVICE_ERROR: 'EXTERNAL_SERVICE_ERROR',
+  TRANSCRIPTION_FAILED: 'TRANSCRIPTION_FAILED',
+  AI_SERVICE_UNAVAILABLE: 'AI_SERVICE_UNAVAILABLE',
+  DEPENDENCY_MISSING: 'DEPENDENCY_MISSING',
+
+  // File errors (413)
+  FILE_TOO_LARGE: 'FILE_TOO_LARGE',
+
+  // Internal errors (500)
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+  DATABASE_ERROR: 'DATABASE_ERROR',
+  CONFIGURATION_ERROR: 'CONFIGURATION_ERROR'
+};
+
+// =============================================================================
+// Custom Error Classes
+// =============================================================================
+
+/**
+ * Base application error class
+ * All custom errors extend this class
+ */
+class AppError extends Error {
+  /**
+   * @param {string} message - Human-readable error message
+   * @param {number} statusCode - HTTP status code (default: 500)
+   * @param {string} code - Error code from ErrorCodes enum
+   * @param {object} details - Optional additional error details
+   */
+  constructor(message, statusCode = 500, code = ErrorCodes.INTERNAL_ERROR, details = null) {
+    super(message);
+    this.name = this.constructor.name;
+    this.statusCode = statusCode;
+    this.code = code;
+    this.details = details;
+    this.isOperational = true; // Distinguishes from programming errors
+
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  /**
+   * Convert error to JSON response format
+   */
+  toJSON() {
+    const response = {
+      success: false,
+      error: {
+        code: this.code,
+        message: this.message
+      }
+    };
+
+    if (this.details) {
+      response.error.details = this.details;
+    }
+
+    return response;
+  }
+}
+
+/**
+ * Validation error (400) - Invalid input data
+ */
+class ValidationError extends AppError {
+  constructor(message, details = null) {
+    super(message, 400, ErrorCodes.VALIDATION_ERROR, details);
+  }
+
+  /**
+   * Create a missing field error
+   * @param {string} fieldName - Name of the missing field
+   */
+  static missingField(fieldName) {
+    return new ValidationError(
+      `${fieldName} is required`,
+      { field: fieldName, code: ErrorCodes.MISSING_FIELD }
+    );
+  }
+
+  /**
+   * Create an invalid format error
+   * @param {string} fieldName - Name of the field
+   * @param {string} expectedFormat - Description of expected format
+   */
+  static invalidFormat(fieldName, expectedFormat) {
+    return new ValidationError(
+      `Invalid ${fieldName} format. Expected: ${expectedFormat}`,
+      { field: fieldName, expected: expectedFormat, code: ErrorCodes.INVALID_FORMAT }
+    );
+  }
+}
+
+/**
+ * Authentication error (401) - Missing or invalid credentials
+ */
+class AuthenticationError extends AppError {
+  constructor(message = 'Authentication required', code = ErrorCodes.AUTH_REQUIRED) {
+    super(message, 401, code);
+  }
+
+  static required() {
+    return new AuthenticationError('Authentication required', ErrorCodes.AUTH_REQUIRED);
+  }
+
+  static invalid() {
+    return new AuthenticationError('Invalid credentials', ErrorCodes.AUTH_INVALID);
+  }
+
+  static expired() {
+    return new AuthenticationError('Token has expired. Please log in again', ErrorCodes.AUTH_EXPIRED);
+  }
+}
+
+/**
+ * Not found error (404) - Resource doesn't exist
+ */
+class NotFoundError extends AppError {
+  constructor(message, resourceType = null) {
+    const code = resourceType === 'file' ? ErrorCodes.FILE_NOT_FOUND : ErrorCodes.RESOURCE_NOT_FOUND;
+    super(message, 404, code, resourceType ? { resourceType } : null);
+  }
+
+  static file(filePath) {
+    return new NotFoundError(`File not found: ${filePath}`, 'file');
+  }
+
+  static resource(resourceType, id) {
+    return new NotFoundError(`${resourceType} not found${id ? `: ${id}` : ''}`, resourceType);
+  }
+}
+
+/**
+ * Access denied error (403) - User lacks permission
+ */
+class AccessDeniedError extends AppError {
+  constructor(message = 'Access denied', code = ErrorCodes.ACCESS_DENIED) {
+    super(message, 403, code);
+  }
+
+  static ownership() {
+    return new AccessDeniedError('Access denied: Resource belongs to another user', ErrorCodes.OWNERSHIP_REQUIRED);
+  }
+}
+
+/**
+ * Rate limit error (429 or 402) - Too many requests or credits exhausted
+ */
+class RateLimitError extends AppError {
+  constructor(message, details = null) {
+    super(message, 429, ErrorCodes.RATE_LIMITED, details);
+  }
+
+  static creditsExhausted(balance = null) {
+    const error = new RateLimitError(
+      'Insufficient credits. Please upgrade your plan or wait for your next billing cycle',
+      balance ? { balance } : null
+    );
+    error.statusCode = 402;
+    error.code = ErrorCodes.CREDITS_EXHAUSTED;
+    return error;
+  }
+}
+
+/**
+ * External service error (502/503) - Third-party service failure
+ */
+class ExternalServiceError extends AppError {
+  constructor(message, serviceName, originalError = null) {
+    const details = { service: serviceName };
+    if (originalError && originalError.message) {
+      details.originalError = originalError.message;
+    }
+    super(message, 502, ErrorCodes.EXTERNAL_SERVICE_ERROR, details);
+    this.serviceName = serviceName;
+  }
+
+  static transcription(originalError = null) {
+    const error = new ExternalServiceError(
+      'Transcription service failed',
+      'whisper',
+      originalError
+    );
+    error.code = ErrorCodes.TRANSCRIPTION_FAILED;
+    return error;
+  }
+
+  static unavailable(serviceName) {
+    const error = new ExternalServiceError(
+      `${serviceName} service is not available`,
+      serviceName
+    );
+    error.statusCode = 503;
+    error.code = ErrorCodes.AI_SERVICE_UNAVAILABLE;
+    return error;
+  }
+
+  static missingDependency(dependencyName, installHint = null) {
+    const details = { dependency: dependencyName };
+    if (installHint) {
+      details.hint = installHint;
+    }
+    const error = new ExternalServiceError(
+      `${dependencyName} is not installed`,
+      dependencyName
+    );
+    error.statusCode = 500;
+    error.code = ErrorCodes.DEPENDENCY_MISSING;
+    error.details = details;
+    return error;
+  }
+}
+
+/**
+ * File too large error (413) - Payload exceeds limit
+ */
+class FileTooLargeError extends AppError {
+  constructor(message, details = null) {
+    super(message, 413, ErrorCodes.FILE_TOO_LARGE, details);
+  }
+
+  static exceeds(actualSizeMB, maxSizeMB) {
+    return new FileTooLargeError(
+      `File too large (${actualSizeMB.toFixed(1)}MB). Maximum allowed: ${maxSizeMB}MB`,
+      { actualSizeMB, maxSizeMB }
+    );
+  }
+}
+
+/**
+ * Database error (500) - Database operation failed
+ */
+class DatabaseError extends AppError {
+  constructor(message = 'Database operation failed', originalError = null) {
+    const details = originalError ? { originalError: originalError.message } : null;
+    super(message, 500, ErrorCodes.DATABASE_ERROR, details);
+  }
+}
+
+// =============================================================================
+// Async Handler Wrapper
+// =============================================================================
+
+/**
+ * Wraps async route handlers to automatically catch errors
+ * Eliminates try-catch boilerplate in every endpoint
+ *
+ * @param {Function} fn - Async route handler function
+ * @returns {Function} Express middleware function
+ *
+ * @example
+ * app.post('/analyze', requireCredits(), asyncHandler(async (req, res) => {
+ *   const result = await someAsyncOperation();
+ *   res.json({ success: true, result });
+ * }));
+ */
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+// =============================================================================
+// Global Error Handler Middleware
+// =============================================================================
+
+/**
+ * Global error handler middleware
+ * Must be registered last in the middleware chain
+ *
+ * Handles:
+ * - AppError subclasses (operational errors)
+ * - Standard JavaScript errors
+ * - Unknown errors
+ *
+ * @param {Error} err - Error object
+ * @param {Request} req - Express request
+ * @param {Response} res - Express response
+ * @param {Function} next - Express next function
+ */
+function errorHandler(err, req, res, _next) {
+  // Log error (with stack trace in development)
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+
+  if (err.isOperational) {
+    // Operational errors - log warning level
+    console.warn(`[SPLICE] ${err.name}: ${err.message}`, {
+      code: err.code,
+      statusCode: err.statusCode,
+      path: req.path,
+      method: req.method
+    });
+  } else {
+    // Programming errors - log error level with stack
+    console.error(`[SPLICE] Unexpected error:`, {
+      message: err.message,
+      stack: isProduction ? undefined : err.stack,
+      path: req.path,
+      method: req.method
+    });
+  }
+
+  // Handle AppError subclasses
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json(err.toJSON());
+  }
+
+  // Handle Stripe errors
+  if (err.type && err.type.startsWith('Stripe')) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'STRIPE_ERROR',
+        message: isProduction ? 'Payment processing error' : err.message
+      }
+    });
+  }
+
+  // Handle JSON parse errors
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Invalid JSON in request body'
+      }
+    });
+  }
+
+  // Handle unknown/unexpected errors
+  const response = {
+    success: false,
+    error: {
+      code: ErrorCodes.INTERNAL_ERROR,
+      message: isProduction ? 'An unexpected error occurred' : err.message
+    }
+  };
+
+  // Include stack trace in development
+  if (!isProduction && err.stack) {
+    response.error.stack = err.stack;
+  }
+
+  return res.status(500).json(response);
+}
+
+/**
+ * 404 handler for unmatched routes
+ * Register before the global error handler
+ */
+function notFoundHandler(req, res, next) {
+  next(new NotFoundError(`Route not found: ${req.method} ${req.path}`, 'route'));
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * SECURITY: Sanitize error message for production
+ * Hides internal error details from clients in production
+ *
+ * @param {Error} err - Error object
+ * @param {string} fallbackMessage - Message to show in production
+ * @returns {string} Sanitized error message
+ */
+function sanitizeError(err, fallbackMessage = 'An error occurred') {
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+
+  // In production, only show the fallback message
+  // Exception: If error is an AppError (operational), show its message
+  if (isProduction) {
+    if (err instanceof AppError && err.isOperational) {
+      return err.message;
+    }
+    return fallbackMessage;
+  }
+
+  // In development, show full error message
+  return err.message || fallbackMessage;
+}
+
+/**
+ * SECURITY: Create sanitized error response
+ * Use this instead of directly using err.message in responses
+ *
+ * @param {Error} err - Error object
+ * @param {string} fallbackMessage - Message to show in production
+ * @returns {Object} Sanitized error response object
+ */
+function createErrorResponse(err, fallbackMessage = 'An error occurred') {
+  return { error: sanitizeError(err, fallbackMessage) };
+}
+
+/**
+ * Validate required fields in request body
+ * Throws ValidationError if any field is missing
+ *
+ * @param {object} body - Request body
+ * @param {string[]} requiredFields - Array of required field names
+ * @throws {ValidationError} If any required field is missing
+ */
+function validateRequired(body, requiredFields) {
+  for (const field of requiredFields) {
+    if (body[field] === undefined || body[field] === null || body[field] === '') {
+      throw ValidationError.missingField(field);
+    }
+  }
+}
+
+/**
+ * Validate that at least one of the specified fields is present
+ *
+ * @param {object} body - Request body
+ * @param {string[]} fields - Array of field names (at least one required)
+ * @param {string} message - Custom error message
+ * @throws {ValidationError} If none of the fields are present
+ */
+function validateOneOf(body, fields, message) {
+  const hasOne = fields.some(f => body[f] !== undefined && body[f] !== null && body[f] !== '');
+  if (!hasOne) {
+    throw new ValidationError(message || `At least one of ${fields.join(', ')} is required`);
+  }
+}
+
+/**
+ * Validate array field
+ *
+ * @param {object} body - Request body
+ * @param {string} fieldName - Field name
+ * @param {object} options - Validation options
+ * @param {boolean} options.required - Whether field is required
+ * @param {number} options.minLength - Minimum array length
+ * @throws {ValidationError} If validation fails
+ */
+function validateArray(body, fieldName, options = {}) {
+  const { required = true, minLength = 0 } = options;
+  const value = body[fieldName];
+
+  if (required && (value === undefined || value === null)) {
+    throw ValidationError.missingField(fieldName);
+  }
+
+  if (value !== undefined && value !== null) {
+    if (!Array.isArray(value)) {
+      throw new ValidationError(`${fieldName} must be an array`);
+    }
+    if (value.length < minLength) {
+      throw new ValidationError(
+        `${fieldName} must have at least ${minLength} item${minLength === 1 ? '' : 's'}`
+      );
+    }
+  }
+}
+
+/**
+ * Validate numeric field
+ *
+ * @param {object} body - Request body
+ * @param {string} fieldName - Field name
+ * @param {object} options - Validation options
+ * @param {number} options.min - Minimum value
+ * @param {number} options.max - Maximum value
+ * @param {boolean} options.required - Whether field is required
+ * @throws {ValidationError} If validation fails
+ */
+function validateNumber(body, fieldName, options = {}) {
+  const { min, max, required = false } = options;
+  const value = body[fieldName];
+
+  if (required && (value === undefined || value === null)) {
+    throw ValidationError.missingField(fieldName);
+  }
+
+  if (value !== undefined && value !== null) {
+    if (typeof value !== 'number' || isNaN(value)) {
+      throw new ValidationError(`${fieldName} must be a number`);
+    }
+    if (min !== undefined && value < min) {
+      throw new ValidationError(`${fieldName} must be at least ${min}`);
+    }
+    if (max !== undefined && value > max) {
+      throw new ValidationError(`${fieldName} must be at most ${max}`);
+    }
+  }
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
+module.exports = {
+  // Error codes
+  ErrorCodes,
+
+  // Error classes
+  AppError,
+  ValidationError,
+  AuthenticationError,
+  NotFoundError,
+  AccessDeniedError,
+  RateLimitError,
+  ExternalServiceError,
+  FileTooLargeError,
+  DatabaseError,
+
+  // Middleware
+  asyncHandler,
+  errorHandler,
+  notFoundHandler,
+
+  // Validation helpers
+  validateRequired,
+  validateOneOf,
+  validateArray,
+  validateNumber
+};

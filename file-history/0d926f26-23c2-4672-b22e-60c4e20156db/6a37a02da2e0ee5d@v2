@@ -1,0 +1,264 @@
+import Stripe from 'stripe';
+import { z } from 'zod';
+import { env } from '../config/env.js';
+import * as userRepository from '../db/repositories/user-repository.js';
+import type { SubscriptionTier, UserPublic } from '../types/user.js';
+import type { CheckoutSession, PortalSession, SubscriptionStatus } from '../types/billing.js';
+
+const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+
+const PRICE_TO_TIER: Record<string, SubscriptionTier> = {
+  [env.STRIPE_PRO_PRICE_ID]: 'pro',
+  [env.STRIPE_ENTERPRISE_PRICE_ID]: 'enterprise',
+};
+
+const TIER_TO_PRICE: Record<Exclude<SubscriptionTier, 'free'>, string> = {
+  pro: env.STRIPE_PRO_PRICE_ID,
+  enterprise: env.STRIPE_ENTERPRISE_PRICE_ID,
+};
+
+export const checkoutSchema = z.object({
+  tier: z.enum(['pro', 'enterprise']),
+});
+
+export class BillingError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number = 400
+  ) {
+    super(message);
+    this.name = 'BillingError';
+  }
+}
+
+async function getOrCreateStripeCustomer(user: UserPublic): Promise<string> {
+  const fullUser = await userRepository.findById(user.id);
+  if (!fullUser) {
+    throw new BillingError('User not found', 404);
+  }
+
+  if (fullUser.stripe_customer_id) {
+    return fullUser.stripe_customer_id;
+  }
+
+  const customer = await stripe.customers.create({
+    email: fullUser.email,
+    name: fullUser.name ?? undefined,
+    metadata: {
+      userId: fullUser.id,
+    },
+  });
+
+  await userRepository.updateSubscription(
+    fullUser.id,
+    fullUser.subscription_tier,
+    customer.id,
+    fullUser.stripe_subscription_id
+  );
+
+  return customer.id;
+}
+
+export async function createCheckoutSession(
+  user: UserPublic,
+  tier: Exclude<SubscriptionTier, 'free'>
+): Promise<CheckoutSession> {
+  if (user.subscription_tier !== 'free') {
+    throw new BillingError('Already subscribed. Use the billing portal to manage your subscription.');
+  }
+
+  const customerId = await getOrCreateStripeCustomer(user);
+  const priceId = TIER_TO_PRICE[tier];
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: 'subscription',
+    payment_method_types: ['card'],
+    line_items: [
+      {
+        price: priceId,
+        quantity: 1,
+      },
+    ],
+    success_url: `${env.NODE_ENV === 'production' ? 'https://splice.app' : 'http://localhost:3000'}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${env.NODE_ENV === 'production' ? 'https://splice.app' : 'http://localhost:3000'}/pricing`,
+    subscription_data: {
+      metadata: {
+        userId: user.id,
+      },
+    },
+  });
+
+  if (!session.url) {
+    throw new BillingError('Failed to create checkout session');
+  }
+
+  return {
+    sessionId: session.id,
+    url: session.url,
+  };
+}
+
+export async function createPortalSession(user: UserPublic): Promise<PortalSession> {
+  const fullUser = await userRepository.findById(user.id);
+  if (!fullUser?.stripe_customer_id) {
+    throw new BillingError('No billing account found. Subscribe first.');
+  }
+
+  const session = await stripe.billingPortal.sessions.create({
+    customer: fullUser.stripe_customer_id,
+    return_url: `${env.NODE_ENV === 'production' ? 'https://splice.app' : 'http://localhost:3000'}/dashboard`,
+  });
+
+  return {
+    url: session.url,
+  };
+}
+
+export async function getSubscriptionStatus(user: UserPublic): Promise<SubscriptionStatus> {
+  const fullUser = await userRepository.findById(user.id);
+  if (!fullUser) {
+    throw new BillingError('User not found', 404);
+  }
+
+  if (!fullUser.stripe_subscription_id) {
+    return {
+      tier: fullUser.subscription_tier,
+      status: fullUser.subscription_tier === 'free' ? 'none' : 'active',
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+    };
+  }
+
+  const subscription = await stripe.subscriptions.retrieve(fullUser.stripe_subscription_id);
+
+  return {
+    tier: fullUser.subscription_tier,
+    status: subscription.status as SubscriptionStatus['status'],
+    currentPeriodEnd: new Date(subscription.current_period_end * 1000),
+    cancelAtPeriodEnd: subscription.cancel_at_period_end,
+  };
+}
+
+export async function handleWebhook(
+  payload: Buffer,
+  signature: string
+): Promise<{ received: boolean }> {
+  let event: Stripe.Event;
+
+  try {
+    event = stripe.webhooks.constructEvent(payload, signature, env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    throw new BillingError(`Webhook signature verification failed: ${err instanceof Error ? err.message : 'Unknown error'}`, 400);
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      await handleCheckoutCompleted(event.data.object);
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      await handleSubscriptionUpdated(event.data.object);
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      await handleSubscriptionDeleted(event.data.object);
+      break;
+    }
+
+    case 'invoice.payment_failed': {
+      await handlePaymentFailed(event.data.object);
+      break;
+    }
+  }
+
+  return { received: true };
+}
+
+async function handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
+  const userId = session.subscription
+    ? (await stripe.subscriptions.retrieve(session.subscription as string)).metadata.userId
+    : null;
+
+  if (!userId) {
+    console.error('No userId found in checkout session metadata');
+    return;
+  }
+
+  const subscriptionId = session.subscription as string;
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const priceId = subscription.items.data[0]?.price.id;
+  const tier = priceId ? PRICE_TO_TIER[priceId] : null;
+
+  if (!tier) {
+    console.error(`Unknown price ID: ${priceId ?? 'undefined'}`);
+    return;
+  }
+
+  await userRepository.updateSubscription(
+    userId,
+    tier,
+    session.customer as string,
+    subscriptionId
+  );
+}
+
+async function handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
+  const userId = subscription.metadata.userId;
+  if (!userId) {
+    console.error('No userId found in subscription metadata');
+    return;
+  }
+
+  const priceId = subscription.items.data[0]?.price.id;
+  const tier = priceId ? PRICE_TO_TIER[priceId] : null;
+
+  if (!tier) {
+    console.error(`Unknown price ID: ${priceId ?? 'undefined'}`);
+    return;
+  }
+
+  if (subscription.status === 'active') {
+    await userRepository.updateSubscription(
+      userId,
+      tier,
+      subscription.customer as string,
+      subscription.id
+    );
+  }
+}
+
+async function handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
+  const userId = subscription.metadata.userId;
+  if (!userId) {
+    console.error('No userId found in subscription metadata');
+    return;
+  }
+
+  const user = await userRepository.findById(userId);
+  if (!user) {
+    console.error(`User not found: ${userId}`);
+    return;
+  }
+
+  await userRepository.updateSubscription(
+    userId,
+    'free',
+    user.stripe_customer_id,
+    null
+  );
+}
+
+async function handlePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
+  const subscriptionId = invoice.subscription as string | null;
+  if (!subscriptionId) return;
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const userId = subscription.metadata.userId;
+
+  if (userId) {
+    console.warn(`Payment failed for user ${userId}, subscription ${subscriptionId}`);
+  }
+}

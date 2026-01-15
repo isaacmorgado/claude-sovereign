@@ -1,0 +1,526 @@
+"""
+Insights Engine - Analyzes metrics and generates Key Strengths & Areas of Improvement
+
+This engine processes insight definitions from insights.json and classifies them
+based on the user's metric scores.
+
+Logic:
+- For each insight definition, calculate average score of affected metrics
+- Weakness: if avg score < threshold -> classify with severity label
+- Strength: if avg score > threshold -> classify with grade label
+
+Severity Labels (Weaknesses):
+    0-3   = "Severe"
+    3-5   = "Moderate"
+    5-7   = "Minor"
+
+Grade Labels (Strengths):
+    8-9   = "Good"
+    9-9.5 = "Excellent"
+    9.5-10 = "Ideal"
+"""
+
+import json
+import os
+from typing import Dict, List, Any, Optional, TypedDict, Literal
+from pathlib import Path
+
+
+# ============================================
+# TYPE DEFINITIONS
+# ============================================
+
+class AffectedRatio(TypedDict):
+    name: str
+    score: float
+    metric_id: str
+
+
+class LinkedPlan(TypedDict):
+    title: str
+    tag: str
+    ref_id: str
+
+
+class StrengthResult(TypedDict):
+    id: str
+    title: str
+    grade: str
+    score: float
+    description: str
+    affected_ratios: List[AffectedRatio]
+
+
+class ImprovementResult(TypedDict):
+    id: str
+    title: str
+    severity: str
+    score: float
+    description: str
+    affected_ratios: List[AffectedRatio]
+    linked_plans: List[LinkedPlan]
+
+
+class InsightsReport(TypedDict):
+    strengths: List[StrengthResult]
+    improvements: List[ImprovementResult]
+
+
+class InsightDefinition(TypedDict):
+    id: str
+    title: str
+    type: Literal["strength", "weakness"]
+    severity_logic: Dict[str, Any]
+    content: Dict[str, Any]
+
+
+# ============================================
+# INSIGHTS ENGINE CLASS
+# ============================================
+
+class InsightsEngine:
+    """
+    Analyzes calculated metrics and groups them into high-level insights
+    (Key Strengths and Areas of Improvement).
+    """
+
+    def __init__(self, insights_path: Optional[str] = None):
+        """
+        Initialize the InsightsEngine with insight definitions.
+
+        Args:
+            insights_path: Path to insights.json. If None, uses default location.
+        """
+        if insights_path is None:
+            # Default path relative to this file
+            insights_path = Path(__file__).parent.parent / "data" / "insights.json"
+
+        self.insights_path = Path(insights_path)
+        self._insights_data: Optional[Dict] = None
+        self._load_insights()
+
+    def _load_insights(self) -> None:
+        """Load insight definitions from JSON file."""
+        try:
+            with open(self.insights_path, 'r', encoding='utf-8') as f:
+                self._insights_data = json.load(f)
+        except FileNotFoundError:
+            print(f"[InsightsEngine] Warning: insights.json not found at {self.insights_path}")
+            self._insights_data = {"insights": [], "metric_targets": {}}
+        except json.JSONDecodeError as e:
+            print(f"[InsightsEngine] Error parsing insights.json: {e}")
+            self._insights_data = {"insights": [], "metric_targets": {}}
+
+    @property
+    def insights(self) -> List[InsightDefinition]:
+        """Get list of insight definitions."""
+        return self._insights_data.get("insights", []) if self._insights_data else []
+
+    @property
+    def metric_targets(self) -> Dict[str, List[str]]:
+        """Get metric to treatment mapping."""
+        return self._insights_data.get("metric_targets", {}) if self._insights_data else {}
+
+    @staticmethod
+    def get_weakness_severity(avg_score: float) -> str:
+        """
+        Determine weakness severity based on average score.
+
+        Ranges:
+            0-3   = "severe"
+            3-5   = "moderate"
+            5-7   = "minor"
+
+        Args:
+            avg_score: The average score (0-10 scale)
+
+        Returns:
+            Severity level as string
+        """
+        if avg_score <= 3:
+            return "severe"
+        elif avg_score <= 5:
+            return "moderate"
+        else:
+            return "minor"
+
+    @staticmethod
+    def get_strength_grade(avg_score: float) -> str:
+        """
+        Determine strength grade based on average score.
+
+        Ranges:
+            8-9   = "good"
+            9-9.5 = "excellent"
+            9.5-10 = "ideal"
+
+        Args:
+            avg_score: The average score (0-10 scale)
+
+        Returns:
+            Grade level as string
+        """
+        if avg_score >= 9.5:
+            return "ideal"
+        elif avg_score >= 9:
+            return "excellent"
+        else:
+            return "good"
+
+    def _find_metric_score(
+        self,
+        metric_id: str,
+        results_dict: Dict[str, Any],
+        _depth: int = 0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find a metric by ID in the results dictionary.
+
+        Supports multiple result structures:
+        1. Flat dict: {"metricId": {"score": X, "value": Y, ...}}
+        2. List format: {"measurements": [{"metricId": "X", "score": Y}, ...]}
+        3. Nested: {"front": {...}, "side": {...}}
+
+        Args:
+            metric_id: The metric identifier to find
+            results_dict: Dictionary containing metric scores
+            _depth: Internal recursion depth tracker
+
+        Returns:
+            Metric data dict with at least 'score' key, or None if not found
+        """
+        # Prevent infinite recursion
+        if _depth > 3:
+            return None
+
+        # Direct access (flat dict with metricId as key)
+        if metric_id in results_dict:
+            data = results_dict[metric_id]
+            if isinstance(data, dict) and 'score' in data:
+                return data
+            elif isinstance(data, (int, float)):
+                return {'score': data, 'value': data}
+
+        # Check measurements list
+        measurements = results_dict.get('measurements', [])
+        if isinstance(measurements, list):
+            for m in measurements:
+                if isinstance(m, dict):
+                    if m.get('metricId') == metric_id or m.get('metric_id') == metric_id:
+                        return m
+
+        # Check nested front/side profiles (only at depth 0)
+        if _depth == 0:
+            for profile_key in ['front', 'side', 'frontProfile', 'sideProfile']:
+                profile = results_dict.get(profile_key)
+                if isinstance(profile, dict) and profile:
+                    # Check for measurements in the nested profile
+                    nested_measurements = profile.get('measurements', [])
+                    if isinstance(nested_measurements, list):
+                        for m in nested_measurements:
+                            if isinstance(m, dict):
+                                if m.get('metricId') == metric_id or m.get('metric_id') == metric_id:
+                                    return m
+
+        return None
+
+    def _get_metric_display_name(self, metric_id: str) -> str:
+        """Convert camelCase metricId to display name."""
+        # Simple camelCase to Title Case conversion
+        import re
+        # Insert space before uppercase letters
+        name = re.sub(r'([A-Z])', r' \1', metric_id)
+        # Capitalize first letter and strip
+        return name.strip().title()
+
+    def _find_linked_plans(
+        self,
+        affected_metric_ids: List[str],
+        plans_list: List[Dict[str, Any]]
+    ) -> List[LinkedPlan]:
+        """
+        Cross-reference affected metrics with treatment plans to find relevant actions.
+
+        Args:
+            affected_metric_ids: List of metric IDs that are affected
+            plans_list: List of treatment plan dictionaries from AdviceEngine
+
+        Returns:
+            List of linked plans that address these metrics
+        """
+        linked: List[LinkedPlan] = []
+        seen_refs = set()
+
+        # Get treatment refs that target these metrics
+        target_refs = set()
+        for metric_id in affected_metric_ids:
+            refs = self.metric_targets.get(metric_id, [])
+            target_refs.update(refs)
+
+        # Find matching plans
+        for plan in plans_list:
+            ref_id = plan.get('ref_id', '')
+
+            # Check if this plan targets any of our affected metrics
+            matches = False
+
+            # Method 1: Check if ref_id matches our targets
+            if ref_id in target_refs:
+                matches = True
+
+            # Method 2: Check plan's target_metrics
+            plan_targets = plan.get('target_metrics', [])
+            if any(m in affected_metric_ids for m in plan_targets):
+                matches = True
+
+            # Method 3: Check plan's matched_ratios
+            matched_ratios = plan.get('matched_ratios', [])
+            if any(m in affected_metric_ids for m in matched_ratios):
+                matches = True
+
+            if matches and ref_id not in seen_refs:
+                seen_refs.add(ref_id)
+                linked.append({
+                    'title': plan.get('name', plan.get('title', 'Unknown Treatment')),
+                    'tag': plan.get('phase', plan.get('tag', 'Treatment')),
+                    'ref_id': ref_id
+                })
+
+        return linked
+
+    def generate_report(
+        self,
+        results_dict: Dict[str, Any],
+        plans_list: Optional[List[Dict[str, Any]]] = None
+    ) -> InsightsReport:
+        """
+        Generate a comprehensive insights report based on metric scores.
+
+        This method:
+        1. Loads insight definitions from insights.json
+        2. Evaluates each insight against the user's metric scores
+        3. Calculates group average scores
+        4. Classifies as strength (avg > threshold) or weakness (avg < threshold)
+        5. Attaches affected ratios and linked treatment plans
+
+        Args:
+            results_dict: Dictionary containing metric scores. Supports formats:
+                - {"metricId": {"score": X, "value": Y}, ...}
+                - {"measurements": [{"metricId": "X", "score": Y}, ...]}
+                - {"front": {...}, "side": {...}}
+
+            plans_list: Optional list of treatment plans from AdviceEngine.
+                Each plan should have: ref_id, name/title, phase/tag, target_metrics
+
+        Returns:
+            InsightsReport with 'strengths' and 'improvements' lists
+
+        Example:
+            >>> engine = InsightsEngine()
+            >>> results = {
+            ...     "gonialAngle": {"score": 3.5, "value": 135},
+            ...     "mandibularPlaneAngle": {"score": 4.0, "value": 32},
+            ...     "chinPhiltrumRatio": {"score": 2.8, "value": 0.7}
+            ... }
+            >>> plans = [{"ref_id": "SUR-03", "name": "Jaw Implants", "phase": "Surgical"}]
+            >>> report = engine.generate_report(results, plans)
+            >>> print(report['improvements'][0]['title'])
+            "Weak Jaw Structure"
+        """
+        if plans_list is None:
+            plans_list = []
+
+        strengths: List[StrengthResult] = []
+        improvements: List[ImprovementResult] = []
+
+        for insight in self.insights:
+            insight_id = insight['id']
+            insight_type = insight['type']
+            title = insight['title']
+            severity_logic = insight['severity_logic']
+            content = insight['content']
+
+            metrics_to_check = severity_logic.get('metrics', [])
+            threshold = severity_logic.get('threshold', 5.0)
+            description = content.get('description', '')
+            labels = content.get('labels', {})
+
+            # Collect scores for metrics in this insight
+            affected_ratios: List[AffectedRatio] = []
+            scores: List[float] = []
+            affected_metric_ids: List[str] = []
+
+            for metric_id in metrics_to_check:
+                metric_data = self._find_metric_score(metric_id, results_dict)
+                if metric_data:
+                    score = metric_data.get('score', 0)
+                    scores.append(score)
+                    affected_metric_ids.append(metric_id)
+                    affected_ratios.append({
+                        'name': self._get_metric_display_name(metric_id),
+                        'score': round(score, 2),
+                        'metric_id': metric_id
+                    })
+
+            # Skip if no metrics matched
+            if not scores:
+                continue
+
+            # Calculate group average score
+            avg_score = sum(scores) / len(scores)
+
+            # Evaluate based on insight type
+            if insight_type == 'weakness':
+                # Weakness is active if avg_score < threshold
+                if avg_score < threshold:
+                    severity = self.get_weakness_severity(avg_score)
+                    severity_label = labels.get(severity, severity.capitalize())
+
+                    # Find linked treatment plans
+                    linked_plans = self._find_linked_plans(affected_metric_ids, plans_list)
+
+                    improvements.append({
+                        'id': insight_id,
+                        'title': title,
+                        'severity': severity_label,
+                        'score': round(avg_score, 2),
+                        'description': description,
+                        'affected_ratios': affected_ratios,
+                        'linked_plans': linked_plans
+                    })
+
+            elif insight_type == 'strength':
+                # Strength is active if avg_score > threshold
+                if avg_score > threshold:
+                    grade = self.get_strength_grade(avg_score)
+                    grade_label = labels.get(grade, grade.capitalize())
+
+                    strengths.append({
+                        'id': insight_id,
+                        'title': title,
+                        'grade': grade_label,
+                        'score': round(avg_score, 2),
+                        'description': description,
+                        'affected_ratios': affected_ratios
+                    })
+
+        # Sort results
+        # Strengths: highest score first
+        strengths.sort(key=lambda x: x['score'], reverse=True)
+        # Improvements: lowest score first (most severe)
+        improvements.sort(key=lambda x: x['score'])
+
+        return {
+            'strengths': strengths,
+            'improvements': improvements
+        }
+
+    def get_summary(self, report: InsightsReport) -> Dict[str, Any]:
+        """
+        Generate a summary of the insights report.
+
+        Args:
+            report: The insights report from generate_report()
+
+        Returns:
+            Summary dict with counts and top items
+        """
+        return {
+            'total_strengths': len(report['strengths']),
+            'total_improvements': len(report['improvements']),
+            'top_strength': report['strengths'][0] if report['strengths'] else None,
+            'top_improvement': report['improvements'][0] if report['improvements'] else None,
+            'severe_count': sum(
+                1 for imp in report['improvements']
+                if 'Severe' in imp.get('severity', '') or
+                   'Very' in imp.get('severity', '') or
+                   'Extremely' in imp.get('severity', '')
+            ),
+            'ideal_count': sum(
+                1 for s in report['strengths']
+                if 'Ideal' in s.get('grade', '') or
+                   'Perfect' in s.get('grade', '')
+            )
+        }
+
+
+# ============================================
+# CONVENIENCE FUNCTIONS
+# ============================================
+
+def generate_insights_report(
+    results_dict: Dict[str, Any],
+    plans_list: Optional[List[Dict[str, Any]]] = None,
+    insights_path: Optional[str] = None
+) -> InsightsReport:
+    """
+    Convenience function to generate an insights report.
+
+    Args:
+        results_dict: Metric scores dictionary
+        plans_list: Optional treatment plans list
+        insights_path: Optional path to insights.json
+
+    Returns:
+        InsightsReport dictionary
+    """
+    engine = InsightsEngine(insights_path)
+    return engine.generate_report(results_dict, plans_list)
+
+
+# ============================================
+# EXAMPLE USAGE
+# ============================================
+
+if __name__ == "__main__":
+    # Example usage
+    sample_results = {
+        "measurements": [
+            {"metricId": "gonialAngle", "score": 3.5, "value": 135, "name": "Gonial Angle"},
+            {"metricId": "mandibularPlaneAngle", "score": 4.0, "value": 32, "name": "Mandibular Plane Angle"},
+            {"metricId": "chinPhiltrumRatio", "score": 2.8, "value": 0.7, "name": "Chin to Philtrum Ratio"},
+            {"metricId": "lateralCanthalTilt", "score": 9.2, "value": 5, "name": "Lateral Canthal Tilt"},
+            {"metricId": "eyeAspectRatio", "score": 9.5, "value": 0.35, "name": "Eye Aspect Ratio"},
+            {"metricId": "nasalTipAngle", "score": 9.8, "value": 118, "name": "Nasal Tip Angle"},
+            {"metricId": "noseTipPosition", "score": 9.6, "value": 0.55, "name": "Nose Tip Position"},
+        ]
+    }
+
+    sample_plans = [
+        {
+            "ref_id": "SUR-03",
+            "name": "Jaw Angle Implants",
+            "phase": "Surgical",
+            "target_metrics": ["gonialAngle", "bigonialWidth"]
+        },
+        {
+            "ref_id": "MIN-01",
+            "name": "Chin/Jawline Filler",
+            "phase": "Minimally Invasive",
+            "target_metrics": ["chinPhiltrumRatio", "jawWidthRatio"]
+        }
+    ]
+
+    engine = InsightsEngine()
+    report = engine.generate_report(sample_results, sample_plans)
+
+    print("\n=== INSIGHTS REPORT ===\n")
+
+    print("KEY STRENGTHS:")
+    for s in report['strengths']:
+        print(f"  - {s['title']} ({s['grade']}) - Score: {s['score']}")
+        for r in s['affected_ratios']:
+            print(f"      * {r['name']}: {r['score']}")
+
+    print("\nAREAS OF IMPROVEMENT:")
+    for imp in report['improvements']:
+        print(f"  - {imp['title']} ({imp['severity']}) - Score: {imp['score']}")
+        for r in imp['affected_ratios']:
+            print(f"      * {r['name']}: {r['score']}")
+        if imp['linked_plans']:
+            print(f"      Recommended: {', '.join(p['title'] for p in imp['linked_plans'])}")
+
+    print("\n=== SUMMARY ===")
+    summary = engine.get_summary(report)
+    print(f"Strengths: {summary['total_strengths']}, Improvements: {summary['total_improvements']}")
+    print(f"Severe Issues: {summary['severe_count']}, Ideal Features: {summary['ideal_count']}")

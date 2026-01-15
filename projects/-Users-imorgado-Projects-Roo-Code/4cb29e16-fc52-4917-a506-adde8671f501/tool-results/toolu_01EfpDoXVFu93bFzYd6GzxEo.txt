@@ -1,0 +1,528 @@
+     1→import * as vscode from "vscode"
+     2→import * as dotenvx from "@dotenvx/dotenvx"
+     3→import * as path from "path"
+     4→
+     5→// Load environment variables from .env file
+     6→try {
+     7→	// Specify path to .env file in the project root directory
+     8→	const envPath = path.join(__dirname, "..", ".env")
+     9→	dotenvx.config({ path: envPath })
+    10→} catch (e) {
+    11→	// Silently handle environment loading errors
+    12→	console.warn("Failed to load environment variables:", e)
+    13→}
+    14→
+    15→import type { CloudUserInfo, AuthState } from "@multi-agent/types"
+    16→import { CloudService, BridgeOrchestrator } from "@multi-agent/cloud"
+    17→import { TelemetryService, PostHogTelemetryClient } from "@multi-agent/telemetry"
+    18→import { customToolRegistry } from "@multi-agent/core"
+    19→
+    20→import "./utils/path" // Necessary to have access to String.prototype.toPosix.
+    21→import { createOutputChannelLogger, createDualLogger } from "./utils/outputChannelLogger"
+    22→
+    23→import { Package } from "./shared/package"
+    24→import { formatLanguage } from "./shared/language"
+    25→import { ContextProxy } from "./core/config/ContextProxy"
+    26→import { ClineProvider } from "./core/webview/ClineProvider"
+    27→import { DIFF_VIEW_URI_SCHEME } from "./integrations/editor/DiffViewProvider"
+    28→import { TerminalRegistry } from "./integrations/terminal/TerminalRegistry"
+    29→import { claudeCodeOAuthManager } from "./integrations/claude-code/oauth"
+    30→import { McpServerManager } from "./services/mcp/McpServerManager"
+    31→import { BundledMcpManager } from "./services/mcp/bundled"
+    32→import { CodeIndexManager } from "./services/code-index/manager"
+    33→import { WorkspaceManager } from "./services/workspace"
+    34→import { AutomationManager } from "./services/automation/AutomationManager"
+    35→import { BrowserPreviewManager } from "./services/browser"
+    36→import { BrowserExtensionBridge } from "./services/browser-bridge"
+    37→import { MdmService } from "./services/mdm/MdmService"
+    38→import { migrateSettings } from "./utils/migrateSettings"
+    39→import { autoImportSettings } from "./utils/autoImportSettings"
+    40→import { API } from "./extension/api"
+    41→
+    42→import {
+    43→	handleUri,
+    44→	registerCommands,
+    45→	registerCodeActions,
+    46→	registerTerminalActions,
+    47→	CodeActionProvider,
+    48→} from "./activate"
+    49→import { initializeI18n } from "./i18n"
+    50→import { flushModels, initializeModelCacheRefresh, refreshModels } from "./api/providers/fetchers/modelCache"
+    51→
+    52→/**
+    53→ * Built using https://github.com/microsoft/vscode-webview-ui-toolkit
+    54→ *
+    55→ * Inspired by:
+    56→ *  - https://github.com/microsoft/vscode-webview-ui-toolkit-samples/tree/main/default/weather-webview
+    57→ *  - https://github.com/microsoft/vscode-webview-ui-toolkit-samples/tree/main/frameworks/hello-world-react-cra
+    58→ */
+    59→
+    60→let outputChannel: vscode.OutputChannel
+    61→let extensionContext: vscode.ExtensionContext
+    62→let cloudService: CloudService | undefined
+    63→let automationManager: AutomationManager | undefined
+    64→
+    65→let authStateChangedHandler: ((data: { state: AuthState; previousState: AuthState }) => Promise<void>) | undefined
+    66→let settingsUpdatedHandler: (() => void) | undefined
+    67→let userInfoHandler: ((data: { userInfo: CloudUserInfo }) => Promise<void>) | undefined
+    68→
+    69→// This method is called when your extension is activated.
+    70→// Your extension is activated the very first time the command is executed.
+    71→export async function activate(context: vscode.ExtensionContext) {
+    72→	extensionContext = context
+    73→	outputChannel = vscode.window.createOutputChannel(Package.outputChannel)
+    74→	context.subscriptions.push(outputChannel)
+    75→	outputChannel.appendLine(`${Package.name} extension activated - ${JSON.stringify(Package)}`)
+    76→
+    77→	// Set extension path for custom tool registry to find bundled esbuild
+    78→	customToolRegistry.setExtensionPath(context.extensionPath)
+    79→
+    80→	// Migrate old settings to new
+    81→	await migrateSettings(context, outputChannel)
+    82→
+    83→	// Initialize telemetry service.
+    84→	const telemetryService = TelemetryService.createInstance()
+    85→
+    86→	try {
+    87→		telemetryService.register(new PostHogTelemetryClient())
+    88→	} catch (error) {
+    89→		console.warn("Failed to register PostHogTelemetryClient:", error)
+    90→	}
+    91→
+    92→	// Create logger for cloud services.
+    93→	const cloudLogger = createDualLogger(createOutputChannelLogger(outputChannel))
+    94→
+    95→	// Initialize MDM service
+    96→	const mdmService = await MdmService.createInstance(cloudLogger)
+    97→
+    98→	// Initialize i18n for internationalization support.
+    99→	initializeI18n(context.globalState.get("language") ?? formatLanguage(vscode.env.language))
+   100→
+   101→	// Initialize terminal shell execution handlers.
+   102→	TerminalRegistry.initialize()
+   103→
+   104→	// Initialize Claude Code OAuth manager for direct API access.
+   105→	claudeCodeOAuthManager.initialize(context)
+   106→
+   107→	// Get default commands from configuration.
+   108→	const defaultCommands = vscode.workspace.getConfiguration(Package.name).get<string[]>("allowedCommands") || []
+   109→
+   110→	// Initialize global state if not already set.
+   111→	if (!context.globalState.get("allowedCommands")) {
+   112→		context.globalState.update("allowedCommands", defaultCommands)
+   113→	}
+   114→
+   115→	const contextProxy = await ContextProxy.getInstance(context)
+   116→
+   117→	// Initialize code index managers for all workspace folders.
+   118→	const codeIndexManagers: CodeIndexManager[] = []
+   119→
+   120→	if (vscode.workspace.workspaceFolders) {
+   121→		for (const folder of vscode.workspace.workspaceFolders) {
+   122→			const manager = CodeIndexManager.getInstance(context, folder.uri.fsPath)
+   123→
+   124→			if (manager) {
+   125→				codeIndexManagers.push(manager)
+   126→
+   127→				// Initialize in background; do not block extension activation
+   128→				void manager.initialize(contextProxy).catch((error) => {
+   129→					const message = error instanceof Error ? error.message : String(error)
+   130→					outputChannel.appendLine(
+   131→						`[CodeIndexManager] Error during background CodeIndexManager configuration/indexing for ${folder.uri.fsPath}: ${message}`,
+   132→					)
+   133→				})
+   134→
+   135→				context.subscriptions.push(manager)
+   136→			}
+   137→		}
+   138→	}
+   139→
+   140→	// Initialize bundled MCP servers manager (Docker, GitHub, Railway, Stripe)
+   141→	// This must be initialized before ClineProvider so McpHub can access it
+   142→	BundledMcpManager.getInstance(context)
+   143→
+   144→	// Initialize browser preview manager for SimpleBrowser/Puppeteer integration
+   145→	BrowserPreviewManager.getInstance(context)
+   146→
+   147→	// Initialize browser extension bridge for Chrome companion extension
+   148→	const browserBridgeEnabled = vscode.workspace.getConfiguration(Package.name).get<boolean>("browserBridge.enabled", false)
+   149→	if (browserBridgeEnabled) {
+   150→		const browserBridge = BrowserExtensionBridge.getInstance(context, {
+   151→			port: vscode.workspace.getConfiguration(Package.name).get<number>("browserBridge.port", 9876),
+   152→		})
+   153→		browserBridge.start().then(() => {
+   154→			outputChannel.appendLine(`[BrowserExtensionBridge] Server started on ${browserBridge.getServerUrl()}`)
+   155→		}).catch((error) => {
+   156→			outputChannel.appendLine(`[BrowserExtensionBridge] Failed to start: ${error instanceof Error ? error.message : String(error)}`)
+   157→		})
+   158→		browserBridge.on("connected", (info) => {
+   159→			outputChannel.appendLine(`[BrowserExtensionBridge] Connected to ${info.browserName} v${info.browserVersion}`)
+   160→		})
+   161→		browserBridge.on("disconnected", () => {
+   162→			outputChannel.appendLine("[BrowserExtensionBridge] Disconnected from browser")
+   163→		})
+   164→		context.subscriptions.push(browserBridge)
+   165→	}
+   166→
+   167→	// Initialize workspace manager for multi-project support
+   168→	const workspaceManager = WorkspaceManager.getInstance({
+   169→		extensionContext: context,
+   170→		outputChannel,
+   171→	})
+   172→	await workspaceManager.initialize()
+   173→	context.subscriptions.push(workspaceManager)
+   174→
+   175→	// Initialize the provider *before* the MultiAgent Cloud service.
+   176→	const provider = new ClineProvider(context, outputChannel, "sidebar", contextProxy, mdmService)
+   177→
+   178→	// Initialize MultiAgent Cloud service.
+   179→	const postStateListener = () => ClineProvider.getVisibleInstance()?.postStateToWebview()
+   180→
+   181→	authStateChangedHandler = async (data: { state: AuthState; previousState: AuthState }) => {
+   182→		postStateListener()
+   183→
+   184→		if (data.state === "logged-out") {
+   185→			try {
+   186→				await provider.remoteControlEnabled(false)
+   187→			} catch (error) {
+   188→				cloudLogger(
+   189→					`[authStateChangedHandler] remoteControlEnabled(false) failed: ${error instanceof Error ? error.message : String(error)}`,
+   190→				)
+   191→			}
+   192→		}
+   193→
+   194→		// Handle Roo models cache based on auth state (ROO-202)
+   195→		const handleRooModelsCache = async () => {
+   196→			try {
+   197→				if (data.state === "active-session") {
+   198→					// Refresh with auth token to get authenticated models
+   199→					const sessionToken = CloudService.hasInstance()
+   200→						? CloudService.instance.authService?.getSessionToken()
+   201→						: undefined
+   202→					await refreshModels({
+   203→						provider: "roo",
+   204→						baseUrl: process.env.ROO_CODE_PROVIDER_URL ?? "https://api.roocode.com/proxy",
+   205→						apiKey: sessionToken,
+   206→					})
+   207→				} else {
+   208→					// Flush without refresh on logout
+   209→					await flushModels({ provider: "roo" }, false)
+   210→				}
+   211→			} catch (error) {
+   212→				cloudLogger(
+   213→					`[authStateChangedHandler] Failed to handle Roo models cache: ${error instanceof Error ? error.message : String(error)}`,
+   214→				)
+   215→			}
+   216→		}
+   217→
+   218→		if (data.state === "active-session" || data.state === "logged-out") {
+   219→			await handleRooModelsCache()
+   220→
+   221→			// Apply stored provider model to API configuration if present
+   222→			if (data.state === "active-session") {
+   223→				try {
+   224→					const storedModel = context.globalState.get<string>("roo-provider-model")
+   225→					if (storedModel) {
+   226→						cloudLogger(`[authStateChangedHandler] Applying stored provider model: ${storedModel}`)
+   227→						// Get the current API configuration name
+   228→						const currentConfigName =
+   229→							provider.contextProxy.getGlobalState("currentApiConfigName") || "default"
+   230→						// Update it with the stored model using upsertProviderProfile
+   231→						await provider.upsertProviderProfile(currentConfigName, {
+   232→							apiProvider: "roo",
+   233→							apiModelId: storedModel,
+   234→						})
+   235→						// Clear the stored model after applying
+   236→						await context.globalState.update("roo-provider-model", undefined)
+   237→						cloudLogger(`[authStateChangedHandler] Applied and cleared stored provider model`)
+   238→					}
+   239→				} catch (error) {
+   240→					cloudLogger(
+   241→						`[authStateChangedHandler] Failed to apply stored provider model: ${error instanceof Error ? error.message : String(error)}`,
+   242→					)
+   243→				}
+   244→			}
+   245→		}
+   246→	}
+   247→
+   248→	settingsUpdatedHandler = async () => {
+   249→		const userInfo = CloudService.instance.getUserInfo()
+   250→
+   251→		if (userInfo && CloudService.instance.cloudAPI) {
+   252→			try {
+   253→				provider.remoteControlEnabled(CloudService.instance.isTaskSyncEnabled())
+   254→			} catch (error) {
+   255→				cloudLogger(
+   256→					`[settingsUpdatedHandler] remoteControlEnabled failed: ${error instanceof Error ? error.message : String(error)}`,
+   257→				)
+   258→			}
+   259→		}
+   260→
+   261→		postStateListener()
+   262→	}
+   263→
+   264→	userInfoHandler = async ({ userInfo }: { userInfo: CloudUserInfo }) => {
+   265→		postStateListener()
+   266→
+   267→		if (!CloudService.instance.cloudAPI) {
+   268→			cloudLogger("[userInfoHandler] CloudAPI is not initialized")
+   269→			return
+   270→		}
+   271→
+   272→		try {
+   273→			provider.remoteControlEnabled(CloudService.instance.isTaskSyncEnabled())
+   274→		} catch (error) {
+   275→			cloudLogger(
+   276→				`[userInfoHandler] remoteControlEnabled failed: ${error instanceof Error ? error.message : String(error)}`,
+   277→			)
+   278→		}
+   279→	}
+   280→
+   281→	cloudService = await CloudService.createInstance(context, cloudLogger, {
+   282→		"auth-state-changed": authStateChangedHandler,
+   283→		"settings-updated": settingsUpdatedHandler,
+   284→		"user-info": userInfoHandler,
+   285→	})
+   286→
+   287→	try {
+   288→		if (cloudService.telemetryClient) {
+   289→			TelemetryService.instance.register(cloudService.telemetryClient)
+   290→		}
+   291→	} catch (error) {
+   292→		outputChannel.appendLine(
+   293→			`[CloudService] Failed to register TelemetryClient: ${error instanceof Error ? error.message : String(error)}`,
+   294→		)
+   295→	}
+   296→
+   297→	// Add to subscriptions for proper cleanup on deactivate.
+   298→	context.subscriptions.push(cloudService)
+   299→
+   300→	// Trigger initial cloud profile sync now that CloudService is ready.
+   301→	try {
+   302→		await provider.initializeCloudProfileSyncWhenReady()
+   303→	} catch (error) {
+   304→		outputChannel.appendLine(
+   305→			`[CloudService] Failed to initialize cloud profile sync: ${error instanceof Error ? error.message : String(error)}`,
+   306→		)
+   307→	}
+   308→
+   309→	// Finish initializing the provider.
+   310→	TelemetryService.instance.setProvider(provider)
+   311→
+   312→	context.subscriptions.push(
+   313→		vscode.window.registerWebviewViewProvider(ClineProvider.sideBarId, provider, {
+   314→			webviewOptions: { retainContextWhenHidden: true },
+   315→		}),
+   316→	)
+   317→
+   318→	// Initialize automation manager for workflow automations
+   319→	const automationsEnabled = vscode.workspace.getConfiguration(Package.name).get<boolean>("automations.enabled", true)
+   320→	const firstWorkspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+   321→
+   322→	if (firstWorkspacePath) {
+   323→		automationManager = new AutomationManager({
+   324→			workspacePath: firstWorkspacePath,
+   325→			taskProvider: provider,
+   326→			enabled: automationsEnabled,
+   327→		})
+   328→
+   329→		// Initialize in background
+   330→		automationManager.initialize().catch((error) => {
+   331→			outputChannel.appendLine(
+   332→				`[AutomationManager] Error during initialization: ${error instanceof Error ? error.message : String(error)}`,
+   333→			)
+   334→		})
+   335→
+   336→		// Listen for automation events
+   337→		automationManager.onAutomationTriggered(({ automation, payload }) => {
+   338→			outputChannel.appendLine(`[AutomationManager] Automation triggered: ${automation.name} (${automation.id})`)
+   339→		})
+   340→
+   341→		automationManager.onAutomationExecuted((result) => {
+   342→			outputChannel.appendLine(
+   343→				`[AutomationManager] Automation executed: ${result.automationId} - ${result.success ? "success" : "failed"}${result.error ? `: ${result.error}` : ""}`,
+   344→			)
+   345→		})
+   346→
+   347→		// Listen for configuration changes
+   348→		context.subscriptions.push(
+   349→			vscode.workspace.onDidChangeConfiguration((e) => {
+   350→				if (e.affectsConfiguration(`${Package.name}.automations.enabled`) && automationManager) {
+   351→					const enabled = vscode.workspace.getConfiguration(Package.name).get<boolean>("automations.enabled", true)
+   352→					automationManager.setEnabled(enabled)
+   353→				}
+   354→			}),
+   355→		)
+   356→
+   357→		// Add to disposables
+   358→		context.subscriptions.push({
+   359→			dispose: async () => {
+   360→				if (automationManager) {
+   361→					await automationManager.dispose()
+   362→				}
+   363→			},
+   364→		})
+   365→
+   366→		outputChannel.appendLine(`[AutomationManager] Initialized for workspace: ${firstWorkspacePath}`)
+   367→	}
+   368→
+   369→	// Auto-import configuration if specified in settings.
+   370→	try {
+   371→		await autoImportSettings(outputChannel, {
+   372→			providerSettingsManager: provider.providerSettingsManager,
+   373→			contextProxy: provider.contextProxy,
+   374→			customModesManager: provider.customModesManager,
+   375→		})
+   376→	} catch (error) {
+   377→		outputChannel.appendLine(
+   378→			`[AutoImport] Error during auto-import: ${error instanceof Error ? error.message : String(error)}`,
+   379→		)
+   380→	}
+   381→
+   382→	registerCommands({ context, outputChannel, provider })
+   383→
+   384→	/**
+   385→	 * We use the text document content provider API to show the left side for diff
+   386→	 * view by creating a virtual document for the original content. This makes it
+   387→	 * readonly so users know to edit the right side if they want to keep their changes.
+   388→	 *
+   389→	 * This API allows you to create readonly documents in VSCode from arbitrary
+   390→	 * sources, and works by claiming an uri-scheme for which your provider then
+   391→	 * returns text contents. The scheme must be provided when registering a
+   392→	 * provider and cannot change afterwards.
+   393→	 *
+   394→	 * Note how the provider doesn't create uris for virtual documents - its role
+   395→	 * is to provide contents given such an uri. In return, content providers are
+   396→	 * wired into the open document logic so that providers are always considered.
+   397→	 *
+   398→	 * https://code.visualstudio.com/api/extension-guides/virtual-documents
+   399→	 */
+   400→	const diffContentProvider = new (class implements vscode.TextDocumentContentProvider {
+   401→		provideTextDocumentContent(uri: vscode.Uri): string {
+   402→			return Buffer.from(uri.query, "base64").toString("utf-8")
+   403→		}
+   404→	})()
+   405→
+   406→	context.subscriptions.push(
+   407→		vscode.workspace.registerTextDocumentContentProvider(DIFF_VIEW_URI_SCHEME, diffContentProvider),
+   408→	)
+   409→
+   410→	context.subscriptions.push(vscode.window.registerUriHandler({ handleUri }))
+   411→
+   412→	// Register code actions provider.
+   413→	context.subscriptions.push(
+   414→		vscode.languages.registerCodeActionsProvider({ pattern: "**/*" }, new CodeActionProvider(), {
+   415→			providedCodeActionKinds: CodeActionProvider.providedCodeActionKinds,
+   416→		}),
+   417→	)
+   418→
+   419→	registerCodeActions(context)
+   420→	registerTerminalActions(context)
+   421→
+   422→	// Allows other extensions to activate once Roo is ready.
+   423→	vscode.commands.executeCommand(`${Package.name}.activationCompleted`)
+   424→
+   425→	// Implements the `MultiAgentAPI` interface.
+   426→	const socketPath = process.env.ROO_CODE_IPC_SOCKET_PATH
+   427→	const enableLogging = typeof socketPath === "string"
+   428→
+   429→	// Watch the core files and automatically reload the extension host.
+   430→	if (process.env.NODE_ENV === "development") {
+   431→		const watchPaths = [
+   432→			{ path: context.extensionPath, pattern: "**/*.ts" },
+   433→			{ path: path.join(context.extensionPath, "../packages/types"), pattern: "**/*.ts" },
+   434→			{ path: path.join(context.extensionPath, "../packages/telemetry"), pattern: "**/*.ts" },
+   435→			{ path: path.join(context.extensionPath, "node_modules/@multi-agent/cloud"), pattern: "**/*" },
+   436→		]
+   437→
+   438→		console.log(
+   439→			`♻️♻️♻️ Core auto-reloading: Watching for changes in ${watchPaths.map(({ path }) => path).join(", ")}`,
+   440→		)
+   441→
+   442→		// Create a debounced reload function to prevent excessive reloads
+   443→		let reloadTimeout: NodeJS.Timeout | undefined
+   444→		const DEBOUNCE_DELAY = 1_000
+   445→
+   446→		const debouncedReload = (uri: vscode.Uri) => {
+   447→			if (reloadTimeout) {
+   448→				clearTimeout(reloadTimeout)
+   449→			}
+   450→
+   451→			console.log(`♻️ ${uri.fsPath} changed; scheduling reload...`)
+   452→
+   453→			reloadTimeout = setTimeout(() => {
+   454→				console.log(`♻️ Reloading host after debounce delay...`)
+   455→				vscode.commands.executeCommand("workbench.action.reloadWindow")
+   456→			}, DEBOUNCE_DELAY)
+   457→		}
+   458→
+   459→		watchPaths.forEach(({ path: watchPath, pattern }) => {
+   460→			const relPattern = new vscode.RelativePattern(vscode.Uri.file(watchPath), pattern)
+   461→			const watcher = vscode.workspace.createFileSystemWatcher(relPattern, false, false, false)
+   462→
+   463→			// Listen to all change types to ensure symlinked file updates trigger reloads.
+   464→			watcher.onDidChange(debouncedReload)
+   465→			watcher.onDidCreate(debouncedReload)
+   466→			watcher.onDidDelete(debouncedReload)
+   467→
+   468→			context.subscriptions.push(watcher)
+   469→		})
+   470→
+   471→		// Clean up the timeout on deactivation
+   472→		context.subscriptions.push({
+   473→			dispose: () => {
+   474→				if (reloadTimeout) {
+   475→					clearTimeout(reloadTimeout)
+   476→				}
+   477→			},
+   478→		})
+   479→	}
+   480→
+   481→	// Initialize background model cache refresh
+   482→	initializeModelCacheRefresh()
+   483→
+   484→	return new API(outputChannel, provider, socketPath, enableLogging)
+   485→}
+   486→
+   487→// This method is called when your extension is deactivated.
+   488→export async function deactivate() {
+   489→	outputChannel.appendLine(`${Package.name} extension deactivated`)
+   490→
+   491→	if (cloudService && CloudService.hasInstance()) {
+   492→		try {
+   493→			if (authStateChangedHandler) {
+   494→				CloudService.instance.off("auth-state-changed", authStateChangedHandler)
+   495→			}
+   496→
+   497→			if (settingsUpdatedHandler) {
+   498→				CloudService.instance.off("settings-updated", settingsUpdatedHandler)
+   499→			}
+   500→
+   501→			if (userInfoHandler) {
+   502→				CloudService.instance.off("user-info", userInfoHandler as any)
+   503→			}
+   504→
+   505→			outputChannel.appendLine("CloudService event handlers cleaned up")
+   506→		} catch (error) {
+   507→			outputChannel.appendLine(
+   508→				`Failed to clean up CloudService event handlers: ${error instanceof Error ? error.message : String(error)}`,
+   509→			)
+   510→		}
+   511→	}
+   512→
+   513→	const bridge = BridgeOrchestrator.getInstance()
+   514→
+   515→	if (bridge) {
+   516→		await bridge.disconnect()
+   517→	}
+   518→
+   519→	await McpServerManager.cleanup(extensionContext)
+   520→	BundledMcpManager.cleanup()
+   521→	BrowserPreviewManager.cleanup()
+   522→	BrowserExtensionBridge.cleanup()
+   523→	TelemetryService.instance.shutdown()
+   524→	TerminalRegistry.cleanup()
+   525→}
+   526→
+
+</system-reminder>

@@ -1,0 +1,563 @@
+# LibreChat XML to JSON Tool Calling Conversion Solution
+
+**Date:** 2026-01-15
+**Problem:** Qwen2.5-Coder uses XML tool calling format, LibreChat expects JSON
+
+---
+
+## Executive Summary
+
+**LibreChat does NOT support custom response parsers or middleware.** All custom endpoints must return OpenAI-compatible JSON responses.
+
+**Solutions:**
+
+1. **Option A:** Use vLLM proxy to convert XML → JSON before reaching LibreChat
+2. **Option B:** Accept Qwen2.5-Coder won't have MCP tools (use for pure coding only)
+3. **Option C:** Use DeepSeek-V3 for coding + MCP tools (already working)
+
+---
+
+## Research Findings
+
+### LibreChat Architecture Limitations
+
+From [LibreChat Custom Endpoints documentation](https://www.librechat.ai/docs/quick_start/custom_endpoints):
+
+- LibreChat expects OpenAI API format responses
+- **No middleware or custom response parser support**
+- Custom endpoints must conform to OpenAI response specifications
+- `forcePrompt: true` and non-streaming mode still require OpenAI format
+
+**Known Issues:**
+- Non-matching formats cause: "Unhandled error type request ended without sending any chunks"
+- UI shows nothing if response format doesn't match expectations
+
+### vLLM XML Parser Solution
+
+From [vLLM Tool Calling documentation](https://docs.vllm.ai/en/latest/features/tool_calling/):
+
+vLLM provides a `qwen3_xml` tool parser that converts Qwen's XML tool calls to OpenAI JSON format.
+
+**Implementation:** `vllm/tool_parsers/qwen3xml_tool_parser.py`
+- Parses `<tool_call>` XML tags
+- Converts to OpenAI `tool_calls` array format
+- Handles parallel tool calls
+- Generates proper `call_id` values
+
+**Usage:**
+```bash
+vllm serve Qwen/Qwen2.5-Coder-32B-Instruct \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
+
+---
+
+## XML → JSON Conversion Pattern
+
+### Qwen2.5-Coder XML Format
+
+```xml
+<tool_call>
+<function=duckduckgo_web_search_mcp_websearch>
+<parameter=query>LibreChat MCP tools</parameter>
+<parameter=count>10</parameter>
+</function>
+</tool_call>
+```
+
+### Required OpenAI JSON Format
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "duckduckgo_web_search_mcp_websearch",
+          "arguments": "{\"query\":\"LibreChat MCP tools\",\"count\":10}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+---
+
+## Solution 1: vLLM Proxy (Enables MCP Tools for Qwen2.5-Coder)
+
+### Architecture
+
+```
+LibreChat → Featherless API (XML) → ❌ Can't parse
+LibreChat → vLLM Proxy → Featherless API (XML) → vLLM Parser → JSON → LibreChat ✅
+```
+
+### Implementation Steps
+
+#### 1. Install vLLM
+
+```bash
+pip install vllm
+```
+
+#### 2. Create vLLM Proxy Server
+
+**File: `~/Desktop/Tools/vllm-proxy/proxy_server.py`**
+
+```python
+#!/usr/bin/env python3
+"""
+vLLM Proxy Server for LibreChat
+Converts Qwen2.5-Coder XML tool calls to OpenAI JSON format
+"""
+
+import os
+import json
+import requests
+from flask import Flask, request, Response, stream_with_context
+from vllm.tool_parsers.qwen3xml_tool_parser import Qwen3XMLToolParser
+
+app = Flask(__name__)
+
+# Featherless API configuration
+FEATHERLESS_API_KEY = os.environ.get('FEATHERLESS_API_KEY')
+FEATHERLESS_BASE_URL = 'https://api.featherless.ai/v1'
+
+# Initialize XML parser
+xml_parser = Qwen3XMLToolParser()
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def chat_completions():
+    """Proxy chat completions with XML to JSON conversion"""
+
+    # Get request data from LibreChat
+    data = request.get_json()
+    model = data.get('model', '')
+
+    # Only process Qwen2.5-Coder models (XML format)
+    needs_conversion = 'qwen2.5-coder' in model.lower() or 'qwq' in model.lower()
+
+    if not needs_conversion:
+        # Pass through to Featherless for other models
+        return proxy_request(data)
+
+    # Make request to Featherless
+    headers = {
+        'Authorization': f'Bearer {FEATHERLESS_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    response = requests.post(
+        f'{FEATHERLESS_BASE_URL}/chat/completions',
+        headers=headers,
+        json=data,
+        stream=data.get('stream', False)
+    )
+
+    if data.get('stream', False):
+        return Response(
+            stream_with_context(convert_streaming_response(response)),
+            content_type='text/event-stream'
+        )
+    else:
+        return convert_response(response.json())
+
+def convert_response(response_data):
+    """Convert XML tool calls to JSON format"""
+
+    try:
+        message = response_data['choices'][0]['message']
+        content = message.get('content', '')
+
+        # Check for XML tool calls
+        if '<tool_call>' in content:
+            # Parse XML tool calls
+            tool_calls = xml_parser.parse_tool_calls(content)
+
+            if tool_calls:
+                # Remove XML from content
+                clean_content = content.split('<tool_call>')[0].strip()
+
+                # Update message with JSON tool calls
+                message['content'] = clean_content if clean_content else None
+                message['tool_calls'] = tool_calls
+
+        return response_data
+
+    except Exception as e:
+        print(f"Error converting response: {e}")
+        return response_data
+
+def convert_streaming_response(response):
+    """Convert streaming response with XML to JSON"""
+
+    accumulated_content = ""
+
+    for line in response.iter_lines():
+        if line:
+            line_str = line.decode('utf-8')
+
+            if line_str.startswith('data: '):
+                data_str = line_str[6:]
+
+                if data_str == '[DONE]':
+                    yield line + b'\n\n'
+                    continue
+
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk['choices'][0]['delta']
+
+                    # Accumulate content
+                    if 'content' in delta:
+                        accumulated_content += delta['content']
+
+                    # Check if we have complete tool calls
+                    if '</tool_call>' in accumulated_content:
+                        tool_calls = xml_parser.parse_tool_calls(accumulated_content)
+
+                        if tool_calls:
+                            # Send tool calls in delta format
+                            chunk['choices'][0]['delta'] = {
+                                'tool_calls': tool_calls
+                            }
+                            accumulated_content = ""
+
+                    yield f"data: {json.dumps(chunk)}\n\n".encode('utf-8')
+
+                except json.JSONDecodeError:
+                    yield line + b'\n\n'
+
+def proxy_request(data):
+    """Pass through request for non-Qwen models"""
+
+    headers = {
+        'Authorization': f'Bearer {FEATHERLESS_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    response = requests.post(
+        f'{FEATHERLESS_BASE_URL}/chat/completions',
+        headers=headers,
+        json=data,
+        stream=data.get('stream', False)
+    )
+
+    if data.get('stream', False):
+        return Response(
+            stream_with_context(response.iter_content(chunk_size=1024)),
+            content_type='text/event-stream'
+        )
+    else:
+        return Response(
+            response.content,
+            status=response.status_code,
+            content_type='application/json'
+        )
+
+if __name__ == '__main__':
+    print("Starting vLLM Proxy Server on http://localhost:8000")
+    print("Converts Qwen2.5-Coder XML tool calls to OpenAI JSON format")
+    app.run(host='0.0.0.0', port=8000)
+```
+
+#### 3. Install Dependencies
+
+```bash
+pip install flask requests vllm
+```
+
+#### 4. Start Proxy Server
+
+```bash
+cd ~/Desktop/Tools/vllm-proxy
+export FEATHERLESS_API_KEY="your_key_here"
+python3 proxy_server.py
+```
+
+#### 5. Update LibreChat Configuration
+
+**File: `/Users/imorgado/Desktop/LibreChat/librechat.yaml`**
+
+```yaml
+endpoints:
+  custom:
+    # Qwen2.5-Coder via vLLM Proxy (XML → JSON conversion)
+    - name: "Featherless-Proxy"
+      apiKey: "${FEATHERLESS_API_KEY}"
+      baseURL: "http://localhost:8000/v1"  # vLLM Proxy
+      models:
+        default:
+          - "huihui-ai/Qwen2.5-Coder-32B-Instruct-abliterated"
+          - "huihui-ai/QwQ-32B-abliterated"
+        fetch: false
+      titleConvo: true
+      titleModel: "huihui-ai/Qwen2.5-Coder-32B-Instruct-abliterated"
+      modelDisplayLabel: "Qwen-Coder (Proxy)"
+      addParams:
+        max_tokens: 2048
+        temperature: 0.7
+
+    # Direct Featherless (for models with native JSON tool calling)
+    - name: "Featherless"
+      apiKey: "${FEATHERLESS_API_KEY}"
+      baseURL: "https://api.featherless.ai/v1"
+      models:
+        default:
+          - "roslein/Qwen3-32B-abliterated"
+          - "mlabonne/Qwen3-14B-abliterated"
+          - "mlabonne/Qwen3-8B-abliterated"
+          - "deepseek-ai/DeepSeek-V3-0324"
+          - "deepseek-ai/DeepSeek-R1-0528"
+        fetch: false
+      modelDisplayLabel: "Featherless"
+```
+
+---
+
+## Solution 2: Accept No MCP Tools (Recommended)
+
+**Simpler approach:** Use Qwen2.5-Coder for pure coding tasks without MCP tools.
+
+### Updated Configuration
+
+```yaml
+endpoints:
+  custom:
+    - name: "Featherless"
+      apiKey: "${FEATHERLESS_API_KEY}"
+      baseURL: "https://api.featherless.ai/v1"
+      models:
+        default:
+          # Architecture Research (abliterated + MCP tools)
+          - "roslein/Qwen3-32B-abliterated"
+
+          # General Research (abliterated + MCP tools)
+          - "mlabonne/Qwen3-14B-abliterated"
+
+          # Pure Coding (best performance, no MCP tools, abliterated)
+          - "huihui-ai/Qwen2.5-Coder-32B-Instruct-abliterated"
+
+          # Reasoning/Problem-Solving (no MCP tools, abliterated)
+          - "huihui-ai/QwQ-32B-abliterated"
+
+          # Coding + MCP Tools (non-abliterated)
+          - "deepseek-ai/DeepSeek-V3-0324"
+
+          # Reasoning + MCP Tools (non-abliterated)
+          - "deepseek-ai/DeepSeek-R1-0528"
+        fetch: false
+      titleConvo: true
+      titleModel: "deepseek-ai/DeepSeek-V3-0324"
+      summarize: false
+      summaryModel: "deepseek-ai/DeepSeek-V3-0324"
+      modelDisplayLabel: "Featherless"
+      addParams:
+        max_tokens: 2048
+        temperature: 0.7
+        top_p: 0.9
+```
+
+### When to Use Each Model
+
+| Task Type | Model | Abliterated | MCP Tools | Why |
+|-----------|-------|-------------|-----------|-----|
+| **Pure Coding** | Qwen2.5-Coder-32B | ✅ | ❌ | 69.6% SWE-Bench, 131K context |
+| **Coding + Research** | DeepSeek-V3 | ❌ | ✅ | 82.6% HumanEval + tools |
+| **Architecture Research** | Qwen3-32B | ✅ | ✅ | Largest abliterated with tools |
+| **General Research** | Qwen3-14B | ✅ | ✅ | Balanced size + tools |
+| **Complex Reasoning** | QwQ-32B | ✅ | ❌ | High-level problem solving |
+| **Reasoning + Tools** | DeepSeek-R1 | ❌ | ✅ | Chain-of-thought + tools |
+
+---
+
+## Comparison: Proxy vs Direct
+
+### vLLM Proxy Approach
+
+**Pros:**
+- ✅ Enables MCP tools for Qwen2.5-Coder
+- ✅ Keep best coding performance + tool support
+- ✅ Transparent to LibreChat
+
+**Cons:**
+- ❌ Additional server to maintain
+- ❌ Extra latency (minimal)
+- ❌ Complexity in deployment
+- ❌ Requires vLLM installation
+
+### Direct Approach (Recommended)
+
+**Pros:**
+- ✅ Simple configuration
+- ✅ No additional infrastructure
+- ✅ Use DeepSeek-V3 when tools needed
+- ✅ Use Qwen2.5-Coder when tools not needed
+
+**Cons:**
+- ❌ Must switch models based on task type
+- ❌ Qwen2.5-Coder can't use MCP tools
+
+---
+
+## Implementation: Direct Approach (Recommended)
+
+### Step 1: Update Configuration
+
+```bash
+cd /Users/imorgado/Desktop/LibreChat
+# Edit librechat.yaml (add both models)
+```
+
+### Step 2: Restart LibreChat
+
+```bash
+docker compose restart api
+```
+
+### Step 3: Test Models
+
+**Test Qwen2.5-Coder (Pure Coding):**
+```
+Write a Python function to calculate the Fibonacci sequence using dynamic programming
+```
+
+**Test DeepSeek-V3 (Coding + MCP Tools):**
+```
+Use web search to find the latest Python best practices for 2025, then write a class implementing those patterns
+```
+
+---
+
+## Alternative: Simple Node.js Proxy (Lightweight)
+
+If you want XML → JSON conversion without full vLLM:
+
+**File: `~/Desktop/Tools/simple-proxy/server.js`**
+
+```javascript
+const express = require('express');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json());
+
+const FEATHERLESS_API_KEY = process.env.FEATHERLESS_API_KEY;
+const FEATHERLESS_BASE_URL = 'https://api.featherless.ai/v1';
+
+// Simple XML parser
+function parseToolCalls(content) {
+  const toolCalls = [];
+  const regex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  let match;
+  let callId = 1;
+
+  while ((match = regex.exec(content)) !== null) {
+    const xmlContent = match[1].trim();
+
+    // Parse JSON inside XML
+    try {
+      const jsonMatch = xmlContent.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        toolCalls.push({
+          id: `call_${callId++}`,
+          type: 'function',
+          function: {
+            name: parsed.name,
+            arguments: JSON.stringify(parsed.arguments)
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Failed to parse tool call:', e);
+    }
+  }
+
+  return toolCalls;
+}
+
+app.post('/v1/chat/completions', async (req, res) => {
+  try {
+    const response = await axios.post(
+      `${FEATHERLESS_BASE_URL}/chat/completions`,
+      req.body,
+      {
+        headers: {
+          'Authorization': `Bearer ${FEATHERLESS_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const data = response.data;
+    const message = data.choices[0].message;
+    const content = message.content || '';
+
+    // Convert XML tool calls to JSON
+    if (content.includes('<tool_call>')) {
+      const toolCalls = parseToolCalls(content);
+
+      if (toolCalls.length > 0) {
+        // Remove XML from content
+        const cleanContent = content.split('<tool_call>')[0].trim();
+        message.content = cleanContent || null;
+        message.tool_calls = toolCalls;
+      }
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Proxy error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(8000, () => {
+  console.log('Simple proxy server running on http://localhost:8000');
+});
+```
+
+**Install and Run:**
+```bash
+npm install express axios
+export FEATHERLESS_API_KEY="your_key"
+node server.js
+```
+
+---
+
+## Final Recommendation
+
+**Use Solution 2 (Direct Approach)** with both models added:
+
+1. ✅ **Add Qwen2.5-Coder-32B** for pure coding (no tools)
+2. ✅ **Keep DeepSeek-V3** for coding + MCP tools
+3. ✅ **Keep Qwen3 models** for architecture/research + tools
+
+**Why:**
+- Simple to maintain
+- No additional infrastructure
+- DeepSeek-V3 already provides excellent coding + tools (82.6% HumanEval)
+- Qwen2.5-Coder for when you need absolute best coding (69.6% SWE-Bench)
+
+**Only use vLLM proxy if:**
+- You need Qwen2.5-Coder to have MCP tool access
+- You're comfortable maintaining additional infrastructure
+- You frequently need 131K context + tool calling together
+
+---
+
+## Sources
+
+1. [LibreChat Custom Endpoints](https://www.librechat.ai/docs/quick_start/custom_endpoints)
+2. [vLLM Tool Calling Documentation](https://docs.vllm.ai/en/latest/features/tool_calling/)
+3. [vLLM Qwen3 XML Parser](https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/qwen3xml_tool_parser.py)
+4. [Qwen3-Coder vLLM Usage](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-Coder-480B-A35B.html)
+5. [LibreChat GitHub - Custom Endpoint Issues](https://github.com/danny-avila/LibreChat/discussions/3913)

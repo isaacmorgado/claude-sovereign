@@ -1,0 +1,392 @@
+"""
+Vision Service - Comprehensive feature extraction using Claude Vision
+
+Extracts all facial and body features as specified in psl.md:
+- Face: skin, hair, eyes, facial_features, teeth
+- Body: body_fat, muscle, frame, shoulder, waist, posture
+"""
+
+import base64
+import json
+import re
+import httpx
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+import anthropic
+
+from app.config import get_settings
+
+settings = get_settings()
+
+
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class SkinAnalysis:
+    clarity: float = 5.0  # 0-10
+    tone: str = "medium"  # pale|fair|medium|olive|tan|dark
+    acne_level: str = "none"  # none|mild|moderate|severe
+    acne_scarring: str = "none"  # none|mild|moderate|severe
+    pore_visibility: str = "visible"  # minimal|visible|prominent
+    texture_issues: List[str] = field(default_factory=list)
+
+
+@dataclass
+class HairAnalysis:
+    hairline_nw: int = 1  # 0-7 Norwood scale
+    density: str = "medium"  # thin|medium|thick
+    texture: str = "straight"  # straight|wavy|curly|coily
+    color: str = "brown"  # blonde|light-brown|brown|dark-brown|black|red|gray
+
+
+@dataclass
+class EyeAnalysis:
+    color: str = "brown"  # blue|green|hazel|brown|dark-brown|black
+    under_eye_darkness: float = 3.0  # 0-10
+    under_eye_puffiness: float = 3.0  # 0-10
+
+
+@dataclass
+class FacialFeatureAnalysis:
+    hollow_cheeks: float = 5.0  # 0-10 (higher = more hollow/defined)
+    eyebrow_density: str = "medium"  # sparse|medium|thick
+    facial_hair_potential: str = "medium"  # low|medium|high
+
+
+@dataclass
+class TeethAnalysis:
+    color: str = "off-white"  # white|off-white|yellow|stained
+    alignment: str = "aligned"  # aligned|minor-issues|crooked
+    visible_in_photo: bool = False
+
+
+@dataclass
+class FaceExtractionResult:
+    skin: SkinAnalysis = field(default_factory=SkinAnalysis)
+    hair: HairAnalysis = field(default_factory=HairAnalysis)
+    eyes: EyeAnalysis = field(default_factory=EyeAnalysis)
+    facial_features: FacialFeatureAnalysis = field(default_factory=FacialFeatureAnalysis)
+    teeth: TeethAnalysis = field(default_factory=TeethAnalysis)
+    confidence: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skin": asdict(self.skin),
+            "hair": asdict(self.hair),
+            "eyes": asdict(self.eyes),
+            "facial_features": asdict(self.facial_features),
+            "teeth": asdict(self.teeth),
+            "confidence": self.confidence,
+        }
+
+
+@dataclass
+class BodyExtractionResult:
+    body_fat_percent: float = 18.0  # 5-45%
+    muscle_mass: str = "medium"  # low|medium|medium-high|high|very-high
+    frame_size: str = "medium"  # small|medium|large|very-large
+    shoulder_width: str = "average"  # narrow|average|broad|very-broad
+    waist_definition: str = "slight"  # undefined|slight|defined|very-defined
+    posture: str = "good"  # poor|fair|good|excellent
+    confidence: float = 0.5
+    notes: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class VisionExtractionResult:
+    face: Optional[FaceExtractionResult] = None
+    body: Optional[BodyExtractionResult] = None
+    extracted_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+async def fetch_image_as_base64(url: str) -> Optional[Dict[str, str]]:
+    """Fetch image from URL and return base64 content dict for Claude"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "image/jpeg")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            base64_data = base64.standard_b64encode(response.content).decode("utf-8")
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": content_type,
+                    "data": base64_data,
+                }
+            }
+    except Exception as e:
+        print(f"[VISION] Failed to fetch image {url}: {e}")
+        return None
+
+
+def parse_json_from_response(text: str) -> Optional[Dict]:
+    """Extract JSON from Claude's response text"""
+    try:
+        # Try to find JSON block
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            return json.loads(json_match.group())
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+# ============================================
+# FACE ANALYSIS
+# ============================================
+
+FACE_ANALYSIS_PROMPT = """Analyze this face photo and extract features. Return ONLY a JSON object:
+
+{
+  "skin": {
+    "clarity": <0-10, 10=flawless>,
+    "tone": "<pale|fair|medium|olive|tan|dark>",
+    "acne_level": "<none|mild|moderate|severe>",
+    "acne_scarring": "<none|mild|moderate|severe>",
+    "pore_visibility": "<minimal|visible|prominent>",
+    "texture_issues": ["<list any: wrinkles, roughness, dryness, oiliness>"]
+  },
+  "hair": {
+    "hairline_nw": <0-7 Norwood scale, 0=perfect, 7=bald>,
+    "density": "<thin|medium|thick>",
+    "texture": "<straight|wavy|curly|coily>",
+    "color": "<blonde|light-brown|brown|dark-brown|black|red|gray>"
+  },
+  "eyes": {
+    "color": "<blue|green|hazel|brown|dark-brown|black>",
+    "under_eye_darkness": <0-10, 10=very dark circles>,
+    "under_eye_puffiness": <0-10, 10=very puffy>
+  },
+  "facial_features": {
+    "hollow_cheeks": <0-10, 10=very defined/hollow cheekbones>,
+    "eyebrow_density": "<sparse|medium|thick>",
+    "facial_hair_potential": "<low|medium|high>"
+  },
+  "teeth": {
+    "color": "<white|off-white|yellow|stained>",
+    "alignment": "<aligned|minor-issues|crooked>",
+    "visible_in_photo": <true|false>
+  },
+  "confidence": <0.0-1.0>
+}
+
+Be objective. Use null for features not visible."""
+
+
+async def extract_face_features(
+    front_photo_url: str,
+    side_photo_url: Optional[str] = None,
+) -> FaceExtractionResult:
+    """Extract all facial features from face photos using Claude Vision"""
+
+    if not settings.anthropic_api_key:
+        print("[VISION] No API key, returning defaults")
+        return FaceExtractionResult(confidence=0.2)
+
+    # Prepare images
+    images = []
+    front_img = await fetch_image_as_base64(front_photo_url)
+    if front_img:
+        images.append(front_img)
+    if side_photo_url:
+        side_img = await fetch_image_as_base64(side_photo_url)
+        if side_img:
+            images.append(side_img)
+
+    if not images:
+        return FaceExtractionResult(confidence=0.1)
+
+    images.append({"type": "text", "text": FACE_ANALYSIS_PROMPT})
+
+    try:
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": images}]
+        )
+
+        data = parse_json_from_response(response.content[0].text)
+        if not data:
+            return FaceExtractionResult(confidence=0.3)
+
+        # Parse into dataclasses with validation
+        result = FaceExtractionResult(
+            skin=SkinAnalysis(
+                clarity=float(data.get("skin", {}).get("clarity", 5)),
+                tone=data.get("skin", {}).get("tone", "medium"),
+                acne_level=data.get("skin", {}).get("acne_level", "none"),
+                acne_scarring=data.get("skin", {}).get("acne_scarring", "none"),
+                pore_visibility=data.get("skin", {}).get("pore_visibility", "visible"),
+                texture_issues=data.get("skin", {}).get("texture_issues", []) or [],
+            ),
+            hair=HairAnalysis(
+                hairline_nw=int(data.get("hair", {}).get("hairline_nw", 1)),
+                density=data.get("hair", {}).get("density", "medium"),
+                texture=data.get("hair", {}).get("texture", "straight"),
+                color=data.get("hair", {}).get("color", "brown"),
+            ),
+            eyes=EyeAnalysis(
+                color=data.get("eyes", {}).get("color", "brown"),
+                under_eye_darkness=float(data.get("eyes", {}).get("under_eye_darkness", 3)),
+                under_eye_puffiness=float(data.get("eyes", {}).get("under_eye_puffiness", 3)),
+            ),
+            facial_features=FacialFeatureAnalysis(
+                hollow_cheeks=float(data.get("facial_features", {}).get("hollow_cheeks", 5)),
+                eyebrow_density=data.get("facial_features", {}).get("eyebrow_density", "medium"),
+                facial_hair_potential=data.get("facial_features", {}).get("facial_hair_potential", "medium"),
+            ),
+            teeth=TeethAnalysis(
+                color=data.get("teeth", {}).get("color", "off-white"),
+                alignment=data.get("teeth", {}).get("alignment", "aligned"),
+                visible_in_photo=bool(data.get("teeth", {}).get("visible_in_photo", False)),
+            ),
+            confidence=float(data.get("confidence", 0.7)),
+        )
+        return result
+
+    except Exception as e:
+        print(f"[VISION] Face extraction error: {e}")
+        return FaceExtractionResult(confidence=0.2)
+
+
+# ============================================
+# BODY ANALYSIS
+# ============================================
+
+def build_body_prompt(gender: str) -> str:
+    """Build body analysis prompt with gender context"""
+    gender_ctx = "male" if gender == "male" else "female"
+
+    return f"""Analyze this {gender_ctx} physique photo. Return ONLY a JSON object:
+
+{{
+  "body_fat_percent": <5-45, estimate based on visible definition>,
+  "muscle_mass": "<low|medium|medium-high|high|very-high>",
+  "frame_size": "<small|medium|large|very-large>",
+  "shoulder_width": "<narrow|average|broad|very-broad>",
+  "waist_definition": "<undefined|slight|defined|very-defined>",
+  "posture": "<poor|fair|good|excellent>",
+  "confidence": <0.0-1.0>,
+  "notes": "<brief observation>"
+}}
+
+Body fat indicators:
+- 8-12%: Visible abs, vascularity, striations
+- 12-15%: Abs visible, some vascularity
+- 15-18%: Flat stomach, abs faint
+- 18-25%: Soft midsection
+- 25%+: Excess fat visible
+
+Be objective and accurate."""
+
+
+async def extract_body_features(
+    front_url: str,
+    side_url: Optional[str] = None,
+    back_url: Optional[str] = None,
+    gender: str = "male",
+) -> BodyExtractionResult:
+    """Extract body composition features from physique photos"""
+
+    if not settings.anthropic_api_key:
+        default_bf = 18.0 if gender == "male" else 25.0
+        return BodyExtractionResult(body_fat_percent=default_bf, confidence=0.2)
+
+    # Prepare images
+    images = []
+    for url in [front_url, side_url, back_url]:
+        if url:
+            img = await fetch_image_as_base64(url)
+            if img:
+                images.append(img)
+
+    if not images:
+        default_bf = 18.0 if gender == "male" else 25.0
+        return BodyExtractionResult(body_fat_percent=default_bf, confidence=0.1)
+
+    images.append({"type": "text", "text": build_body_prompt(gender)})
+
+    try:
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=512,
+            messages=[{"role": "user", "content": images}]
+        )
+
+        data = parse_json_from_response(response.content[0].text)
+        if not data:
+            default_bf = 18.0 if gender == "male" else 25.0
+            return BodyExtractionResult(body_fat_percent=default_bf, confidence=0.3)
+
+        return BodyExtractionResult(
+            body_fat_percent=max(5.0, min(45.0, float(data.get("body_fat_percent", 18)))),
+            muscle_mass=data.get("muscle_mass", "medium"),
+            frame_size=data.get("frame_size", "medium"),
+            shoulder_width=data.get("shoulder_width", "average"),
+            waist_definition=data.get("waist_definition", "slight"),
+            posture=data.get("posture", "good"),
+            confidence=max(0.0, min(1.0, float(data.get("confidence", 0.5)))),
+            notes=data.get("notes"),
+        )
+
+    except Exception as e:
+        print(f"[VISION] Body extraction error: {e}")
+        default_bf = 18.0 if gender == "male" else 25.0
+        return BodyExtractionResult(body_fat_percent=default_bf, confidence=0.2)
+
+
+# ============================================
+# UNIFIED EXTRACTION
+# ============================================
+
+async def extract_all_features(
+    front_face_url: str,
+    side_face_url: Optional[str] = None,
+    front_body_url: Optional[str] = None,
+    side_body_url: Optional[str] = None,
+    back_body_url: Optional[str] = None,
+    gender: str = "male",
+) -> VisionExtractionResult:
+    """
+    Extract all features from face and body photos.
+
+    This is the main entry point for comprehensive feature extraction.
+    """
+    result = VisionExtractionResult()
+
+    # Extract face features
+    result.face = await extract_face_features(front_face_url, side_face_url)
+
+    # Extract body features if photos provided
+    if front_body_url:
+        result.body = await extract_body_features(
+            front_body_url, side_body_url, back_body_url, gender
+        )
+
+    return result
+
+
+# Legacy function for backward compatibility
+async def analyze_physique(
+    front_url: str,
+    side_url: Optional[str] = None,
+    back_url: Optional[str] = None,
+    gender: str = "male",
+) -> BodyExtractionResult:
+    """Legacy wrapper for body analysis - maintains backward compatibility"""
+    return await extract_body_features(front_url, side_url, back_url, gender)

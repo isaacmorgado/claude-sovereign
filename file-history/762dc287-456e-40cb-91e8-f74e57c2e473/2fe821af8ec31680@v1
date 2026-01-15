@@ -1,0 +1,402 @@
+/**
+ * SPLICE Cut List Generator (v3.5)
+ *
+ * Generates JSON cut lists for direct DOM sequence building.
+ * Replaces XML processing for v3.5 architecture.
+ *
+ * Cut list format:
+ * {
+ *   version: '3.5',
+ *   source: { name, path, duration },
+ *   segments: [{ type, sourceName, sourcePath, inPoint, outPoint }],
+ *   metadata: { silencesRemoved, takesDetected, generatedAt }
+ * }
+ *
+ * Frame Alignment:
+ * When frameRate is provided, all cut points are aligned to frame boundaries.
+ * This prevents sub-frame edits that can cause playback issues.
+ */
+
+/**
+ * Align a time value to the nearest frame boundary
+ * @param {number} time - Time in seconds
+ * @param {number} frameRate - Frames per second (e.g., 23.976, 24, 29.97, 30, 60)
+ * @returns {number} Time aligned to frame boundary
+ */
+function alignToFrame(time, frameRate) {
+  if (!frameRate || frameRate <= 0) return time;
+  const frameDuration = 1 / frameRate;
+  return Math.round(time / frameDuration) * frameDuration;
+}
+
+/**
+ * Align to frame boundary, rounding down (for in-points)
+ */
+function alignToFrameFloor(time, frameRate) {
+  if (!frameRate || frameRate <= 0) return time;
+  const frameDuration = 1 / frameRate;
+  return Math.floor(time / frameDuration) * frameDuration;
+}
+
+/**
+ * Align to frame boundary, rounding up (for out-points)
+ */
+function alignToFrameCeil(time, frameRate) {
+  if (!frameRate || frameRate <= 0) return time;
+  const frameDuration = 1 / frameRate;
+  return Math.ceil(time / frameDuration) * frameDuration;
+}
+
+/**
+ * Generate a cut list from detected silences
+ * Creates segments that represent speech (non-silence) portions
+ *
+ * @param {Object} options - Generation options
+ * @param {string} options.sourceName - Name of the source clip
+ * @param {string} options.sourcePath - Full path to the source file
+ * @param {number} options.duration - Total duration of source in seconds
+ * @param {Array} options.silences - Array of silence segments [{start, end, duration}]
+ * @param {Array} [options.takes] - Optional array of detected takes
+ * @param {Object} [options.settings] - Optional generation settings
+ * @returns {Object} The generated cut list
+ */
+function generateCutList(options) {
+  const {
+    sourceName,
+    sourcePath,
+    duration,
+    silences = [],
+    takes = [],
+    settings = {}
+  } = options;
+
+  // Settings with defaults
+  const {
+    minSegmentDuration = 0.1,  // Minimum segment length to include
+    padding = 0,               // Padding around speech (extend into silence)
+    markBestTakes = true       // Color-code best takes differently
+  } = settings;
+
+  // Sort silences by start time
+  const sortedSilences = [...silences].sort((a, b) => a.start - b.start);
+
+  // Build segments from gaps between silences (speech segments)
+  const segments = [];
+  let lastEnd = 0;
+  let silencesRemoved = 0;
+
+  for (const silence of sortedSilences) {
+    // Calculate segment boundaries with padding
+    const segmentStart = Math.max(0, lastEnd - padding);
+    const segmentEnd = Math.min(duration, silence.start + padding);
+
+    // Only add if segment meets minimum duration
+    if (segmentEnd - segmentStart >= minSegmentDuration) {
+      const segment = {
+        type: 'speech',
+        sourceName,
+        sourcePath,
+        inPoint: segmentStart,
+        outPoint: segmentEnd
+      };
+
+      // Check if this segment contains a take
+      const containingTake = findContainingTake(segmentStart, segmentEnd, takes);
+      if (containingTake) {
+        segment.take = {
+          text: containingTake.text?.substring(0, 100),
+          isBest: containingTake.isBest || false
+        };
+        if (containingTake.isBest && markBestTakes) {
+          segment.type = 'best_take';
+        }
+      }
+
+      segments.push(segment);
+    }
+
+    silencesRemoved++;
+    lastEnd = silence.end;
+  }
+
+  // Add final segment after last silence
+  if (lastEnd < duration) {
+    const segmentStart = Math.max(0, lastEnd - padding);
+    const segmentEnd = duration;
+
+    if (segmentEnd - segmentStart >= minSegmentDuration) {
+      const segment = {
+        type: 'speech',
+        sourceName,
+        sourcePath,
+        inPoint: segmentStart,
+        outPoint: segmentEnd
+      };
+
+      // Check if this segment contains a take
+      const containingTake = findContainingTake(segmentStart, segmentEnd, takes);
+      if (containingTake) {
+        segment.take = {
+          text: containingTake.text?.substring(0, 100),
+          isBest: containingTake.isBest || false
+        };
+        if (containingTake.isBest && markBestTakes) {
+          segment.type = 'best_take';
+        }
+      }
+
+      segments.push(segment);
+    }
+  }
+
+  // Calculate stats
+  const totalKeptDuration = segments.reduce(
+    (sum, seg) => sum + (seg.outPoint - seg.inPoint),
+    0
+  );
+  const totalRemovedDuration = duration - totalKeptDuration;
+
+  const cutList = {
+    version: '3.5',
+    source: {
+      name: sourceName,
+      path: sourcePath,
+      duration
+    },
+    segments,
+    metadata: {
+      silencesRemoved,
+      takesDetected: takes.length,
+      totalKeptDuration: parseFloat(totalKeptDuration.toFixed(3)),
+      totalRemovedDuration: parseFloat(totalRemovedDuration.toFixed(3)),
+      segmentCount: segments.length,
+      generatedAt: new Date().toISOString()
+    }
+  };
+
+  console.log(`[SPLICE] Generated cut list: ${segments.length} segments, ${silencesRemoved} silences removed`);
+
+  return cutList;
+}
+
+/**
+ * Find a take that overlaps with a given time range
+ * @param {number} start - Start time in seconds
+ * @param {number} end - End time in seconds
+ * @param {Array} takes - Array of takes
+ * @returns {Object|null} The overlapping take or null
+ */
+function findContainingTake(start, end, takes) {
+  if (!takes || takes.length === 0) return null;
+
+  for (const take of takes) {
+    const takeStart = take.startTime || take.start;
+    const takeEnd = take.endTime || take.end;
+
+    // Check for overlap
+    if (start < takeEnd && end > takeStart) {
+      return take;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Generate a cut list that keeps only specific takes
+ * Useful for "keep best takes only" workflow
+ *
+ * @param {Object} options - Generation options
+ * @param {string} options.sourceName - Name of the source clip
+ * @param {string} options.sourcePath - Full path to the source file
+ * @param {number} options.duration - Total duration of source in seconds
+ * @param {Array} options.takes - Array of takes to keep
+ * @param {Object} [options.settings] - Optional generation settings
+ * @returns {Object} The generated cut list
+ */
+function generateTakesCutList(options) {
+  const {
+    sourceName,
+    sourcePath,
+    duration,
+    takes = [],
+    settings = {}
+  } = options;
+
+  const {
+    padding = 0.2,          // Small padding around takes
+    onlyBestTakes = false   // If true, only include takes marked as best
+  } = settings;
+
+  // Filter to best takes if requested
+  const takesToKeep = onlyBestTakes
+    ? takes.filter(t => t.isBest)
+    : takes;
+
+  // Sort by start time
+  const sortedTakes = [...takesToKeep].sort((a, b) => {
+    const aStart = a.startTime || a.start;
+    const bStart = b.startTime || b.start;
+    return aStart - bStart;
+  });
+
+  // Build segments from takes
+  const segments = sortedTakes.map(take => {
+    const takeStart = take.startTime || take.start;
+    const takeEnd = take.endTime || take.end;
+
+    return {
+      type: take.isBest ? 'best_take' : 'take',
+      sourceName,
+      sourcePath,
+      inPoint: Math.max(0, takeStart - padding),
+      outPoint: Math.min(duration, takeEnd + padding),
+      take: {
+        text: take.text?.substring(0, 100),
+        isBest: take.isBest || false
+      }
+    };
+  });
+
+  const totalKeptDuration = segments.reduce(
+    (sum, seg) => sum + (seg.outPoint - seg.inPoint),
+    0
+  );
+
+  const cutList = {
+    version: '3.5',
+    source: {
+      name: sourceName,
+      path: sourcePath,
+      duration
+    },
+    segments,
+    metadata: {
+      takesKept: segments.length,
+      takesTotal: takes.length,
+      totalKeptDuration: parseFloat(totalKeptDuration.toFixed(3)),
+      totalRemovedDuration: parseFloat((duration - totalKeptDuration).toFixed(3)),
+      generatedAt: new Date().toISOString()
+    }
+  };
+
+  console.log(`[SPLICE] Generated takes cut list: ${segments.length} takes kept`);
+
+  return cutList;
+}
+
+/**
+ * Merge overlapping segments in a cut list
+ * Useful when silences and takes create overlapping regions
+ *
+ * @param {Object} cutList - The cut list to merge
+ * @returns {Object} Cut list with merged segments
+ */
+function mergeOverlappingSegments(cutList) {
+  if (!cutList.segments || cutList.segments.length < 2) {
+    return cutList;
+  }
+
+  // Sort by start time
+  const sorted = [...cutList.segments].sort((a, b) => a.inPoint - b.inPoint);
+
+  const merged = [];
+  let current = { ...sorted[0] };
+
+  for (let i = 1; i < sorted.length; i++) {
+    const next = sorted[i];
+
+    // Check for overlap
+    if (next.inPoint <= current.outPoint) {
+      // Merge: extend current segment
+      current.outPoint = Math.max(current.outPoint, next.outPoint);
+      // Keep the more specific type (best_take > take > speech)
+      if (next.type === 'best_take' || (next.type === 'take' && current.type === 'speech')) {
+        current.type = next.type;
+        current.take = next.take;
+      }
+    } else {
+      // No overlap: save current and start new
+      merged.push(current);
+      current = { ...next };
+    }
+  }
+
+  // Don't forget the last segment
+  merged.push(current);
+
+  // Update metadata
+  const newCutList = {
+    ...cutList,
+    segments: merged,
+    metadata: {
+      ...cutList.metadata,
+      segmentCount: merged.length,
+      mergedFrom: cutList.segments.length
+    }
+  };
+
+  console.log(`[SPLICE] Merged ${cutList.segments.length} segments into ${merged.length}`);
+
+  return newCutList;
+}
+
+/**
+ * Validate a cut list structure
+ * @param {Object} cutList - The cut list to validate
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+function validateCutList(cutList) {
+  const errors = [];
+
+  if (!cutList) {
+    errors.push('Cut list is null or undefined');
+    return { valid: false, errors };
+  }
+
+  if (!cutList.version) {
+    errors.push('Missing version field');
+  }
+
+  if (!cutList.source) {
+    errors.push('Missing source field');
+  } else {
+    if (!cutList.source.name && !cutList.source.path) {
+      errors.push('Source must have name or path');
+    }
+    if (typeof cutList.source.duration !== 'number' || cutList.source.duration <= 0) {
+      errors.push('Source duration must be a positive number');
+    }
+  }
+
+  if (!Array.isArray(cutList.segments)) {
+    errors.push('Segments must be an array');
+  } else {
+    cutList.segments.forEach((seg, i) => {
+      if (typeof seg.inPoint !== 'number') {
+        errors.push(`Segment ${i}: inPoint must be a number`);
+      }
+      if (typeof seg.outPoint !== 'number') {
+        errors.push(`Segment ${i}: outPoint must be a number`);
+      }
+      if (seg.inPoint >= seg.outPoint) {
+        errors.push(`Segment ${i}: inPoint must be less than outPoint`);
+      }
+      if (!seg.sourceName && !seg.sourcePath) {
+        errors.push(`Segment ${i}: must have sourceName or sourcePath`);
+      }
+    });
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+module.exports = {
+  generateCutList,
+  generateTakesCutList,
+  mergeOverlappingSegments,
+  validateCutList
+};

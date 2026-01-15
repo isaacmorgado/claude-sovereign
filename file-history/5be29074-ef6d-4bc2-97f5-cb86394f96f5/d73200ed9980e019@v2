@@ -1,0 +1,216 @@
+/**
+ * End-to-End License Flow Test
+ *
+ * Tests the complete flow:
+ * 1. License key is generated for a customer (simulates webhook result)
+ * 2. User enters license key in plugin
+ * 3. Plugin activates key and gets customer ID
+ * 4. Subsequent API calls work with customer ID
+ *
+ * NOTE: The actual Stripe webhook is tested in production with real Stripe events.
+ * This test verifies the license service and API endpoints work correctly.
+ */
+
+require('dotenv').config();
+
+const https = require('https');
+const licenseService = require('../services/licenseService');
+const usageTracking = require('../services/usageTracking');
+
+const BASE_URL = 'https://127.0.0.1:3847';
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+function request(method, path, body = null, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, BASE_URL);
+    const options = {
+      method,
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers
+      },
+      agent
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(data) });
+        } catch (e) {
+          resolve({ status: res.statusCode, data: data });
+        }
+      });
+    });
+
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+async function testFullFlow() {
+  console.log('╔════════════════════════════════════════════════════════════════╗');
+  console.log('║          SPLICE E2E License Flow Test                          ║');
+  console.log('╚════════════════════════════════════════════════════════════════╝\n');
+
+  const testCustomerId = `cus_e2e_test_${Date.now()}`;
+  let generatedKey = null;
+
+  // Step 1: Generate license key directly (simulates what webhook does)
+  console.log('Step 1: Generating license key (simulates Stripe webhook)...');
+
+  try {
+    // Create user first (as webhook would do via updateTier)
+    await usageTracking.updateTier(testCustomerId, 'starter');
+    console.log(`  ✓ Created user with starter tier`);
+
+    // Generate license key (as webhook would do)
+    const keyResult = await licenseService.generateLicenseKey(testCustomerId);
+    if (keyResult.success) {
+      generatedKey = keyResult.key;
+      console.log(`  ✓ License key generated: ${generatedKey}`);
+    } else {
+      console.log(`  ✗ Failed to generate key: ${keyResult.error}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    return false;
+  }
+
+  // Step 2: Get the generated license key via API
+  console.log('\nStep 2: Retrieving license key via API...');
+
+  try {
+    const keyRes = await request('GET', '/license/key', null, {
+      'x-stripe-customer-id': testCustomerId
+    });
+
+    if (keyRes.status === 200 && keyRes.data.success && keyRes.data.key) {
+      generatedKey = keyRes.data.key;
+      console.log(`  ✓ License key retrieved: ${generatedKey}`);
+    } else {
+      console.log(`  ✗ Failed to retrieve key: ${JSON.stringify(keyRes.data)}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Key retrieval error: ${err.message}`);
+    return false;
+  }
+
+  // Step 3: Activate the license key (as the plugin would)
+  console.log('\nStep 3: Activating license key (simulating plugin)...');
+
+  try {
+    const activateRes = await request('POST', '/license/activate', {
+      key: generatedKey
+    });
+
+    if (activateRes.status === 200 && activateRes.data.success) {
+      console.log(`  ✓ License activated successfully`);
+      console.log(`    - Customer ID: ${activateRes.data.customerId}`);
+      console.log(`    - Tier: ${activateRes.data.tierName} (${activateRes.data.tier})`);
+      console.log(`    - Hours Remaining: ${activateRes.data.hoursRemaining}`);
+      console.log(`    - Hours Total: ${activateRes.data.hoursTotal}`);
+
+      // Verify the customer ID matches
+      if (activateRes.data.customerId !== testCustomerId) {
+        console.log(`  ✗ Customer ID mismatch! Expected ${testCustomerId}, got ${activateRes.data.customerId}`);
+        return false;
+      }
+    } else {
+      console.log(`  ✗ Activation failed: ${JSON.stringify(activateRes.data)}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Activation error: ${err.message}`);
+    return false;
+  }
+
+  // Step 4: Verify credits endpoint works with customer ID
+  console.log('\nStep 4: Verifying credits endpoint with customer ID...');
+
+  try {
+    const creditsRes = await request('GET', '/credits', null, {
+      'x-stripe-customer-id': testCustomerId
+    });
+
+    if (creditsRes.status === 200 && creditsRes.data.success) {
+      console.log(`  ✓ Credits retrieved successfully`);
+      console.log(`    - Hours Remaining: ${creditsRes.data.hoursRemaining}`);
+      console.log(`    - Tier: ${creditsRes.data.tierName}`);
+    } else {
+      console.log(`  ✗ Credits failed: ${JSON.stringify(creditsRes.data)}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Credits error: ${err.message}`);
+    return false;
+  }
+
+  // Step 5: Test that an invalid key is rejected
+  console.log('\nStep 5: Verifying invalid key rejection...');
+
+  try {
+    const invalidRes = await request('POST', '/license/activate', {
+      key: 'SPLICE-FAKE-FAKE-FAKE'
+    });
+
+    if (invalidRes.status === 400 && invalidRes.data.error) {
+      console.log(`  ✓ Invalid key correctly rejected: ${invalidRes.data.error}`);
+    } else {
+      console.log(`  ✗ Invalid key was not rejected!`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    return false;
+  }
+
+  // Step 6: Test that lowercase key works (normalization)
+  console.log('\nStep 6: Verifying key normalization (lowercase)...');
+
+  try {
+    const lowercaseRes = await request('POST', '/license/activate', {
+      key: generatedKey.toLowerCase()
+    });
+
+    if (lowercaseRes.status === 200 && lowercaseRes.data.success) {
+      console.log(`  ✓ Lowercase key normalized and accepted`);
+    } else {
+      console.log(`  ✗ Lowercase key rejected: ${JSON.stringify(lowercaseRes.data)}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`  ✗ Error: ${err.message}`);
+    return false;
+  }
+
+  return true;
+}
+
+async function main() {
+  try {
+    const success = await testFullFlow();
+
+    console.log('\n╔════════════════════════════════════════════════════════════════╗');
+    if (success) {
+      console.log('║  ✓ ALL E2E TESTS PASSED - Full license flow working!          ║');
+    } else {
+      console.log('║  ✗ SOME TESTS FAILED - Check output above                     ║');
+    }
+    console.log('╚════════════════════════════════════════════════════════════════╝');
+
+    process.exit(success ? 0 : 1);
+  } catch (err) {
+    console.error('Test error:', err);
+    process.exit(1);
+  }
+}
+
+main();

@@ -1,0 +1,542 @@
+#!/bin/bash
+# vector-embedder.sh - Vector Embeddings with Hybrid Search (BM25 + Semantic)
+# Uses all-MiniLM-L6-v2 for local embeddings + Reciprocal Rank Fusion
+# Based on production patterns from real GitHub implementations
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_HELPER="${SCRIPT_DIR}/../lib/vector_embedder.py"
+EMBEDDINGS_DIR="${HOME}/.claude/embeddings"
+CACHE_DIR="${HOME}/.claude/cache/embeddings"
+
+# Ensure directories exist
+mkdir -p "$EMBEDDINGS_DIR" "$CACHE_DIR"
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+usage() {
+    cat << EOF
+Usage: vector-embedder.sh <command> [options]
+
+Commands:
+    embed <text|file>                Generate embedding for text or file
+    batch <directory> [pattern]      Generate embeddings for all files
+    search <query> [top_k]           Semantic search using embeddings
+    hybrid <query> [top_k]           Hybrid search (BM25 + Vector + RRF)
+    similar <doc_id> [top_k]         Find similar documents
+    stats                            Show embedding statistics
+    clear-cache                      Clear embedding cache
+
+Options:
+    text|file:    Text string or file path to embed
+    directory:    Directory to process
+    pattern:      File glob pattern (default: *.{py,js,ts,md})
+    query:        Search query text
+    doc_id:       Document ID for similarity search
+    top_k:        Number of results to return (default: 10)
+
+Examples:
+    vector-embedder.sh embed "machine learning concepts"
+    vector-embedder.sh batch src/ "*.py"
+    vector-embedder.sh search "error handling patterns" 10
+    vector-embedder.sh hybrid "authentication flow" 5
+    vector-embedder.sh similar doc_123 10
+
+Model: all-MiniLM-L6-v2 (22MB, 384 dimensions, local)
+Search: Reciprocal Rank Fusion (BM25 + Vector)
+EOF
+}
+
+# ============================================================================
+# PYTHON HELPER INTEGRATION
+# ============================================================================
+
+ensure_python_helper() {
+    if [[ ! -f "$PYTHON_HELPER" ]]; then
+        echo "Installing vector embedder Python helper..." >&2
+        cat > "$PYTHON_HELPER" << 'PYTHON_EOF'
+#!/usr/bin/env python3
+"""
+Vector Embedder with Hybrid Search
+Uses all-MiniLM-L6-v2 for local embeddings + RRF for hybrid ranking
+"""
+
+import sys
+import json
+import hashlib
+import numpy as np
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    print("Warning: sentence-transformers not installed. Install: pip install sentence-transformers", file=sys.stderr)
+
+# Global model instance (lazy loaded)
+_model = None
+MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_DIM = 384
+
+def get_model():
+    """Lazy load the embedding model."""
+    global _model
+    if _model is None:
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError("sentence-transformers not installed")
+        _model = SentenceTransformer(MODEL_NAME)
+    return _model
+
+def compute_text_hash(text: str) -> str:
+    """Compute SHA-256 hash of text."""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def embed_text(text: str) -> np.ndarray:
+    """Generate embedding for text using all-MiniLM-L6-v2."""
+    model = get_model()
+    embedding = model.encode([text], convert_to_numpy=True, show_progress_bar=False)
+    return embedding[0]
+
+def embed_texts_batch(texts: List[str], batch_size: int = 32) -> np.ndarray:
+    """Generate embeddings for multiple texts (batch processing)."""
+    model = get_model()
+    embeddings = model.encode(texts, batch_size=batch_size, convert_to_numpy=True, show_progress_bar=True)
+    return embeddings
+
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors."""
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return np.dot(vec1, vec2) / (norm1 * norm2)
+
+def cosine_similarity_matrix(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
+    """Compute cosine similarity between query and multiple documents."""
+    query_vec = np.array(query_vec).reshape(1, -1)
+    doc_vecs = np.array(doc_vecs)
+
+    query_norm = np.linalg.norm(query_vec, axis=1, keepdims=True)
+    doc_norms = np.linalg.norm(doc_vecs, axis=1, keepdims=True)
+
+    similarities = np.dot(query_vec, doc_vecs.T) / (query_norm * doc_norms.T)
+    return similarities[0]
+
+def reciprocal_rank_fusion(
+    bm25_results: List[Tuple[str, float]],
+    vector_results: List[Tuple[str, float]],
+    k: int = 60
+) -> List[Tuple[str, float]]:
+    """
+    Combine BM25 and vector search results using Reciprocal Rank Fusion.
+
+    RRF formula: score = 1/(rank + k) where k=60 is experimentally optimal
+
+    Based on production implementations from:
+    - deepset-ai/haystack
+    - langroid/langroid
+    - letta-ai/letta
+    """
+    scores = {}
+
+    # Add BM25 contributions
+    for rank, (doc_id, bm25_score) in enumerate(bm25_results, 1):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (rank + k)
+
+    # Add vector contributions
+    for rank, (doc_id, vec_score) in enumerate(vector_results, 1):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (rank + k)
+
+    # Sort by combined RRF score
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return ranked
+
+def bm25_search(query: str, documents: List[Dict[str, Any]], k1: float = 1.5, b: float = 0.75) -> List[Tuple[str, float]]:
+    """
+    Simple BM25 implementation for keyword search.
+    Used as sparse retrieval component in hybrid search.
+    """
+    from collections import Counter
+    import math
+
+    # Tokenize query and documents
+    query_tokens = query.lower().split()
+
+    doc_tokens = []
+    doc_ids = []
+    for doc in documents:
+        doc_id = doc.get('id', doc.get('doc_id', 'unknown'))
+        text = doc.get('text', doc.get('content', ''))
+        tokens = text.lower().split()
+        doc_tokens.append(Counter(tokens))
+        doc_ids.append(doc_id)
+
+    # Calculate document frequencies
+    N = len(documents)
+    df = Counter()
+    for token_count in doc_tokens:
+        for token in token_count:
+            df[token] += 1
+
+    # Calculate BM25 scores
+    avg_dl = sum(sum(tokens.values()) for tokens in doc_tokens) / N if N > 0 else 1
+
+    scores = []
+    for i, (doc_id, tokens) in enumerate(zip(doc_ids, doc_tokens)):
+        score = 0.0
+        dl = sum(tokens.values())
+
+        for query_token in query_tokens:
+            if query_token not in tokens:
+                continue
+
+            tf = tokens[query_token]
+            idf = math.log((N - df[query_token] + 0.5) / (df[query_token] + 0.5) + 1)
+
+            numerator = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * dl / avg_dl)
+
+            score += idf * (numerator / denominator)
+
+        scores.append((doc_id, score))
+
+    # Sort by score descending
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores
+
+def embed_file(file_path: str) -> Dict[str, Any]:
+    """Generate embedding for a file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        text_hash = compute_text_hash(content)
+        embedding = embed_text(content)
+
+        return {
+            'file': file_path,
+            'text_hash': text_hash,
+            'embedding': embedding.tolist(),
+            'embedding_dim': len(embedding),
+            'model': MODEL_NAME,
+            'text_length': len(content)
+        }
+    except Exception as e:
+        return {
+            'error': str(e),
+            'file': file_path
+        }
+
+def semantic_search(query: str, documents: List[Dict[str, Any]], top_k: int = 10) -> List[Tuple[str, float]]:
+    """Perform semantic search using vector embeddings."""
+    query_embedding = embed_text(query)
+
+    # Extract document embeddings
+    doc_embeddings = []
+    doc_ids = []
+    for doc in documents:
+        if 'embedding' in doc:
+            doc_embeddings.append(doc['embedding'])
+            doc_ids.append(doc.get('id', doc.get('doc_id', 'unknown')))
+
+    if not doc_embeddings:
+        return []
+
+    doc_embeddings = np.array(doc_embeddings)
+
+    # Compute cosine similarities
+    similarities = cosine_similarity_matrix(query_embedding, doc_embeddings)
+
+    # Sort and return top_k
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+    results = [(doc_ids[i], float(similarities[i])) for i in top_indices]
+
+    return results
+
+def hybrid_search(query: str, documents: List[Dict[str, Any]], top_k: int = 10, rrf_k: int = 60) -> List[Tuple[str, float]]:
+    """
+    Hybrid search combining BM25 (keyword) and vector (semantic) search using RRF.
+    Production-ready pattern from Haystack, Langroid, and other RAG systems.
+    """
+    # BM25 search (sparse)
+    bm25_results = bm25_search(query, documents)[:top_k * 2]  # Get more candidates
+
+    # Vector search (dense)
+    vector_results = semantic_search(query, documents, top_k * 2)
+
+    # Combine using RRF
+    fused_results = reciprocal_rank_fusion(bm25_results, vector_results, k=rrf_k)
+
+    # Return top_k
+    return fused_results[:top_k]
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: vector_embedder.py <command> [args...]", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "embed_text":
+        if len(sys.argv) < 3:
+            print("Usage: vector_embedder.py embed_text <text>", file=sys.stderr)
+            sys.exit(1)
+        text = sys.argv[2]
+        embedding = embed_text(text)
+        print(json.dumps({
+            'text_hash': compute_text_hash(text),
+            'embedding': embedding.tolist(),
+            'embedding_dim': len(embedding),
+            'model': MODEL_NAME
+        }))
+
+    elif command == "embed_file":
+        if len(sys.argv) < 3:
+            print("Usage: vector_embedder.py embed_file <file_path>", file=sys.stderr)
+            sys.exit(1)
+        file_path = sys.argv[2]
+        result = embed_file(file_path)
+        print(json.dumps(result))
+
+    elif command == "semantic_search":
+        if len(sys.argv) < 4:
+            print("Usage: vector_embedder.py semantic_search <query> <documents_json> [top_k]", file=sys.stderr)
+            sys.exit(1)
+        query = sys.argv[2]
+        documents = json.loads(sys.argv[3])
+        top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+        results = semantic_search(query, documents, top_k)
+        print(json.dumps({'results': results}))
+
+    elif command == "hybrid_search":
+        if len(sys.argv) < 4:
+            print("Usage: vector_embedder.py hybrid_search <query> <documents_json> [top_k] [rrf_k]", file=sys.stderr)
+            sys.exit(1)
+        query = sys.argv[2]
+        documents = json.loads(sys.argv[3])
+        top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+        rrf_k = int(sys.argv[5]) if len(sys.argv) > 5 else 60
+        results = hybrid_search(query, documents, top_k, rrf_k)
+        print(json.dumps({'results': results, 'method': 'reciprocal_rank_fusion', 'rrf_k': rrf_k}))
+
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+PYTHON_EOF
+        chmod +x "$PYTHON_HELPER"
+    fi
+}
+
+# ============================================================================
+# EMBED COMMAND
+# ============================================================================
+
+embed_text() {
+    local input="$1"
+
+    ensure_python_helper
+
+    # Check if input is a file
+    if [[ -f "$input" ]]; then
+        # Check cache
+        local file_hash=$(sha256sum "$input" | awk '{print $1}')
+        local cache_file="${CACHE_DIR}/${file_hash}.json"
+
+        if [[ -f "$cache_file" ]]; then
+            cat "$cache_file"
+            return 0
+        fi
+
+        # Generate embedding
+        local result=$(python3 "$PYTHON_HELPER" embed_file "$input")
+
+        if [[ $? -eq 0 ]]; then
+            echo "$result" > "$cache_file"
+            echo "$result"
+            return 0
+        else
+            echo "$result" >&2
+            return 1
+        fi
+    else
+        # Embed text string
+        python3 "$PYTHON_HELPER" embed_text "$input"
+    fi
+}
+
+# ============================================================================
+# BATCH COMMAND
+# ============================================================================
+
+batch_embed() {
+    local directory="$1"
+    local pattern="${2:-*.{py,js,ts,md}}"
+
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: Directory not found: $directory" >&2
+        return 1
+    fi
+
+    local total_files=0
+    local success_count=0
+
+    while IFS= read -r file; do
+        ((total_files++))
+
+        result=$(embed_text "$file")
+        if [[ $? -eq 0 ]]; then
+            ((success_count++))
+            echo "[✓] $file"
+        else
+            echo "[✗] $file: Failed" >&2
+        fi
+
+        if [[ $((total_files % 10)) -eq 0 ]]; then
+            echo "Progress: $success_count / $total_files files embedded"
+        fi
+    done < <(find "$directory" -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.md" \))
+
+    echo ""
+    echo "Batch embedding complete: $success_count / $total_files files"
+}
+
+# ============================================================================
+# SEARCH COMMANDS
+# ============================================================================
+
+semantic_search() {
+    local query="$1"
+    local top_k="${2:-10}"
+
+    ensure_python_helper
+
+    # Load all embeddings
+    local documents="[]"
+
+    if [[ -d "$EMBEDDINGS_DIR" ]]; then
+        documents=$(find "$EMBEDDINGS_DIR" -name "*.json" -type f -exec cat {} \; | jq -s '.')
+    fi
+
+    if [[ "$documents" == "[]" ]]; then
+        echo "No embeddings found. Run: vector-embedder.sh batch <directory>" >&2
+        return 1
+    fi
+
+    python3 "$PYTHON_HELPER" semantic_search "$query" "$documents" "$top_k"
+}
+
+hybrid_search() {
+    local query="$1"
+    local top_k="${2:-10}"
+    local rrf_k="${3:-60}"
+
+    ensure_python_helper
+
+    # Load all embeddings + text
+    local documents="[]"
+
+    if [[ -d "$EMBEDDINGS_DIR" ]]; then
+        documents=$(find "$EMBEDDINGS_DIR" -name "*.json" -type f -exec cat {} \; | jq -s '.')
+    fi
+
+    if [[ "$documents" == "[]" ]]; then
+        echo "No embeddings found. Run: vector-embedder.sh batch <directory>" >&2
+        return 1
+    fi
+
+    python3 "$PYTHON_HELPER" hybrid_search "$query" "$documents" "$top_k" "$rrf_k"
+}
+
+# ============================================================================
+# STATS COMMAND
+# ============================================================================
+
+show_stats() {
+    local cache_count=$(find "$CACHE_DIR" -name "*.json" -type f 2>/dev/null | wc -l)
+    local embeddings_count=$(find "$EMBEDDINGS_DIR" -name "*.json" -type f 2>/dev/null | wc -l)
+
+    cat << STATS
+Vector Embedding Statistics
+============================
+Model: $MODEL_NAME
+Dimensions: 384
+Cached embeddings: $cache_count
+Stored embeddings: $embeddings_count
+
+Cache directory: $CACHE_DIR
+Embeddings directory: $EMBEDDINGS_DIR
+
+Recent embeddings:
+$(find "$CACHE_DIR" -name "*.json" -type f -mtime -7 | head -5 | while read -r file; do
+    echo "  - $(jq -r '.file // "unknown"' "$file" 2>/dev/null)"
+done)
+STATS
+}
+
+# ============================================================================
+# CLEAR CACHE
+# ============================================================================
+
+clear_cache() {
+    rm -rf "$CACHE_DIR"/*
+    echo "Embedding cache cleared: $CACHE_DIR"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        embed)
+            shift
+            embed_text "$@"
+            ;;
+        batch)
+            shift
+            batch_embed "$@"
+            ;;
+        search)
+            shift
+            semantic_search "$@"
+            ;;
+        hybrid)
+            shift
+            hybrid_search "$@"
+            ;;
+        stats)
+            show_stats
+            ;;
+        clear-cache)
+            clear_cache
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "Error: Unknown command: $command" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Web Crawler for Claude Code - Handles password-protected sites
+Based on: crawl4ai, Playwright, Firecrawl patterns
+
+Usage:
+    python web-crawler.py <url> [--password <pwd>] [--output <file>] [--format md|json|html]
+    python web-crawler.py https://kenkais.com/exclusive --password 9111 --output courses.md
+"""
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from urllib.parse import urljoin, urlparse
+
+try:
+    from playwright.async_api import async_playwright, Page, Browser
+except ImportError:
+    print("Installing playwright...")
+    import subprocess
+    subprocess.run([sys.executable, "-m", "pip", "install", "playwright"], check=True)
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    from playwright.async_api import async_playwright, Page, Browser
+
+try:
+    from markdownify import markdownify as md
+except ImportError:
+    print("Installing markdownify...")
+    import subprocess
+    subprocess.run([sys.executable, "-m", "pip", "install", "markdownify"], check=True)
+    from markdownify import markdownify as md
+
+
+class WebCrawler:
+    """Crawler that handles password-protected sites."""
+
+    def __init__(self, headless: bool = True, timeout: int = 30000):
+        self.headless = headless
+        self.timeout = timeout
+        self.browser: Optional[Browser] = None
+        self.visited: set = set()
+        self.results: List[Dict[str, Any]] = []
+
+    async def __aenter__(self):
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=self.headless)
+        return self
+
+    async def __aexit__(self, *args):
+        if self.browser:
+            await self.browser.close()
+        await self.playwright.stop()
+
+    async def authenticate(self, page: Page, password: str) -> bool:
+        """Handle password authentication on page."""
+        try:
+            # First, try numeric keypad input (like Ken Kai's site)
+            # Check for restricted access / code entry page
+            page_text = await page.content()
+            if 'Restricted Access' in page_text or 'digit code' in page_text.lower():
+                print("Detected numeric code entry page...")
+
+                # Type each digit with keyboard
+                for digit in password:
+                    await page.keyboard.press(digit)
+                    await asyncio.sleep(0.2)
+
+                # Wait for page to process and redirect
+                await asyncio.sleep(2)
+                await page.wait_for_load_state('networkidle', timeout=15000)
+
+                # Check if we're past the restricted page
+                new_content = await page.content()
+                if 'Restricted Access' not in new_content:
+                    print("Successfully authenticated!")
+                    return True
+                else:
+                    print("Still on restricted page, trying click approach...")
+
+            # Try clicking on keypad buttons if available
+            for digit in password:
+                try:
+                    # Look for keypad buttons
+                    keypad_selectors = [
+                        f'button:has-text("{digit}")',
+                        f'[data-key="{digit}"]',
+                        f'.keypad button:has-text("{digit}")',
+                        f'.pin-input button:has-text("{digit}")',
+                    ]
+                    for sel in keypad_selectors:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            await asyncio.sleep(0.2)
+                            break
+                except:
+                    continue
+
+            await asyncio.sleep(2)
+            await page.wait_for_load_state('networkidle', timeout=10000)
+
+            # Common password input selectors
+            password_selectors = [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="pwd"]',
+                'input[placeholder*="password" i]',
+                'input[placeholder*="Password" i]',
+                '#password',
+                '.password-input',
+            ]
+
+            for selector in password_selectors:
+                try:
+                    input_el = await page.wait_for_selector(selector, timeout=3000)
+                    if input_el:
+                        await input_el.fill(password)
+
+                        # Find and click submit button
+                        submit_selectors = [
+                            'button[type="submit"]',
+                            'input[type="submit"]',
+                            'button:has-text("Enter")',
+                            'button:has-text("Submit")',
+                            'button:has-text("Login")',
+                            'button:has-text("Access")',
+                            '.submit-btn',
+                        ]
+
+                        for submit_sel in submit_selectors:
+                            try:
+                                submit_btn = await page.query_selector(submit_sel)
+                                if submit_btn:
+                                    await submit_btn.click()
+                                    await page.wait_for_load_state('networkidle', timeout=10000)
+                                    return True
+                            except:
+                                continue
+
+                        # Try pressing Enter if no submit button found
+                        await page.keyboard.press('Enter')
+                        await page.wait_for_load_state('networkidle', timeout=10000)
+                        return True
+                except:
+                    continue
+
+            return False
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            return False
+
+    async def extract_content(self, page: Page) -> Dict[str, Any]:
+        """Extract content from page."""
+        title = await page.title()
+        url = page.url
+
+        # Get main content HTML
+        content_html = await page.evaluate('''() => {
+            // Try to find main content area
+            const selectors = [
+                'main',
+                'article',
+                '.content',
+                '.main-content',
+                '#content',
+                '#main',
+                '.post-content',
+                '.entry-content',
+                '.course-content',
+                '.lesson-content',
+            ];
+
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) return el.innerHTML;
+            }
+
+            // Fallback to body, removing nav/header/footer
+            const body = document.body.cloneNode(true);
+            ['nav', 'header', 'footer', '.nav', '.header', '.footer', '.sidebar', 'script', 'style'].forEach(sel => {
+                body.querySelectorAll(sel).forEach(el => el.remove());
+            });
+            return body.innerHTML;
+        }''')
+
+        # Convert to markdown
+        content_md = md(content_html, heading_style="ATX", strip=['script', 'style'])
+
+        # Clean up markdown
+        content_md = re.sub(r'\n{3,}', '\n\n', content_md)
+        content_md = re.sub(r'^\s+', '', content_md, flags=re.MULTILINE)
+
+        # Extract links for further crawling
+        links = await page.evaluate('''() => {
+            return Array.from(document.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .filter(href => href.startsWith('http'));
+        }''')
+
+        return {
+            'url': url,
+            'title': title,
+            'content_md': content_md,
+            'content_html': content_html,
+            'links': links,
+        }
+
+    async def crawl_page(self, url: str, password: Optional[str] = None) -> Dict[str, Any]:
+        """Crawl a single page."""
+        if url in self.visited:
+            return {}
+
+        self.visited.add(url)
+        print(f"Crawling: {url}")
+
+        context = await self.browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        )
+        page = await context.new_page()
+
+        try:
+            # Pre-set localStorage auth if password provided (for Ken Kai style sites)
+            if password:
+                await page.goto(url.split('/')[0] + '//' + url.split('/')[2], wait_until='domcontentloaded', timeout=self.timeout)
+                await page.evaluate(f'''() => {{
+                    // Try setting various auth storage keys
+                    localStorage.setItem('authenticated', 'true');
+                    localStorage.setItem('auth', 'true');
+                    localStorage.setItem('access', 'true');
+                    localStorage.setItem('accessCode', '{password}');
+                    localStorage.setItem('code', '{password}');
+                    localStorage.setItem('pin', '{password}');
+                    localStorage.setItem('exclusiveAccess', 'true');
+                    sessionStorage.setItem('authenticated', 'true');
+                    sessionStorage.setItem('accessCode', '{password}');
+                }}''')
+
+            await page.goto(url, wait_until='networkidle', timeout=self.timeout)
+
+            # Check if still showing restricted access
+            page_content = await page.content()
+            if password and 'Restricted Access' in page_content:
+                print("Trying keyboard code entry...")
+                # Focus body and type the code
+                await page.click('body')
+                await asyncio.sleep(0.5)
+                for digit in password:
+                    await page.keyboard.press(digit)
+                    await asyncio.sleep(0.3)
+
+                await asyncio.sleep(2)
+                await page.wait_for_load_state('networkidle', timeout=15000)
+
+            # Check if password required (traditional form)
+            if password:
+                needs_auth = await page.query_selector('input[type="password"]')
+                if needs_auth:
+                    print("Password field detected, authenticating...")
+                    auth_success = await self.authenticate(page, password)
+                    if not auth_success:
+                        print("Warning: Authentication may have failed")
+
+            # Wait for content to load
+            await page.wait_for_load_state('networkidle')
+            await asyncio.sleep(1)  # Extra wait for dynamic content
+
+            # Extract content
+            result = await self.extract_content(page)
+            self.results.append(result)
+            return result
+
+        except Exception as e:
+            print(f"Error crawling {url}: {e}")
+            return {'url': url, 'error': str(e)}
+        finally:
+            await context.close()
+
+    async def crawl_site(self, start_url: str, password: Optional[str] = None,
+                         max_pages: int = 50, same_domain_only: bool = True) -> List[Dict[str, Any]]:
+        """Crawl multiple pages from a starting URL."""
+        parsed_start = urlparse(start_url)
+        base_domain = parsed_start.netloc
+
+        to_crawl = [start_url]
+
+        while to_crawl and len(self.results) < max_pages:
+            url = to_crawl.pop(0)
+            result = await self.crawl_page(url, password)
+
+            if 'links' in result:
+                for link in result['links']:
+                    parsed_link = urlparse(link)
+
+                    # Filter links
+                    if link in self.visited:
+                        continue
+                    if same_domain_only and parsed_link.netloc != base_domain:
+                        continue
+                    if any(ext in link for ext in ['.pdf', '.zip', '.png', '.jpg', '.gif']):
+                        continue
+
+                    to_crawl.append(link)
+
+        return self.results
+
+
+def format_results(results: List[Dict[str, Any]], format_type: str = 'md') -> str:
+    """Format crawl results."""
+    if format_type == 'json':
+        return json.dumps(results, indent=2)
+
+    elif format_type == 'html':
+        html_parts = ['<html><head><title>Crawl Results</title></head><body>']
+        for r in results:
+            html_parts.append(f"<h1>{r.get('title', 'Untitled')}</h1>")
+            html_parts.append(f"<p><a href='{r.get('url', '')}'>{r.get('url', '')}</a></p>")
+            html_parts.append(r.get('content_html', ''))
+            html_parts.append('<hr>')
+        html_parts.append('</body></html>')
+        return '\n'.join(html_parts)
+
+    else:  # markdown
+        md_parts = []
+        for r in results:
+            md_parts.append(f"# {r.get('title', 'Untitled')}")
+            md_parts.append(f"\n**Source:** {r.get('url', '')}\n")
+            md_parts.append(r.get('content_md', ''))
+            md_parts.append('\n---\n')
+        return '\n'.join(md_parts)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description='Web Crawler for Claude Code')
+    parser.add_argument('url', help='URL to crawl')
+    parser.add_argument('--password', '-p', help='Password for protected content')
+    parser.add_argument('--output', '-o', help='Output file path')
+    parser.add_argument('--format', '-f', choices=['md', 'json', 'html'], default='md',
+                        help='Output format (default: md)')
+    parser.add_argument('--max-pages', '-m', type=int, default=50,
+                        help='Maximum pages to crawl (default: 50)')
+    parser.add_argument('--single', '-s', action='store_true',
+                        help='Only crawl the single page, don\'t follow links')
+    parser.add_argument('--visible', '-v', action='store_true',
+                        help='Run browser in visible mode (not headless)')
+
+    args = parser.parse_args()
+
+    async with WebCrawler(headless=not args.visible) as crawler:
+        if args.single:
+            result = await crawler.crawl_page(args.url, args.password)
+            results = [result] if result else []
+        else:
+            results = await crawler.crawl_site(
+                args.url,
+                password=args.password,
+                max_pages=args.max_pages
+            )
+
+        output = format_results(results, args.format)
+
+        if args.output:
+            Path(args.output).write_text(output)
+            print(f"\nSaved to: {args.output}")
+        else:
+            print(output)
+
+        print(f"\nCrawled {len(results)} pages")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

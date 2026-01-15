@@ -1,0 +1,254 @@
+import * as vscode from "vscode"
+import * as path from "path"
+import * as fs from "fs/promises"
+import { parse as parseYaml } from "yaml"
+import {
+	AutomationConfig,
+	automationConfigSchema,
+	AutomationDefinition,
+	MultiProjectConfig,
+	multiProjectConfigSchema,
+} from "@multi-agent/types"
+
+const DEFAULT_AUTOMATIONS_PATH = ".multiagent/automations.yaml"
+const DEFAULT_WORKSPACES_PATH = ".multiagent/workspaces.yaml"
+
+export interface AutomationConfigLoaderOptions {
+	workspacePath: string
+	automationsPath?: string
+	workspacesPath?: string
+}
+
+export class AutomationConfigLoader {
+	private workspacePath: string
+	private automationsPath: string
+	private workspacesPath: string
+	private automationsWatcher?: vscode.FileSystemWatcher
+	private workspacesWatcher?: vscode.FileSystemWatcher
+	private _onAutomationsChanged = new vscode.EventEmitter<AutomationConfig | null>()
+	private _onWorkspacesChanged = new vscode.EventEmitter<MultiProjectConfig | null>()
+
+	public readonly onAutomationsChanged = this._onAutomationsChanged.event
+	public readonly onWorkspacesChanged = this._onWorkspacesChanged.event
+
+	private cachedAutomationsConfig: AutomationConfig | null = null
+	private cachedWorkspacesConfig: MultiProjectConfig | null = null
+
+	constructor(options: AutomationConfigLoaderOptions) {
+		this.workspacePath = options.workspacePath
+		this.automationsPath = options.automationsPath || DEFAULT_AUTOMATIONS_PATH
+		this.workspacesPath = options.workspacesPath || DEFAULT_WORKSPACES_PATH
+	}
+
+	/**
+	 * Initialize file watchers for config changes
+	 */
+	async initialize(): Promise<void> {
+		// Watch for automations config changes
+		const automationsFullPath = path.join(this.workspacePath, this.automationsPath)
+		const automationsPattern = new vscode.RelativePattern(
+			path.dirname(automationsFullPath),
+			path.basename(automationsFullPath)
+		)
+		this.automationsWatcher = vscode.workspace.createFileSystemWatcher(automationsPattern)
+		this.automationsWatcher.onDidChange(() => this.reloadAutomations())
+		this.automationsWatcher.onDidCreate(() => this.reloadAutomations())
+		this.automationsWatcher.onDidDelete(() => this.handleAutomationsDeleted())
+
+		// Watch for workspaces config changes
+		const workspacesFullPath = path.join(this.workspacePath, this.workspacesPath)
+		const workspacesPattern = new vscode.RelativePattern(
+			path.dirname(workspacesFullPath),
+			path.basename(workspacesFullPath)
+		)
+		this.workspacesWatcher = vscode.workspace.createFileSystemWatcher(workspacesPattern)
+		this.workspacesWatcher.onDidChange(() => this.reloadWorkspaces())
+		this.workspacesWatcher.onDidCreate(() => this.reloadWorkspaces())
+		this.workspacesWatcher.onDidDelete(() => this.handleWorkspacesDeleted())
+
+		// Initial load
+		await this.reloadAutomations()
+		await this.reloadWorkspaces()
+	}
+
+	/**
+	 * Load automations configuration
+	 */
+	async loadAutomations(): Promise<AutomationConfig | null> {
+		if (this.cachedAutomationsConfig) {
+			return this.cachedAutomationsConfig
+		}
+		return this.reloadAutomations()
+	}
+
+	/**
+	 * Load workspaces configuration
+	 */
+	async loadWorkspaces(): Promise<MultiProjectConfig | null> {
+		if (this.cachedWorkspacesConfig) {
+			return this.cachedWorkspacesConfig
+		}
+		return this.reloadWorkspaces()
+	}
+
+	/**
+	 * Reload automations from disk
+	 */
+	private async reloadAutomations(): Promise<AutomationConfig | null> {
+		const fullPath = path.join(this.workspacePath, this.automationsPath)
+		try {
+			const content = await fs.readFile(fullPath, "utf-8")
+			const parsed = parseYaml(content)
+			const validated = automationConfigSchema.parse(parsed)
+			this.cachedAutomationsConfig = validated
+			this._onAutomationsChanged.fire(validated)
+			return validated
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				// File doesn't exist, that's ok
+				this.cachedAutomationsConfig = null
+				return null
+			}
+			console.error(`Failed to load automations config from ${fullPath}:`, error)
+			// Don't update cache on parse errors, keep using old config
+			return this.cachedAutomationsConfig
+		}
+	}
+
+	/**
+	 * Reload workspaces from disk
+	 */
+	private async reloadWorkspaces(): Promise<MultiProjectConfig | null> {
+		const fullPath = path.join(this.workspacePath, this.workspacesPath)
+		try {
+			const content = await fs.readFile(fullPath, "utf-8")
+			const parsed = parseYaml(content)
+			const validated = multiProjectConfigSchema.parse(parsed)
+			this.cachedWorkspacesConfig = validated
+			this._onWorkspacesChanged.fire(validated)
+			return validated
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				this.cachedWorkspacesConfig = null
+				return null
+			}
+			console.error(`Failed to load workspaces config from ${fullPath}:`, error)
+			return this.cachedWorkspacesConfig
+		}
+	}
+
+	private handleAutomationsDeleted(): void {
+		this.cachedAutomationsConfig = null
+		this._onAutomationsChanged.fire(null)
+	}
+
+	private handleWorkspacesDeleted(): void {
+		this.cachedWorkspacesConfig = null
+		this._onWorkspacesChanged.fire(null)
+	}
+
+	/**
+	 * Get a specific automation by ID
+	 */
+	getAutomation(id: string): AutomationDefinition | undefined {
+		return this.cachedAutomationsConfig?.automations.find((a) => a.id === id)
+	}
+
+	/**
+	 * Get all enabled automations
+	 */
+	getEnabledAutomations(): AutomationDefinition[] {
+		return this.cachedAutomationsConfig?.automations.filter((a) => a.enabled) || []
+	}
+
+	/**
+	 * Check if automations config exists
+	 */
+	async hasAutomationsConfig(): Promise<boolean> {
+		const fullPath = path.join(this.workspacePath, this.automationsPath)
+		try {
+			await fs.access(fullPath)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * Check if workspaces config exists
+	 */
+	async hasWorkspacesConfig(): Promise<boolean> {
+		const fullPath = path.join(this.workspacePath, this.workspacesPath)
+		try {
+			await fs.access(fullPath)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * Create default automations config file
+	 */
+	async createDefaultAutomationsConfig(): Promise<void> {
+		const fullPath = path.join(this.workspacePath, this.automationsPath)
+		const dirPath = path.dirname(fullPath)
+
+		// Ensure directory exists
+		await fs.mkdir(dirPath, { recursive: true })
+
+		const defaultConfig = `version: "1.0"
+automations:
+  # Example: Auto-run tests when test files are saved
+  # - id: auto-test-runner
+  #   name: Auto Test Runner
+  #   description: Run tests when test files change
+  #   enabled: true
+  #   trigger:
+  #     type: file_watcher
+  #     patterns:
+  #       - "**/*.test.ts"
+  #       - "**/*.spec.ts"
+  #     events: [save]
+  #     debounceMs: 1000
+  #   action:
+  #     mode: code
+  #     prompt: "Run tests for {{triggerFile}} and report any failures"
+  #     autoApprove: true
+`
+		await fs.writeFile(fullPath, defaultConfig, "utf-8")
+	}
+
+	/**
+	 * Create default workspaces config file
+	 */
+	async createDefaultWorkspacesConfig(): Promise<void> {
+		const fullPath = path.join(this.workspacePath, this.workspacesPath)
+		const dirPath = path.dirname(fullPath)
+
+		await fs.mkdir(dirPath, { recursive: true })
+
+		const defaultConfig = `version: "1.0"
+workspaces:
+  # Add workspace configurations here
+  # - workspacePath: "\${workspaceFolder}/packages/frontend"
+  #   defaultMode: code
+  #   maxConcurrentTasks: 1
+
+orchestration:
+  enabled: false
+  # orchestratorMode: architect
+`
+		await fs.writeFile(fullPath, defaultConfig, "utf-8")
+	}
+
+	/**
+	 * Dispose of file watchers
+	 */
+	dispose(): void {
+		this.automationsWatcher?.dispose()
+		this.workspacesWatcher?.dispose()
+		this._onAutomationsChanged.dispose()
+		this._onWorkspacesChanged.dispose()
+	}
+}

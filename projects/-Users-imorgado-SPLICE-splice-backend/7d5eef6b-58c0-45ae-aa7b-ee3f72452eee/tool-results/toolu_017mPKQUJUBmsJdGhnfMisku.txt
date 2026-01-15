@@ -1,0 +1,264 @@
+     1→/**
+     2→ * JWT Authentication Middleware
+     3→ *
+     4→ * Replaces insecure x-stripe-customer-id header with JWT tokens.
+     5→ * Tokens are signed with a secret and contain the customer ID.
+     6→ */
+     7→
+     8→const jwt = require('jsonwebtoken');
+     9→
+    10→// JWT configuration
+    11→const JWT_SECRET = process.env.JWT_SECRET || 'splice-dev-secret-change-in-production';
+    12→const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
+    13→const JWT_REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || '7d';
+    14→
+    15→// Check if running in production
+    16→const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+    17→
+    18→// Warn if using default secret in production
+    19→if (isProduction && JWT_SECRET === 'splice-dev-secret-change-in-production') {
+    20→  console.error('[SECURITY] CRITICAL: JWT_SECRET not set in production! Set JWT_SECRET environment variable.');
+    21→  console.error('[SECURITY] Exiting process to prevent insecure operation.');
+    22→  process.exit(1);
+    23→}
+    24→
+    25→/**
+    26→ * Generate a JWT token for a customer
+    27→ * @param {string} stripeCustomerId - Stripe customer ID (cus_xxx)
+    28→ * @param {Object} options - Additional options
+    29→ * @param {string} options.tier - User's subscription tier
+    30→ * @param {string} options.email - User's email (optional)
+    31→ * @returns {Object} { token, expiresIn }
+    32→ */
+    33→function generateToken(stripeCustomerId, options = {}) {
+    34→  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+    35→    throw new Error('Invalid Stripe customer ID');
+    36→  }
+    37→
+    38→  const payload = {
+    39→    sub: stripeCustomerId,
+    40→    type: 'access',
+    41→    tier: options.tier || 'starter',
+    42→    iat: Math.floor(Date.now() / 1000)
+    43→  };
+    44→
+    45→  if (options.email) {
+    46→    payload.email = options.email;
+    47→  }
+    48→
+    49→  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    50→
+    51→  return {
+    52→    token,
+    53→    expiresIn: JWT_EXPIRES_IN,
+    54→    tokenType: 'Bearer'
+    55→  };
+    56→}
+    57→
+    58→/**
+    59→ * Generate a refresh token for a customer
+    60→ * @param {string} stripeCustomerId - Stripe customer ID
+    61→ * @returns {Object} { refreshToken, expiresIn }
+    62→ */
+    63→function generateRefreshToken(stripeCustomerId) {
+    64→  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+    65→    throw new Error('Invalid Stripe customer ID');
+    66→  }
+    67→
+    68→  const payload = {
+    69→    sub: stripeCustomerId,
+    70→    type: 'refresh',
+    71→    iat: Math.floor(Date.now() / 1000)
+    72→  };
+    73→
+    74→  const refreshToken = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_REFRESH_EXPIRES_IN });
+    75→
+    76→  return {
+    77→    refreshToken,
+    78→    expiresIn: JWT_REFRESH_EXPIRES_IN
+    79→  };
+    80→}
+    81→
+    82→/**
+    83→ * Verify and decode a JWT token
+    84→ * @param {string} token - JWT token to verify
+    85→ * @returns {Object|null} Decoded payload or null if invalid
+    86→ */
+    87→function verifyToken(token) {
+    88→  try {
+    89→    const decoded = jwt.verify(token, JWT_SECRET);
+    90→    return decoded;
+    91→  } catch (err) {
+    92→    // Log specific error types for debugging
+    93→    if (err.name === 'TokenExpiredError') {
+    94→      console.log('[Auth] Token expired');
+    95→    } else if (err.name === 'JsonWebTokenError') {
+    96→      console.log('[Auth] Invalid token:', err.message);
+    97→    }
+    98→    return null;
+    99→  }
+   100→}
+   101→
+   102→/**
+   103→ * Extract Bearer token from Authorization header
+   104→ * @param {string} authHeader - Authorization header value
+   105→ * @returns {string|null} Token or null if not found
+   106→ */
+   107→function extractBearerToken(authHeader) {
+   108→  if (!authHeader || typeof authHeader !== 'string') {
+   109→    return null;
+   110→  }
+   111→
+   112→  const parts = authHeader.split(' ');
+   113→  if (parts.length !== 2 || parts[0].toLowerCase() !== 'bearer') {
+   114→    return null;
+   115→  }
+   116→
+   117→  return parts[1];
+   118→}
+   119→
+   120→/**
+   121→ * Middleware to authenticate JWT tokens
+   122→ * Sets req.stripeCustomerId if valid token found
+   123→ *
+   124→ * Supports both:
+   125→ * - Authorization: Bearer <token> (preferred)
+   126→ * - x-stripe-customer-id header (legacy, will be deprecated)
+   127→ */
+   128→function authenticateToken(req, res, next) {
+   129→  // First, try JWT token from Authorization header
+   130→  const authHeader = req.headers['authorization'];
+   131→  const token = extractBearerToken(authHeader);
+   132→
+   133→  if (token) {
+   134→    const decoded = verifyToken(token);
+   135→    if (decoded && decoded.sub) {
+   136→      req.stripeCustomerId = decoded.sub;
+   137→      req.tokenData = decoded;
+   138→      return next();
+   139→    }
+   140→    // Token present but invalid
+   141→    return res.status(401).json({
+   142→      error: 'Invalid or expired token',
+   143→      message: 'Please log in again to continue'
+   144→    });
+   145→  }
+   146→
+   147→  // Fallback: Legacy x-stripe-customer-id header (for backward compatibility)
+   148→  // This will be deprecated in future versions
+   149→  const legacyCustomerId = req.headers['x-stripe-customer-id'];
+   150→  if (legacyCustomerId) {
+   151→    // Log deprecation warning (once per request)
+   152→    if (!req._legacyAuthWarned) {
+   153→      console.warn('[Auth] DEPRECATED: Using x-stripe-customer-id header. Migrate to JWT tokens.');
+   154→      req._legacyAuthWarned = true;
+   155→    }
+   156→
+   157→    // Validate format
+   158→    if (!legacyCustomerId.startsWith('cus_')) {
+   159→      return res.status(401).json({
+   160→        error: 'Invalid customer ID format',
+   161→        message: 'Customer ID must start with cus_'
+   162→      });
+   163→    }
+   164→
+   165→    req.stripeCustomerId = legacyCustomerId;
+   166→    req.isLegacyAuth = true;
+   167→    return next();
+   168→  }
+   169→
+   170→  // No authentication provided
+   171→  return res.status(401).json({
+   172→    error: 'Authentication required',
+   173→    message: 'Please provide a valid Bearer token in the Authorization header'
+   174→  });
+   175→}
+   176→
+   177→/**
+   178→ * Optional authentication middleware
+   179→ * Allows unauthenticated access but sets req.stripeCustomerId if token present
+   180→ */
+   181→function optionalAuthentication(req, res, next) {
+   182→  const authHeader = req.headers['authorization'];
+   183→  const token = extractBearerToken(authHeader);
+   184→
+   185→  if (token) {
+   186→    const decoded = verifyToken(token);
+   187→    if (decoded && decoded.sub) {
+   188→      req.stripeCustomerId = decoded.sub;
+   189→      req.tokenData = decoded;
+   190→    }
+   191→  } else {
+   192→    // Check legacy header
+   193→    const legacyCustomerId = req.headers['x-stripe-customer-id'];
+   194→    if (legacyCustomerId && legacyCustomerId.startsWith('cus_')) {
+   195→      req.stripeCustomerId = legacyCustomerId;
+   196→      req.isLegacyAuth = true;
+   197→    }
+   198→  }
+   199→
+   200→  next();
+   201→}
+   202→
+   203→/**
+   204→ * Mask sensitive data for logging
+   205→ * @param {string} key - License key or other sensitive string
+   206→ * @returns {string} Masked string (e.g., "SPLICE-ABC1-****-****-****")
+   207→ */
+   208→function maskSensitiveData(data) {
+   209→  if (!data || typeof data !== 'string') {
+   210→    return '****';
+   211→  }
+   212→
+   213→  // For license keys (SPLICE-XXXX-XXXX-XXXX-XXXX format)
+   214→  if (data.startsWith('SPLICE-')) {
+   215→    const parts = data.split('-');
+   216→    if (parts.length === 5) {
+   217→      return `${parts[0]}-${parts[1]}-****-****-****`;
+   218→    }
+   219→  }
+   220→
+   221→  // For customer IDs (cus_xxxx format)
+   222→  if (data.startsWith('cus_')) {
+   223→    if (data.length > 10) {
+   224→      return `cus_${data.slice(4, 8)}****`;
+   225→    }
+   226→    return 'cus_****';
+   227→  }
+   228→
+   229→  // For JWTs (eyJ... format)
+   230→  if (data.startsWith('eyJ')) {
+   231→    return `${data.slice(0, 10)}...****`;
+   232→  }
+   233→
+   234→  // For emails
+   235→  if (data.includes('@')) {
+   236→    const [local, domain] = data.split('@');
+   237→    const maskedLocal = local.length > 2 ? `${local[0]}***${local[local.length-1]}` : '***';
+   238→    return `${maskedLocal}@${domain}`;
+   239→  }
+   240→
+   241→  // Generic masking - show first 4 chars
+   242→  if (data.length > 8) {
+   243→    return `${data.slice(0, 4)}****`;
+   244→  }
+   245→
+   246→  return '****';
+   247→}
+   248→
+   249→module.exports = {
+   250→  generateToken,
+   251→  generateRefreshToken,
+   252→  verifyToken,
+   253→  extractBearerToken,
+   254→  authenticateToken,
+   255→  optionalAuthentication,
+   256→  maskSensitiveData,
+   257→  JWT_SECRET,
+   258→  JWT_EXPIRES_IN
+   259→};
+   260→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,418 @@
+---
+description: Collect research and documentation into buildguide.md
+argument-hint: "[feature-name]"
+allowed-tools: ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]
+---
+
+# Collect Command
+
+Consolidate all research, documentation, and plans into `buildguide.md` - a comprehensive build guide that understands your architecture and creates actionable implementation plans.
+
+## Instructions
+
+### 1. Check if buildguide.md Exists
+
+Check for `buildguide.md` in the project root.
+
+**If it exists:** Skip to Step 4 (Add to existing guide).
+
+**If it does NOT exist:** Proceed to Step 2 (Full initialization).
+
+---
+
+## First-Time Setup (Steps 2-3)
+
+### 2. Gather All Project Knowledge
+
+#### 2a. Launch 3 Explore Agents in Parallel
+
+Use the Task tool to spawn 3 explore agents simultaneously (single message, 3 Task calls):
+
+**Agent 1 - Architecture & Structure:**
+```
+Explore the codebase thoroughly. Document:
+- Project type and main entry points
+- Directory structure and file organization
+- Frameworks and libraries in use
+- Database/data layer (ORM, schemas, migrations)
+- API structure (routes, endpoints, middleware)
+- Frontend structure (components, pages, routing)
+- Build system and tooling
+Return a detailed technical architecture summary.
+```
+
+**Agent 2 - Patterns, Style & Limitations:**
+```
+Explore the codebase for patterns and constraints. Document:
+- Code style and naming conventions
+- Component/module patterns
+- State management approach
+- Error handling patterns
+- Authentication/authorization patterns
+- Current technical limitations or debt
+- Areas that need improvement
+Return patterns to follow AND limitations to be aware of.
+```
+
+**Agent 3 - Dependencies & External Services:**
+```
+Explore all project dependencies and integrations. Document:
+- All dependencies (package.json, requirements.txt, go.mod, etc.)
+- External services (auth, payments, email, storage, etc.)
+- API integrations (third-party APIs in use)
+- Environment variables and configuration
+- Deployment setup (hosting, CI/CD)
+Return a complete dependency and integration map.
+```
+
+#### 2b. Scan for ALL Existing Documentation
+
+Search the entire project for documentation and research:
+
+```
+Locations to check:
+- .claude/plans/*.md
+- .claude/docs/*.md
+- docs/**/*.md
+- *.md in project root (README, CONTRIBUTING, etc.)
+- .github/*.md
+- Any research/ or notes/ directories
+- CLAUDE.md if it exists
+- Comments in config files with important context
+```
+
+Read and extract key information from each document found:
+- What decisions were made and why
+- Implementation details documented
+- Research findings
+- API documentation
+- Architecture decisions
+- Meeting notes or requirements
+
+#### 2c. Scan Current Conversation
+
+Review the current conversation for:
+- Research that was just completed
+- Decisions discussed
+- URLs visited and information gathered
+- User requirements stated
+
+### 3. Create buildguide.md with Plan Agent
+
+Launch a Plan agent (subagent_type=Plan) with ALL gathered information:
+
+```
+You have the following information about this project:
+
+ARCHITECTURE:
+[Output from Agent 1]
+
+PATTERNS & LIMITATIONS:
+[Output from Agent 2]
+
+DEPENDENCIES & INTEGRATIONS:
+[Output from Agent 3]
+
+EXISTING DOCUMENTATION:
+[Summaries from all .md files found]
+
+CURRENT RESEARCH:
+[Any research from this conversation]
+
+USER'S GOAL:
+[What the user said they want to build, or ask them]
+
+---
+
+Create a comprehensive buildguide.md that:
+
+1. Synthesizes all architecture knowledge into a clear overview
+2. Documents current limitations and how they affect implementation
+3. Creates a logical section breakdown for the build
+4. For each section, outlines:
+   - What needs to be built
+   - How it fits with existing architecture
+   - Dependencies on other sections
+   - Key implementation considerations
+5. Consolidates all existing documentation into appropriate sections
+6. Identifies gaps where more research is needed
+
+Structure the buildguide.md as:
+
+# Build Guide
+
+> Project: [name]
+> Created: [date]
+> Last Updated: [date]
+
+## Project Overview
+[What this project is and does]
+
+## Current Architecture
+[How the codebase is structured now]
+
+## Technical Stack
+[Frameworks, libraries, services in use]
+
+## Known Limitations
+[Technical debt, constraints, things to work around]
+
+## Build Sections
+- [ ] Section 1
+- [ ] Section 2
+...
+
+---
+
+## Section: [Name]
+### Overview
+[What this section accomplishes]
+
+### Architecture Fit
+[How it integrates with existing code]
+
+### Implementation Approach
+[Key steps and considerations]
+
+### Research & References
+[Any relevant documentation/research]
+
+---
+
+[Repeat for each section]
+
+---
+
+## Imported Documentation
+[Key excerpts from existing docs that are relevant]
+
+---
+
+## Completed Sections
+[Filled in by /checkpoint as sections complete]
+```
+
+The Plan agent should ask clarifying questions if the user's goals are unclear.
+
+---
+
+## Updating Existing Guide (Steps 4-7)
+
+### 4. Launch 2 Explore Agents in Parallel
+
+Even when buildguide.md exists, spawn agents to catch changes:
+
+**Agent 1 - New Documentation Scanner:**
+```
+Scan the entire project for documentation. Find:
+- All .md files in .claude/plans/, .claude/docs/, docs/, research/, notes/
+- All .md files in project root
+- Any new or modified documentation since [last updated date from buildguide.md]
+
+For each file found, extract:
+- File path
+- Key content summary
+- Whether it's already referenced in buildguide.md
+
+Return list of NEW documentation not yet in buildguide.md.
+```
+
+**Agent 2 - Codebase Changes Scanner:**
+```
+Check for significant codebase changes that affect the build guide:
+- New dependencies added
+- New integrations or services
+- Architecture changes (new directories, patterns)
+- New limitations or technical debt discovered
+- Files that were heavily modified
+
+Compare against the architecture documented in buildguide.md.
+Return any changes that should update the guide.
+```
+
+### 5. Collect Current Conversation Research
+
+Review the current conversation for:
+- Research just completed (pricing, APIs, docs visited)
+- Decisions made
+- New requirements discussed
+- Problems discovered and solutions found
+
+### 6. Plan Integration with Plan Agent
+
+Spawn a Plan agent to analyze how new research affects the current build:
+
+```
+CURRENT buildguide.md:
+[full contents - this is the current architecture and implementation plan]
+
+NEW DOCUMENTATION FOUND:
+[output from Agent 1]
+
+CODEBASE CHANGES:
+[output from Agent 2]
+
+CONVERSATION RESEARCH:
+[research from current session - e.g., pricing research, API docs, etc.]
+
+---
+
+Analyze how this new information affects the current build:
+
+1. **Understand current state:**
+   - What's the current architecture?
+   - What sections are in progress vs pending?
+   - What are the existing implementation approaches?
+
+2. **Evaluate new research:**
+   - How does this new info affect existing sections?
+   - Does it require changes to the architecture?
+   - Does it add new requirements or constraints?
+   - Does it conflict with current implementation plans?
+
+3. **Propose implementation:**
+   - How should this new research be integrated?
+   - What sections need updated implementation approaches?
+   - Are new sections needed?
+   - What's the recommended order of changes?
+
+4. **Ask the user:**
+   - Present 2-3 options for how to integrate this
+   - Ask which approach they prefer
+   - Clarify any ambiguities about their intent
+
+Do NOT mark sections complete - that's what /checkpoint does.
+Focus on PLANNING how to implement the new research.
+```
+
+### 7. Update buildguide.md Based on User Response
+
+After the user chooses an approach:
+
+1. **Consolidate research** into appropriate sections
+2. **Update implementation approaches** for affected sections
+3. **Add new sections** if scope expanded
+4. **Update architecture docs** if structure changes needed
+5. **Update "Last Updated"** date
+
+### 8. Show Summary
+
+```
+Updated buildguide.md:
+
+New research integrated:
+- [what was added]
+
+Implementation changes:
+- [Section X]: [how approach changed]
+- [Section Y]: [new requirements added]
+
+Architecture updates:
+- [any structural changes proposed]
+
+Next action: [what to build or research next]
+
+Run /checkpoint after completing a section to mark it done.
+```
+
+---
+
+## Integration with /checkpoint
+
+When `/checkpoint` runs after completing a section:
+1. Section marked `[x]` complete in Build Sections
+2. Implementation notes added to that section
+3. Content condensed and moved to Completed Sections
+4. Next uncompleted section highlighted
+
+---
+
+## Example: First Run (No buildguide.md)
+
+```
+User: /collect
+
+Claude: No buildguide.md found. Initializing full project analysis...
+
+[Spawns 3 explore agents in parallel]
+
+Scanning for existing documentation...
+Found:
+- README.md (project overview)
+- .claude/plans/auth-migration.md (auth system redesign)
+- .claude/plans/api-v2.md (API redesign notes)
+- docs/database-schema.md (current schema docs)
+
+[Spawns Plan agent with all gathered info]
+
+Plan agent: I've analyzed your Next.js e-commerce project. I see you have:
+- Partial Clerk auth implementation
+- PostgreSQL with Prisma
+- No payment system yet
+- Plans for auth migration and API v2
+
+What features are you building? I'll create a comprehensive build guide.
+
+User: I need to finish auth, add Stripe payments, and build an admin dashboard
+
+Plan agent: Creating buildguide.md with 3 main sections...
+[Creates detailed buildguide.md with architecture-aware implementation plans]
+```
+
+## Example: Adding Research to Existing Build
+
+```
+User: [researches Stripe pricing, finds $0.30 + 2.9% per transaction]
+User: /collect
+
+Claude: buildguide.md exists. Scanning for updates...
+
+[Spawns 2 explore agents - doc scanner + codebase scanner]
+[Collects pricing research from conversation]
+
+[Spawns Plan agent]
+
+Plan agent: I see you researched Stripe pricing. Your buildguide.md shows:
+- Payments section is pending (80% of plugin complete)
+- Current approach: "Integrate Stripe Checkout"
+
+This pricing info affects implementation. Options:
+
+1. **Add to existing Payments section**
+   - Update implementation approach with pricing tiers
+   - Add note about volume discounts at $80k+/mo
+
+2. **Create new Pricing subsection**
+   - Separate pricing logic from payment flow
+   - Allows for future pricing strategy changes
+
+3. **Update architecture for metered billing**
+   - If you need usage-based pricing, requires webhook changes
+
+Which approach fits your needs?
+
+User: Option 1, just add it to payments
+
+Claude: Updated buildguide.md:
+- Added Stripe pricing research to Payments section
+- Updated implementation approach with cost considerations
+- Next: Complete payments integration, then run /checkpoint
+```
+
+---
+
+## Guidelines
+
+- **Always spawns agents** - First run: 3 explore + Plan. Updates: 2 explore + Plan
+- **Scan everywhere** - Not just plans folder, ALL documentation in the project
+- **Plan agent proposes** - Presents options for how to integrate research, asks user
+- **Architecture-aware** - Every change considers current build state and structure
+- **Does NOT mark complete** - That's `/checkpoint`'s job
+- **Living document** - Grows and evolves as you research and plan
+
+## Command Responsibilities
+
+| Command | Purpose |
+|---------|---------|
+| `/collect` | Gather research → Plan how to integrate → Update implementation approaches |
+| `/checkpoint` | Mark section complete → Move to Completed → Advance to next section |

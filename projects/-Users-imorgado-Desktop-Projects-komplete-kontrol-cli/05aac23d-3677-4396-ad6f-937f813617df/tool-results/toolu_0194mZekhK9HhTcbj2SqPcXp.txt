@@ -1,0 +1,309 @@
+     1→#!/bin/bash
+     2→# Auto-Continue Hook - Fully automated context management with quality awareness
+     3→# V2 Enhanced with: context event tracking, sliding window fallback
+     4→# When context hits threshold:
+     5→# 1. Checks if build is in progress
+     6→# 2. Runs validation before checkpoint
+     7→# 3. Saves state and creates continuation prompt
+     8→# 4. Feeds prompt back to keep running
+     9→
+    10→set -euo pipefail
+    11→
+    12→THRESHOLD=${CLAUDE_CONTEXT_THRESHOLD:-40}
+    13→LOG_FILE="${HOME}/.claude/auto-continue.log"
+    14→STATE_FILE=".claude/auto-continue.local.md"
+    15→BUILD_STATE=".claude/current-build.local.md"
+    16→
+    17→# V2 Integration
+    18→SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    19→EVENT_TRACKER="${SCRIPT_DIR}/context-event-tracker.sh"
+    20→SLIDING_WINDOW="${SCRIPT_DIR}/sliding-window.sh"
+    21→
+    22→log() {
+    23→    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    24→}
+    25→
+    26→# Read hook input
+    27→HOOK_INPUT=$(cat)
+    28→
+    29→# Extract context info
+    30→CONTEXT_SIZE=$(echo "$HOOK_INPUT" | jq -r '.context_window.context_window_size // 200000')
+    31→USAGE=$(echo "$HOOK_INPUT" | jq '.context_window.current_usage // null')
+    32→TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // ""')
+    33→
+    34→if [[ "$USAGE" == "null" ]]; then
+    35→    log "No usage data - allowing stop"
+    36→    exit 0
+    37→fi
+    38→
+    39→# Calculate percentage
+    40→INPUT_TOKENS=$(echo "$USAGE" | jq -r '.input_tokens // 0')
+    41→CACHE_CREATE=$(echo "$USAGE" | jq -r '.cache_creation_input_tokens // 0')
+    42→CACHE_READ=$(echo "$USAGE" | jq -r '.cache_read_input_tokens // 0')
+    43→CURRENT_TOKENS=$((INPUT_TOKENS + CACHE_CREATE + CACHE_READ))
+    44→PERCENT=$((CURRENT_TOKENS * 100 / CONTEXT_SIZE))
+    45→
+    46→log "Context: ${PERCENT}% (${CURRENT_TOKENS}/${CONTEXT_SIZE})"
+    47→
+    48→# Check if auto-continue is disabled
+    49→if [[ -f ".claude/auto-continue-disabled" ]]; then
+    50→    log "Auto-continue disabled - allowing stop"
+    51→    exit 0
+    52→fi
+    53→
+    54→# Check for stop words in last message
+    55→if [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+    56→    LAST_USER=$(grep '"role":"user"' "$TRANSCRIPT_PATH" | tail -1 | jq -r '.message.content[0].text // ""' 2>/dev/null || echo "")
+    57→    if echo "$LAST_USER" | grep -qiE '\b(stop|pause|hold|wait|quit)\b'; then
+    58→        log "Stop word detected - allowing stop"
+    59→        exit 0
+    60→    fi
+    61→fi
+    62→
+    63→# Below threshold - allow normal stop
+    64→if [[ $PERCENT -lt $THRESHOLD ]]; then
+    65→    exit 0
+    66→fi
+    67→
+    68→log "Threshold reached (${PERCENT}% >= ${THRESHOLD}%) - triggering auto-continue"
+    69→
+    70→# PHASE 1 & 4 INTEGRATION: Check context budget and create checkpoint
+    71→log "Checking memory context budget..."
+    72→MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+    73→CHECKPOINT_ID=""
+    74→
+    75→if [[ -x "$MEMORY_MANAGER" ]]; then
+    76→    # PHASE 4: Check context budget
+    77→    CONTEXT_USAGE=$("$MEMORY_MANAGER" context-usage 2>/dev/null || echo "{}")
+    78→    CONTEXT_STATUS=$(echo "$CONTEXT_USAGE" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+    79→
+    80→    if [[ "$CONTEXT_STATUS" == "critical" || "$CONTEXT_STATUS" == "warning" ]]; then
+    81→        log "⚠️  Memory context budget at warning/critical - compacting memory..."
+    82→
+    83→        # V2: Log event before compaction
+    84→        local before_tokens=$CURRENT_TOKENS
+    85→
+    86→        # Attempt compaction
+    87→        if "$MEMORY_MANAGER" context-compact 2>/dev/null; then
+    88→            log "✅ Memory compaction successful"
+    89→
+    90→            # V2: Log successful compaction event
+    91→            if [[ -x "$EVENT_TRACKER" ]]; then
+    92→                local after_tokens=$((CURRENT_TOKENS * 70 / 100))  # Estimate 30% reduction
+    93→                "$EVENT_TRACKER" log compact_memory "$before_tokens" "$after_tokens" "auto" "true" "" 2>/dev/null || true
+    94→            fi
+    95→        else
+    96→            log "⚠️  Memory compact failed - trying sliding window fallback"
+    97→
+    98→            # V2: Sliding window fallback
+    99→            if [[ -x "$SLIDING_WINDOW" ]]; then
+   100→                local strategy=$("$SLIDING_WINDOW" strategy "$CURRENT_TOKENS" "$CONTEXT_SIZE" 2>/dev/null || echo '{}')
+   101→                local should_truncate=$(echo "$strategy" | jq -r '.shouldTruncate // "false"')
+   102→
+   103→                if [[ "$should_truncate" == "true" ]]; then
+   104→                    log "📉 Applying sliding window truncation"
+   105→                    local plan=$("$SLIDING_WINDOW" truncate "$CURRENT_TOKENS" "$CONTEXT_SIZE" 60 2>/dev/null || echo '{}')
+   106→                    local target=$(echo "$plan" | jq -r '.targetTokens // 0')
+   107→
+   108→                    # Log event
+   109→                    if [[ -x "$EVENT_TRACKER" ]]; then
+   110→                        "$EVENT_TRACKER" log sliding_window "$before_tokens" "$target" "fallback" "true" "Compaction failed, used fallback" 2>/dev/null || true
+   111→                    fi
+   112→                fi
+   113→            fi
+   114→        fi
+   115→    fi
+   116→
+   117→    # PHASE 1: Create checkpoint with context percentage in description
+   118→    log "Creating memory checkpoint before Claude context compact..."
+   119→    CHECKPOINT_ID=$("$MEMORY_MANAGER" checkpoint "Auto-checkpoint at ${PERCENT}% context before compact" 2>/dev/null || echo "")
+   120→
+   121→    if [[ -n "$CHECKPOINT_ID" ]]; then
+   122→        log "✅ Memory checkpoint created: $CHECKPOINT_ID"
+   123→    else
+   124→        log "⚠️  Failed to create memory checkpoint"
+   125→    fi
+   126→else
+   127→    log "⚠️  memory-manager.sh not found - skipping checkpoint"
+   128→fi
+   129→
+   130→# Get current working directory info
+   131→PROJECT_NAME=$(basename "$(pwd)")
+   132→PROJECT_DIR=$(pwd)
+   133→
+   134→# Check if build is in progress
+   135→BUILD_CONTEXT=""
+   136→if [[ -f "$BUILD_STATE" ]]; then
+   137→    BUILD_FEATURE=$(grep '^feature:' "$BUILD_STATE" | sed 's/feature: *//' || echo "")
+   138→    BUILD_PHASE=$(grep '^phase:' "$BUILD_STATE" | sed 's/phase: *//' || echo "")
+   139→    BUILD_ITERATION=$(grep '^iteration:' "$BUILD_STATE" | sed 's/iteration: *//' || echo "1")
+   140→
+   141→    if [[ -n "$BUILD_FEATURE" ]] && [[ "$BUILD_PHASE" != "complete" ]]; then
+   142→        BUILD_CONTEXT="
+   143→**Active Build**: $BUILD_FEATURE (phase: $BUILD_PHASE, iteration: $BUILD_ITERATION)
+   144→Continue implementing this feature. Check .claude/current-build.local.md for progress."
+   145→    fi
+   146→fi
+   147→
+   148→# Read CLAUDE.md if exists
+   149→CLAUDE_MD_CONTENT=""
+   150→if [[ -f "CLAUDE.md" ]]; then
+   151→    CLAUDE_MD_CONTENT=$(head -50 CLAUDE.md 2>/dev/null || echo "")
+   152→fi
+   153→
+   154→# Read buildguide.md next section if exists
+   155→NEXT_SECTION=""
+   156→NEXT_SECTION_DETAIL=""
+   157→if [[ -f "buildguide.md" ]]; then
+   158→    # Get first unchecked section
+   159→    NEXT_SECTION=$(grep -m1 '^\- \[ \]' buildguide.md 2>/dev/null | sed 's/- \[ \] //' || echo "")
+   160→
+   161→    # Try to get the section details
+   162→    if [[ -n "$NEXT_SECTION" ]]; then
+   163→        # Find the section header and get content until next section
+   164→        SECTION_CONTENT=$(awk "/^## .*${NEXT_SECTION}/,/^## /" buildguide.md 2>/dev/null | head -30 || echo "")
+   165→        if [[ -n "$SECTION_CONTENT" ]]; then
+   166→            NEXT_SECTION_DETAIL="
+   167→**Next Section from buildguide.md**: $NEXT_SECTION
+   168→$SECTION_CONTENT"
+   169→        fi
+   170→    fi
+   171→fi
+   172→
+   173→# Check for architecture docs
+   174→ARCH_CONTEXT=""
+   175→for arch_file in "ARCHITECTURE.md" "docs/architecture.md" ".claude/docs/architecture.md"; do
+   176→    if [[ -f "$arch_file" ]]; then
+   177→        ARCH_CONTEXT="
+   178→**Architecture**: See $arch_file for system design."
+   179→        break
+   180→    fi
+   181→done
+   182→
+   183→# Check for stuck issues in debug-log
+   184→STUCK_ISSUES=""
+   185→if [[ -f ".claude/docs/debug-log.md" ]]; then
+   186→    STUCK=$(grep -c "STUCK" ".claude/docs/debug-log.md" 2>/dev/null || echo "0")
+   187→    STUCK=$(echo "$STUCK" | tr -d '\n' | tr -d ' ')
+   188→    if [[ -n "$STUCK" ]] && [[ "$STUCK" =~ ^[0-9]+$ ]] && [[ "$STUCK" -gt 0 ]]; then
+   189→        STUCK_ISSUES="
+   190→⚠️ $STUCK stuck issues in debug-log.md - may need review."
+   191→    fi
+   192→fi
+   193→
+   194→# Build continuation prompt (token-effective per Ken Kai principles)
+   195→# Short, focused, no essays - agent is smart
+   196→CHECKPOINT_INFO=""
+   197→if [[ -n "$CHECKPOINT_ID" ]]; then
+   198→    CHECKPOINT_INFO="
+   199→📋 Memory checkpoint: $CHECKPOINT_ID (restore with: memory-manager.sh restore $CHECKPOINT_ID)"
+   200→fi
+   201→
+   202→# Use intelligent command router to determine checkpoint action
+   203→COMMAND_ROUTER="${HOME}/.claude/hooks/autonomous-command-router.sh"
+   204→ROUTER_DECISION=""
+   205→SHOULD_EXECUTE_CHECKPOINT="false"
+   206→
+   207→if [[ -x "$COMMAND_ROUTER" ]]; then
+   208→    ROUTER_OUTPUT=$("$COMMAND_ROUTER" execute checkpoint_context "${CURRENT_TOKENS}/${CONTEXT_SIZE}" 2>/dev/null || echo '{}')
+   209→
+   210→    # Check if autonomous execution is signaled
+   211→    EXECUTE_SKILL=$(echo "$ROUTER_OUTPUT" | jq -r '.execute_skill // ""')
+   212→    if [[ "$EXECUTE_SKILL" == "checkpoint" ]]; then
+   213→        SHOULD_EXECUTE_CHECKPOINT="true"
+   214→        ROUTER_DECISION="$ROUTER_OUTPUT"
+   215→        log "Router decided: Auto-execute /checkpoint"
+   216→    fi
+   217→fi
+   218→
+   219→# Build continuation prompt based on autonomous mode and router decision
+   220→if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
+   221→    # AUTONOMOUS MODE: Direct Claude to execute /checkpoint skill immediately
+   222→    CONTINUATION_PROMPT="Auto-Continue (${PERCENT}% context)
+   223→
+   224→Context compacted. Executing autonomous checkpoint now.
+   225→
+   226→TASK: Use the Skill tool to execute checkpoint skill immediately.
+   227→- Call: Skill tool with skill=\"checkpoint\"
+   228→- Reason: Context threshold reached (${PERCENT}% of ${CONTEXT_SIZE} tokens)
+   229→- Mode: Autonomous execution (no confirmation needed)
+   230→
+   231→After checkpoint completes:
+   232→${BUILD_CONTEXT:+* Resume: .claude/current-build.local.md}${BUILD_CONTEXT:-* Next: Check buildguide.md for pending sections}${NEXT_SECTION:+
+   233→* Focus on: $NEXT_SECTION}
+   234→
+   235→This is autonomous mode - proceed immediately without asking."
+   236→else
+   237→    # NORMAL MODE: Suggest checkpoint to user
+   238→    CONTINUATION_PROMPT="Continue ${PROJECT_NAME}. Context: ${PERCENT}%.${CHECKPOINT_INFO}
+   239→${BUILD_CONTEXT}${NEXT_SECTION:+Next: $NEXT_SECTION}${STUCK_ISSUES}
+   240→
+   241→Recommendation: Run /checkpoint to save progress before continuing.
+   242→
+   243→${BUILD_CONTEXT:+Resume: .claude/current-build.local.md}${BUILD_CONTEXT:-Check: buildguide.md}
+   244→
+   245→Ken's rules: Short > long. Reference, don't dump. Stay focused."
+   246→fi
+   247→
+   248→# Track iteration
+   249→ITERATION=1
+   250→if [[ -f "$STATE_FILE" ]]; then
+   251→    ITERATION=$(grep '^iteration:' "$STATE_FILE" | sed 's/iteration: *//' || echo "1")
+   252→    ITERATION=$((ITERATION + 1))
+   253→fi
+   254→
+   255→# Create/update state file
+   256→mkdir -p .claude
+   257→cat > "$STATE_FILE" <<EOF
+   258→---
+   259→active: true
+   260→iteration: $ITERATION
+   261→threshold: $THRESHOLD
+   262→last_percent: $PERCENT
+   263→last_compact: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   264→build_active: $(if [[ -n "$BUILD_CONTEXT" ]]; then echo "true"; else echo "false"; fi)
+   265→---
+   266→
+   267→Auto-continue active. Iteration ${ITERATION}.
+   268→EOF
+   269→
+   270→# Output JSON to block stop and feed continuation prompt
+   271→# Include router decision for autonomous skill execution
+   272→SYSTEM_MSG="Auto-continue: Context ${PERCENT}% compacted (iteration ${ITERATION})${BUILD_CONTEXT:+ | Build: $BUILD_FEATURE}"
+   273→
+   274→if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
+   275→    # Autonomous mode: Include execution metadata
+   276→    jq -n \
+   277→        --arg prompt "$CONTINUATION_PROMPT" \
+   278→        --arg msg "$SYSTEM_MSG | Auto-executing /checkpoint" \
+   279→        --argjson router "$ROUTER_DECISION" \
+   280→        '{
+   281→            "decision": "block",
+   282→            "reason": $prompt,
+   283→            "systemMessage": $msg,
+   284→            "autonomous_execution": {
+   285→                "enabled": true,
+   286→                "skill": "checkpoint",
+   287→                "reason": "context_threshold",
+   288→                "router_decision": $router
+   289→            }
+   290→        }'
+   291→else
+   292→    # Normal mode: Just continuation prompt
+   293→    jq -n \
+   294→        --arg prompt "$CONTINUATION_PROMPT" \
+   295→        --arg msg "$SYSTEM_MSG" \
+   296→        '{
+   297→            "decision": "block",
+   298→            "reason": $prompt,
+   299→            "systemMessage": $msg
+   300→        }'
+   301→fi
+   302→
+   303→log "Auto-continue triggered - iteration $ITERATION"
+   304→exit 0
+   305→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

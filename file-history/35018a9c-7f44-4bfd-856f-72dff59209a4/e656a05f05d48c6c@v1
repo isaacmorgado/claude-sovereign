@@ -1,0 +1,179 @@
+import { Worker, Job } from 'bullmq'
+import { redis } from '../config/redis.js'
+import { env } from '../config/env.js'
+import * as audioService from '../services/audio-service.js'
+import type { AudioJobQueueData, TranscriptionResult } from '../types/audio.js'
+
+const QUEUE_NAME = audioService.QUEUE_NAMES.transcription
+
+async function processTranscriptionJob(job: Job<AudioJobQueueData>): Promise<void> {
+  const { jobId, audioUrl } = job.data
+
+  console.log(`Processing transcription job ${jobId}`)
+
+  await audioService.markJobProcessing(jobId)
+  await audioService.updateJobProgress(jobId, 10)
+
+  try {
+    // Update progress before API call
+    await audioService.updateJobProgress(jobId, 30)
+
+    const result = await transcribeAudio(audioUrl)
+
+    // Update progress after API call completes
+    await audioService.updateJobProgress(jobId, 90)
+
+    await audioService.markJobCompleted(jobId, null, result as unknown as Record<string, unknown>)
+
+    console.log(`Transcription job ${jobId} completed successfully`)
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    console.error(`Transcription job ${jobId} failed:`, errorMessage)
+    throw error
+  }
+}
+
+async function transcribeAudio(audioUrl: string): Promise<TranscriptionResult> {
+  if (env.DEEPGRAM_API_KEY) {
+    return transcribeWithDeepgram(audioUrl, env.DEEPGRAM_API_KEY)
+  }
+
+  if (env.WHISPER_API_URL) {
+    return transcribeWithWhisper(audioUrl, env.WHISPER_API_URL)
+  }
+
+  throw new Error('No transcription service configured. Set DEEPGRAM_API_KEY or WHISPER_API_URL.')
+}
+
+async function transcribeWithDeepgram(
+  audioUrl: string,
+  apiKey: string
+): Promise<TranscriptionResult> {
+  const response = await fetch(
+    'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ url: audioUrl }),
+    }
+  )
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Deepgram API error: ${String(response.status)} - ${errorText}`)
+  }
+
+  const data = (await response.json()) as DeepgramResponse
+
+  const channel = data.results?.channels?.[0]
+  const alternative = channel?.alternatives?.[0]
+
+  if (!alternative) {
+    throw new Error('No transcription result from Deepgram')
+  }
+
+  return {
+    text: alternative.transcript,
+    segments: (alternative.words ?? []).map((word) => ({
+      start: word.start,
+      end: word.end,
+      text: word.word,
+      confidence: word.confidence,
+    })),
+    language: data.results?.channels?.[0]?.detected_language ?? 'en',
+    confidence: alternative.confidence,
+  }
+}
+
+async function transcribeWithWhisper(
+  audioUrl: string,
+  apiUrl: string
+): Promise<TranscriptionResult> {
+  const response = await fetch(apiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ audio_url: audioUrl }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Whisper API error: ${String(response.status)} - ${errorText}`)
+  }
+
+  const data = (await response.json()) as WhisperResponse
+
+  return {
+    text: data.text,
+    segments: (data.segments ?? []).map((segment) => ({
+      start: segment.start,
+      end: segment.end,
+      text: segment.text,
+      confidence: segment.confidence ?? 1.0,
+    })),
+    language: data.language ?? 'en',
+    confidence: data.confidence ?? 1.0,
+  }
+}
+
+interface DeepgramResponse {
+  results?: {
+    channels?: Array<{
+      detected_language?: string
+      alternatives?: Array<{
+        transcript: string
+        confidence: number
+        words?: Array<{
+          word: string
+          start: number
+          end: number
+          confidence: number
+        }>
+      }>
+    }>
+  }
+}
+
+interface WhisperResponse {
+  text: string
+  language?: string
+  confidence?: number
+  segments?: Array<{
+    start: number
+    end: number
+    text: string
+    confidence?: number
+  }>
+}
+
+export function startTranscriptionWorker(): Worker<AudioJobQueueData> {
+  const worker = new Worker<AudioJobQueueData>(QUEUE_NAME, processTranscriptionJob, {
+    connection: redis,
+    concurrency: 3,
+  })
+
+  worker.on('completed', (job) => {
+    console.log(`Job ${String(job.id)} completed`)
+  })
+
+  worker.on('failed', (job, err) => {
+    if (job) {
+      console.error(`Job ${String(job.id)} failed with error: ${err.message}`)
+      audioService.markJobFailed(job.data.jobId, err.message).catch((e: unknown) => {
+        console.error('Failed to mark job as failed:', e)
+      })
+    }
+  })
+
+  worker.on('error', (err) => {
+    console.error('Worker error:', err)
+  })
+
+  console.log(`Transcription worker started, listening on queue: ${QUEUE_NAME}`)
+
+  return worker
+}

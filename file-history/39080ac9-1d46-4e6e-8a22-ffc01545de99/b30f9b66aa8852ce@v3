@@ -1,0 +1,1043 @@
+#!/bin/bash
+# Memory Manager - Persistent memory for Claude Code sessions
+# Based on patterns from: MemGPT/Letta, Generative Agents (Stanford), Mem0, LangChain, CrewAI
+#
+# Supports both global and project-scoped memory:
+# - Global: ~/.claude/memory/ (shared across all projects)
+# - Project: .claude/memory/ (project-specific, auto-detected)
+#
+# Set MEMORY_SCOPE=project to force project-local memory
+# Set MEMORY_SCOPE=global to force global memory
+
+set -uo pipefail
+
+# Detect project root (look for .git, package.json, Cargo.toml, etc.)
+find_project_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -f "$dir/package.json" ]] || \
+           [[ -f "$dir/Cargo.toml" ]] || [[ -f "$dir/go.mod" ]] || \
+           [[ -f "$dir/pyproject.toml" ]] || [[ -f "$dir/CLAUDE.md" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Determine memory directory based on scope
+get_memory_dir() {
+    local scope="${MEMORY_SCOPE:-auto}"
+
+    if [[ "$scope" == "project" ]]; then
+        local project_root
+        if project_root=$(find_project_root); then
+            echo "$project_root/.claude/memory"
+            return 0
+        fi
+    elif [[ "$scope" == "global" ]]; then
+        echo "${HOME}/.claude/memory"
+        return 0
+    fi
+
+    # Auto mode: use project memory if in a project, otherwise global
+    local project_root
+    if project_root=$(find_project_root); then
+        echo "$project_root/.claude/memory"
+    else
+        echo "${HOME}/.claude/memory"
+    fi
+}
+
+MEMORY_DIR="$(get_memory_dir)"
+WORKING_MEMORY="$MEMORY_DIR/working.json"
+EPISODIC_MEMORY="$MEMORY_DIR/episodic.json"
+SEMANTIC_MEMORY="$MEMORY_DIR/semantic.json"
+ACTION_LOG="$MEMORY_DIR/actions.jsonl"
+REFLECTION_LOG="$MEMORY_DIR/reflections.json"
+LOG_FILE="${HOME}/.claude/memory-manager.log"
+
+# Memory limits
+MAX_WORKING_ITEMS="${MAX_WORKING_ITEMS:-50}"
+MAX_EPISODIC_ITEMS="${MAX_EPISODIC_ITEMS:-1000}"
+MAX_SEMANTIC_ITEMS="${MAX_SEMANTIC_ITEMS:-500}"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+init_memory() {
+    mkdir -p "$MEMORY_DIR"
+
+    # Initialize working memory (current session state)
+    if [[ ! -f "$WORKING_MEMORY" ]]; then
+        cat > "$WORKING_MEMORY" << 'EOF'
+{
+    "currentTask": null,
+    "currentContext": [],
+    "recentActions": [],
+    "pendingItems": [],
+    "scratchpad": "",
+    "lastUpdated": null
+}
+EOF
+    fi
+
+    # Initialize episodic memory (past experiences)
+    if [[ ! -f "$EPISODIC_MEMORY" ]]; then
+        echo '{"episodes":[]}' > "$EPISODIC_MEMORY"
+    fi
+
+    # Initialize semantic memory (facts and knowledge)
+    if [[ ! -f "$SEMANTIC_MEMORY" ]]; then
+        echo '{"facts":[],"patterns":[],"preferences":[]}' > "$SEMANTIC_MEMORY"
+    fi
+
+    # Initialize reflections
+    if [[ ! -f "$REFLECTION_LOG" ]]; then
+        echo '{"reflections":[]}' > "$REFLECTION_LOG"
+    fi
+
+    # Initialize action log (JSONL)
+    if [[ ! -f "$ACTION_LOG" ]]; then
+        touch "$ACTION_LOG"
+    fi
+}
+
+# =============================================================================
+# WORKING MEMORY (Short-term, current session)
+# Based on: MemGPT core memory, Generative Agents scratch
+# =============================================================================
+
+# Set current task
+set_task() {
+    local task="$1"
+    local context="${2:-}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    jq --arg task "$task" \
+       --arg context "$context" \
+       --arg ts "$timestamp" \
+       '
+       .currentTask = $task |
+       .currentContext = (if $context != "" then [{content: $context, importance: 5, addedAt: $ts}] else [] end) |
+       .lastUpdated = $ts
+       ' "$WORKING_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$WORKING_MEMORY"
+    log "Set task: $task"
+}
+
+# Add to current context
+add_context() {
+    local context="$1"
+    local importance="${2:-5}"  # 1-10 scale
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    jq --arg ctx "$context" \
+       --argjson imp "$importance" \
+       --arg ts "$timestamp" \
+       '
+       .currentContext += [{
+           content: $ctx,
+           importance: $imp,
+           addedAt: $ts
+       }] |
+       .currentContext = (.currentContext | sort_by(-.importance) | .[0:20]) |
+       .lastUpdated = $ts
+       ' "$WORKING_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$WORKING_MEMORY"
+    log "Added context (importance: $importance)"
+}
+
+# Update scratchpad (quick notes)
+update_scratchpad() {
+    local note="$1"
+    local append="${2:-true}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if [[ "$append" == "true" ]]; then
+        jq --arg note "$note" \
+           --arg ts "$timestamp" \
+           '
+           .scratchpad = (.scratchpad + "\n" + $ts + ": " + $note) |
+           .lastUpdated = $ts
+           ' "$WORKING_MEMORY" > "$temp_file"
+    else
+        jq --arg note "$note" \
+           --arg ts "$timestamp" \
+           '
+           .scratchpad = $note |
+           .lastUpdated = $ts
+           ' "$WORKING_MEMORY" > "$temp_file"
+    fi
+
+    mv "$temp_file" "$WORKING_MEMORY"
+}
+
+# Get working memory state
+get_working() {
+    init_memory
+    jq '.' "$WORKING_MEMORY"
+}
+
+# Clear working memory (new session)
+clear_working() {
+    init_memory
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    cat > "$WORKING_MEMORY" << EOF
+{
+    "currentTask": null,
+    "currentContext": [],
+    "recentActions": [],
+    "pendingItems": [],
+    "scratchpad": "",
+    "lastUpdated": "$timestamp"
+}
+EOF
+    log "Cleared working memory"
+}
+
+# =============================================================================
+# EPISODIC MEMORY (Past experiences/episodes)
+# Based on: Generative Agents memory stream, MemGPT archival memory
+# =============================================================================
+
+# Record an episode (completed task/action)
+record_episode() {
+    local type="$1"        # task_complete, error_fixed, research_done, etc.
+    local description="$2"
+    local outcome="${3:-success}"
+    local details="${4:-}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local episode_id
+    episode_id="ep_$(date +%s%N | cut -c1-13)"
+
+    # Calculate importance based on type and outcome
+    local importance=5
+    case "$type" in
+        error_fixed) importance=8 ;;
+        task_complete) importance=7 ;;
+        research_done) importance=6 ;;
+        pattern_learned) importance=9 ;;
+        failure) importance=7 ;;
+    esac
+
+    jq --arg id "$episode_id" \
+       --arg type "$type" \
+       --arg desc "$description" \
+       --arg outcome "$outcome" \
+       --arg details "$details" \
+       --argjson imp "$importance" \
+       --arg ts "$timestamp" \
+       '
+       .episodes = [{
+           id: $id,
+           type: $type,
+           description: $desc,
+           outcome: $outcome,
+           details: $details,
+           importance: $imp,
+           timestamp: $ts,
+           accessCount: 0,
+           lastAccessed: null
+       }] + .episodes |
+       .episodes = .episodes[0:'"$MAX_EPISODIC_ITEMS"']
+       ' "$EPISODIC_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$EPISODIC_MEMORY"
+    log "Recorded episode: $type - $description"
+    echo "$episode_id"
+}
+
+# Search episodes (simple text match)
+search_episodes() {
+    local query="$1"
+    local limit="${2:-10}"
+
+    init_memory
+
+    jq --arg q "$query" \
+       --argjson limit "$limit" \
+       '
+       .episodes |
+       map(select(
+           (.description | ascii_downcase | contains($q | ascii_downcase)) or
+           (.details | ascii_downcase | contains($q | ascii_downcase)) or
+           (.type | ascii_downcase | contains($q | ascii_downcase))
+       )) |
+       sort_by(.importance | (- if type == "number" then . else 0 end)) |
+       .[0:$limit]
+       ' "$EPISODIC_MEMORY"
+}
+
+# Get recent episodes
+get_recent_episodes() {
+    local limit="${1:-10}"
+    local type_filter="${2:-}"
+
+    init_memory
+
+    if [[ -n "$type_filter" ]]; then
+        jq --arg type "$type_filter" \
+           --argjson limit "$limit" \
+           '.episodes | map(select(.type == $type)) | .[0:$limit]' "$EPISODIC_MEMORY"
+    else
+        jq --argjson limit "$limit" \
+           '.episodes | .[0:$limit]' "$EPISODIC_MEMORY"
+    fi
+}
+
+# =============================================================================
+# SEMANTIC MEMORY (Facts, patterns, preferences)
+# Based on: MemGPT persona/human blocks, knowledge graphs
+# =============================================================================
+
+# Add a fact
+add_fact() {
+    local category="$1"    # project, user, tool, api, etc.
+    local key="$2"
+    local value="$3"
+    local confidence="${4:-0.8}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Update or insert fact
+    jq --arg cat "$category" \
+       --arg key "$key" \
+       --arg val "$value" \
+       --argjson conf "$confidence" \
+       --arg ts "$timestamp" \
+       '
+       .facts = [.facts[] | select(.category != $cat or .key != $key)] + [{
+           category: $cat,
+           key: $key,
+           value: $val,
+           confidence: $conf,
+           updatedAt: $ts
+       }] |
+       .facts = (.facts | sort_by(.category, .key) | .[0:'"$MAX_SEMANTIC_ITEMS"'])
+       ' "$SEMANTIC_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$SEMANTIC_MEMORY"
+    log "Added fact: $category/$key"
+}
+
+# Get a fact
+get_fact() {
+    local category="$1"
+    local key="$2"
+
+    init_memory
+
+    jq --arg cat "$category" \
+       --arg key "$key" \
+       '.facts[] | select(.category == $cat and .key == $key)' "$SEMANTIC_MEMORY"
+}
+
+# Get all facts in category
+get_facts_by_category() {
+    local category="$1"
+
+    init_memory
+
+    jq --arg cat "$category" \
+       '.facts | map(select(.category == $cat))' "$SEMANTIC_MEMORY"
+}
+
+# Add a learned pattern
+add_pattern() {
+    local pattern_type="$1"   # error_fix, optimization, workflow, etc.
+    local trigger="$2"        # What triggers this pattern
+    local solution="$3"       # The solution/action
+    local success_rate="${4:-1.0}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local pattern_id
+    pattern_id="pat_$(date +%s%N | cut -c1-13)"
+
+    jq --arg id "$pattern_id" \
+       --arg type "$pattern_type" \
+       --arg trigger "$trigger" \
+       --arg solution "$solution" \
+       --argjson rate "$success_rate" \
+       --arg ts "$timestamp" \
+       '
+       .patterns = [{
+           id: $id,
+           type: $type,
+           trigger: $trigger,
+           solution: $solution,
+           successRate: $rate,
+           useCount: 0,
+           createdAt: $ts
+       }] + .patterns |
+       .patterns = .patterns[0:200]
+       ' "$SEMANTIC_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$SEMANTIC_MEMORY"
+    log "Added pattern: $pattern_type"
+    echo "$pattern_id"
+}
+
+# Find matching patterns
+find_patterns() {
+    local query="$1"
+    local limit="${2:-5}"
+
+    init_memory
+
+    jq --arg q "$query" \
+       --argjson limit "$limit" \
+       '
+       .patterns |
+       map(select(
+           (.trigger | ascii_downcase | contains($q | ascii_downcase)) or
+           (.type | ascii_downcase | contains($q | ascii_downcase))
+       )) |
+       sort_by(-.successRate, -.useCount) |
+       .[0:$limit]
+       ' "$SEMANTIC_MEMORY"
+}
+
+# Add user preference
+add_preference() {
+    local key="$1"
+    local value="$2"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    jq --arg key "$key" \
+       --arg val "$value" \
+       --arg ts "$timestamp" \
+       '
+       .preferences = [.preferences[] | select(.key != $key)] + [{
+           key: $key,
+           value: $val,
+           updatedAt: $ts
+       }]
+       ' "$SEMANTIC_MEMORY" > "$temp_file"
+
+    mv "$temp_file" "$SEMANTIC_MEMORY"
+    log "Set preference: $key"
+}
+
+# Get preference
+get_preference() {
+    local key="$1"
+    local default="${2:-}"
+
+    init_memory
+
+    local value
+    value=$(jq -r --arg key "$key" \
+       '.preferences[] | select(.key == $key) | .value' "$SEMANTIC_MEMORY")
+
+    if [[ -n "$value" && "$value" != "null" ]]; then
+        echo "$value"
+    else
+        echo "$default"
+    fi
+}
+
+# =============================================================================
+# ACTION LOG (Append-only log of all actions)
+# Based on: Generative Agents memory stream
+# =============================================================================
+
+# Log an action
+log_action() {
+    local action_type="$1"   # tool_call, edit, search, etc.
+    local description="$2"
+    local result="${3:-}"
+    local metadata="${4:-}"
+
+    init_memory
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local action_id
+    action_id="act_$(date +%s%N | cut -c1-13)"
+
+    # Validate or default metadata to empty object
+    if [[ -z "$metadata" ]] || ! echo "$metadata" | jq -e . >/dev/null 2>&1; then
+        metadata='{}'
+    fi
+
+    # Append to JSONL file
+    jq -n -c \
+       --arg id "$action_id" \
+       --arg type "$action_type" \
+       --arg desc "$description" \
+       --arg result "$result" \
+       --argjson meta "$metadata" \
+       --arg ts "$timestamp" \
+       '{
+           id: $id,
+           type: $type,
+           description: $desc,
+           result: $result,
+           metadata: $meta,
+           timestamp: $ts
+       }' >> "$ACTION_LOG"
+
+    log "Logged action: $action_type"
+    echo "$action_id"
+}
+
+# Get recent actions
+get_recent_actions() {
+    local limit="${1:-20}"
+    local type_filter="${2:-}"
+
+    init_memory
+
+    if [[ ! -f "$ACTION_LOG" ]]; then
+        echo "[]"
+        return
+    fi
+
+    if [[ -n "$type_filter" ]]; then
+        tail -n 1000 "$ACTION_LOG" | jq -s --arg type "$type_filter" \
+           'map(select(.type == $type)) | reverse | .[0:'"$limit"']'
+    else
+        tail -n "$limit" "$ACTION_LOG" | jq -s 'reverse'
+    fi
+}
+
+# Search action log
+search_actions() {
+    local query="$1"
+    local limit="${2:-20}"
+
+    init_memory
+
+    if [[ ! -f "$ACTION_LOG" ]]; then
+        echo "[]"
+        return
+    fi
+
+    grep -i "$query" "$ACTION_LOG" 2>/dev/null | tail -n "$limit" | jq -s '.'
+}
+
+# =============================================================================
+# REFLECTION (Memory consolidation)
+# Based on: Generative Agents reflection, MemGPT summarization
+# =============================================================================
+
+# Create a reflection (consolidate recent experiences)
+create_reflection() {
+    local focus="${1:-general}"  # general, errors, patterns, progress
+    local content="$2"
+    local insights="${3:-}"
+
+    init_memory
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local reflection_id
+    reflection_id="ref_$(date +%s)"
+
+    jq --arg id "$reflection_id" \
+       --arg focus "$focus" \
+       --arg content "$content" \
+       --arg insights "$insights" \
+       --arg ts "$timestamp" \
+       '
+       .reflections = [{
+           id: $id,
+           focus: $focus,
+           content: $content,
+           insights: $insights,
+           timestamp: $ts
+       }] + .reflections |
+       .reflections = .reflections[0:100]
+       ' "$REFLECTION_LOG" > "$temp_file"
+
+    mv "$temp_file" "$REFLECTION_LOG"
+    log "Created reflection: $focus"
+    echo "$reflection_id"
+}
+
+# Get reflections
+get_reflections() {
+    local focus="${1:-}"
+    local limit="${2:-10}"
+
+    init_memory
+
+    if [[ -n "$focus" ]]; then
+        jq --arg focus "$focus" \
+           --argjson limit "$limit" \
+           '.reflections | map(select(.focus == $focus)) | .[0:$limit]' "$REFLECTION_LOG"
+    else
+        jq --argjson limit "$limit" \
+           '.reflections | .[0:$limit]' "$REFLECTION_LOG"
+    fi
+}
+
+# =============================================================================
+# MEMORY RETRIEVAL (Combined search across all memory types)
+# Based on: Generative Agents retrieval (recency + relevance + importance)
+# =============================================================================
+
+# Calculate recency score with exponential decay
+# Formula: decay_rate ^ hours_since_access
+calculate_recency_score() {
+    local timestamp="$1"
+    local decay_rate="${2:-0.995}"
+
+    # Get hours since timestamp
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    local ts_epoch
+    ts_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" +%s 2>/dev/null || echo "$now_epoch")
+
+    local hours_ago
+    hours_ago=$(( (now_epoch - ts_epoch) / 3600 ))
+
+    # Calculate decay (using bc for floating point)
+    echo "scale=4; e(l($decay_rate) * $hours_ago)" | bc -l 2>/dev/null || echo "0.5"
+}
+
+# Calculate relevance score (keyword overlap)
+calculate_relevance_score() {
+    local query="$1"
+    local content="$2"
+
+    # Normalize to lowercase and split into words
+    local query_words
+    query_words=$(echo "$query" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sort -u)
+
+    local content_words
+    content_words=$(echo "$content" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sort -u)
+
+    # Count matching words
+    local matches=0
+    local total=0
+    for word in $query_words; do
+        total=$((total + 1))
+        if echo "$content_words" | grep -qw "$word"; then
+            matches=$((matches + 1))
+        fi
+    done
+
+    # Return overlap ratio
+    if [[ $total -gt 0 ]]; then
+        echo "scale=4; $matches / $total" | bc -l 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Advanced retrieval with three-factor scoring
+# Based on Generative Agents: recency + relevance + importance
+retrieve_scored() {
+    local query="$1"
+    local limit="${2:-10}"
+    local recency_weight="${3:-0.5}"
+    local relevance_weight="${4:-3.0}"
+    local importance_weight="${5:-2.0}"
+
+    init_memory
+
+    local results="[]"
+
+    # Score episodic memories
+    local episodes
+    episodes=$(jq '.episodes' "$EPISODIC_MEMORY")
+
+    while IFS= read -r episode; do
+        if [[ -z "$episode" || "$episode" == "null" ]]; then
+            continue
+        fi
+
+        local description
+        description=$(echo "$episode" | jq -r '.description')
+
+        local timestamp
+        timestamp=$(echo "$episode" | jq -r '.timestamp')
+
+        local importance
+        importance=$(echo "$episode" | jq -r '.importance // 5')
+
+        # Calculate scores
+        local recency_score
+        recency_score=$(calculate_recency_score "$timestamp")
+
+        local relevance_score
+        relevance_score=$(calculate_relevance_score "$query" "$description")
+
+        # Normalize importance to 0-1
+        local importance_score
+        importance_score=$(echo "scale=4; $importance / 10" | bc -l 2>/dev/null || echo "0.5")
+
+        # Combined score with weights
+        local final_score
+        final_score=$(echo "scale=4; ($recency_weight * $recency_score) + ($relevance_weight * $relevance_score) + ($importance_weight * $importance_score)" | bc -l 2>/dev/null || echo "0")
+
+        # Add to results with score
+        results=$(echo "$results" | jq --argjson ep "$episode" --arg score "$final_score" \
+            '. + [($ep + {retrievalScore: ($score | tonumber), source: "episodic"})]')
+    done < <(echo "$episodes" | jq -c '.[]')
+
+    # Score patterns
+    local patterns
+    patterns=$(jq '.patterns' "$SEMANTIC_MEMORY")
+
+    while IFS= read -r pattern; do
+        if [[ -z "$pattern" || "$pattern" == "null" ]]; then
+            continue
+        fi
+
+        local trigger
+        trigger=$(echo "$pattern" | jq -r '.trigger')
+
+        local timestamp
+        timestamp=$(echo "$pattern" | jq -r '.createdAt')
+
+        local success_rate
+        success_rate=$(echo "$pattern" | jq -r '.successRate // 1.0')
+
+        # Calculate scores
+        local recency_score
+        recency_score=$(calculate_recency_score "$timestamp")
+
+        local relevance_score
+        relevance_score=$(calculate_relevance_score "$query" "$trigger")
+
+        # Use success rate as importance
+        local importance_score="$success_rate"
+
+        # Combined score
+        local final_score
+        final_score=$(echo "scale=4; ($recency_weight * $recency_score) + ($relevance_weight * $relevance_score) + ($importance_weight * $importance_score)" | bc -l 2>/dev/null || echo "0")
+
+        # Add to results
+        results=$(echo "$results" | jq --argjson pat "$pattern" --arg score "$final_score" \
+            '. + [($pat + {retrievalScore: ($score | tonumber), source: "pattern"})]')
+    done < <(echo "$patterns" | jq -c '.[]')
+
+    # Sort by score and return top results
+    echo "$results" | jq --argjson limit "$limit" \
+        'sort_by(-.retrievalScore) | .[0:$limit]'
+}
+
+# Unified memory search (simple)
+remember() {
+    local query="$1"
+    local limit="${2:-10}"
+
+    init_memory
+
+    echo "{"
+
+    # Search episodic memory
+    echo '"episodes":'
+    search_episodes "$query" "$limit"
+    echo ","
+
+    # Search patterns
+    echo '"patterns":'
+    find_patterns "$query" "$limit"
+    echo ","
+
+    # Search actions
+    echo '"actions":'
+    search_actions "$query" "$limit"
+
+    echo "}"
+}
+
+# Unified memory search (with scoring)
+remember_scored() {
+    local query="$1"
+    local limit="${2:-10}"
+
+    retrieve_scored "$query" "$limit"
+}
+
+# Get context for current task
+get_context() {
+    init_memory
+
+    echo "{"
+
+    # Working memory
+    echo '"working":'
+    get_working
+    echo ","
+
+    # Recent episodes
+    echo '"recentEpisodes":'
+    get_recent_episodes 5
+    echo ","
+
+    # Recent reflections
+    echo '"reflections":'
+    get_reflections "" 3
+
+    echo "}"
+}
+
+# =============================================================================
+# MEMORY STATISTICS
+# =============================================================================
+
+get_stats() {
+    init_memory
+
+    local episodic_count
+    episodic_count=$(jq '.episodes | length' "$EPISODIC_MEMORY")
+
+    local facts_count
+    facts_count=$(jq '.facts | length' "$SEMANTIC_MEMORY")
+
+    local patterns_count
+    patterns_count=$(jq '.patterns | length' "$SEMANTIC_MEMORY")
+
+    local actions_count
+    actions_count=$(wc -l < "$ACTION_LOG" 2>/dev/null || echo "0")
+
+    local reflections_count
+    reflections_count=$(jq '.reflections | length' "$REFLECTION_LOG")
+
+    jq -n \
+       --argjson episodes "$episodic_count" \
+       --argjson facts "$facts_count" \
+       --argjson patterns "$patterns_count" \
+       --argjson actions "$actions_count" \
+       --argjson reflections "$reflections_count" \
+       '{
+           episodicMemory: $episodes,
+           semanticFacts: $facts,
+           learnedPatterns: $patterns,
+           actionLog: $actions,
+           reflections: $reflections
+       }'
+}
+
+# =============================================================================
+# COMMAND INTERFACE
+# =============================================================================
+
+case "${1:-help}" in
+    # Working memory
+    set-task)
+        set_task "${2:-}" "${3:-}"
+        ;;
+    add-context)
+        add_context "${2:-}" "${3:-5}"
+        ;;
+    scratchpad)
+        update_scratchpad "${2:-}" "${3:-true}"
+        ;;
+    get-working)
+        get_working
+        ;;
+    clear-working)
+        clear_working
+        ;;
+
+    # Episodic memory
+    record)
+        record_episode "${2:-task}" "${3:-}" "${4:-success}" "${5:-}"
+        ;;
+    search-episodes)
+        search_episodes "${2:-}" "${3:-10}"
+        ;;
+    recent-episodes)
+        get_recent_episodes "${2:-10}" "${3:-}"
+        ;;
+
+    # Semantic memory
+    add-fact)
+        add_fact "${2:-}" "${3:-}" "${4:-}" "${5:-0.8}"
+        ;;
+    get-fact)
+        get_fact "${2:-}" "${3:-}"
+        ;;
+    facts)
+        get_facts_by_category "${2:-}"
+        ;;
+    add-pattern)
+        add_pattern "${2:-}" "${3:-}" "${4:-}" "${5:-1.0}"
+        ;;
+    find-patterns)
+        find_patterns "${2:-}" "${3:-5}"
+        ;;
+    set-pref)
+        add_preference "${2:-}" "${3:-}"
+        ;;
+    get-pref)
+        get_preference "${2:-}" "${3:-}"
+        ;;
+
+    # Action log
+    log-action)
+        log_action "${2:-}" "${3:-}" "${4:-}" "${5:-{}}"
+        ;;
+    recent-actions)
+        get_recent_actions "${2:-20}" "${3:-}"
+        ;;
+    search-actions)
+        search_actions "${2:-}" "${3:-20}"
+        ;;
+
+    # Reflection
+    reflect)
+        create_reflection "${2:-general}" "${3:-}" "${4:-}"
+        ;;
+    reflections)
+        get_reflections "${2:-}" "${3:-10}"
+        ;;
+
+    # Retrieval
+    remember)
+        remember "${2:-}" "${3:-10}"
+        ;;
+    remember-scored)
+        remember_scored "${2:-}" "${3:-10}"
+        ;;
+    context)
+        get_context
+        ;;
+
+    # Stats
+    stats)
+        get_stats
+        ;;
+
+    init)
+        init_memory
+        echo "Memory initialized at $MEMORY_DIR"
+        ;;
+
+    scope)
+        echo "Memory Scope Configuration"
+        echo ""
+        echo "Current settings:"
+        echo "  MEMORY_DIR: $MEMORY_DIR"
+        echo "  MEMORY_SCOPE: ${MEMORY_SCOPE:-auto}"
+        echo ""
+        project_root=$(find_project_root 2>/dev/null) && \
+            echo "  Project root: $project_root" || \
+            echo "  Project root: (none detected)"
+        echo ""
+        echo "To change scope, set MEMORY_SCOPE:"
+        echo "  export MEMORY_SCOPE=project  # Use project-local memory"
+        echo "  export MEMORY_SCOPE=global   # Use global memory"
+        echo "  export MEMORY_SCOPE=auto     # Auto-detect (default)"
+        ;;
+
+    help|*)
+        echo "Memory Manager - Persistent Agent Memory"
+        echo ""
+        echo "Usage: $0 <command> [args]"
+        echo ""
+        echo "Working Memory (current session):"
+        echo "  set-task <task> [context]        - Set current task"
+        echo "  add-context <text> [importance]  - Add context (1-10)"
+        echo "  scratchpad <note> [append]       - Update scratchpad"
+        echo "  get-working                      - Get working memory"
+        echo "  clear-working                    - Clear for new session"
+        echo ""
+        echo "Episodic Memory (past experiences):"
+        echo "  record <type> <desc> [outcome] [details] - Record episode"
+        echo "    Types: task_complete, error_fixed, research_done, pattern_learned"
+        echo "  search-episodes <query> [limit]  - Search episodes"
+        echo "  recent-episodes [limit] [type]   - Get recent episodes"
+        echo ""
+        echo "Semantic Memory (facts & patterns):"
+        echo "  add-fact <category> <key> <value> [confidence]"
+        echo "  get-fact <category> <key>        - Get a fact"
+        echo "  facts <category>                 - Get category facts"
+        echo "  add-pattern <type> <trigger> <solution> [success_rate]"
+        echo "  find-patterns <query> [limit]    - Find matching patterns"
+        echo "  set-pref <key> <value>           - Set preference"
+        echo "  get-pref <key> [default]         - Get preference"
+        echo ""
+        echo "Action Log:"
+        echo "  log-action <type> <desc> [result] [metadata]"
+        echo "  recent-actions [limit] [type]    - Get recent actions"
+        echo "  search-actions <query> [limit]   - Search actions"
+        echo ""
+        echo "Reflection:"
+        echo "  reflect <focus> <content> [insights]"
+        echo "  reflections [focus] [limit]      - Get reflections"
+        echo ""
+        echo "Retrieval:"
+        echo "  remember <query> [limit]         - Search all memory (simple)"
+        echo "  remember-scored <query> [limit]  - Search with 3-factor scoring"
+        echo "                                     (recency + relevance + importance)"
+        echo "  context                          - Get current context"
+        echo ""
+        echo "Management:"
+        echo "  stats                            - Memory statistics"
+        echo "  init                             - Initialize memory"
+        echo "  scope                            - Show memory scope info"
+        echo ""
+        echo "Environment:"
+        echo "  MEMORY_SCOPE=auto|project|global - Control memory location"
+        echo "  Current: $MEMORY_DIR"
+        ;;
+esac

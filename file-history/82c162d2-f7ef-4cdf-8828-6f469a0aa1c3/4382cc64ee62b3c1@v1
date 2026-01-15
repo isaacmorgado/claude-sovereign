@@ -1,0 +1,273 @@
+#!/usr/bin/env node
+/**
+ * Script to add Google OAuth support to model-proxy-server.js
+ * This patches the existing file to integrate OAuth authentication
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const PROXY_PATH = path.join(process.env.HOME, '.claude', 'model-proxy-server.js');
+const BACKUP_PATH = PROXY_PATH + '.pre-oauth';
+
+// Read the existing file
+let content = fs.readFileSync(PROXY_PATH, 'utf-8');
+
+// Backup if not already backed up
+if (!fs.existsSync(BACKUP_PATH)) {
+  fs.writeFileSync(BACKUP_PATH, content);
+  console.log('✓ Created backup at:', BACKUP_PATH);
+}
+
+// 1. Add OAuth CLI handling at the top (after existing requires)
+const cliHandling = `
+// Check for OAuth CLI flags
+const args = process.argv.slice(2);
+const isLoginCommand = args.includes('--gemini-login') || args.includes('--google-login');
+const isLogoutCommand = args.includes('--gemini-logout') || args.includes('--google-logout');
+
+// Handle OAuth commands before starting server
+if (isLoginCommand || isLogoutCommand) {
+  (async () => {
+    const { startOAuthLogin, clearTokens } = await import('./lib/gemini-oauth.js');
+
+    if (isLoginCommand) {
+      console.log('');
+      console.log('🔐 Starting Google OAuth login...');
+      console.log('');
+      try {
+        await startOAuthLogin();
+        console.log('');
+        console.log('✅ Google authentication successful!');
+        console.log('');
+        console.log('You can now use Google Gemini models without GOOGLE_API_KEY');
+        console.log('Example: /model google/gemini-2.0-flash');
+        console.log('');
+      } catch (error) {
+        console.error('');
+        console.error('❌ OAuth login failed:', error.message);
+        console.error('');
+        process.exit(1);
+      }
+    } else if (isLogoutCommand) {
+      console.log('');
+      console.log('🔓 Clearing Google OAuth tokens...');
+      const cleared = await clearTokens();
+      if (cleared) {
+        console.log('✓ Logged out successfully');
+      } else {
+        console.log('ℹ No tokens found');
+      }
+      console.log('');
+    }
+
+    process.exit(0);
+  })();
+  return; // Don't start server
+}
+`;
+
+// Find the line after "const { URL } = require('url');" and insert CLI handling
+const urlRequireLine = content.indexOf("const { URL } = require('url');");
+if (urlRequireLine !== -1) {
+  const insertPos = content.indexOf('\n', urlRequireLine) + 1;
+  content = content.slice(0, insertPos) + cliHandling + content.slice(insertPos);
+  console.log('✓ Added OAuth CLI handling');
+}
+
+// 2. Add OAuth helper functions after log function
+const oauthHelpers = `
+// OAuth module (loaded dynamically when needed)
+let oauthModule = null;
+async function getOAuthModule() {
+  if (!oauthModule) {
+    oauthModule = await import('./lib/gemini-oauth.js');
+  }
+  return oauthModule;
+}
+
+/**
+ * Get Google API authentication (OAuth token or API key)
+ * Returns { type: 'oauth' | 'apikey', token: string } or null
+ */
+async function getGoogleAuth() {
+  // Try OAuth first
+  try {
+    const oauth = await getOAuthModule();
+    const accessToken = await oauth.getAccessToken();
+    if (accessToken) {
+      return { type: 'oauth', token: accessToken };
+    }
+  } catch (error) {
+    // OAuth not available, fall through to API key
+  }
+
+  // Fall back to API key
+  if (GOOGLE_API_KEY) {
+    return { type: 'apikey', token: GOOGLE_API_KEY };
+  }
+
+  return null;
+}
+`;
+
+// Find where to insert OAuth helpers (after log function)
+const logFunctionEnd = content.indexOf('function log(message, color = \'reset\') {');
+if (logFunctionEnd !== -1) {
+  const nextFunctionStart = content.indexOf('\n/**\n', logFunctionEnd);
+  if (nextFunctionStart !== -1) {
+    content = content.slice(0, nextFunctionStart) + '\n' + oauthHelpers + content.slice(nextFunctionStart);
+    console.log('✓ Added OAuth helper functions');
+  }
+}
+
+// 3. Replace handleGoogle function to use OAuth
+const newHandleGoogle = `/**
+ * Handle Google Gemini provider requests (with OAuth support)
+ */
+async function handleGoogle(anthropicBody, res) {
+  // Try to get authentication (OAuth or API key)
+  const auth = await getGoogleAuth();
+
+  if (!auth) {
+    log(\`✗ Google: No authentication configured\`, 'red');
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message: 'Google authentication not configured. Run: node ~/.claude/model-proxy-server.js --gemini-login'
+      }
+    }));
+    return;
+  }
+
+  const { model } = parseModel(anthropicBody.model);
+  const openaiBody = anthropicToOpenAI(anthropicBody, false);
+
+  log(\`→ Google (\${auth.type}): \${model}\`, 'blue');
+
+  try {
+    // Build request URL and headers based on auth type
+    let url, headers;
+
+    if (auth.type === 'oauth') {
+      // Use OAuth token with Authorization header
+      url = \`\${GOOGLE_BASE_URL}/models/\${model}:generateContent\`;
+      headers = {
+        'Content-Type': 'application/json',
+        'Authorization': \`Bearer \${auth.token}\`
+      };
+    } else {
+      // Use API key in URL
+      url = \`\${GOOGLE_BASE_URL}/models/\${model}:generateContent?key=\${auth.token}\`;
+      headers = {
+        'Content-Type': 'application/json'
+      };
+    }
+
+    // Google uses a different endpoint structure
+    const response = await makeRequest(
+      url,
+      {
+        method: 'POST',
+        headers: headers
+      },
+      {
+        contents: openaiBody.messages.map(msg => ({
+          role: msg.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: msg.content }]
+        })),
+        generationConfig: {
+          maxOutputTokens: openaiBody.max_tokens,
+          temperature: openaiBody.temperature,
+          topP: openaiBody.top_p
+        }
+      }
+    );
+
+    if (response.status !== 200) {
+      log(\`✗ Google error: \${response.status}\`, 'red');
+      res.writeHead(response.status, { 'Content-Type': 'application/json' });
+      res.end(response.body);
+      return;
+    }
+
+    const googleResponse = JSON.parse(response.body);
+    const content = googleResponse.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    const anthropicResponse = {
+      id: \`msg_\${Date.now()}\`,
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: content }],
+      model: model,
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: googleResponse.usageMetadata?.promptTokenCount || 0,
+        output_tokens: googleResponse.usageMetadata?.candidatesTokenCount || 0
+      }
+    };
+
+    log(\`← Google: \${anthropicResponse.usage.output_tokens} tokens\`, 'green');
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(anthropicResponse));
+
+  } catch (error) {
+    log(\`✗ Google error: \${error.message}\`, 'red');
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: error.message
+      }
+    }));
+  }
+}`;
+
+// Find and replace the handleGoogle function
+const handleGoogleStart = content.indexOf('/**\n * Handle Google Gemini provider requests\n */');
+if (handleGoogleStart !== -1) {
+  const handleGoogleEnd = content.indexOf('\n/**', handleGoogleStart + 10);
+  if (handleGoogleEnd !== -1) {
+    content = content.slice(0, handleGoogleStart) + newHandleGoogle + '\n' + content.slice(handleGoogleEnd);
+    console.log('✓ Updated handleGoogle function with OAuth support');
+  }
+}
+
+// 4. Update startup message to show OAuth status
+const oldGoogleLine = "  log(`  ${GOOGLE_API_KEY ? '✓' : '✗'} Google Gemini    - google/gemini-pro`, GOOGLE_API_KEY ? 'green' : 'dim');";
+const newGoogleLine = `  // Check OAuth status asynchronously
+  (async () => {
+    const auth = await getGoogleAuth();
+    const status = auth ? (auth.type === 'oauth' ? '✓ (OAuth)' : '✓ (API Key)') : '✗';
+    const color = auth ? 'green' : 'dim';
+    log(\`  \${status} Google Gemini    - google/gemini-pro\`, color);
+    if (!auth) {
+      log(\`     Tip: Run \\"node ~/.claude/model-proxy-server.js --gemini-login\\" to authenticate\`, 'dim');
+    }
+  })();`;
+
+content = content.replace(oldGoogleLine, newGoogleLine);
+console.log('✓ Updated startup message with OAuth status');
+
+// 5. Update usage documentation
+const oldUsage = ' *   node model-proxy-server.js [port]';
+const newUsage = ` *   node model-proxy-server.js [port]          # Start proxy server
+ *   node model-proxy-server.js --gemini-login  # Login to Google via OAuth`;
+
+content = content.replace(oldUsage, newUsage);
+console.log('✓ Updated usage documentation');
+
+// Write the modified content
+fs.writeFileSync(PROXY_PATH, content);
+console.log('');
+console.log('✅ Successfully added Google OAuth support to model-proxy-server.js');
+console.log('');
+console.log('Next steps:');
+console.log('  1. Restart your proxy server if it\'s running');
+console.log('  2. Run: node ~/.claude/model-proxy-server.js --gemini-login');
+console.log('  3. Use Google models without GOOGLE_API_KEY!');
+console.log('');

@@ -1,0 +1,587 @@
+     1→/**
+     2→ * Music Timeline Service
+     3→ * Generates per-chapter mood-matched music with crossfade assembly
+     4→ *
+     5→ * Features:
+     6→ * - Per-chapter mood assignment using chapter detection + scene analysis
+     7→ * - Parallel music generation for each chapter segment
+     8→ * - FFmpeg crossfade assembly between segments
+     9→ * - Final audio with smooth transitions matching video structure
+    10→ */
+    11→
+    12→const { exec } = require('child_process');
+    13→const { promisify } = require('util');
+    14→const fs = require('fs').promises;
+    15→const path = require('path');
+    16→
+    17→const chapterDetection = require('./chapterDetection');
+    18→const sceneAnalysis = require('./sceneAnalysis');
+    19→const musicGeneration = require('./musicGeneration');
+    20→const musicAlignment = require('./musicAlignment');
+    21→
+    22→const execAsync = promisify(exec);
+    23→
+    24→// Default settings
+    25→const DEFAULT_CROSSFADE_DURATION = 2.0; // seconds
+    26→const MIN_CROSSFADE_DURATION = 0.5;
+    27→const MAX_CROSSFADE_DURATION = 5.0;
+    28→const MIN_CHAPTER_MUSIC_DURATION = 15; // Minimum music segment duration
+    29→const MAX_CONCURRENT_GENERATIONS = 2; // Limit parallel API calls
+    30→
+    31→// Mood mapping from scene analysis to music generation moods
+    32→const MOOD_MAPPING = {
+    33→  happy: 'happy',
+    34→  sad: 'melancholic',
+    35→  angry: 'intense',
+    36→  fearful: 'mysterious',
+    37→  surprised: 'energetic',
+    38→  neutral: 'neutral',
+    39→  excited: 'energetic',
+    40→  calm: 'relaxed',
+    41→  tense: 'intense',
+    42→  inspirational: 'epic',
+    43→  humorous: 'happy'
+    44→};
+    45→
+    46→/**
+    47→ * Analyze chapters and assign moods based on transcript content
+    48→ * @param {Object} transcript - Transcript with segments and full text
+    49→ * @param {Object} settings - Chapter detection settings
+    50→ * @returns {Promise<Object>} Chapters with mood assignments
+    51→ */
+    52→async function analyzeChapterMoods(transcript, settings = {}) {
+    53→  const {
+    54→    maxChapters = 10,
+    55→    minChapterLength = 60
+    56→  } = settings;
+    57→
+    58→  // Detect chapters using AI
+    59→  const chapterResult = await chapterDetection.detectChapters(transcript, {
+    60→    maxChapters,
+    61→    minChapterLength
+    62→  });
+    63→
+    64→  if (!chapterResult.chapters || chapterResult.chapters.length === 0) {
+    65→    throw new Error('No chapters detected in transcript');
+    66→  }
+    67→
+    68→  // Get segments for scene analysis
+    69→  const segments = transcript.segments || [];
+    70→
+    71→  if (segments.length === 0) {
+    72→    // If no segments, create basic ones from chapters
+    73→    return {
+    74→      chapters: chapterResult.chapters.map((ch, i) => ({
+    75→        ...ch,
+    76→        mood: 'neutral',
+    77→        energy: 50,
+    78→        musicDuration: calculateChapterDuration(ch, chapterResult.chapters, i, transcript.duration)
+    79→      })),
+    80→      metadata: {
+    81→        ...chapterResult.metadata,
+    82→        moodSource: 'default'
+    83→      }
+    84→    };
+    85→  }
+    86→
+    87→  // Analyze each chapter's segments for mood
+    88→  const chaptersWithMoods = await Promise.all(
+    89→    chapterResult.chapters.map(async (chapter, index) => {
+    90→      const nextChapter = chapterResult.chapters[index + 1];
+    91→      const chapterEnd = nextChapter ? nextChapter.startTime : transcript.duration;
+    92→
+    93→      // Filter segments that belong to this chapter
+    94→      const chapterSegments = segments.filter(
+    95→        s => s.start >= chapter.startTime && s.start < chapterEnd
+    96→      );
+    97→
+    98→      if (chapterSegments.length === 0) {
+    99→        return {
+   100→          ...chapter,
+   101→          mood: 'neutral',
+   102→          energy: 50,
+   103→          musicDuration: chapterEnd - chapter.startTime
+   104→        };
+   105→      }
+   106→
+   107→      // Analyze segments for this chapter
+   108→      const sceneResult = await sceneAnalysis.analyzeScenes(chapterSegments);
+   109→
+   110→      return {
+   111→        ...chapter,
+   112→        mood: MOOD_MAPPING[sceneResult.dominantMood] || 'neutral',
+   113→        originalMood: sceneResult.dominantMood,
+   114→        energy: sceneResult.averageEnergy,
+   115→        keywords: extractUniqueKeywords(sceneResult.scenes),
+   116→        musicDuration: chapterEnd - chapter.startTime
+   117→      };
+   118→    })
+   119→  );
+   120→
+   121→  return {
+   122→    chapters: chaptersWithMoods,
+   123→    totalDuration: transcript.duration,
+   124→    metadata: {
+   125→      ...chapterResult.metadata,
+   126→      moodSource: 'scene_analysis'
+   127→    }
+   128→  };
+   129→}
+   130→
+   131→/**
+   132→ * Calculate chapter duration
+   133→ * @param {Object} chapter - Current chapter
+   134→ * @param {Object[]} allChapters - All chapters
+   135→ * @param {number} index - Chapter index
+   136→ * @param {number} totalDuration - Total video duration
+   137→ * @returns {number} Chapter duration in seconds
+   138→ */
+   139→function calculateChapterDuration(chapter, allChapters, index, totalDuration) {
+   140→  const nextChapter = allChapters[index + 1];
+   141→  return nextChapter ? nextChapter.startTime - chapter.startTime : totalDuration - chapter.startTime;
+   142→}
+   143→
+   144→/**
+   145→ * Extract unique keywords from scenes
+   146→ * @param {Object[]} scenes - Scene analysis results
+   147→ * @returns {string[]} Unique keywords
+   148→ */
+   149→function extractUniqueKeywords(scenes) {
+   150→  const keywords = scenes.flatMap(s => s.keywords || []);
+   151→  return [...new Set(keywords)].slice(0, 10);
+   152→}
+   153→
+   154→/**
+   155→ * Generate music for a single chapter
+   156→ * @param {Object} chapter - Chapter with mood info
+   157→ * @param {Object} options - Generation options
+   158→ * @param {Function} onProgress - Progress callback
+   159→ * @returns {Promise<Object>} Generated music segment
+   160→ */
+   161→async function generateChapterMusic(chapter, options, onProgress = null) {
+   162→  const duration = Math.max(MIN_CHAPTER_MUSIC_DURATION, Math.min(chapter.musicDuration, 180));
+   163→
+   164→  const generationOptions = {
+   165→    mood: chapter.mood,
+   166→    duration,
+   167→    instruments: options.instruments || [],
+   168→    prompt: buildChapterPrompt(chapter, options)
+   169→  };
+   170→
+   171→  try {
+   172→    const result = await musicGeneration.generateMusic(generationOptions, onProgress);
+   173→
+   174→    return {
+   175→      chapterIndex: chapter.index,
+   176→      chapterTitle: chapter.title,
+   177→      startTime: chapter.startTime,
+   178→      duration: result.duration,
+   179→      mood: chapter.mood,
+   180→      audioBuffer: result.audioBuffer,
+   181→      taskId: result.taskId,
+   182→      success: true
+   183→    };
+   184→  } catch (error) {
+   185→    console.error(`[SPLICE Timeline] Chapter ${chapter.index} generation failed:`, error.message);
+   186→    return {
+   187→      chapterIndex: chapter.index,
+   188→      chapterTitle: chapter.title,
+   189→      startTime: chapter.startTime,
+   190→      duration: chapter.musicDuration,
+   191→      mood: chapter.mood,
+   192→      error: error.message,
+   193→      success: false
+   194→    };
+   195→  }
+   196→}
+   197→
+   198→/**
+   199→ * Build a prompt for chapter music generation
+   200→ * @param {Object} chapter - Chapter with mood info
+   201→ * @param {Object} options - User options
+   202→ * @returns {string} Prompt string
+   203→ */
+   204→function buildChapterPrompt(chapter, options) {
+   205→  const parts = [];
+   206→
+   207→  // Add chapter context
+   208→  if (chapter.title && chapter.title !== 'Introduction') {
+   209→    parts.push(`Music for section: "${chapter.title}"`);
+   210→  }
+   211→
+   212→  // Add mood context
+   213→  if (chapter.originalMood) {
+   214→    parts.push(`Emotional tone: ${chapter.originalMood}`);
+   215→  }
+   216→
+   217→  // Add energy level
+   218→  if (chapter.energy) {
+   219→    if (chapter.energy > 70) {
+   220→      parts.push('High energy, dynamic');
+   221→    } else if (chapter.energy < 30) {
+   222→      parts.push('Low energy, ambient');
+   223→    } else {
+   224→      parts.push('Moderate energy');
+   225→    }
+   226→  }
+   227→
+   228→  // Add keywords if available
+   229→  if (chapter.keywords && chapter.keywords.length > 0) {
+   230→    parts.push(`Content themes: ${chapter.keywords.slice(0, 5).join(', ')}`);
+   231→  }
+   232→
+   233→  // Add user custom prompt
+   234→  if (options.prompt) {
+   235→    parts.push(options.prompt);
+   236→  }
+   237→
+   238→  return parts.join('. ');
+   239→}
+   240→
+   241→/**
+   242→ * Generate music for all chapters with rate limiting
+   243→ * @param {Object[]} chapters - Chapters with mood assignments
+   244→ * @param {Object} options - Generation options
+   245→ * @param {Function} onProgress - Progress callback (chapterIndex, progress, status)
+   246→ * @returns {Promise<Object[]>} Array of generated music segments
+   247→ */
+   248→async function generateAllChapterMusic(chapters, options, onProgress = null) {
+   249→  const results = [];
+   250→
+   251→  // Process chapters in batches to respect rate limits
+   252→  for (let i = 0; i < chapters.length; i += MAX_CONCURRENT_GENERATIONS) {
+   253→    const batch = chapters.slice(i, i + MAX_CONCURRENT_GENERATIONS);
+   254→
+   255→    const batchResults = await Promise.all(
+   256→      batch.map((chapter, batchIndex) => {
+   257→        const chapterIndex = i + batchIndex;
+   258→        return generateChapterMusic(
+   259→          { ...chapter, index: chapterIndex },
+   260→          options,
+   261→          (progress, status) => {
+   262→            if (onProgress) {
+   263→              onProgress(chapterIndex, progress, status);
+   264→            }
+   265→          }
+   266→        );
+   267→      })
+   268→    );
+   269→
+   270→    results.push(...batchResults);
+   271→  }
+   272→
+   273→  return results;
+   274→}
+   275→
+   276→/**
+   277→ * Assemble music segments with crossfades using FFmpeg
+   278→ * @param {Object[]} segments - Array of music segments with audioBuffer
+   279→ * @param {Object} options - Assembly options
+   280→ * @returns {Promise<Buffer>} Combined audio buffer
+   281→ */
+   282→async function assembleWithCrossfades(segments, options = {}) {
+   283→  const {
+   284→    crossfadeDuration = DEFAULT_CROSSFADE_DURATION
+   285→  } = options;
+   286→
+   287→  // Filter successful segments
+   288→  const successfulSegments = segments.filter(s => s.success && s.audioBuffer);
+   289→
+   290→  if (successfulSegments.length === 0) {
+   291→    throw new Error('No successful music segments to assemble');
+   292→  }
+   293→
+   294→  // If only one segment, just return it with fade out
+   295→  if (successfulSegments.length === 1) {
+   296→    return successfulSegments[0].audioBuffer;
+   297→  }
+   298→
+   299→  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+   300→  await fs.mkdir(tempDir, { recursive: true });
+   301→
+   302→  const timestamp = Date.now();
+   303→  const tempFiles = [];
+   304→
+   305→  try {
+   306→    // Write all segments to temp files
+   307→    for (let i = 0; i < successfulSegments.length; i++) {
+   308→      const tempPath = path.join(tempDir, `timeline_seg_${timestamp}_${i}.wav`);
+   309→      await fs.writeFile(tempPath, successfulSegments[i].audioBuffer);
+   310→      tempFiles.push(tempPath);
+   311→    }
+   312→
+   313→    // Build FFmpeg filter complex for multi-segment crossfade
+   314→    const outputPath = path.join(tempDir, `timeline_final_${timestamp}.wav`);
+   315→
+   316→    // For 2 segments, use simple acrossfade
+   317→    if (successfulSegments.length === 2) {
+   318→      const ffmpegCmd = `ffmpeg -y -i "${tempFiles[0]}" -i "${tempFiles[1]}" -filter_complex "acrossfade=d=${crossfadeDuration}:c1=tri:c2=tri" -c:a pcm_s16le "${outputPath}"`;
+   319→
+   320→      await execAsync(ffmpegCmd, { timeout: 300000 }); // 5 min timeout
+   321→    } else {
+   322→      // For 3+ segments, chain crossfades
+   323→      const filterComplex = buildMultiCrossfadeFilter(tempFiles.length, crossfadeDuration);
+   324→      const inputs = tempFiles.map(f => `-i "${f}"`).join(' ');
+   325→
+   326→      const ffmpegCmd = `ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -c:a pcm_s16le "${outputPath}"`;
+   327→
+   328→      await execAsync(ffmpegCmd, { timeout: 600000 }); // 10 min timeout for many segments
+   329→    }
+   330→
+   331→    return await fs.readFile(outputPath);
+   332→  } finally {
+   333→    // Cleanup temp files
+   334→    for (const tempFile of tempFiles) {
+   335→      try {
+   336→        await fs.unlink(tempFile);
+   337→      } catch (e) {
+   338→        // Ignore cleanup errors
+   339→      }
+   340→    }
+   341→
+   342→    try {
+   343→      await fs.unlink(path.join(tempDir, `timeline_final_${timestamp}.wav`));
+   344→    } catch (e) {
+   345→      // Ignore
+   346→    }
+   347→  }
+   348→}
+   349→
+   350→/**
+   351→ * Build FFmpeg filter_complex for chaining multiple crossfades
+   352→ * @param {number} segmentCount - Number of segments
+   353→ * @param {number} crossfadeDuration - Crossfade duration
+   354→ * @returns {string} filter_complex string
+   355→ */
+   356→function buildMultiCrossfadeFilter(segmentCount, crossfadeDuration) {
+   357→  const filters = [];
+   358→
+   359→  // For N segments, we need N-1 crossfades
+   360→  // [0:a][1:a]acrossfade=d=2[a01];[a01][2:a]acrossfade=d=2[a012];...
+   361→
+   362→  let lastOutput = '[0:a]';
+   363→
+   364→  for (let i = 1; i < segmentCount; i++) {
+   365→    const input2 = `[${i}:a]`;
+   366→    const outputLabel = i === segmentCount - 1 ? '' : `[a${i}]`;
+   367→
+   368→    if (i === 1) {
+   369→      filters.push(`[0:a][1:a]acrossfade=d=${crossfadeDuration}:c1=tri:c2=tri${outputLabel}`);
+   370→      lastOutput = `[a${i}]`;
+   371→    } else if (i === segmentCount - 1) {
+   372→      // Last crossfade outputs directly (no label needed)
+   373→      filters.push(`${lastOutput}[${i}:a]acrossfade=d=${crossfadeDuration}:c1=tri:c2=tri`);
+   374→    } else {
+   375→      filters.push(`${lastOutput}[${i}:a]acrossfade=d=${crossfadeDuration}:c1=tri:c2=tri[a${i}]`);
+   376→      lastOutput = `[a${i}]`;
+   377→    }
+   378→  }
+   379→
+   380→  return filters.join(';');
+   381→}
+   382→
+   383→/**
+   384→ * Full timeline music generation workflow
+   385→ * @param {Object} transcript - Full transcript with segments
+   386→ * @param {Object} options - Generation options
+   387→ * @param {Function} onProgress - Progress callback
+   388→ * @returns {Promise<Object>} Timeline music result
+   389→ */
+   390→async function generateTimelineMusic(transcript, options = {}, onProgress = null) {
+   391→  const {
+   392→    maxChapters = 10,
+   393→    minChapterLength = 60,
+   394→    crossfadeDuration = DEFAULT_CROSSFADE_DURATION,
+   395→    instruments = [],
+   396→    prompt = ''
+   397→  } = options;
+   398→
+   399→  // Step 1: Analyze chapters and assign moods
+   400→  if (onProgress) onProgress(null, 5, 'analyzing_chapters');
+   401→
+   402→  const chapterAnalysis = await analyzeChapterMoods(transcript, {
+   403→    maxChapters,
+   404→    minChapterLength
+   405→  });
+   406→
+   407→  console.log(`[SPLICE Timeline] Detected ${chapterAnalysis.chapters.length} chapters`);
+   408→
+   409→  // Step 2: Generate music for each chapter
+   410→  if (onProgress) onProgress(null, 10, 'generating_chapters');
+   411→
+   412→  const chapterProgress = new Array(chapterAnalysis.chapters.length).fill(0);
+   413→
+   414→  const musicSegments = await generateAllChapterMusic(
+   415→    chapterAnalysis.chapters,
+   416→    { instruments, prompt },
+   417→    (chapterIndex, progress, status) => {
+   418→      chapterProgress[chapterIndex] = progress;
+   419→      const overallProgress = 10 + Math.floor(
+   420→        (chapterProgress.reduce((a, b) => a + b, 0) / chapterProgress.length) * 0.75
+   421→      );
+   422→      if (onProgress) onProgress(chapterIndex, overallProgress, `chapter_${chapterIndex}_${status}`);
+   423→    }
+   424→  );
+   425→
+   426→  // Check if any segments succeeded
+   427→  const successfulCount = musicSegments.filter(s => s.success).length;
+   428→  if (successfulCount === 0) {
+   429→    throw new Error('All chapter music generations failed');
+   430→  }
+   431→
+   432→  console.log(`[SPLICE Timeline] Generated ${successfulCount}/${musicSegments.length} chapter segments`);
+   433→
+   434→  // Step 3: Assemble with crossfades
+   435→  if (onProgress) onProgress(null, 90, 'assembling');
+   436→
+   437→  const finalAudio = await assembleWithCrossfades(musicSegments, {
+   438→    crossfadeDuration: Math.max(MIN_CROSSFADE_DURATION, Math.min(MAX_CROSSFADE_DURATION, crossfadeDuration))
+   439→  });
+   440→
+   441→  // Calculate final duration
+   442→  const finalDuration = await musicAlignment.getAudioDuration(finalAudio);
+   443→
+   444→  if (onProgress) onProgress(null, 100, 'completed');
+   445→
+   446→  return {
+   447→    audioBuffer: finalAudio,
+   448→    duration: finalDuration,
+   449→    chapters: chapterAnalysis.chapters.map((ch, i) => ({
+   450→      title: ch.title,
+   451→      startTime: ch.startTime,
+   452→      mood: ch.mood,
+   453→      originalMood: ch.originalMood,
+   454→      energy: ch.energy,
+   455→      musicGenerated: musicSegments[i]?.success || false,
+   456→      musicDuration: musicSegments[i]?.duration || 0
+   457→    })),
+   458→    metadata: {
+   459→      totalChapters: chapterAnalysis.chapters.length,
+   460→      successfulSegments: successfulCount,
+   461→      failedSegments: musicSegments.length - successfulCount,
+   462→      crossfadeDuration,
+   463→      moodSource: chapterAnalysis.metadata.moodSource
+   464→    }
+   465→  };
+   466→}
+   467→
+   468→/**
+   469→ * Validate timeline generation options
+   470→ * @param {Object} transcript - Transcript object
+   471→ * @param {Object} options - Generation options
+   472→ * @returns {{valid: boolean, errors: string[]}}
+   473→ */
+   474→function validateTimelineOptions(transcript, options = {}) {
+   475→  const errors = [];
+   476→
+   477→  // Validate transcript
+   478→  if (!transcript) {
+   479→    errors.push('Transcript is required');
+   480→  } else {
+   481→    if (!transcript.text && (!transcript.segments || transcript.segments.length === 0)) {
+   482→      errors.push('Transcript must have text or segments');
+   483→    }
+   484→    if (!transcript.duration || transcript.duration <= 0) {
+   485→      errors.push('Transcript must have a valid duration');
+   486→    }
+   487→  }
+   488→
+   489→  // Validate options
+   490→  if (options.maxChapters !== undefined) {
+   491→    if (typeof options.maxChapters !== 'number' || options.maxChapters < 1 || options.maxChapters > 20) {
+   492→      errors.push('maxChapters must be between 1 and 20');
+   493→    }
+   494→  }
+   495→
+   496→  if (options.minChapterLength !== undefined) {
+   497→    if (typeof options.minChapterLength !== 'number' || options.minChapterLength < 30) {
+   498→      errors.push('minChapterLength must be at least 30 seconds');
+   499→    }
+   500→  }
+   501→
+   502→  if (options.crossfadeDuration !== undefined) {
+   503→    if (typeof options.crossfadeDuration !== 'number') {
+   504→      errors.push('crossfadeDuration must be a number');
+   505→    } else if (options.crossfadeDuration < MIN_CROSSFADE_DURATION || options.crossfadeDuration > MAX_CROSSFADE_DURATION) {
+   506→      errors.push(`crossfadeDuration must be between ${MIN_CROSSFADE_DURATION} and ${MAX_CROSSFADE_DURATION} seconds`);
+   507→    }
+   508→  }
+   509→
+   510→  return {
+   511→    valid: errors.length === 0,
+   512→    errors
+   513→  };
+   514→}
+   515→
+   516→/**
+   517→ * Get timeline generation presets
+   518→ * @returns {Object} Available presets and defaults
+   519→ */
+   520→function getTimelinePresets() {
+   521→  return {
+   522→    defaults: {
+   523→      maxChapters: 10,
+   524→      minChapterLength: 60,
+   525→      crossfadeDuration: DEFAULT_CROSSFADE_DURATION
+   526→    },
+   527→    moodMapping: MOOD_MAPPING,
+   528→    constraints: {
+   529→      minCrossfadeDuration: MIN_CROSSFADE_DURATION,
+   530→      maxCrossfadeDuration: MAX_CROSSFADE_DURATION,
+   531→      minChapterMusicDuration: MIN_CHAPTER_MUSIC_DURATION,
+   532→      maxConcurrentGenerations: MAX_CONCURRENT_GENERATIONS
+   533→    }
+   534→  };
+   535→}
+   536→
+   537→/**
+   538→ * Estimate timeline generation time
+   539→ * @param {Object} transcript - Transcript to analyze
+   540→ * @param {Object} options - Generation options
+   541→ * @returns {Object} Time estimate
+   542→ */
+   543→function estimateGenerationTime(transcript, options = {}) {
+   544→  const duration = transcript.duration || 0;
+   545→  const maxChapters = options.maxChapters || 10;
+   546→  const minChapterLength = options.minChapterLength || 60;
+   547→
+   548→  // Estimate chapter count
+   549→  const estimatedChapters = Math.min(
+   550→    maxChapters,
+   551→    Math.max(1, Math.floor(duration / minChapterLength))
+   552→  );
+   553→
+   554→  // Each generation takes ~3-5 minutes
+   555→  // With parallel processing of 2 at a time
+   556→  const batches = Math.ceil(estimatedChapters / MAX_CONCURRENT_GENERATIONS);
+   557→  const estimatedMinutes = batches * 4; // ~4 minutes per batch
+   558→
+   559→  return {
+   560→    estimatedChapters,
+   561→    estimatedMinutes,
+   562→    estimatedTimeDisplay: `${estimatedMinutes}-${estimatedMinutes + 2} minutes`
+   563→  };
+   564→}
+   565→
+   566→module.exports = {
+   567→  analyzeChapterMoods,
+   568→  generateChapterMusic,
+   569→  generateAllChapterMusic,
+   570→  assembleWithCrossfades,
+   571→  buildMultiCrossfadeFilter,
+   572→  generateTimelineMusic,
+   573→  validateTimelineOptions,
+   574→  getTimelinePresets,
+   575→  estimateGenerationTime,
+   576→  MOOD_MAPPING,
+   577→  DEFAULT_CROSSFADE_DURATION,
+   578→  MIN_CROSSFADE_DURATION,
+   579→  MAX_CROSSFADE_DURATION,
+   580→  MIN_CHAPTER_MUSIC_DURATION,
+   581→  MAX_CONCURRENT_GENERATIONS
+   582→};
+   583→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

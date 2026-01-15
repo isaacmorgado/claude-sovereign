@@ -1,0 +1,291 @@
+     1→/**
+     2→ * License Routes
+     3→ *
+     4→ * License key management endpoints
+     5→ */
+     6→
+     7→const express = require('express');
+     8→
+     9→/**
+    10→ * Create license routes
+    11→ * @param {Object} options - Route configuration options
+    12→ * @param {Object} options.services - Shared services (licenseService, usageTracking, stripe)
+    13→ * @param {Object} options.authHelpers - Auth helper functions (maskSensitiveData)
+    14→ * @returns {express.Router}
+    15→ */
+    16→function createLicenseRoutes(options = {}) {
+    17→  const router = express.Router();
+    18→  const { licenseService, usageTracking, stripe } = options.services || {};
+    19→  const { maskSensitiveData } = options.authHelpers || {};
+    20→
+    21→  /**
+    22→   * POST /activate - Activate a license key
+    23→   *
+    24→   * Body: { key: "SPLICE-XXXX-XXXX-XXXX" }
+    25→   * Returns: { success, customerId, tier, hoursRemaining }
+    26→   */
+    27→  router.post('/activate', async (req, res) => {
+    28→    const { key } = req.body;
+    29→
+    30→    if (!key) {
+    31→      return res.status(400).json({
+    32→        error: 'Missing license key',
+    33→        message: 'License key is required'
+    34→      });
+    35→    }
+    36→
+    37→    // Validate format
+    38→    if (!licenseService.isValidKeyFormat(key)) {
+    39→      return res.status(400).json({
+    40→        error: 'Invalid license key format',
+    41→        message: 'License key should be in format: SPLICE-XXXX-XXXX-XXXX'
+    42→      });
+    43→    }
+    44→
+    45→    try {
+    46→      // Activate the key
+    47→      const result = await licenseService.activateLicenseKey(key);
+    48→
+    49→      if (!result.success) {
+    50→        return res.status(400).json({
+    51→          success: false,
+    52→          error: result.error
+    53→        });
+    54→      }
+    55→
+    56→      // Get the customer's balance and tier info
+    57→      const balance = await usageTracking.getBalance(result.customerId);
+    58→
+    59→      res.json({
+    60→        success: true,
+    61→        customerId: result.customerId,
+    62→        tier: balance.tier,
+    63→        tierName: balance.tierName,
+    64→        hoursRemaining: balance.hoursRemaining,
+    65→        hoursTotal: balance.hoursTotal
+    66→      });
+    67→    } catch (err) {
+    68→      console.error('[SPLICE] License activation error:', err);
+    69→      res.status(500).json({ error: err.message });
+    70→    }
+    71→  });
+    72→
+    73→  /**
+    74→   * GET /key - Get license key for a customer (for display/resend)
+    75→   *
+    76→   * Requires x-stripe-customer-id header
+    77→   */
+    78→  router.get('/key', async (req, res) => {
+    79→    const stripeCustomerId = req.headers['x-stripe-customer-id'];
+    80→
+    81→    if (!stripeCustomerId) {
+    82→      return res.status(401).json({
+    83→        error: 'Authentication required',
+    84→        message: 'Missing x-stripe-customer-id header'
+    85→      });
+    86→    }
+    87→
+    88→    try {
+    89→      const result = await licenseService.getLicenseByCustomerId(stripeCustomerId);
+    90→
+    91→      if (!result.success) {
+    92→        return res.status(404).json({
+    93→          success: false,
+    94→          error: result.error
+    95→        });
+    96→      }
+    97→
+    98→      res.json({
+    99→        success: true,
+   100→        key: result.key,
+   101→        activated: result.activated,
+   102→        createdAt: result.createdAt
+   103→      });
+   104→    } catch (err) {
+   105→      console.error('[SPLICE] License lookup error:', err);
+   106→      res.status(500).json({ error: err.message });
+   107→    }
+   108→  });
+   109→
+   110→  /**
+   111→   * POST /resend - Resend license key to customer email
+   112→   *
+   113→   * For support cases where customer didn't receive their license key.
+   114→   * Requires x-stripe-customer-id header or customerId in body (for support).
+   115→   */
+   116→  router.post('/resend', async (req, res) => {
+   117→    // Allow customerId from header or body (for support staff)
+   118→    const stripeCustomerId = req.headers['x-stripe-customer-id'] || req.body.customerId;
+   119→
+   120→    if (!stripeCustomerId) {
+   121→      return res.status(401).json({
+   122→        error: 'Authentication required',
+   123→        message: 'Missing customer ID'
+   124→      });
+   125→    }
+   126→
+   127→    try {
+   128→      // Get existing license key
+   129→      let licenseResult = await licenseService.getLicenseByCustomerId(stripeCustomerId);
+   130→
+   131→      if (!licenseResult.success) {
+   132→        // No license exists - try to generate one
+   133→        console.log(`[SPLICE] No license found for ${stripeCustomerId}, generating new one`);
+   134→        const newLicense = await licenseService.generateLicenseKey(stripeCustomerId);
+   135→
+   136→        if (!newLicense.success) {
+   137→          return res.status(500).json({
+   138→            success: false,
+   139→            error: 'Failed to generate license key',
+   140→            details: newLicense.error
+   141→          });
+   142→        }
+   143→
+   144→        licenseResult = { key: newLicense.key, success: true };
+   145→      }
+   146→
+   147→      // Get customer email from Stripe
+   148→      let customerEmail = null;
+   149→      try {
+   150→        const customer = await stripe.customers.retrieve(stripeCustomerId);
+   151→        customerEmail = customer.email;
+   152→      } catch (stripeErr) {
+   153→        console.error(`[SPLICE] Failed to get customer email:`, stripeErr.message);
+   154→      }
+   155→
+   156→      if (!customerEmail) {
+   157→        return res.status(400).json({
+   158→          success: false,
+   159→          error: 'No email address found for customer',
+   160→          key: licenseResult.key, // Still return key for manual delivery
+   161→          manualDeliveryRequired: true
+   162→        });
+   163→      }
+   164→
+   165→      // SECURITY: Mask sensitive data in logs
+   166→      console.log(`[SPLICE] License key resend requested for ${maskSensitiveData(customerEmail)}: ${maskSensitiveData(licenseResult.key)}`);
+   167→      // TODO: Integrate with email service
+   168→      // await sendLicenseKeyEmail(customerEmail, licenseResult.key);
+   169→
+   170→      res.json({
+   171→        success: true,
+   172→        message: `License key will be sent to ${customerEmail}`,
+   173→        email: customerEmail,
+   174→        key: licenseResult.key, // Include key for immediate display
+   175→        activated: licenseResult.activated
+   176→      });
+   177→    } catch (err) {
+   178→      console.error('[SPLICE] License resend error:', err);
+   179→      res.status(500).json({ error: err.message });
+   180→    }
+   181→  });
+   182→
+   183→  /**
+   184→   * POST /lookup - Look up license key by email address
+   185→   *
+   186→   * SECURITY: Does NOT return the license key in the response.
+   187→   * Instead, sends the key via email to the verified email address.
+   188→   * This prevents attackers from obtaining keys by guessing email addresses.
+   189→   */
+   190→  router.post('/lookup', async (req, res) => {
+   191→    const { email } = req.body;
+   192→
+   193→    if (!email) {
+   194→      return res.status(400).json({
+   195→        error: 'Email address required'
+   196→      });
+   197→    }
+   198→
+   199→    // Validate email format
+   200→    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+   201→    if (!emailRegex.test(email)) {
+   202→      return res.status(400).json({
+   203→        error: 'Invalid email format'
+   204→      });
+   205→    }
+   206→
+   207→    try {
+   208→      // Look up customer by email in Stripe
+   209→      const customers = await stripe.customers.list({
+   210→        email: email.toLowerCase(),
+   211→        limit: 1
+   212→      });
+   213→
+   214→      if (customers.data.length === 0) {
+   215→        // SECURITY: Don't reveal if email exists in our system
+   216→        // Always return same success message to prevent enumeration
+   217→        console.log(`[SPLICE] License lookup attempt for unknown email: ${maskSensitiveData(email)}`);
+   218→        return res.json({
+   219→          success: true,
+   220→          message: 'If an account exists with this email, the license key will be sent shortly.',
+   221→          emailSent: true
+   222→        });
+   223→      }
+   224→
+   225→      const customer = customers.data[0];
+   226→
+   227→      // Get license key for this customer
+   228→      let licenseResult = await licenseService.getLicenseByCustomerId(customer.id);
+   229→
+   230→      if (!licenseResult.success) {
+   231→        // Check if they have an active subscription before generating key
+   232→        const subscriptions = await stripe.subscriptions.list({
+   233→          customer: customer.id,
+   234→          status: 'active',
+   235→          limit: 1
+   236→        });
+   237→
+   238→        if (subscriptions.data.length === 0) {
+   239→          // SECURITY: Same message to prevent enumeration
+   240→          console.log(`[SPLICE] License lookup - no active subscription for: ${maskSensitiveData(email)}`);
+   241→          return res.json({
+   242→            success: true,
+   243→            message: 'If an account exists with this email, the license key will be sent shortly.',
+   244→            emailSent: true
+   245→          });
+   246→        }
+   247→
+   248→        // Generate a new license key for active subscriber without one
+   249→        const newLicense = await licenseService.generateLicenseKey(customer.id);
+   250→        if (!newLicense.success) {
+   251→          console.error(`[SPLICE] Failed to generate license key for ${maskSensitiveData(customer.id)}`);
+   252→          return res.status(500).json({
+   253→            success: false,
+   254→            error: 'Failed to process request. Please try again later.'
+   255→          });
+   256→        }
+   257→        licenseResult = newLicense;
+   258→      }
+   259→
+   260→      // SECURITY: Log the lookup (masked) and send via email
+   261→      console.log(`[SPLICE] License key lookup for ${maskSensitiveData(email)} - sending via email`);
+   262→
+   263→      // TODO: Integrate with email service (SendGrid, SES, etc.)
+   264→      // await sendLicenseKeyEmail(email, licenseResult.key);
+   265→
+   266→      // SECURITY: Never return the key in the response
+   267→      // Always send via email to the verified address
+   268→      res.json({
+   269→        success: true,
+   270→        message: 'Your license key has been sent to your email address. Please check your inbox (and spam folder).',
+   271→        emailSent: true,
+   272→        // Hint at activation status without revealing the key
+   273→        hint: licenseResult.activated
+   274→          ? 'Note: Your license is already activated on a device.'
+   275→          : null
+   276→      });
+   277→    } catch (err) {
+   278→      console.error('[SPLICE] License lookup error:', err.message);
+   279→      res.status(500).json({ error: 'Failed to process request. Please try again later.' });
+   280→    }
+   281→  });
+   282→
+   283→  return router;
+   284→}
+   285→
+   286→module.exports = createLicenseRoutes;
+   287→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

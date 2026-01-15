@@ -1,0 +1,375 @@
+/**
+ * Detects chapters in the audio/video content using AI analysis
+ * @param {Object} params - Optional detection parameters
+ * @param {boolean} returnResult - If true, returns result object instead of showing UI messages
+ * @returns {Object|undefined} Result object with status and message if returnResult is true
+ */
+async function detect_chapters(params = null, returnResult = false) {
+    const isLicenseValid = await verify_license_throttled();
+
+    if (!isLicenseValid || !check_function_availability('detect_chapters')) {
+        showError('Please provide a valid license key in the Settings menu');
+        return;
+    }
+
+    test_52_schedule_log_upload(time_delay = 0);
+    regular_license_key_checker();
+    await test_45_save_state('Before detecting chapters');
+    await test_46_retrieve_undo_state_info();
+
+    const trackingId = tracker.start('detect_chapters');
+
+    try {
+        // Reset UI elements
+        $('#copy-timestamps-success').addClass('hidden');
+        $('#chapters-add-clips-selection-spinner').removeClass('hidden');
+        $('#chapters-add-clips-selection-error-wrapper').addClass('hidden');
+        $('#chapters-add-clips-selection-grid').html('');
+
+        let detectionParams = params || await test_45_get_chapters_params();
+        console.log('detect_chapters_params', detectionParams);
+
+        if (!detectionParams.scopeValid) {
+            showError('Please select a valid scope (you may need to set the in and out points explicitly)');
+            hideSpinner();
+            return;
+        }
+
+        showSpinner(spinner_msg_chapters_analysis);
+        console.log('Transcribing audio');
+
+        if (isNaN(detectionParams.inPoint) || isNaN(detectionParams.outPoint)) {
+            throw new Error('inPoint or outPoint is NaN');
+        }
+
+        const transcript = await test_92_chunked_transcription(
+            detectionParams.inPoint,
+            detectionParams.outPoint,
+            false,
+            detectionParams.language
+        );
+        console.log('TRANSCRIPT', transcript);
+
+        // Check if transcript is long enough
+        if (transcript.text.split(' ').length < detect_chapters_min_words) {
+            if (!returnResult) {
+                return {
+                    'status': 'failed',
+                    'message': 'Transcript is too short for detecting chapters (<' + detect_chapters_min_words + ' words).'
+                };
+            }
+            showError('Transcript is too short for detecting chapters (<' + detect_chapters_min_words + ' words). Please check your audio is clear / loud enough and try again.');
+            hideSpinner();
+        }
+
+        // Build array of promises for parallel execution
+        const promises = [];
+
+        const chaptersPromise = test_32_generate_chapters_from_transcript(transcript, detectionParams.language, {
+            'chaptersMin': detectionParams.chaptersMin ?? null,
+            'chaptersMax': detectionParams.chaptersMax ?? null
+        });
+        promises.push(chaptersPromise);
+
+        // Add titles/descriptions generation if enabled
+        if (detectionParams.titlesDescription) {
+            const youtubeConfig = chapters_constants.youtube;
+            const youtubePromise = editai_api.generateTitlesDescription(
+                transcript.text,
+                youtubeConfig.long_short,
+                youtubeConfig.title_max_characters,
+                youtubeConfig.title_main_word_in_first_n_characters,
+                youtubeConfig.title_is_personal,
+                youtubeConfig.description_min_words,
+                youtubeConfig.description_max_words,
+                detectionParams.language
+            );
+            promises.push(youtubePromise);
+
+            const shortConfig = chapters_constants.short_formats;
+            const shortPromise = editai_api.generateTitlesDescription(
+                transcript.text,
+                shortConfig.long_short,
+                shortConfig.title_max_characters,
+                shortConfig.title_main_word_in_first_n_characters,
+                shortConfig.title_is_personal,
+                shortConfig.description_min_words,
+                shortConfig.description_max_words,
+                detectionParams.language
+            );
+            promises.push(shortPromise);
+        }
+
+        showSpinner(spinner_msg_chapters_ai);
+        console.log('Getting chapter starting words and times');
+
+        const results = await Promise.all(promises);
+        const chapters = results[0];
+
+        // Update titles/descriptions UI if enabled
+        if (detectionParams.titlesDescription) {
+            updateChaptersTitlesDescription('long', results[1]);
+            updateChaptersTitlesDescription('short', results[2]);
+            $('#chapters-title-description-wrapper').removeClass('hidden');
+        } else {
+            $('#chapters-title-description-wrapper').addClass('hidden');
+        }
+
+        console.log('chapters after getting markers', chapters);
+
+        if (chapters) {
+            console.log('chapters after moving by inPoint:', chapters);
+            $('#chapters-start').addClass('hidden');
+            chapter_markers_write_HTML(chapters);
+
+            g_chapter_detection_inout = {
+                'inPoint': detectionParams.inPoint,
+                'outPoint': detectionParams.outPoint
+            };
+
+            loadChapterClips();
+
+            return {
+                'status': 'completed',
+                'message': chapters.length + ' chapters detected successfully.'
+            };
+        } else {
+            if (returnResult) {
+                return {
+                    'status': 'skipped',
+                    'message': 'Sorry, no chapters could be detected.'
+                };
+            }
+            showError('Sorry, no chapters could be detected.');
+        }
+
+    } catch (error) {
+        if (returnResult) {
+            return error && error.message ? error.message : String(error) || 'Unknown error';
+        }
+        console.error(error);
+        handleErrorNotification(error);
+
+    } finally {
+        if (!returnResult) {
+            hideSpinner();
+        }
+        clear_abort_undo_state();
+        tracker.end(trackingId);
+        test_52_schedule_log_upload(600);
+    }
+}
+
+/**
+ * Adds chapter markers to the sequence based on current chapter data
+ * @param {Object} params - Optional marker parameters
+ * @param {boolean} suppressUI - If true, doesn't hide spinner on completion
+ */
+async function add_markers(params = null, suppressUI = false) {
+    const isLicenseValid = await verify_license_throttled();
+
+    if (!isLicenseValid || !check_function_availability('add_markers')) {
+        showError('Please provide a valid license key in the Settings menu');
+        return;
+    }
+
+    test_52_schedule_log_upload(time_delay = 0);
+    regular_license_key_checker();
+    await test_45_save_state('Before adding markers');
+    await test_46_retrieve_undo_state_info();
+
+    const trackingId = tracker.start('add_markers');
+
+    try {
+        showSpinner(spinner_msg_add_markers);
+        console.log('Getting chapter starting words and times from HTML');
+
+        try {
+            chapters = chapter_markers_read_HTML();
+        } catch (error) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            hideSpinner();
+            return;
+        }
+
+        if (!chapters) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            hideSpinner();
+            return;
+        }
+
+        if (chapters == null) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            hideSpinner();
+            return;
+        }
+
+        if (chapters.length == 0) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            hideSpinner();
+            return;
+        }
+
+        console.log('Adding markers');
+        await test_33_load_chapter_set_and_create_markers(chapters, params);
+
+    } catch (error) {
+        handleErrorNotification(error);
+
+    } finally {
+        if (!suppressUI) {
+            hideSpinner();
+        }
+        clear_abort_undo_state();
+        tracker.end(trackingId);
+        test_52_schedule_log_upload(600);
+    }
+}
+
+/**
+ * Copies chapter timestamps to clipboard in standard format
+ * @param {boolean} suppressUI - If true, doesn't hide spinner on completion
+ */
+async function copy_timestamps(suppressUI = false) {
+    const isLicenseValid = await verify_license_throttled();
+
+    if (!isLicenseValid || !check_function_availability('copy_timestamps')) {
+        showError('Please provide a valid license key in the Settings menu');
+        return;
+    }
+
+    test_52_schedule_log_upload(time_delay = 0);
+    regular_license_key_checker();
+    await test_45_save_state('Before copying timestamps');
+    await test_46_retrieve_undo_state_info();
+
+    const trackingId = tracker.start('copy_timestamps');
+
+    try {
+        console.log('Getting chapter starting words and times from HTML');
+
+        try {
+            chapters = chapter_markers_read_HTML();
+        } catch (error) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            return;
+        }
+
+        if (!chapters) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            return;
+        }
+
+        if (chapters == null) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            return;
+        }
+
+        if (chapters.length == 0) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            return;
+        }
+
+        console.log('Copying timestamps');
+
+        let timestampText = '';
+
+        for (let i = 0; i < chapters.length; i++) {
+            let formattedTime = timeConversion(chapters[i].time, 's', 'hh:mm:ss');
+            timestampText += formattedTime + ' - ' + chapters[i].name + '\n';
+        }
+
+        copy_to_clipboard(timestampText);
+        $('#copy-timestamps-success').removeClass('hidden');
+
+    } catch (error) {
+        handleErrorNotification(error);
+
+    } finally {
+        if (!suppressUI) {
+            hideSpinner();
+        }
+        clear_abort_undo_state();
+        tracker.end(trackingId);
+        test_52_schedule_log_upload(600);
+    }
+}
+
+/**
+ * Adds section/chapter clips (MOGRT templates) to the sequence
+ * @param {string} mogrtUrl - URL to the MOGRT template (optional, uses selected if not provided)
+ * @param {Object} colorOptions - Optional color customization options
+ * @param {boolean} suppressUI - If true, doesn't hide spinner on completion
+ */
+async function add_section_clips(mogrtUrl = null, colorOptions = null, suppressUI = false) {
+    const isLicenseValid = await verify_license_throttled();
+
+    if (!isLicenseValid || !check_function_availability('add_section_clips')) {
+        showError('Please provide a valid license key in the Settings menu');
+        return;
+    }
+
+    test_52_schedule_log_upload(time_delay = 0);
+    regular_license_key_checker();
+    await test_45_save_state('Before adding section clips');
+    await test_46_retrieve_undo_state_info();
+
+    const trackingId = tracker.start('add_section_clips');
+
+    try {
+        showSpinner(spinner_msg_sections_analysis);
+        console.log('Getting chapter starting words and times from HTML');
+
+        let chapters;
+
+        try {
+            chapters = chapter_markers_read_HTML();
+        } catch (error) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            hideSpinner();
+            return;
+        }
+
+        if (!chapters) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            hideSpinner();
+            return;
+        }
+
+        if (chapters === null) {
+            showError('Chapters could not be read. Please check the times are formatted correctly.');
+            hideSpinner();
+            return;
+        }
+
+        if (chapters.length === 0) {
+            showError('No chapter markers found. Please click the \'Detect chapters\' button first.');
+            hideSpinner();
+            return;
+        }
+
+        const selectedMogrt = mogrtUrl || chaptersGetSelectedMogrt();
+
+        if (selectedMogrt === null) {
+            showError('Please select a clip to add.');
+            hideSpinner();
+            return;
+        }
+
+        const localMogrtPath = await checkOrDownloadMogrt(selectedMogrt);
+
+        console.log('Adding markers');
+        result = await test_35_chapter_dividers_with_custom_colors(chapters, localMogrtPath, colorOptions);
+
+    } catch (error) {
+        handleErrorNotification(error);
+
+    } finally {
+        if (!suppressUI) {
+            hideSpinner();
+        }
+        clear_abort_undo_state();
+        tracker.end(trackingId);
+        test_52_schedule_log_upload(600);
+    }
+}

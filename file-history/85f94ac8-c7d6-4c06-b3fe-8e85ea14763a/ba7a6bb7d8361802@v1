@@ -1,0 +1,150 @@
+/**
+ * Slice 9: FFprobe-based Audio Silence Detection
+ *
+ * Uses FFprobe's silencedetect filter to find actual audio silence
+ * (not just gaps between speech segments like Whisper).
+ *
+ * More accurate than Whisper gap detection because it analyzes
+ * actual audio levels, not transcribed speech boundaries.
+ */
+
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
+const { validateAudioPath, safeFFprobe } = require('./securityUtils');
+
+/**
+ * Detect silence regions in audio file using FFprobe silencedetect
+ *
+ * @param {string} wavPath - Path to WAV file
+ * @param {Object} options - Detection options
+ * @param {number} options.threshold - dB threshold (default: -30, range: -60 to -20)
+ * @param {number} options.minDuration - Minimum silence duration in seconds (default: 0.5)
+ * @param {number} options.padding - Buffer to add around silences in seconds (default: 0.1)
+ * @returns {Promise<Array<{start: number, end: number, duration: number}>>}
+ */
+async function detectAudioSilences(wavPath, options = {}) {
+  const {
+    threshold = -30,
+    minDuration = 0.5,
+    padding = 0.1
+  } = options;
+
+  // Validate threshold range
+  const safeThreshold = Math.max(-60, Math.min(-20, threshold));
+
+  // Build FFprobe command
+  // silencedetect outputs to stderr, not stdout
+  const cmd = `ffprobe -f lavfi -i "amovie='${wavPath}',silencedetect=n=${safeThreshold}dB:d=${minDuration}" -show_entries frame_tags=lavfi.silence_start,lavfi.silence_end -of default=nw=1 2>&1`;
+
+  console.log(`[SPLICE] FFprobe command: ${cmd}`);
+
+  try {
+    const { stdout, stderr } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
+
+    // silencedetect outputs to stderr
+    const output = stderr || stdout;
+    const silences = parseFFprobeOutput(output, padding);
+
+    console.log(`[SPLICE] FFprobe detected ${silences.length} silence(s) at threshold ${safeThreshold}dB`);
+    return silences;
+
+  } catch (error) {
+    // FFprobe may exit with error but still produce output
+    if (error.stderr) {
+      const silences = parseFFprobeOutput(error.stderr, padding);
+      if (silences.length > 0) {
+        console.log(`[SPLICE] FFprobe detected ${silences.length} silence(s) (with exit error)`);
+        return silences;
+      }
+    }
+    throw new Error(`FFprobe failed: ${error.message}`);
+  }
+}
+
+/**
+ * Parse FFprobe silencedetect output
+ *
+ * Output format:
+ * [silencedetect @ 0x...] silence_start: 1.234
+ * [silencedetect @ 0x...] silence_end: 2.567 | silence_duration: 1.333
+ *
+ * @param {string} output - FFprobe stderr output
+ * @param {number} padding - Padding to apply to silence boundaries
+ * @returns {Array<{start: number, end: number, duration: number}>}
+ */
+function parseFFprobeOutput(output, padding = 0) {
+  const silences = [];
+  const lines = output.split('\n');
+
+  let currentStart = null;
+
+  for (const line of lines) {
+    // Match silence_start
+    const startMatch = line.match(/silence_start:\s*([\d.]+)/);
+    if (startMatch) {
+      currentStart = parseFloat(startMatch[1]);
+      continue;
+    }
+
+    // Match silence_end
+    const endMatch = line.match(/silence_end:\s*([\d.]+)/);
+    if (endMatch && currentStart !== null) {
+      const end = parseFloat(endMatch[1]);
+
+      // Apply padding (shrink silence region)
+      const paddedStart = currentStart + padding;
+      const paddedEnd = end - padding;
+
+      // Only add if still valid after padding
+      if (paddedEnd > paddedStart) {
+        silences.push({
+          start: paddedStart,
+          end: paddedEnd,
+          duration: parseFloat((paddedEnd - paddedStart).toFixed(3))
+        });
+      }
+
+      currentStart = null;
+    }
+  }
+
+  return silences;
+}
+
+/**
+ * Get audio file duration using FFprobe
+ *
+ * @param {string} filePath - Path to audio file
+ * @returns {Promise<number>} Duration in seconds
+ */
+async function getAudioDuration(filePath) {
+  const cmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`;
+
+  try {
+    const { stdout } = await execAsync(cmd);
+    return parseFloat(stdout.trim());
+  } catch (error) {
+    throw new Error(`Failed to get audio duration: ${error.message}`);
+  }
+}
+
+/**
+ * Check if FFprobe is installed
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isFFprobeInstalled() {
+  try {
+    await execAsync('ffprobe -version');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+module.exports = {
+  detectAudioSilences,
+  getAudioDuration,
+  isFFprobeInstalled
+};

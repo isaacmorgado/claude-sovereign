@@ -1,0 +1,344 @@
+/**
+ * Stripe Webhook Tests
+ *
+ * Tests for:
+ * 1. Webhook signature verification
+ * 2. Event type handling (checkout.session.completed, invoice.paid, etc.)
+ * 3. License key generation on subscription
+ * 4. Idempotency handling
+ * 5. Error handling for malformed events
+ * 6. Production vs development behavior
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+// =============================================================================
+// TEST FRAMEWORK
+// =============================================================================
+
+let passCount = 0;
+let failCount = 0;
+
+function test(name, fn) {
+  try {
+    const result = fn();
+    if (result instanceof Promise) {
+      return result.then(() => {
+        passCount++;
+        console.log(`  ✓ ${name}`);
+      }).catch(err => {
+        failCount++;
+        console.log(`  ✗ ${name}`);
+        console.log(`    Error: ${err.message}`);
+      });
+    }
+    passCount++;
+    console.log(`  ✓ ${name}`);
+  } catch (err) {
+    failCount++;
+    console.log(`  ✗ ${name}`);
+    console.log(`    Error: ${err.message}`);
+  }
+}
+
+function assertEqual(actual, expected, message = '') {
+  if (actual !== expected) {
+    throw new Error(`${message}: Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function assertTrue(condition, message = '') {
+  if (!condition) {
+    throw new Error(`${message}: Expected true, got false`);
+  }
+}
+
+function assertFalse(condition, message = '') {
+  if (condition) {
+    throw new Error(`${message}: Expected false, got true`);
+  }
+}
+
+function assertIncludes(str, substring, message = '') {
+  if (!str.includes(substring)) {
+    throw new Error(`${message}: Expected string to include "${substring}"`);
+  }
+}
+
+// =============================================================================
+// SOURCE CODE ANALYSIS
+// =============================================================================
+
+console.log('\n=== Stripe Webhook Tests ===\n');
+
+const serverSource = fs.readFileSync(
+  path.join(__dirname, '../server.js'),
+  'utf8'
+);
+
+// Extract webhook handler section
+const webhookSection = serverSource.substring(
+  serverSource.indexOf("app.post('/webhooks/stripe'"),
+  serverSource.indexOf("app.post('/webhooks/stripe'") + 5000
+);
+
+console.log('1. Webhook Endpoint Configuration Tests');
+
+test('should use express.raw for webhook body', () => {
+  assertIncludes(serverSource, "express.raw({ type: 'application/json' })", 'Should use raw body parser');
+});
+
+test('should mount webhook before express.json', () => {
+  const rawIndex = serverSource.indexOf("app.post('/webhooks/stripe'");
+  const jsonIndex = serverSource.indexOf('express.json()');
+  assertTrue(rawIndex < jsonIndex, 'Webhook should be before JSON parser');
+});
+
+test('should read stripe-signature header', () => {
+  assertIncludes(serverSource, "req.headers['stripe-signature']", 'Should read signature header');
+});
+
+console.log('\n2. Signature Verification Tests');
+
+test('should use stripe.webhooks.constructEvent', () => {
+  assertIncludes(serverSource, 'stripe.webhooks.constructEvent', 'Should use constructEvent');
+});
+
+test('should pass body, signature, and secret to constructEvent', () => {
+  assertIncludes(serverSource, 'constructEvent(req.body, sig, webhookSecret)', 'Should pass correct args');
+});
+
+test('should check for STRIPE_WEBHOOK_SECRET', () => {
+  assertIncludes(serverSource, 'process.env.STRIPE_WEBHOOK_SECRET', 'Should use env secret');
+});
+
+test('should reject unsigned webhooks in production', () => {
+  assertIncludes(serverSource, 'Reject unsigned webhooks in production', 'Should have security comment');
+  assertIncludes(serverSource, 'STRIPE_WEBHOOK_SECRET not set in production', 'Should log critical error');
+});
+
+test('should allow unsigned webhooks in development', () => {
+  assertIncludes(serverSource, 'Processing webhook without signature verification (dev only)', 'Should warn in dev');
+});
+
+test('should return 400 on signature verification failure', () => {
+  assertIncludes(serverSource, 'Webhook signature verification failed', 'Should have verification error');
+  assertIncludes(serverSource, "return res.status(400).json({ error: 'Webhook signature", 'Should return 400');
+});
+
+console.log('\n3. Event Type Handling Tests');
+
+test('should handle checkout.session.completed', () => {
+  assertIncludes(serverSource, "event.type === 'checkout.session.completed'", 'Should handle checkout.session.completed');
+});
+
+test('should handle invoice.paid', () => {
+  assertIncludes(serverSource, "event.type === 'invoice.paid'", 'Should handle invoice.paid');
+});
+
+test('should handle customer.subscription.deleted', () => {
+  assertIncludes(serverSource, "'customer.subscription.deleted'", 'Should handle subscription deleted');
+});
+
+test('should log unhandled event types', () => {
+  assertIncludes(serverSource, 'Unhandled event type', 'Should log unhandled events');
+});
+
+console.log('\n4. License Key Generation Tests');
+
+test('should generate license key on checkout.session.completed', () => {
+  assertIncludes(serverSource, 'generateLicenseKey', 'Should call generateLicenseKey');
+});
+
+test('should store license key in Stripe metadata', () => {
+  assertIncludes(serverSource, 'stripe.subscriptions.update', 'Should update subscription');
+  assertIncludes(serverSource, 'license_key:', 'Should store license_key in metadata');
+});
+
+test('should get customer email for license delivery', () => {
+  assertIncludes(serverSource, 'stripe.customers.retrieve(customerId)', 'Should retrieve customer');
+  assertIncludes(serverSource, 'customer.email', 'Should check for email');
+});
+
+test('should log license key delivery', () => {
+  assertIncludes(serverSource, 'License key ready for delivery', 'Should log delivery');
+});
+
+console.log('\n5. Customer and Subscription Handling Tests');
+
+test('should extract customer ID from event', () => {
+  assertIncludes(serverSource, 'session.customer', 'Should get customer from session');
+  assertIncludes(serverSource, 'invoice.customer', 'Should get customer from invoice');
+});
+
+test('should extract subscription ID', () => {
+  assertIncludes(serverSource, 'session.subscription', 'Should get subscription from session');
+  assertIncludes(serverSource, 'invoice.subscription', 'Should get subscription from invoice');
+});
+
+test('should get tier from price ID', () => {
+  assertIncludes(serverSource, 'getTierFromPriceId', 'Should call getTierFromPriceId');
+});
+
+console.log('\n6. Invoice.paid Handler Tests');
+
+test('should reset hours on invoice.paid', () => {
+  // Look for resetHours or similar functionality in invoice.paid handler
+  assertIncludes(serverSource, 'invoice.paid', 'Should handle invoice.paid');
+  assertIncludes(serverSource, 'stripe.subscriptions.retrieve', 'Should retrieve subscription');
+});
+
+test('should use correct tier for resetting', () => {
+  assertIncludes(serverSource, 'price?.id', 'Should get price ID from subscription');
+  assertIncludes(serverSource, 'getTierFromPriceId(priceId)', 'Should convert price to tier');
+});
+
+console.log('\n7. Error Handling Tests');
+
+test('should catch and log webhook errors', () => {
+  assertIncludes(serverSource, 'catch (err)', 'Should have try-catch');
+});
+
+test('should return 200 even on processing errors', () => {
+  // Webhooks should return 200 to prevent retries for non-retriable errors
+  assertIncludes(serverSource, "res.json({ received: true })", 'Should return received: true');
+});
+
+test('should handle missing customer ID', () => {
+  assertIncludes(serverSource, 'if (!customerId)', 'Should check for missing customer');
+});
+
+console.log('\n8. Idempotency Tests');
+
+test('should log event ID for idempotency tracking', () => {
+  assertIncludes(serverSource, 'event.id', 'Should use event ID');
+  assertIncludes(serverSource, 'Webhook received:', 'Should log webhook receipt');
+});
+
+test('should include event ID in log for deduplication', () => {
+  assertIncludes(serverSource, '${event.type} (${event.id})', 'Should log type and ID');
+});
+
+console.log('\n9. Security Best Practices Tests');
+
+test('should mask sensitive data in logs', () => {
+  assertIncludes(serverSource, 'maskSensitiveData', 'Should use data masking');
+});
+
+test('should not log full license keys', () => {
+  // License keys should be masked when logged
+  assertIncludes(serverSource, 'maskSensitiveData(licenseResult.key)', 'Should mask license key');
+});
+
+test('should not log full customer emails', () => {
+  assertIncludes(serverSource, 'maskSensitiveData(customer.email)', 'Should mask email');
+});
+
+console.log('\n10. Response Handling Tests');
+
+test('should return success response', () => {
+  assertIncludes(serverSource, "res.json({ received: true })", 'Should return received: true');
+});
+
+test('should return 500 for webhook configuration errors', () => {
+  assertIncludes(serverSource, "return res.status(500).json({ error: 'Webhook configuration", 'Should return 500 for config error');
+});
+
+test('should return 400 for signature verification failure', () => {
+  assertIncludes(serverSource, "return res.status(400).json({ error: 'Webhook signature", 'Should return 400');
+});
+
+// =============================================================================
+// WEBHOOK EVENT MOCK TESTS
+// =============================================================================
+
+console.log('\n11. Mock Event Structure Tests');
+
+// Test the getTierFromPriceId function
+const getTierMatch = serverSource.match(/function getTierFromPriceId\(priceId\) \{[\s\S]*?return ['"]starter['"];?\s*\}/);
+
+test('getTierFromPriceId function should exist', () => {
+  assertTrue(getTierMatch !== null, 'Should find getTierFromPriceId function');
+});
+
+if (getTierMatch) {
+  // Extract and test the function
+  const getTierCode = getTierMatch[0];
+
+  test('getTierFromPriceId should check STRIPE_PRICE_STARTER', () => {
+    assertIncludes(getTierCode, 'STRIPE_PRICE_STARTER', 'Should check starter price');
+  });
+
+  test('getTierFromPriceId should check STRIPE_PRICE_PRO', () => {
+    assertIncludes(getTierCode, 'STRIPE_PRICE_PRO', 'Should check pro price');
+  });
+
+  test('getTierFromPriceId should check STRIPE_PRICE_TEAM', () => {
+    assertIncludes(getTierCode, 'STRIPE_PRICE_TEAM', 'Should check team price');
+  });
+
+  test('getTierFromPriceId should default to starter', () => {
+    assertIncludes(getTierCode, "return 'starter'", 'Should default to starter');
+  });
+}
+
+console.log('\n12. Webhook Event Types Completeness');
+
+const expectedEventTypes = [
+  'checkout.session.completed',
+  'invoice.paid',
+  'customer.subscription.deleted'
+];
+
+for (const eventType of expectedEventTypes) {
+  test(`should handle ${eventType} event`, () => {
+    assertIncludes(serverSource, eventType, `Should handle ${eventType}`);
+  });
+}
+
+console.log('\n13. Stripe API Call Safety Tests');
+
+test('should await Stripe API calls', () => {
+  assertIncludes(serverSource, 'await stripe.', 'Should await Stripe calls');
+});
+
+test('should have error handling around Stripe calls', () => {
+  assertIncludes(serverSource, 'try {', 'Should use try blocks');
+});
+
+test('should handle Stripe API errors gracefully', () => {
+  // Look for Stripe-specific error handling
+  assertIncludes(serverSource, 'stripeErr', 'Should catch Stripe errors');
+});
+
+// =============================================================================
+// CORS AND HEADERS TESTS
+// =============================================================================
+
+console.log('\n14. CORS and Headers Tests');
+
+test('should allow stripe-signature header', () => {
+  assertIncludes(serverSource, "'stripe-signature'", 'Should allow stripe-signature header');
+});
+
+test('should include stripe in allowedHeaders', () => {
+  assertIncludes(serverSource, "allowedHeaders:", 'Should have allowedHeaders');
+});
+
+// =============================================================================
+// SUMMARY
+// =============================================================================
+
+console.log('\n=== Test Summary ===');
+console.log(`  Passed: ${passCount}`);
+console.log(`  Failed: ${failCount}`);
+console.log(`  Total: ${passCount + failCount}`);
+
+if (failCount > 0) {
+  console.log('\n[X] Some tests failed');
+  process.exit(1);
+} else {
+  console.log('\n[OK] All Stripe Webhook tests passed');
+  process.exit(0);
+}

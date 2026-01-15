@@ -1,0 +1,175 @@
+     1→/**
+     2→ * Slice 4: GPT-4o-mini Transcription Service
+     3→ *
+     4→ * Handles audio transcription using OpenAI's gpt-4o-mini-transcribe model.
+     5→ * 50% cheaper than Whisper ($0.003/min vs $0.006/min).
+     6→ * Returns timestamped segments for take detection.
+     7→ * Includes caching to avoid repeated API calls.
+     8→ */
+     9→
+    10→const fs = require('fs');
+    11→const OpenAI = require('openai');
+    12→
+    13→// Initialize OpenAI client
+    14→const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    15→
+    16→// In-memory cache: { wavPath: { mtime, result } }
+    17→const transcriptCache = new Map();
+    18→
+    19→/**
+    20→ * Transcribe audio file using GPT-4o-mini-transcribe (with caching)
+    21→ * @param {string} wavPath - Path to the WAV file
+    22→ * @returns {Promise<{text: string, segments: Array, language: string, duration: number}>}
+    23→ */
+    24→async function transcribeAudio(wavPath) {
+    25→  // Check cache based on file modification time
+    26→  const stats = fs.statSync(wavPath);
+    27→  const mtime = stats.mtimeMs;
+    28→
+    29→  const cached = transcriptCache.get(wavPath);
+    30→  if (cached && cached.mtime === mtime) {
+    31→    console.log('[SPLICE] Using cached transcription (file unchanged)');
+    32→    return cached.result;
+    33→  }
+    34→
+    35→  console.log('[SPLICE] Starting GPT-4o-mini transcription...');
+    36→
+    37→  // GPT-4o-mini-transcribe uses the same transcriptions API as Whisper
+    38→  // but only supports 'json' response format (not verbose_json)
+    39→  const transcription = await openai.audio.transcriptions.create({
+    40→    file: fs.createReadStream(wavPath),
+    41→    model: 'gpt-4o-mini-transcribe',
+    42→    response_format: 'json',
+    43→    language: 'en',
+    44→  });
+    45→
+    46→  console.log(`[SPLICE] Transcription complete: ${transcription.text.slice(0, 100)}...`);
+    47→
+    48→  // GPT-4o-mini-transcribe returns simpler response than verbose_json
+    49→  // We need to estimate segments from the text if not provided
+    50→  const result = {
+    51→    text: transcription.text,
+    52→    segments: transcription.segments || estimateSegments(transcription.text),
+    53→    language: transcription.language || 'en',
+    54→    duration: transcription.duration || 0
+    55→  };
+    56→
+    57→  // Cache the result
+    58→  transcriptCache.set(wavPath, { mtime, result });
+    59→  console.log('[SPLICE] Transcription cached');
+    60→
+    61→  return result;
+    62→}
+    63→
+    64→/**
+    65→ * Estimate segments from text when not provided by API
+    66→ * Creates rough segments based on sentence boundaries
+    67→ * @param {string} text - Full transcript text
+    68→ * @returns {Array} Estimated segments
+    69→ */
+    70→function estimateSegments(text) {
+    71→  if (!text) return [];
+    72→
+    73→  // Split by sentence boundaries
+    74→  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    75→
+    76→  // Create segments with estimated timing (will be refined by take detection)
+    77→  return sentences.map((sentence, index) => ({
+    78→    id: index,
+    79→    start: 0, // Will be refined by take detection
+    80→    end: 0,
+    81→    text: sentence.trim()
+    82→  }));
+    83→}
+    84→
+    85→/**
+    86→ * Transcribe audio with word-level timestamps using Whisper
+    87→ * Required for profanity, repetition, and stutter detection endpoints.
+    88→ *
+    89→ * @param {string} wavPath - Path to the WAV file
+    90→ * @returns {Promise<{text: string, words: Array<{word: string, start: number, end: number}>}>}
+    91→ */
+    92→async function transcribeWithWords(wavPath) {
+    93→  // Check cache based on file modification time
+    94→  const stats = fs.statSync(wavPath);
+    95→  const mtime = stats.mtimeMs;
+    96→  const cacheKey = `words:${wavPath}`;
+    97→
+    98→  const cached = transcriptCache.get(cacheKey);
+    99→  if (cached && cached.mtime === mtime) {
+   100→    console.log('[SPLICE] Using cached word-level transcription (file unchanged)');
+   101→    return cached.result;
+   102→  }
+   103→
+   104→  console.log('[SPLICE] Starting Whisper transcription with word timestamps...');
+   105→
+   106→  // Use whisper-1 with word-level timestamp granularity
+   107→  let transcription;
+   108→  try {
+   109→    transcription = await openai.audio.transcriptions.create({
+   110→      file: fs.createReadStream(wavPath),
+   111→      model: 'whisper-1',
+   112→      response_format: 'verbose_json',
+   113→      timestamp_granularities: ['word'],
+   114→      language: 'en',
+   115→    });
+   116→  } catch (err) {
+   117→    // Handle quota errors with clear message
+   118→    if (err.code === 'insufficient_quota' || err.message?.includes('quota')) {
+   119→      throw new Error('OpenAI API quota exceeded. Please check your billing at https://platform.openai.com/account/billing');
+   120→    }
+   121→    // Handle connection errors with retry hint
+   122→    if (err.code === 'ECONNRESET' || err.message?.includes('Connection error')) {
+   123→      throw new Error('OpenAI API connection failed. Please try again in a moment.');
+   124→    }
+   125→    throw err;
+   126→  }
+   127→
+   128→  console.log(`[SPLICE] Word transcription complete: ${transcription.words?.length || 0} words`);
+   129→
+   130→  // Map to consistent format
+   131→  const result = {
+   132→    text: transcription.text,
+   133→    words: (transcription.words || []).map(w => ({
+   134→      word: w.word,
+   135→      start: w.start,
+   136→      end: w.end
+   137→    })),
+   138→    language: transcription.language || 'en',
+   139→    duration: transcription.duration || 0
+   140→  };
+   141→
+   142→  // Cache the result
+   143→  transcriptCache.set(cacheKey, { mtime, result });
+   144→  console.log(`[SPLICE] Word transcription cached (${result.words.length} words)`);
+   145→
+   146→  return result;
+   147→}
+   148→
+   149→/**
+   150→ * Clear transcription cache
+   151→ * Useful for testing or memory management
+   152→ */
+   153→function clearCache() {
+   154→  const size = transcriptCache.size;
+   155→  transcriptCache.clear();
+   156→  console.log(`[SPLICE] Cleared ${size} cached transcription(s)`);
+   157→  return size;
+   158→}
+   159→
+   160→/**
+   161→ * Get cache statistics
+   162→ */
+   163→function getCacheStats() {
+   164→  return {
+   165→    entries: transcriptCache.size,
+   166→    keys: Array.from(transcriptCache.keys())
+   167→  };
+   168→}
+   169→
+   170→module.exports = { transcribeAudio, transcribeWithWords, clearCache, getCacheStats };
+   171→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

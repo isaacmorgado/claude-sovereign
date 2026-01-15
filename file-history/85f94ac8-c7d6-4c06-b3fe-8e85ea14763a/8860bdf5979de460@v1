@@ -1,0 +1,470 @@
+/**
+ * Referral Code Service
+ *
+ * Manages referral codes for user acquisition and rewards.
+ * Each user gets a unique referral code that gives:
+ * - Referee: 10% discount on first purchase
+ * - Referrer: 1 hour credit bonus when code is used
+ */
+
+const { Pool } = require('pg');
+const crypto = require('crypto');
+
+// Use the same pool configuration as usageTracking
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
+});
+
+// Default referral rewards
+const DEFAULT_REFEREE_DISCOUNT = 10;    // 10% discount for new users
+const DEFAULT_REFERRER_CREDIT = 1.0;    // 1 hour credit for referrer
+
+/**
+ * Initialize referral tables
+ */
+async function initReferralTables() {
+  const client = await pool.connect();
+  try {
+    // Create referral_codes table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS referral_codes (
+        id SERIAL PRIMARY KEY,
+        code VARCHAR(12) UNIQUE NOT NULL,
+        owner_customer_id VARCHAR(255) NOT NULL,
+        referee_discount_percent INTEGER DEFAULT ${DEFAULT_REFEREE_DISCOUNT},
+        referrer_credit_hours DECIMAL(10,2) DEFAULT ${DEFAULT_REFERRER_CREDIT},
+        times_used INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Create referral_uses table to track who used which code
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS referral_uses (
+        id SERIAL PRIMARY KEY,
+        code_id INTEGER REFERENCES referral_codes(id),
+        referee_customer_id VARCHAR(255) NOT NULL,
+        used_at TIMESTAMP DEFAULT NOW(),
+        credit_awarded BOOLEAN DEFAULT FALSE,
+        stripe_coupon_id VARCHAR(255)
+      )
+    `);
+
+    // Add indexes for efficient lookups
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_referral_codes_owner
+      ON referral_codes(owner_customer_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_referral_codes_code
+      ON referral_codes(code)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_referral_uses_code
+      ON referral_uses(code_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_referral_uses_referee
+      ON referral_uses(referee_customer_id)
+    `);
+
+    console.log('[Referral] Database tables initialized');
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Generate a unique referral code
+ * Format: SPLICE-XXXX (8 random alphanumeric chars)
+ */
+function generateCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars
+  let code = 'SPLICE-';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(crypto.randomInt(chars.length));
+  }
+  return code;
+}
+
+/**
+ * Get or create referral code for a customer
+ *
+ * @param {string} customerId - Stripe customer ID
+ * @returns {Promise<Object>} Referral code info
+ */
+async function getOrCreateCode(customerId) {
+  if (!customerId) {
+    throw new Error('Customer ID is required');
+  }
+
+  const client = await pool.connect();
+  try {
+    // Check for existing code
+    let result = await client.query(
+      'SELECT * FROM referral_codes WHERE owner_customer_id = $1',
+      [customerId]
+    );
+
+    if (result.rows.length > 0) {
+      return {
+        code: result.rows[0].code,
+        discountPercent: result.rows[0].referee_discount_percent,
+        creditHours: parseFloat(result.rows[0].referrer_credit_hours),
+        timesUsed: result.rows[0].times_used,
+        isActive: result.rows[0].is_active,
+        createdAt: result.rows[0].created_at
+      };
+    }
+
+    // Generate unique code with retry logic
+    let code;
+    let attempts = 0;
+    const maxAttempts = 10;
+
+    while (attempts < maxAttempts) {
+      code = generateCode();
+      try {
+        result = await client.query(
+          `INSERT INTO referral_codes (code, owner_customer_id)
+           VALUES ($1, $2)
+           RETURNING *`,
+          [code, customerId]
+        );
+        break;
+      } catch (err) {
+        if (err.code === '23505') { // Unique violation
+          attempts++;
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (attempts >= maxAttempts) {
+      throw new Error('Failed to generate unique referral code');
+    }
+
+    return {
+      code: result.rows[0].code,
+      discountPercent: result.rows[0].referee_discount_percent,
+      creditHours: parseFloat(result.rows[0].referrer_credit_hours),
+      timesUsed: 0,
+      isActive: true,
+      createdAt: result.rows[0].created_at
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Validate a referral code
+ *
+ * @param {string} code - Referral code to validate
+ * @param {string} refereeCustomerId - The customer trying to use the code (optional)
+ * @returns {Promise<Object>} Validation result
+ */
+async function validateCode(code, refereeCustomerId = null) {
+  if (!code || typeof code !== 'string') {
+    return {
+      valid: false,
+      error: 'Invalid code format'
+    };
+  }
+
+  // Normalize code
+  const normalizedCode = code.toUpperCase().trim();
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT * FROM referral_codes WHERE code = $1',
+      [normalizedCode]
+    );
+
+    if (result.rows.length === 0) {
+      return {
+        valid: false,
+        error: 'Code not found'
+      };
+    }
+
+    const codeRow = result.rows[0];
+
+    // Check if code is active
+    if (!codeRow.is_active) {
+      return {
+        valid: false,
+        error: 'Code is no longer active'
+      };
+    }
+
+    // Check if user is trying to use their own code
+    if (refereeCustomerId && codeRow.owner_customer_id === refereeCustomerId) {
+      return {
+        valid: false,
+        error: 'Cannot use your own referral code'
+      };
+    }
+
+    // Check if referee has already used a code
+    if (refereeCustomerId) {
+      const usageCheck = await client.query(
+        'SELECT id FROM referral_uses WHERE referee_customer_id = $1',
+        [refereeCustomerId]
+      );
+      if (usageCheck.rows.length > 0) {
+        return {
+          valid: false,
+          error: 'You have already used a referral code'
+        };
+      }
+    }
+
+    return {
+      valid: true,
+      code: codeRow.code,
+      discountPercent: codeRow.referee_discount_percent,
+      ownerCustomerId: codeRow.owner_customer_id
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Apply a referral code for a new signup
+ *
+ * @param {string} code - Referral code
+ * @param {string} refereeCustomerId - New customer's Stripe ID
+ * @param {Object} stripe - Stripe instance for creating coupons (optional)
+ * @returns {Promise<Object>} Application result with coupon info
+ */
+async function applyCode(code, refereeCustomerId, stripe = null) {
+  if (!code || !refereeCustomerId) {
+    throw new Error('Code and referee customer ID are required');
+  }
+
+  // Validate the code first
+  const validation = await validateCode(code, refereeCustomerId);
+  if (!validation.valid) {
+    throw new Error(validation.error);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Get the code details
+    const codeResult = await client.query(
+      'SELECT * FROM referral_codes WHERE code = $1',
+      [validation.code]
+    );
+    const codeRow = codeResult.rows[0];
+
+    // Create Stripe coupon if Stripe instance provided
+    let stripeCouponId = null;
+    if (stripe) {
+      try {
+        const coupon = await stripe.coupons.create({
+          percent_off: codeRow.referee_discount_percent,
+          duration: 'once',
+          metadata: {
+            referral_code: codeRow.code,
+            referrer: codeRow.owner_customer_id
+          }
+        });
+        stripeCouponId = coupon.id;
+      } catch (err) {
+        console.warn(`[Referral] Failed to create Stripe coupon: ${err.message}`);
+        // Continue without coupon - user still gets tracking
+      }
+    }
+
+    // Record the usage
+    await client.query(
+      `INSERT INTO referral_uses (code_id, referee_customer_id, stripe_coupon_id)
+       VALUES ($1, $2, $3)`,
+      [codeRow.id, refereeCustomerId, stripeCouponId]
+    );
+
+    // Increment usage count
+    await client.query(
+      'UPDATE referral_codes SET times_used = times_used + 1 WHERE id = $1',
+      [codeRow.id]
+    );
+
+    await client.query('COMMIT');
+
+    return {
+      success: true,
+      discountPercent: codeRow.referee_discount_percent,
+      stripeCouponId,
+      referrerCustomerId: codeRow.owner_customer_id,
+      creditHoursToAward: parseFloat(codeRow.referrer_credit_hours)
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Award credit to referrer when a referred user completes first payment
+ *
+ * @param {string} refereeCustomerId - The new customer who was referred
+ * @param {Object} usageTracking - Usage tracking service for adding credits
+ * @returns {Promise<Object>} Award result
+ */
+async function awardReferrerCredit(refereeCustomerId, usageTracking) {
+  const client = await pool.connect();
+  try {
+    // Find the referral use record
+    const useResult = await client.query(
+      `SELECT ru.*, rc.owner_customer_id, rc.referrer_credit_hours
+       FROM referral_uses ru
+       JOIN referral_codes rc ON ru.code_id = rc.id
+       WHERE ru.referee_customer_id = $1 AND ru.credit_awarded = FALSE`,
+      [refereeCustomerId]
+    );
+
+    if (useResult.rows.length === 0) {
+      return { awarded: false, reason: 'No pending referral credit' };
+    }
+
+    const useRow = useResult.rows[0];
+    const creditHours = parseFloat(useRow.referrer_credit_hours);
+
+    // Add credit to referrer's balance
+    if (usageTracking) {
+      const referrerBalance = await usageTracking.getBalance(useRow.owner_customer_id);
+
+      // Add bonus hours to existing balance
+      await pool.query(
+        `UPDATE users
+         SET hours_remaining = hours_remaining + $1,
+             hours_total = hours_total + $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_customer_id = $2`,
+        [creditHours, useRow.owner_customer_id]
+      );
+    }
+
+    // Mark as awarded
+    await client.query(
+      'UPDATE referral_uses SET credit_awarded = TRUE WHERE id = $1',
+      [useRow.id]
+    );
+
+    return {
+      awarded: true,
+      referrerCustomerId: useRow.owner_customer_id,
+      creditHours
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get referral statistics for a customer
+ *
+ * @param {string} customerId - Stripe customer ID
+ * @returns {Promise<Object>} Referral statistics
+ */
+async function getStats(customerId) {
+  if (!customerId) {
+    throw new Error('Customer ID is required');
+  }
+
+  const client = await pool.connect();
+  try {
+    // Get the customer's referral code
+    const codeResult = await client.query(
+      'SELECT * FROM referral_codes WHERE owner_customer_id = $1',
+      [customerId]
+    );
+
+    if (codeResult.rows.length === 0) {
+      return {
+        hasCode: false,
+        code: null,
+        stats: null
+      };
+    }
+
+    const codeRow = codeResult.rows[0];
+
+    // Get usage details
+    const usesResult = await client.query(
+      `SELECT ru.*, ru.credit_awarded
+       FROM referral_uses ru
+       WHERE ru.code_id = $1
+       ORDER BY ru.used_at DESC`,
+      [codeRow.id]
+    );
+
+    const uses = usesResult.rows;
+    const totalUses = uses.length;
+    const creditsAwarded = uses.filter(u => u.credit_awarded).length;
+    const pendingCredits = totalUses - creditsAwarded;
+
+    return {
+      hasCode: true,
+      code: codeRow.code,
+      stats: {
+        totalReferrals: totalUses,
+        successfulReferrals: creditsAwarded,
+        pendingReferrals: pendingCredits,
+        totalCreditsEarned: creditsAwarded * parseFloat(codeRow.referrer_credit_hours),
+        discountPercent: codeRow.referee_discount_percent,
+        creditHoursPerReferral: parseFloat(codeRow.referrer_credit_hours),
+        isActive: codeRow.is_active,
+        recentReferrals: uses.slice(0, 10).map(u => ({
+          usedAt: u.used_at,
+          creditAwarded: u.credit_awarded
+        }))
+      }
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Check if a customer has used a referral code
+ *
+ * @param {string} customerId - Stripe customer ID
+ * @returns {Promise<boolean>}
+ */
+async function hasUsedReferralCode(customerId) {
+  const result = await pool.query(
+    'SELECT id FROM referral_uses WHERE referee_customer_id = $1',
+    [customerId]
+  );
+  return result.rows.length > 0;
+}
+
+module.exports = {
+  initReferralTables,
+  getOrCreateCode,
+  validateCode,
+  applyCode,
+  awardReferrerCredit,
+  getStats,
+  hasUsedReferralCode,
+  generateCode,
+  DEFAULT_REFEREE_DISCOUNT,
+  DEFAULT_REFERRER_CREDIT
+};

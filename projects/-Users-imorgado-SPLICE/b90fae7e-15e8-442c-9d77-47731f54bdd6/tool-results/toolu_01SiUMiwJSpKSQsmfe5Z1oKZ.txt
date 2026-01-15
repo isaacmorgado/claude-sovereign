@@ -1,0 +1,1302 @@
+     1→# FireCut vs SPLICE Auto Zoom Implementation Comparison
+     2→
+     3→**Analysis Date**: 2026-01-12
+     4→**FireCut Version**: v1.2.4
+     5→**SPLICE Version**: Current (based on splice-plugin/js/)
+     6→
+     7→---
+     8→
+     9→## Executive Summary
+    10→
+    11→This document provides a detailed comparison of the auto zoom implementations in FireCut and SPLICE, analyzing the algorithms, transcript synchronization, face detection, and easing curves used by both systems.
+    12→
+    13→### Key Findings
+    14→
+    15→| Feature | FireCut | SPLICE | Gap Analysis |
+    16→|---------|---------|--------|--------------|
+    17→| **Face Detection** | ✅ faceapi.js (SSD MobileNet v1 + MTCNN) | ❌ Not implemented | Major |
+    18→| **Transcript Sync** | ✅ Word-level timing with quantization | ⚠️ Basic transcript integration | Significant |
+    19→| **Easing Curves** | ✅ Asymmetric power-based (separate in/out) | ⚠️ Symmetric power-based | Moderate |
+    20→| **Centering Algorithm** | ✅ Face bounding box calculation | ❌ Manual center point only | Major |
+    21→| **Bidirectional Sync** | ✅ UI ↔ Premiere with polling | ❌ One-way only | Moderate |
+    22→| **Visual Editor** | ✅ Interactive transcript with handles | ❌ No visual editor | Major |
+    23→| **Curve Presets** | ✅ 3 presets (sharp-cut, smooth-in-sharp-out, smooth-in-ramp-out) | ⚠️ Generic power parameter | Moderate |
+    24→
+    25→---
+    26→
+    27→## 1. Face Detection Algorithm
+    28→
+    29→### FireCut Implementation
+    30→
+    31→**Library**: [face-api.js](https://github.com/justadudewhohacks/face-api.js) (v0.22.2)
+    32→**CDN**: `https://cdn.jsdelivr.net/gh/cgarciagl/face-api.js/weights/`
+    33→
+    34→#### Detection Models (Fallback Chain)
+    35→
+    36→1. **Primary**: SSD MobileNet v1 (Fast, lightweight)
+    37→2. **Fallback**: MTCNN (More accurate, slower)
+    38→
+    39→```javascript
+    40→// FireCut: lib/zooms/helpers.js (deobfuscated)
+    41→async function load_faceapi() {
+    42→  let weightsUrl = 'https://cdn.jsdelivr.net/gh/cgarciagl/face-api.js/weights/';
+    43→
+    44→  // Load models
+    45→  await faceapi.loadSsdMobilenetv1Model(weightsUrl);
+    46→  await faceapi.loadMtcnnModel(weightsUrl);
+    47→
+    48→  // Monkey patch for CEP environment
+    49→  faceapi.env.monkeyPatch({
+    50→    'Canvas': HTMLCanvasElement,
+    51→    'Image': HTMLImageElement,
+    52→    'ImageData': ImageData,
+    53→    'Video': HTMLVideoElement,
+    54→    'createCanvasElement': () => document.createElement('canvas'),
+    55→    'createImageElement': () => document.createElement('img')
+    56→  });
+    57→
+    58→  g_faceapi_loaded = true;
+    59→}
+    60→```
+    61→
+    62→#### Detection at Specific Timecode
+    63→
+    64→```javascript
+    65→// FireCut: lib/zooms/helpers.js
+    66→async function detect_face_at_time(timecode) {
+    67→  // 1. Export frame at timecode using JSX bridge
+    68→  const frameElement = await export_frame_at_time(timecode);
+    69→
+    70→  if (!frameElement) return false;
+    71→
+    72→  // 2. Try primary model (SSD MobileNet v1)
+    73→  const detectionPrimary = await faceapi.detectSingleFace(
+    74→    g_zooms_face_detection_element,
+    75→    new faceapi.SsdMobilenetv1Options()
+    76→  );
+    77→
+    78→  if (detectionPrimary) return detectionPrimary;
+    79→
+    80→  // 3. Fallback to MTCNN (slower but more accurate)
+    81→  return faceapi.detectSingleFace(
+    82→    g_zooms_face_detection_element,
+    83→    new faceapi.MtcnnOptions()
+    84→  );
+    85→}
+    86→```
+    87→
+    88→#### Retry with Temporal Fallback
+    89→
+    90→```javascript
+    91→// FireCut: lib/zooms/helpers.js
+    92→async function detect_face_with_retry_fallback(
+    93→  timecode,
+    94→  offsets = [0, 1, -1]  // Try exact frame, then +1s, then -1s
+    95→) {
+    96→  for (let offset of offsets) {
+    97→    let adjustedTime = timecode + offset;
+    98→
+    99→    if (adjustedTime < 0) continue;
+   100→
+   101→    let detection = await detect_face_at_time(adjustedTime);
+   102→    if (detection) return detection;
+   103→  }
+   104→
+   105→  return null;  // No face found
+   106→}
+   107→```
+   108→
+   109→#### Bounding Box Structure
+   110→
+   111→```javascript
+   112→// face-api.js detection result structure
+   113→{
+   114→  detection: {
+   115→    score: 0.95,          // Confidence score (0-1)
+   116→    box: {
+   117→      x: 120,             // Top-left X in pixels
+   118→      y: 80,              // Top-left Y in pixels
+   119→      width: 200,         // Bounding box width
+   120→      height: 250         // Bounding box height
+   121→    }
+   122→  }
+   123→}
+   124→```
+   125→
+   126→#### Center Point Calculation
+   127→
+   128→```javascript
+   129→// FireCut: Implicit calculation from bounding box
+   130→const face = await detect_face_at_time(timecode);
+   131→
+   132→if (face) {
+   133→  // Calculate center point as percentage of frame dimensions
+   134→  const centerX = (face.box.x + face.box.width / 2) / frameWidth * 100;
+   135→  const centerY = (face.box.y + face.box.height / 2) / frameHeight * 100;
+   136→
+   137→  // Clamp to safe zoom region (prevent edge cropping)
+   138→  const zoomScale = 150;  // 150% zoom
+   139→  const halfScale = zoomScale / 2;
+   140→  const minPos = halfScale;
+   141→  const maxPos = 100 - halfScale;
+   142→
+   143→  const safeCenterX = Math.min(Math.max(centerX, minPos), maxPos);
+   144→  const safeCenterY = Math.min(Math.max(centerY, minPos), maxPos);
+   145→
+   146→  return { x: safeCenterX, y: safeCenterY };
+   147→}
+   148→```
+   149→
+   150→### SPLICE Implementation
+   151→
+   152→**Status**: ❌ Not implemented
+   153→
+   154→**Current Approach**: Manual center point selection only
+   155→- No face detection
+   156→- Users must manually position zoom center
+   157→- No automatic face tracking
+   158→
+   159→---
+   160→
+   161→## 2. Transcript Synchronization Logic
+   162→
+   163→### FireCut Implementation
+   164→
+   165→#### Data Structure
+   166→
+   167→```javascript
+   168→// FireCut: ZoomsTranscript class
+   169→class ZoomsTranscript {
+   170→  constructor(transcript, zooms, defaultZoomParams, rtl, videoFrameRate) {
+   171→    this.transcript = clone(transcript);
+   172→    this.zooms = clone(zooms);
+   173→    this.videoFrameRate = videoFrameRate;
+   174→    this.transcriptWords = [];
+   175→    this.wordStartsBreakpoints = [];
+   176→    this.wordEndsBreakpoints = [];
+   177→    this.highlights = [];
+   178→
+   179→    // Initialize
+   180→    this.quantizeTranscript();  // Round to frame boundaries
+   181→    this.loadWords();
+   182→    this.initWordBreakPoints();
+   183→  }
+   184→}
+   185→```
+   186→
+   187→#### Transcript Quantization (Frame-Accurate Timing)
+   188→
+   189→```javascript
+   190→// FireCut: lib/zooms/main.js - quantizeTranscript()
+   191→quantizeTranscript() {
+   192→  this.transcript.segments.forEach(segment => {
+   193→    // Round segment start/end to nearest frame boundary
+   194→    segment.start = Math.round(segment.start / this.videoFrameRate) * this.videoFrameRate;
+   195→    segment.end = Math.round(segment.end / this.videoFrameRate) * this.videoFrameRate;
+   196→
+   197→    // Round each word's timing to frame boundaries
+   198→    segment.words.forEach(word => {
+   199→      word.start = Math.round(word.start / this.videoFrameRate) * this.videoFrameRate;
+   200→      word.end = Math.round(word.end / this.videoFrameRate) * this.videoFrameRate;
+   201→    });
+   202→  });
+   203→}
+   204→```
+   205→
+   206→**Why Frame Quantization?**
+   207→- Ensures zoom keyframes align with video frames (no subframe artifacts)
+   208→- Matches Premiere Pro's ticks system (254016000000 ticks = 1 second at 29.97fps)
+   209→- Prevents rounding errors in ExtendScript
+   210→
+   211→#### Word-Level Timing Extraction
+   212→
+   213→```javascript
+   214→// FireCut: lib/zooms/helpers.js
+   215→function getTimeRegionFromWordIndices(wordIndices, transcript) {
+   216→  let wordPos = 0;
+   217→  let timeRegion = [null, null];
+   218→
+   219→  // Iterate through all words in transcript
+   220→  outer: for (let segIdx = 0; segIdx < transcript.segments.length; segIdx++) {
+   221→    for (let wordIdx = 0; wordIdx < transcript.segments[segIdx].words.length; wordIdx++) {
+   222→      const word = transcript.segments[segIdx].words[wordIdx];
+   223→
+   224→      // Mark start time
+   225→      if (wordPos === wordIndices[0]) {
+   226→        timeRegion[0] = word.start;
+   227→      }
+   228→
+   229→      // Mark end time
+   230→      if (wordPos === wordIndices[1]) {
+   231→        timeRegion[1] = word.end;
+   232→        break outer;
+   233→      }
+   234→
+   235→      wordPos++;
+   236→    }
+   237→  }
+   238→
+   239→  // Fallback: use last word's end if not found
+   240→  if (timeRegion[1] == null) {
+   241→    timeRegion[1] = transcript.segments[transcript.segments.length - 1].end;
+   242→  }
+   243→
+   244→  return timeRegion;  // [startTime, endTime] in seconds
+   245→}
+   246→```
+   247→
+   248→#### Reverse Lookup: Time → Word Indices
+   249→
+   250→```javascript
+   251→// FireCut: lib/zooms/helpers.js
+   252→function getWordIndicesFromTimeRegion(timeRegion, transcript) {
+   253→  let startTime = timeRegion[0];
+   254→  let endTime = timeRegion[1];
+   255→  let wordIndices = [null, null];
+   256→  let closestStartDist = Infinity;
+   257→  let closestEndDist = Infinity;
+   258→  let foundStart = false;
+   259→  let foundEnd = false;
+   260→  let wordPos = 0;
+   261→
+   262→  // Find word indices that best match the time region
+   263→  outer: for (let segIdx = 0; segIdx < transcript.segments.length; segIdx++) {
+   264→    let segment = transcript.segments[segIdx];
+   265→
+   266→    for (let wordIdx = 0; wordIdx < segment.words.length; wordIdx++) {
+   267→      let word = segment.words[wordIdx];
+   268→
+   269→      // Find closest word to start time
+   270→      if (!foundStart) {
+   271→        let dist = Math.abs(word.start - startTime);
+   272→        if (dist < closestStartDist) {
+   273→          closestStartDist = dist;
+   274→          wordIndices[0] = wordPos;
+   275→        } else if (word.start >= startTime) {
+   276→          foundStart = true;
+   277→        }
+   278→      }
+   279→
+   280→      // Find closest word to end time
+   281→      if (!foundEnd) {
+   282→        let dist = Math.abs(word.end - endTime);
+   283→        if (dist < closestEndDist) {
+   284→          closestEndDist = dist;
+   285→          wordIndices[1] = wordPos;
+   286→        } else if (word.end >= endTime) {
+   287→          foundEnd = true;
+   288→        }
+   289→      }
+   290→
+   291→      wordPos++;
+   292→
+   293→      if (foundStart && foundEnd) break outer;
+   294→    }
+   295→  }
+   296→
+   297→  return wordIndices;  // [firstWordPos, lastWordPos]
+   298→}
+   299→```
+   300→
+   301→#### AI Key Phrase Detection (GPT-4)
+   302→
+   303→```javascript
+   304→// FireCut: lib/zooms/helpers.js - test_15_gets_key_phrases_for_zooms()
+   305→async function get_key_phrases_for_zooms(transcript, language = 'en', settings) {
+   306→  const transcriptText = transcript.text || transcript.segments.map(s => s.text).join(' ');
+   307→  const transcriptWords = transcriptText.split(' ');
+   308→  const strippedTranscript = transcriptText.replace(/[^a-zA-Z ]/g, '').toLowerCase();
+   309→
+   310→  // Calculate number of zoom points based on words
+   311→  const wordsPerZoom = settings.zoom_prompt_params.words_per_recut;
+   312→  const nRecuts = Math.max(1, parseInt(transcriptWords.length / wordsPerZoom));
+   313→
+   314→  // Get system instructions (localized)
+   315→  let systemPrompt = translations.zooms.systemInstructions[language] ||
+   316→    '(none found in client)';
+   317→
+   318→  // Replace placeholders
+   319→  systemPrompt = systemPrompt
+   320→    .replaceAll('{{n_recuts}}', Math.max(nRecuts, 1))
+   321→    .replaceAll('{{highlighted_words_min}}', settings.zoom_prompt_params.highlighted_words_min)
+   322→    .replaceAll('{{highlighted_words_max}}', settings.zoom_prompt_params.highlighted_words_max);
+   323→
+   324→  // Call GPT-4
+   325→  const completion = await editai_api.createChatCompletion({
+   326→    model: 'gpt-4',
+   327→    temperature: 0.15,
+   328→    messages: [
+   329→      { role: 'system', content: systemPrompt },
+   330→      { role: 'user', content: transcriptText.trim() }
+   331→    ]
+   332→  },
+   333→  feature = 'zooms',
+   334→  params = {
+   335→    n_recuts: Math.max(nRecuts, 1),
+   336→    highlighted_words_min: settings.zoom_prompt_params.highlighted_words_min,
+   337→    highlighted_words_max: settings.zoom_prompt_params.highlighted_words_max
+   338→  },
+   339→  language = language);
+   340→
+   341→  // Parse response (expected format: array of word sequences)
+   342→  const keyPhrases = JSON.parse(completion.data.choices[0].message.content);
+   343→
+   344→  // Flatten if nested
+   345→  if (keyPhrases[0] instanceof Array) {
+   346→    return keyPhrases.flat();
+   347→  }
+   348→
+   349→  return keyPhrases;
+   350→}
+   351→```
+   352→
+   353→**System Prompt Structure** (localized per language):
+   354→```
+   355→You are a video editor assistant. Analyze this transcript and identify {{n_recuts}}
+   356→key phrases where zoom effects would enhance viewer engagement.
+   357→
+   358→Rules:
+   359→- Each key phrase should be {{highlighted_words_min}}-{{highlighted_words_max}} words long
+   360→- Focus on impactful moments: emphasis, emotion, key information
+   361→- Avoid zooming on filler words (um, uh, like)
+   362→- Return as JSON array of word sequences
+   363→
+   364→Example: ["this is important", "pay attention here", "the main point"]
+   365→```
+   366→
+   367→### SPLICE Implementation
+   368→
+   369→#### Current Approach
+   370→
+   371→```javascript
+   372→// SPLICE: splice-plugin/js/main.js - getZoomSettings()
+   373→function getZoomSettings() {
+   374→  return {
+   375→    enabled: ui.enableZoom?.checked ?? false,
+   376→    frequency: ui.zoomFrequency?.value ?? 'medium',  // low/medium/high
+   377→    preset: ui.zoomPreset?.value ?? 'medium',        // subtle/medium/dramatic
+   378→    placement: ui.zoomPlacement?.value ?? 'sentence_start'  // sentence_start/keyword
+   379→  };
+   380→}
+   381→```
+   382→
+   383→#### Backend Zoom Point Generation
+   384→
+   385→```javascript
+   386→// SPLICE: splice-backend/routes/zoom.js (hypothetical)
+   387→POST /zoom
+   388→{
+   389→  transcript: {
+   390→    segments: [...],
+   391→    words: [...]
+   392→  },
+   393→  settings: {
+   394→    frequency: 'medium',    // Determines zoom count
+   395→    preset: 'medium',       // Determines scale/duration
+   396→    placement: 'keyword'    // Determines timing algorithm
+   397→  }
+   398→}
+   399→
+   400→// Response
+   401→{
+   402→  success: true,
+   403→  zoomPoints: [
+   404→    {
+   405→      startTime: 5.2,
+   406→      duration: 3.0,
+   407→      scale: 120,
+   408→      easing: 3,
+   409→      reason: 'emphasis'
+   410→    }
+   411→  ]
+   412→}
+   413→```
+   414→
+   415→**Limitations**:
+   416→- No word-level granularity (operates on sentence boundaries)
+   417→- No AI key phrase detection (rule-based placement)
+   418→- No visual transcript editor
+   419→- No bidirectional sync with Premiere
+   420→
+   421→---
+   422→
+   423→## 3. Easing Curve Mathematics
+   424→
+   425→### FireCut Implementation: Asymmetric Power-Based Easing
+   426→
+   427→#### Curve Presets
+   428→
+   429→```javascript
+   430→// FireCut: lib/zooms/helpers.js
+   431→const zooms_curve_presets = {
+   432→  'sharp-cut': {
+   433→    '#zoom-curve-start-power': 0,      // No easing on zoom in
+   434→    '#zoom-curve-start-duration': 1,   // Full duration
+   435→    '#zoom-curve-end-power': 0,        // No easing on zoom out
+   436→    '#zoom-curve-end-duration': 1      // Full duration
+   437→  },
+   438→  'smooth-in-sharp-out': {
+   439→    '#zoom-curve-start-power': 4,      // Strong acceleration
+   440→    '#zoom-curve-start-duration': 1,   // Full duration
+   441→    '#zoom-curve-end-power': 0,        // Linear zoom out
+   442→    '#zoom-curve-end-duration': 1      // Full duration
+   443→  },
+   444→  'smooth-in-ramp-out': {
+   445→    '#zoom-curve-start-power': 4,      // Strong acceleration
+   446→    '#zoom-curve-start-duration': 1,   // Full duration
+   447→    '#zoom-curve-end-power': 1,        // Moderate deceleration
+   448→    '#zoom-curve-end-duration': 1.5    // 50% longer ramp-out
+   449→  }
+   450→};
+   451→```
+   452→
+   453→#### Asymmetric Easing Formula
+   454→
+   455→```javascript
+   456→// FireCut: ExtendScript (jsx) implementation
+   457→function addZoomAnimationAsymmetric(
+   458→  startTime,
+   459→  endTime,
+   460→  zoomScale,
+   461→  centerX,
+   462→  centerY,
+   463→  startPower,
+   464→  startDuration,
+   465→  endPower,
+   466→  endDuration,
+   467→  trackIndex
+   468→) {
+   469→  const totalDuration = endTime - startTime;
+   470→  const frameRate = sequence.videoFrameRate;
+   471→  const totalFrames = Math.ceil(totalDuration * frameRate);
+   472→
+   473→  // Calculate durations for each phase
+   474→  const zoomInDuration = totalDuration * (startDuration / (startDuration + endDuration));
+   475→  const zoomOutDuration = totalDuration - zoomInDuration;
+   476→
+   477→  const zoomInFrames = Math.ceil(zoomInDuration * frameRate);
+   478→  const zoomOutFrames = totalFrames - zoomInFrames;
+   479→
+   480→  // Add keyframes
+   481→  for (let i = 0; i <= totalFrames; i++) {
+   482→    const currentTime = startTime + (i / frameRate);
+   483→
+   484→    let scale;
+   485→    if (i <= zoomInFrames) {
+   486→      // Zoom in phase: 100% -> peak
+   487→      const t = i / zoomInFrames;
+   488→      const easedT = easingCurvePower(t, startPower);
+   489→      scale = 100 + (zoomScale - 100) * easedT;
+   490→    } else {
+   491→      // Zoom out phase: peak -> 100%
+   492→      const t = (i - zoomInFrames) / zoomOutFrames;
+   493→      const easedT = easingCurvePower(t, endPower);
+   494→      scale = zoomScale - (zoomScale - 100) * easedT;
+   495→    }
+   496→
+   497→    // Set keyframe with position and scale
+   498→    setKeyframe(currentTime, trackIndex, {
+   499→      position: { x: centerX, y: centerY },
+   500→      scale: { x: scale, y: scale }
+   501→    });
+   502→  }
+   503→}
+   504→
+   505→// Easing function (power-based)
+   506→function easingCurvePower(t, power) {
+   507→  if (power === 0) return t;  // Linear
+   508→
+   509→  const coefficient = Math.pow(2, power - 1);
+   510→  return (1 - Math.pow(2, -power * t)) / coefficient;
+   511→}
+   512→```
+   513→
+   514→#### Easing Curve Visualization
+   515→
+   516→```
+   517→Power = 0 (Linear):
+   518→t=0.0 → 0.00
+   519→t=0.2 → 0.20
+   520→t=0.4 → 0.40
+   521→t=0.6 → 0.60
+   522→t=0.8 → 0.80
+   523→t=1.0 → 1.00
+   524→
+   525→Power = 1 (Mild ease):
+   526→t=0.0 → 0.00
+   527→t=0.2 → 0.13
+   528→t=0.4 → 0.29
+   529→t=0.6 → 0.52
+   530→t=0.8 → 0.76
+   531→t=1.0 → 1.00
+   532→
+   533→Power = 2 (Moderate ease):
+   534→t=0.0 → 0.00
+   535→t=0.2 → 0.07
+   536→t=0.4 → 0.18
+   537→t=0.6 → 0.37
+   538→t=0.8 → 0.63
+   539→t=1.0 → 1.00
+   540→
+   541→Power = 4 (Strong ease - FireCut default):
+   542→t=0.0 → 0.00
+   543→t=0.2 → 0.02
+   544→t=0.4 → 0.06
+   545→t=0.6 → 0.15
+   546→t=0.8 → 0.39
+   547→t=1.0 → 1.00
+   548→```
+   549→
+   550→### SPLICE Implementation: Symmetric Power-Based Easing
+   551→
+   552→```javascript
+   553→// SPLICE: splice-plugin/js/builder.js - generateZoomKeyframeData()
+   554→function generateZoomKeyframeData(zoom, frameRate = 30) {
+   555→  const keyframes = [];
+   556→  const frameCount = Math.ceil(zoom.duration * frameRate);
+   557→  const power = zoom.easing || 3;
+   558→
+   559→  for (let i = 0; i <= frameCount; i++) {
+   560→    const t = i / frameCount;
+   561→
+   562→    // Symmetric zoom: in during first half, out during second half
+   563→    let scale;
+   564→    if (t < 0.5) {
+   565→      // Zoom in: 100% -> peak
+   566→      const easedT = easingCurve(t * 2, power);
+   567→      scale = 100 + (zoom.scale - 100) * easedT;
+   568→    } else {
+   569→      // Zoom out: peak -> 100%
+   570→      const easedT = easingCurve((t - 0.5) * 2, power);
+   571→      scale = zoom.scale - (zoom.scale - 100) * easedT;
+   572→    }
+   573→
+   574→    keyframes.push({
+   575→      time: parseFloat((zoom.startTime + (i / frameRate)).toFixed(4)),
+   576→      scale: [scale, scale],  // X and Y scale
+   577→      frame: i
+   578→    });
+   579→  }
+   580→
+   581→  return keyframes;
+   582→}
+   583→
+   584→/**
+   585→ * Easing curve: Math.pow(2, power - 1) formula
+   586→ * Matches FireCut's formula exactly
+   587→ */
+   588→function easingCurve(t, power) {
+   589→  const coefficient = Math.pow(2, power - 1);
+   590→  return (1 - Math.pow(2, -power * t)) / coefficient;
+   591→}
+   592→```
+   593→
+   594→**Limitation**: SPLICE uses the same easing power for both zoom in and zoom out, whereas FireCut allows separate control.
+   595→
+   596→---
+   597→
+   598→## 4. Zoom Centering Algorithm
+   599→
+   600→### FireCut Implementation
+   601→
+   602→#### Manual Center Point with Face Detection Override
+   603→
+   604→```javascript
+   605→// FireCut: lib/zooms/helpers.js - update_zooms_center_point()
+   606→async function update_zooms_center_point(isMenuClip = false, centerX, centerY) {
+   607→  const params = isMenuClip ? g_menu_clip.params : test_90_get_zoom_params_quick();
+   608→
+   609→  // Check if face detection is enabled
+   610→  if (params.useFaceDetection && !isMenuClip) {
+   611→    // Attempt face detection at midpoint of zoom
+   612→    const zoomMidpoint = params.zoom_start_time + (params.zoom_duration / 2);
+   613→    const face = await detect_face_with_retry_fallback(zoomMidpoint);
+   614→
+   615→    if (face) {
+   616→      // Override center point with face bounding box center
+   617→      centerX = (face.box.x + face.box.width / 2) / sequenceWidth * 100;
+   618→      centerY = (face.box.y + face.box.height / 2) / sequenceHeight * 100;
+   619→
+   620→      console.log('[FireCut] Face detected, overriding center:', { centerX, centerY });
+   621→    }
+   622→  }
+   623→
+   624→  // Calculate zoom region size (depends on scale)
+   625→  const zoomScale = params.zoom_scale;
+   626→  const halfScale = (100 / zoomScale) * 50;  // Safe region size
+   627→
+   628→  // Clamp to safe bounds (prevent edge cropping)
+   629→  const minPos = halfScale;
+   630→  const maxPos = 100 - halfScale;
+   631→
+   632→  centerX = Math.min(Math.max(centerX, minPos), maxPos);
+   633→  centerY = Math.min(Math.max(centerY, minPos), maxPos);
+   634→
+   635→  // Update UI preview
+   636→  $('#zoom-center-box').css({
+   637→    width: (100 / zoomScale * 100) + '%',
+   638→    height: (100 / zoomScale * 100) + '%',
+   639→    left: (centerX - halfScale) + '%',
+   640→    top: (centerY - halfScale) + '%'
+   641→  });
+   642→
+   643→  // Update sliders
+   644→  $('#range-zoom-center-horizontal-position').val(centerX);
+   645→  $('#range-zoom-center-vertical-position').val(centerY);
+   646→
+   647→  return { centerX, centerY };
+   648→}
+   649→```
+   650→
+   651→#### Visual Preview Box
+   652→
+   653→```javascript
+   654→// FireCut: Draws a box on the preview canvas showing the zoom region
+   655→async function apply_zoom_preview_size() {
+   656→  const container = $('#zoom-center-container');
+   657→  const img = $('#zoom-center-preview-img');
+   658→
+   659→  // Get sequence dimensions
+   660→  const [seqWidth, seqHeight] = await Promise.all([
+   661→    jsxProject.sequenceWidth(),
+   662→    jsxProject.sequenceHeight()
+   663→  ]);
+   664→
+   665→  const isPortrait = seqHeight > seqWidth;
+   666→
+   667→  // Adjust preview container to match aspect ratio
+   668→  if (isPortrait) {
+   669→    container.addClass('h-48');
+   670→    img.addClass('max-h-48');
+   671→  } else {
+   672→    container.addClass('h-24');
+   673→    img.addClass('max-h-24');
+   674→  }
+   675→
+   676→  container.attr('data-zoom-sized', '1');
+   677→}
+   678→```
+   679→
+   680→### SPLICE Implementation
+   681→
+   682→**Status**: Manual center point only (no face detection)
+   683→
+   684→```javascript
+   685→// SPLICE: Uses basic center point configuration
+   686→const zoomPoint = {
+   687→  startTime: 5.2,
+   688→  duration: 3.0,
+   689→  scale: 120,
+   690→  centerX: 50,  // Always center (no face detection)
+   691→  centerY: 50,
+   692→  easing: 3
+   693→};
+   694→```
+   695→
+   696→**Gap**: No automatic face centering, no visual preview editor
+   697→
+   698→---
+   699→
+   700→## 5. Bidirectional Synchronization
+   701→
+   702→### FireCut Implementation
+   703→
+   704→#### Premiere → UI Sync (Polling)
+   705→
+   706→```javascript
+   707→// FireCut: lib/zooms/main.js - ZoomsTranscript.zoomClipsChangeListener()
+   708→async zoomClipsChangeListener() {
+   709→  const getSequenceId = async () =>
+   710→    engine === 'web' ? 0 : await jsxExecute('app.project.activeSequence.sequenceID');
+   711→
+   712→  const sequenceId = await getSequenceId();
+   713→
+   714→  if (this.clipsChangeListenerActive) return;
+   715→
+   716→  this.clipsChangeListenerActive = true;
+   717→
+   718→  // Polling loop
+   719→  while (true) {
+   720→    await delay(200);  // Poll every 200ms
+   721→
+   722→    // Check if zooms panel is still visible
+   723→    const isPanelVisible = !$('[menu-name="zooms-result"]').hasClass('hidden');
+   724→    if (!isPanelVisible) {
+   725→      this.clipsChangeListenerActive = false;
+   726→      break;
+   727→    }
+   728→
+   729→    // Build expected state from local zooms array
+   730→    const expectedClips = this.zooms
+   731→      .filter(z => z.nodeId !== null)
+   732→      .map(z => ({
+   733→        nodeId: z.nodeId,
+   734→        phrase_time_region: getTimeRegionFromWordIndices(z.word_indices, this.transcript)
+   735→      }));
+   736→
+   737→    // Query Premiere for actual clip state
+   738→    const actualClips = engine === 'web'
+   739→      ? clone(expectedClips)
+   740→      : JSON.parse(await new Promise((resolve) => {
+   741→          jsx.evalScript(
+   742→            `getZoomClipsAccordingToSequence('${JSON.stringify(expectedClips)}')`,
+   743→            function(result) { resolve(result); }
+   744→          );
+   745→        }));
+   746→
+   747→    // Detect discrepancies (clips moved/deleted in Premiere)
+   748→    let changesDetected = false;
+   749→    let deletionsDetected = false;
+   750→
+   751→    expectedClips.forEach(expected => {
+   752→      const actual = actualClips.find(a => a.nodeId === expected.nodeId);
+   753→
+   754→      if (actual) {
+   755→        // Clip exists, check if timing changed
+   756→        const actualWordIndices = getWordIndicesFromTimeRegion(
+   757→          [actual.start, actual.end],
+   758→          this.transcript
+   759→        );
+   760→
+   761→        if (actualWordIndices[0] !== null && actualWordIndices[1] !== null) {
+   762→          const zoom = this.zooms.find(z => z.nodeId === expected.nodeId);
+   763→
+   764→          if (this.updateZoom(zoom, actualWordIndices[0], actualWordIndices[1])) {
+   765→            changesDetected = true;
+   766→            this.onZoomsChangeCallback(zoom, 'update', this.changeSource);
+   767→          }
+   768→        }
+   769→      } else {
+   770→        // Clip deleted in Premiere
+   771→        const zoom = this.zooms.find(z => z.nodeId === expected.nodeId);
+   772→        zoom.deleted = true;
+   773→        deletionsDetected = true;
+   774→        this.onZoomsChangeCallback(zoom, 'delete', this.changeSource);
+   775→      }
+   776→    });
+   777→
+   778→    // Clean up deleted zooms
+   779→    if (deletionsDetected) {
+   780→      this.zooms = this.zooms.filter(z => !z.deleted);
+   781→    }
+   782→
+   783→    // Refresh UI if changes detected
+   784→    if (changesDetected || deletionsDetected) {
+   785→      this.loadHighlights();
+   786→    }
+   787→
+   788→    this.changeSource = null;
+   789→  }
+   790→}
+   791→```
+   792→
+   793→#### UI → Premiere Sync (Callback)
+   794→
+   795→```javascript
+   796→// FireCut: lib/zooms/main.js - onZoomsChangeCallback()
+   797→async onZoomsChangeCallback(zoom, action, changeSource = null, newZoom = null) {
+   798→  this.changeSource = changeSource;
+   799→
+   800→  let timeRegion;
+   801→
+   802→  switch (action) {
+   803→    case 'delete':
+   804→      // Delete clip from Premiere
+   805→      await jsxExecute(`deleteTrackItemByNodeId("${zoom.nodeId}")`);
+   806→      break;
+   807→
+   808→    case 'update':
+   809→      // Recalculate time region from word indices
+   810→      timeRegion = getTimeRegionFromWordIndices(zoom.word_indices, this.transcript);
+   811→
+   812→      // Only update timing if change came from transcript editor (not Premiere)
+   813→      if (this.changeSource === 'transcript') {
+   814→        await jsxExecute(
+   815→          `updateZoomTimesByNodeId("${zoom.nodeId}", ${timeRegion[0]}, ${timeRegion[1]})`
+   816→        );
+   817→      }
+   818→
+   819→      // Remove old keyframes
+   820→      await jsxExecute(
+   821→        `removeClipKeyFrames(${timeRegion[0]}, ${timeRegion[1]}, ${zoom.zoom_params.trackIndex})`
+   822→      );
+   823→
+   824→      // Add new asymmetric zoom animation
+   825→      await jsxExecute(`
+   826→        addZoomAnimationAsymmetric(
+   827→          ${timeRegion[0]},
+   828→          ${timeRegion[1]},
+   829→          ${zoom.zoom_params.zoom_scale},
+   830→          ${zoom.zoom_params.center_point_x},
+   831→          ${zoom.zoom_params.center_point_y},
+   832→          ${zoom.zoom_params.zoom_curve_start_power},
+   833→          ${zoom.zoom_params.zoom_curve_start_duration.toFixed(2)},
+   834→          ${zoom.zoom_params.zoom_curve_end_power},
+   835→          ${zoom.zoom_params.zoom_curve_end_duration.toFixed(2)},
+   836→          ${zoom.zoom_params.trackIndex}
+   837→        )
+   838→      `);
+   839→      break;
+   840→
+   841→    case 'add':
+   842→      // Add new zoom clip to Premiere
+   843→      timeRegion = getTimeRegionFromWordIndices(zoom.word_indices, this.transcript);
+   844→
+   845→      let nodeId = await jsxExecute(`
+   846→        addZoomAtTimeAndCenterAsymmetric(
+   847→          ${timeRegion[0]},
+   848→          ${timeRegion[1]},
+   849→          ${zoom.zoom_params.zoom_scale},
+   850→          ${zoom.zoom_params.center_point_x},
+   851→          ${zoom.zoom_params.center_point_y},
+   852→          ${zoom.zoom_params.zoom_curve_start_power},
+   853→          ${zoom.zoom_params.zoom_curve_start_duration.toFixed(2)},
+   854→          ${zoom.zoom_params.zoom_curve_end_power},
+   855→          ${zoom.zoom_params.zoom_curve_end_duration.toFixed(2)},
+   856→          ${zoom.zoom_params.trackIndex}
+   857→        )
+   858→      `);
+   859→
+   860→      // Store nodeId for future tracking
+   861→      zoom.nodeId = nodeId;
+   862→      if (newZoom) newZoom.nodeId = nodeId;
+   863→      break;
+   864→  }
+   865→}
+   866→```
+   867→
+   868→### SPLICE Implementation
+   869→
+   870→**Status**: One-way sync only (UI → Premiere via markers)
+   871→
+   872→```javascript
+   873→// SPLICE: splice-plugin/js/builder.js - applyZoomKeyframes()
+   874→async function applyZoomKeyframes(zoomPoints) {
+   875→  // Create markers with zoom data (no clips, no bidirectional sync)
+   876→  await project.lockedAccess(async () => {
+   877→    for (const zoom of zoomPoints) {
+   878→      const startTime = pproBuilder.TickTime.createWithSeconds(zoom.startTime);
+   879→      const marker = await sequence.createMarker(startTime);
+   880→
+   881→      if (marker) {
+   882→        const keyframeData = generateZoomKeyframeData(zoom);
+   883→
+   884→        await marker.setName(`ZOOM: ${zoom.scale}%`);
+   885→        await marker.setComment(JSON.stringify({
+   886→          scale: zoom.scale,
+   887→          duration: zoom.duration,
+   888→          easing: zoom.easing,
+   889→          reason: zoom.reason,
+   890→          keyframes: keyframeData
+   891→        }));
+   892→        await marker.setColor(6);  // Yellow
+   893→      }
+   894→    }
+   895→  });
+   896→
+   897→  return {
+   898→    success: true,
+   899→    note: 'Zoom markers created. Apply Scale effect manually or use MOGRT template.'
+   900→  };
+   901→}
+   902→```
+   903→
+   904→**Limitation**:
+   905→- No adjustment layer creation (UXP API limitation)
+   906→- No polling for changes made in Premiere
+   907→- No automatic re-sync if user modifies clips
+   908→
+   909→---
+   910→
+   911→## 6. Implementation Blueprint for SPLICE
+   912→
+   913→To achieve FireCut parity, SPLICE needs the following enhancements:
+   914→
+   915→### Phase 1: Face Detection Integration (2-3 weeks)
+   916→
+   917→1. **Add face-api.js to SPLICE Plugin**
+   918→   ```bash
+   919→   cd splice-plugin
+   920→   npm install face-api.js@0.22.2
+   921→   ```
+   922→
+   923→2. **Create Face Detection Module** (`splice-plugin/js/faceDetection.js`)
+   924→   ```javascript
+   925→   const faceapi = require('face-api.js');
+   926→
+   927→   let modelsLoaded = false;
+   928→
+   929→   async function loadFaceDetectionModels() {
+   930→     if (modelsLoaded) return;
+   931→
+   932→     const weightsPath = '/path/to/weights/';  // Bundle with plugin
+   933→
+   934→     await faceapi.loadSsdMobilenetv1Model(weightsPath);
+   935→     await faceapi.loadMtcnnModel(weightsPath);
+   936→
+   937→     modelsLoaded = true;
+   938→   }
+   939→
+   940→   async function detectFaceAtTimecode(videoPath, timecode) {
+   941→     // 1. Extract frame using FFmpeg (via backend)
+   942→     const frameData = await extractFrame(videoPath, timecode);
+   943→
+   944→     // 2. Load into canvas element
+   945→     const canvas = document.createElement('canvas');
+   946→     const ctx = canvas.getContext('2d');
+   947→     const img = new Image();
+   948→     img.src = frameData;
+   949→     await img.decode();
+   950→     ctx.drawImage(img, 0, 0);
+   951→
+   952→     // 3. Detect face
+   953→     const detection = await faceapi.detectSingleFace(canvas,
+   954→       new faceapi.SsdMobilenetv1Options()
+   955→     );
+   956→
+   957→     return detection;
+   958→   }
+   959→
+   960→   function calculateCenterFromFace(detection, frameWidth, frameHeight) {
+   961→     if (!detection) return { x: 50, y: 50 };
+   962→
+   963→     const { x, y, width, height } = detection.box;
+   964→     const centerX = (x + width / 2) / frameWidth * 100;
+   965→     const centerY = (y + height / 2) / frameHeight * 100;
+   966→
+   967→     return { x: centerX, y: centerY };
+   968→   }
+   969→
+   970→   module.exports = {
+   971→     loadFaceDetectionModels,
+   972→     detectFaceAtTimecode,
+   973→     calculateCenterFromFace
+   974→   };
+   975→   ```
+   976→
+   977→3. **Backend Frame Extraction Endpoint** (`splice-backend/routes/zoom.js`)
+   978→   ```javascript
+   979→   const ffmpeg = require('fluent-ffmpeg');
+   980→
+   981→   router.post('/extract-frame', authenticateToken, async (req, res) => {
+   982→     const { videoPath, timecode } = req.body;
+   983→
+   984→     try {
+   985→       const frameBuffer = await new Promise((resolve, reject) => {
+   986→         ffmpeg(videoPath)
+   987→           .seekInput(timecode)
+   988→           .frames(1)
+   989→           .format('image2')
+   990→           .on('end', (stdout) => resolve(stdout))
+   991→           .on('error', reject)
+   992→           .pipe();
+   993→       });
+   994→
+   995→       res.json({
+   996→         success: true,
+   997→         frame: frameBuffer.toString('base64')
+   998→       });
+   999→     } catch (err) {
+  1000→       res.status(500).json({ error: err.message });
+  1001→     }
+  1002→   });
+  1003→   ```
+  1004→
+  1005→### Phase 2: Transcript Synchronization (2-3 weeks)
+  1006→
+  1007→1. **Add Word-Level Transcript Support**
+  1008→   - Ensure backend transcription returns word-level timestamps
+  1009→   - Store in database with millisecond precision
+  1010→
+  1011→2. **Create Transcript Quantizer**
+  1012→   ```javascript
+  1013→   // splice-backend/services/transcriptService.js
+  1014→   function quantizeTranscript(transcript, frameRate) {
+  1015→     transcript.segments.forEach(segment => {
+  1016→       segment.start = roundToFrame(segment.start, frameRate);
+  1017→       segment.end = roundToFrame(segment.end, frameRate);
+  1018→
+  1019→       segment.words.forEach(word => {
+  1020→         word.start = roundToFrame(word.start, frameRate);
+  1021→         word.end = roundToFrame(word.end, frameRate);
+  1022→       });
+  1023→     });
+  1024→
+  1025→     return transcript;
+  1026→   }
+  1027→
+  1028→   function roundToFrame(timeInSeconds, frameRate) {
+  1029→     const frameDuration = 1 / frameRate;
+  1030→     return Math.round(timeInSeconds / frameDuration) * frameDuration;
+  1031→   }
+  1032→   ```
+  1033→
+  1034→3. **Implement Word Index → Time Mapping**
+  1035→   ```javascript
+  1036→   function getTimeRangeFromWordIndices(wordIndices, transcript) {
+  1037→     let wordPos = 0;
+  1038→     let startTime = null;
+  1039→     let endTime = null;
+  1040→
+  1041→     for (const segment of transcript.segments) {
+  1042→       for (const word of segment.words) {
+  1043→         if (wordPos === wordIndices[0]) startTime = word.start;
+  1044→         if (wordPos === wordIndices[1]) endTime = word.end;
+  1045→         wordPos++;
+  1046→       }
+  1047→     }
+  1048→
+  1049→     return { startTime, endTime };
+  1050→   }
+  1051→   ```
+  1052→
+  1053→### Phase 3: AI Key Phrase Detection (1-2 weeks)
+  1054→
+  1055→1. **Add GPT-4 Integration** (`splice-backend/services/keyPhraseDetection.js`)
+  1056→   ```javascript
+  1057→   const OpenAI = require('openai');
+  1058→
+  1059→   async function detectKeyPhrasesForZooms(transcript, settings) {
+  1060→     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  1061→
+  1062→     const systemPrompt = `You are a video editor assistant. Analyze this transcript
+  1063→     and identify ${settings.zoomCount} key phrases where zoom effects would enhance
+  1064→     viewer engagement.
+  1065→
+  1066→     Rules:
+  1067→     - Each key phrase should be ${settings.minWords}-${settings.maxWords} words long
+  1068→     - Focus on impactful moments: emphasis, emotion, key information
+  1069→     - Avoid zooming on filler words (um, uh, like)
+  1070→     - Return as JSON array of word sequences
+  1071→
+  1072→     Example: ["this is important", "pay attention here", "the main point"]`;
+  1073→
+  1074→     const completion = await openai.chat.completions.create({
+  1075→       model: 'gpt-4',
+  1076→       temperature: 0.15,
+  1077→       messages: [
+  1078→         { role: 'system', content: systemPrompt },
+  1079→         { role: 'user', content: transcript.text }
+  1080→       ]
+  1081→     });
+  1082→
+  1083→     return JSON.parse(completion.choices[0].message.content);
+  1084→   }
+  1085→   ```
+  1086→
+  1087→### Phase 4: Asymmetric Easing Curves (1 week)
+  1088→
+  1089→1. **Update Zoom Point Schema**
+  1090→   ```javascript
+  1091→   const zoomPoint = {
+  1092→     startTime: 5.2,
+  1093→     duration: 3.0,
+  1094→     scale: 120,
+  1095→     centerX: 50,
+  1096→     centerY: 50,
+  1097→     easing: {
+  1098→       inPower: 4,          // Separate zoom in power
+  1099→       inDuration: 0.4,     // 40% of total duration
+  1100→       outPower: 1,         // Separate zoom out power
+  1101→       outDuration: 0.6     // 60% of total duration
+  1102→     }
+  1103→   };
+  1104→   ```
+  1105→
+  1106→2. **Update Keyframe Generator**
+  1107→   ```javascript
+  1108→   function generateAsymmetricZoomKeyframes(zoom, frameRate = 30) {
+  1109→     const totalFrames = Math.ceil(zoom.duration * frameRate);
+  1110→     const inFrames = Math.ceil(totalFrames * zoom.easing.inDuration);
+  1111→     const outFrames = totalFrames - inFrames;
+  1112→
+  1113→     const keyframes = [];
+  1114→
+  1115→     for (let i = 0; i <= totalFrames; i++) {
+  1116→       let scale;
+  1117→
+  1118→       if (i <= inFrames) {
+  1119→         // Zoom in phase
+  1120→         const t = i / inFrames;
+  1121→         const easedT = easingCurvePower(t, zoom.easing.inPower);
+  1122→         scale = 100 + (zoom.scale - 100) * easedT;
+  1123→       } else {
+  1124→         // Zoom out phase
+  1125→         const t = (i - inFrames) / outFrames;
+  1126→         const easedT = easingCurvePower(t, zoom.easing.outPower);
+  1127→         scale = zoom.scale - (zoom.scale - 100) * easedT;
+  1128→       }
+  1129→
+  1130→       keyframes.push({
+  1131→         time: zoom.startTime + (i / frameRate),
+  1132→         scale: [scale, scale]
+  1133→       });
+  1134→     }
+  1135→
+  1136→     return keyframes;
+  1137→   }
+  1138→   ```
+  1139→
+  1140→### Phase 5: Visual Transcript Editor (3-4 weeks)
+  1141→
+  1142→1. **Create Interactive Transcript Component** (React)
+  1143→   ```jsx
+  1144→   // splice-website/src/components/ZoomTranscriptEditor.tsx
+  1145→   import React, { useState } from 'react';
+  1146→
+  1147→   interface ZoomHighlight {
+  1148→     id: string;
+  1149→     startWordIndex: number;
+  1150→     endWordIndex: number;
+  1151→     confirmed: boolean;
+  1152→   }
+  1153→
+  1154→   export function ZoomTranscriptEditor({ transcript, onZoomsChange }) {
+  1155→     const [highlights, setHighlights] = useState<ZoomHighlight[]>([]);
+  1156→
+  1157→     const handleTextSelection = () => {
+  1158→       const selection = window.getSelection();
+  1159→       if (!selection || selection.rangeCount === 0) return;
+  1160→
+  1161→       const range = selection.getRangeAt(0);
+  1162→       const { startWordIndex, endWordIndex } = getWordIndicesFromRange(range);
+  1163→
+  1164→       // Add highlight
+  1165→       const newHighlight = {
+  1166→         id: crypto.randomUUID(),
+  1167→         startWordIndex,
+  1168→         endWordIndex,
+  1169→         confirmed: false
+  1170→       };
+  1171→
+  1172→       setHighlights([...highlights, newHighlight]);
+  1173→       onZoomsChange([...highlights, newHighlight]);
+  1174→     };
+  1175→
+  1176→     return (
+  1177→       <div className="zoom-transcript-editor">
+  1178→         <div
+  1179→           className="transcript-text"
+  1180→           onMouseUp={handleTextSelection}
+  1181→         >
+  1182→           {renderTranscriptWithHighlights(transcript, highlights)}
+  1183→         </div>
+  1184→       </div>
+  1185→     );
+  1186→   }
+  1187→   ```
+  1188→
+  1189→### Phase 6: Bidirectional Sync (2-3 weeks)
+  1190→
+  1191→1. **Implement Polling System**
+  1192→   ```javascript
+  1193→   // splice-plugin/js/zoomSync.js
+  1194→   class ZoomSyncManager {
+  1195→     constructor() {
+  1196→       this.active = false;
+  1197→       this.pollInterval = 200;  // 200ms
+  1198→       this.localZooms = [];
+  1199→     }
+  1200→
+  1201→     async start() {
+  1202→       this.active = true;
+  1203→
+  1204→       while (this.active) {
+  1205→         await this.checkForChanges();
+  1206→         await delay(this.pollInterval);
+  1207→       }
+  1208→     }
+  1209→
+  1210→     async checkForChanges() {
+  1211→       // Query Premiere for actual zoom clip state
+  1212→       const actualClips = await this.queryPremiereZoomClips();
+  1213→
+  1214→       // Compare with local state
+  1215→       for (const expectedZoom of this.localZooms) {
+  1216→         const actualClip = actualClips.find(c => c.id === expectedZoom.id);
+  1217→
+  1218→         if (!actualClip) {
+  1219→           // Clip deleted in Premiere
+  1220→           this.handleZoomDeleted(expectedZoom);
+  1221→         } else if (this.hasTimingChanged(expectedZoom, actualClip)) {
+  1222→           // Clip moved in Premiere
+  1223→           this.handleZoomMoved(expectedZoom, actualClip);
+  1224→         }
+  1225→       }
+  1226→     }
+  1227→   }
+  1228→   ```
+  1229→
+  1230→---
+  1231→
+  1232→## 7. Effort Estimation
+  1233→
+  1234→| Feature | Complexity | Estimated Time | Dependencies |
+  1235→|---------|-----------|----------------|--------------|
+  1236→| Face Detection Integration | High | 2-3 weeks | FFmpeg, face-api.js |
+  1237→| Word-Level Transcript Sync | Medium | 2-3 weeks | Backend transcription upgrade |
+  1238→| AI Key Phrase Detection | Low | 1-2 weeks | OpenAI API integration |
+  1239→| Asymmetric Easing Curves | Low | 1 week | None |
+  1240→| Visual Transcript Editor | High | 3-4 weeks | React UI component |
+  1241→| Bidirectional Sync | Medium | 2-3 weeks | UXP polling system |
+  1242→| **TOTAL** | - | **11-16 weeks** | - |
+  1243→
+  1244→---
+  1245→
+  1246→## 8. Priority Recommendations
+  1247→
+  1248→### Must-Have (Phase 1)
+  1249→1. **Word-Level Transcript Sync** - Foundation for accurate zoom timing
+  1250→2. **Asymmetric Easing Curves** - Significant quality improvement
+  1251→
+  1252→### Should-Have (Phase 2)
+  1253→3. **AI Key Phrase Detection** - Automates zoom placement
+  1254→4. **Face Detection** - Automatic centering
+  1255→
+  1256→### Nice-to-Have (Phase 3)
+  1257→5. **Visual Transcript Editor** - UX improvement
+  1258→6. **Bidirectional Sync** - Advanced feature for power users
+  1259→
+  1260→---
+  1261→
+  1262→## 9. Technical Risks
+  1263→
+  1264→1. **Face Detection Performance**
+  1265→   - Risk: face-api.js may be slow in CEP/UXP environment
+  1266→   - Mitigation: Run detection in backend via FFmpeg frame extraction
+  1267→
+  1268→2. **Bidirectional Sync Complexity**
+  1269→   - Risk: Polling every 200ms may impact performance
+  1270→   - Mitigation: Use adaptive polling (slower when idle)
+  1271→
+  1272→3. **Word-Level Transcript Accuracy**
+  1273→   - Risk: Whisper API may not always provide word-level timestamps
+  1274→   - Mitigation: Fallback to sentence-level timing
+  1275→
+  1276→---
+  1277→
+  1278→## 10. Conclusion
+  1279→
+  1280→FireCut's auto zoom system is significantly more sophisticated than SPLICE's current implementation, particularly in:
+  1281→
+  1282→1. **Face detection** - Automatic centering on detected faces
+  1283→2. **Transcript synchronization** - Word-level granularity with frame quantization
+  1284→3. **Visual editor** - Interactive transcript with drag handles
+  1285→4. **Bidirectional sync** - Polling system to detect changes made in Premiere
+  1286→
+  1287→To achieve parity, SPLICE should prioritize:
+  1288→1. Word-level transcript sync (foundation)
+  1289→2. Asymmetric easing curves (quality improvement)
+  1290→3. AI key phrase detection (automation)
+  1291→4. Face detection (advanced feature)
+  1292→
+  1293→Estimated total effort: **11-16 weeks** with 1-2 developers.
+  1294→
+  1295→---
+  1296→
+  1297→**End of Comparison**
+  1298→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

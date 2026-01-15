@@ -1,0 +1,514 @@
+/**
+ * Slice 9: XML Processor for Premiere Pro
+ *
+ * Handles XMEML format (Final Cut Pro 7 XML) which is what
+ * Premiere Pro exports via File > Export > Final Cut Pro XML.
+ *
+ * Uses regex-based string manipulation to preserve original XML formatting
+ * while modifying clip boundaries.
+ *
+ * Key insight: Video and audio clips are LINKED - when splitting, we must
+ * coordinate the new IDs across all linked clips.
+ */
+
+const fs = require('fs').promises;
+const { validatePath } = require('./securityUtils');
+
+/**
+ * XMEML Processor Class - String-based manipulation
+ */
+class XMEMLProcessor {
+  constructor() {
+    this.xmlContent = null;
+    this.timebase = 30;
+  }
+
+  async loadFromFile(filePath) {
+    this.xmlContent = await fs.readFile(filePath, 'utf8');
+    this.detectTimebase();
+    return this.xmlContent;
+  }
+
+  detectTimebase() {
+    const match = this.xmlContent.match(/<sequence[^>]*>[\s\S]*?<timebase>(\d+)<\/timebase>/);
+    if (match) {
+      this.timebase = parseInt(match[1]);
+      console.log(`[SPLICE] Detected timebase: ${this.timebase} fps`);
+    }
+  }
+
+  framesToSeconds(frames) {
+    return frames / this.timebase;
+  }
+
+  secondsToFrames(seconds) {
+    return Math.round(seconds * this.timebase);
+  }
+
+  /**
+   * Find all sequence clipitems with their positions and link info
+   */
+  findSequenceClipitems() {
+    const clips = [];
+    const clipRegex = /<clipitem\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/clipitem>/g;
+    let match;
+
+    while ((match = clipRegex.exec(this.xmlContent)) !== null) {
+      const clipContent = match[2];
+
+      const startMatch = clipContent.match(/<start>(\d+)<\/start>/);
+      const endMatch = clipContent.match(/<end>(\d+)<\/end>/);
+
+      if (startMatch && endMatch) {
+        const inMatch = clipContent.match(/<in>(\d+)<\/in>/);
+        const outMatch = clipContent.match(/<out>(\d+)<\/out>/);
+        const nameMatch = clipContent.match(/<name>([^<]*)<\/name>/);
+        const durationMatch = clipContent.match(/<duration>(\d+)<\/duration>/);
+
+        // Extract all link references
+        const linkRefs = [];
+        const linkRegex = /<linkclipref>([^<]+)<\/linkclipref>/g;
+        let linkMatch;
+        while ((linkMatch = linkRegex.exec(clipContent)) !== null) {
+          linkRefs.push(linkMatch[1]);
+        }
+
+        clips.push({
+          id: match[1],
+          fullMatch: match[0],
+          startIndex: match.index,
+          endIndex: match.index + match[0].length,
+          content: clipContent,
+          start: parseInt(startMatch[1]),
+          end: parseInt(endMatch[1]),
+          in: inMatch ? parseInt(inMatch[1]) : 0,
+          out: outMatch ? parseInt(outMatch[1]) : parseInt(endMatch[1]),
+          duration: durationMatch ? parseInt(durationMatch[1]) : null,
+          name: nameMatch ? nameMatch[1] : 'Unknown',
+          linkRefs: linkRefs
+        });
+      }
+    }
+
+    return clips;
+  }
+
+  /**
+   * Group clips by their start time (linked clips have same start)
+   */
+  groupLinkedClips(clips) {
+    const groups = {};
+    for (const clip of clips) {
+      const key = clip.start;
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(clip);
+    }
+    return Object.values(groups);
+  }
+
+  /**
+   * Create a modified clip with new timing and updated link references
+   */
+  createModifiedClip(originalClip, newStart, newEnd, newIn, newOut, idMapping) {
+    let modified = originalClip.fullMatch;
+
+    // Update timing values
+    modified = modified.replace(/<start>\d+<\/start>/, `<start>${newStart}</start>`);
+    modified = modified.replace(/<end>\d+<\/end>/, `<end>${newEnd}</end>`);
+    modified = modified.replace(/<in>\d+<\/in>/, `<in>${newIn}</in>`);
+    modified = modified.replace(/<out>\d+<\/out>/, `<out>${newOut}</out>`);
+
+    const newDuration = newOut - newIn;
+    modified = modified.replace(/<duration>\d+<\/duration>/, `<duration>${newDuration}</duration>`);
+
+    // Update pproTicks if present
+    const ticksPerFrame = 254016000000 / this.timebase;
+    modified = modified.replace(
+      /<pproTicksIn>\d+<\/pproTicksIn>/,
+      `<pproTicksIn>${Math.round(newIn * ticksPerFrame)}</pproTicksIn>`
+    );
+    modified = modified.replace(
+      /<pproTicksOut>\d+<\/pproTicksOut>/,
+      `<pproTicksOut>${Math.round(newOut * ticksPerFrame)}</pproTicksOut>`
+    );
+
+    // Update clip ID if in mapping
+    if (idMapping[originalClip.id]) {
+      modified = modified.replace(
+        new RegExp(`id="${originalClip.id}"`),
+        `id="${idMapping[originalClip.id]}"`
+      );
+    }
+
+    // Update ALL link references using the mapping
+    for (const [oldId, newId] of Object.entries(idMapping)) {
+      modified = modified.replace(
+        new RegExp(`<linkclipref>${oldId}</linkclipref>`, 'g'),
+        `<linkclipref>${newId}</linkclipref>`
+      );
+    }
+
+    return modified;
+  }
+
+  /**
+   * Split clips at silence boundaries - handles linked clips together
+   */
+  splitClipsAtSilences(silences, removeGaps = true) {
+    const stats = {
+      clipsProcessed: 0,
+      clipsSplit: 0,
+      silencesRemoved: 0,
+      totalTimeRemoved: 0,
+      cuts: []
+    };
+
+    if (!silences || silences.length === 0) {
+      return stats;
+    }
+
+    const sortedSilences = [...silences].sort((a, b) => a.start - b.start);
+    const clips = this.findSequenceClipitems();
+    console.log(`[SPLICE] Found ${clips.length} sequence clips`);
+
+    // Group linked clips (same start time = linked)
+    const linkedGroups = this.groupLinkedClips(clips);
+    console.log(`[SPLICE] Found ${linkedGroups.length} linked clip groups`);
+
+    // Sort groups by start position (descending for safe replacement)
+    linkedGroups.sort((a, b) => b[0].startIndex - a[0].startIndex);
+
+    let clipIdCounter = 1000;
+
+    for (const group of linkedGroups) {
+      // All clips in a group have the same timing
+      const refClip = group[0];
+      stats.clipsProcessed += group.length;
+
+      const clipStartSec = this.framesToSeconds(refClip.start);
+      const clipEndSec = this.framesToSeconds(refClip.end);
+
+      // Find silences that overlap with this group
+      const overlappingSilences = sortedSilences.filter(s =>
+        s.start < clipEndSec && s.end > clipStartSec
+      );
+
+      if (overlappingSilences.length === 0) {
+        continue;
+      }
+
+      // Calculate segments (non-silent portions)
+      const segments = this.calculateSegments(refClip, overlappingSilences);
+
+      if (segments.length === 0) {
+        // Entire clip group is silence - remove all
+        for (const clip of group.sort((a, b) => b.startIndex - a.startIndex)) {
+          this.xmlContent =
+            this.xmlContent.substring(0, clip.startIndex) +
+            this.xmlContent.substring(clip.endIndex);
+        }
+        continue;
+      }
+
+      console.log(`[SPLICE] Splitting ${group.length} linked clips into ${segments.length} segment(s)`);
+
+      // Track removed silences
+      for (const silence of overlappingSilences) {
+        const overlapStart = Math.max(silence.start, clipStartSec);
+        const overlapEnd = Math.min(silence.end, clipEndSec);
+        const duration = overlapEnd - overlapStart;
+
+        stats.silencesRemoved++;
+        stats.totalTimeRemoved += duration;
+        stats.cuts.push({
+          clipName: refClip.name,
+          clipType: 'video/audio',
+          silenceStart: overlapStart.toFixed(2),
+          silenceEnd: overlapEnd.toFixed(2),
+          duration: duration.toFixed(2)
+        });
+      }
+
+      // For each segment, create ID mappings for all clips in the group
+      const allReplacements = [];
+
+      for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+        const seg = segments[segIdx];
+
+        // Create ID mapping for this segment
+        // First segment keeps original IDs, subsequent segments get new IDs
+        const idMapping = {};
+        if (segIdx > 0) {
+          for (const clip of group) {
+            idMapping[clip.id] = `clipitem-${clipIdCounter++}`;
+          }
+          stats.clipsSplit += group.length;
+        }
+
+        // Create modified clips for this segment
+        for (const clip of group) {
+          const modifiedClip = this.createModifiedClip(
+            clip,
+            seg.timelineStart,
+            seg.timelineEnd,
+            seg.sourceIn,
+            seg.sourceOut,
+            idMapping
+          );
+
+          allReplacements.push({
+            originalClip: clip,
+            modifiedClip: modifiedClip,
+            segmentIndex: segIdx
+          });
+        }
+      }
+
+      // Group replacements by original clip and sort by position (descending)
+      const clipReplacements = {};
+      for (const repl of allReplacements) {
+        const clipId = repl.originalClip.id;
+        if (!clipReplacements[clipId]) {
+          clipReplacements[clipId] = {
+            original: repl.originalClip,
+            segments: []
+          };
+        }
+        clipReplacements[clipId].segments.push(repl.modifiedClip);
+      }
+
+      // Apply replacements (process in reverse order of position)
+      const sortedClipIds = Object.keys(clipReplacements).sort((a, b) => {
+        return clipReplacements[b].original.startIndex - clipReplacements[a].original.startIndex;
+      });
+
+      for (const clipId of sortedClipIds) {
+        const { original, segments: segmentClips } = clipReplacements[clipId];
+        const replacement = segmentClips.join('\n');
+
+        this.xmlContent =
+          this.xmlContent.substring(0, original.startIndex) +
+          replacement +
+          this.xmlContent.substring(original.endIndex);
+      }
+    }
+
+    // Update sequence duration
+    this.updateSequenceDuration();
+
+    // Remove gaps if requested
+    if (removeGaps) {
+      this.removeGaps();
+    }
+
+    return stats;
+  }
+
+  /**
+   * Calculate non-silent segments from a clip
+   */
+  calculateSegments(clip, silences) {
+    const segments = [];
+    const clipStartSec = this.framesToSeconds(clip.start);
+    const clipEndSec = this.framesToSeconds(clip.end);
+    let currentTime = clipStartSec;
+
+    const mergedSilences = this.mergeSilences(silences);
+
+    for (const silence of mergedSilences) {
+      const silStartInClip = Math.max(silence.start, clipStartSec);
+      const silEndInClip = Math.min(silence.end, clipEndSec);
+
+      if (silStartInClip > currentTime) {
+        const segStartFrame = this.secondsToFrames(currentTime);
+        const segEndFrame = this.secondsToFrames(silStartInClip);
+        const offsetFrames = segStartFrame - clip.start;
+
+        segments.push({
+          timelineStart: segStartFrame,
+          timelineEnd: segEndFrame,
+          sourceIn: clip.in + offsetFrames,
+          sourceOut: clip.in + offsetFrames + (segEndFrame - segStartFrame)
+        });
+      }
+
+      currentTime = silEndInClip;
+    }
+
+    if (currentTime < clipEndSec) {
+      const segStartFrame = this.secondsToFrames(currentTime);
+      const segEndFrame = clip.end;
+      const offsetFrames = segStartFrame - clip.start;
+
+      segments.push({
+        timelineStart: segStartFrame,
+        timelineEnd: segEndFrame,
+        sourceIn: clip.in + offsetFrames,
+        sourceOut: clip.in + offsetFrames + (segEndFrame - segStartFrame)
+      });
+    }
+
+    return segments;
+  }
+
+  mergeSilences(silences) {
+    if (silences.length === 0) return [];
+
+    const sorted = [...silences].sort((a, b) => a.start - b.start);
+    const merged = [{ ...sorted[0] }];
+
+    for (let i = 1; i < sorted.length; i++) {
+      const current = sorted[i];
+      const last = merged[merged.length - 1];
+
+      if (current.start <= last.end) {
+        last.end = Math.max(last.end, current.end);
+      } else {
+        merged.push({ ...current });
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * Update sequence duration based on clips
+   */
+  updateSequenceDuration() {
+    const clips = this.findSequenceClipitems();
+    if (clips.length === 0) return;
+
+    const maxEnd = Math.max(...clips.map(c => c.end));
+    console.log(`[SPLICE] Updating sequence duration to ${maxEnd} frames`);
+
+    // Update sequence duration
+    this.xmlContent = this.xmlContent.replace(
+      /(<sequence[^>]*>[\s\S]*?<duration>)\d+(<\/duration>)/,
+      `$1${maxEnd}$2`
+    );
+  }
+
+  /**
+   * Remove gaps by adjusting clip start/end times
+   */
+  removeGaps() {
+    const clips = this.findSequenceClipitems();
+    const linkedGroups = this.groupLinkedClips(clips);
+
+    // Sort by start time
+    linkedGroups.sort((a, b) => a[0].start - b[0].start);
+
+    let cumulativeShift = 0;
+    let lastEnd = 0;
+
+    for (const group of linkedGroups) {
+      const clipStart = group[0].start;
+      const clipEnd = group[0].end;
+      const gap = clipStart - lastEnd;
+
+      if (gap > 0) {
+        cumulativeShift += gap;
+        console.log(`[SPLICE] Found gap of ${gap} frames at position ${clipStart}`);
+      }
+
+      if (cumulativeShift > 0) {
+        const newStart = clipStart - cumulativeShift;
+        const newEnd = clipEnd - cumulativeShift;
+
+        for (const clip of group) {
+          // Update this clip's start/end
+          const updatedClip = clip.fullMatch
+            .replace(/<start>\d+<\/start>/, `<start>${newStart}</start>`)
+            .replace(/<end>\d+<\/end>/, `<end>${newEnd}</end>`);
+
+          this.xmlContent = this.xmlContent.replace(clip.fullMatch, updatedClip);
+        }
+      }
+
+      lastEnd = clipEnd - cumulativeShift;
+    }
+
+    // Update sequence duration after gap removal
+    if (cumulativeShift > 0) {
+      this.updateSequenceDuration();
+    }
+  }
+
+  analyzeSilences(silences) {
+    const stats = {
+      clipsProcessed: 0,
+      clipsSplit: 0,
+      silencesRemoved: 0,
+      totalTimeRemoved: 0,
+      cuts: []
+    };
+
+    const clips = this.findSequenceClipitems();
+
+    for (const clip of clips) {
+      stats.clipsProcessed++;
+
+      const clipStartSec = this.framesToSeconds(clip.start);
+      const clipEndSec = this.framesToSeconds(clip.end);
+
+      for (const silence of silences) {
+        if (silence.start < clipEndSec && silence.end > clipStartSec) {
+          const overlapStart = Math.max(silence.start, clipStartSec);
+          const overlapEnd = Math.min(silence.end, clipEndSec);
+          const duration = overlapEnd - overlapStart;
+
+          stats.silencesRemoved++;
+          stats.totalTimeRemoved += duration;
+          stats.cuts.push({
+            clipName: clip.name,
+            clipType: 'video/audio',
+            silenceStart: overlapStart.toFixed(2),
+            silenceEnd: overlapEnd.toFixed(2),
+            duration: duration.toFixed(2)
+          });
+
+          if (silence.start > clipStartSec && silence.end < clipEndSec) {
+            stats.clipsSplit++;
+          }
+        }
+      }
+    }
+
+    return stats;
+  }
+
+  async saveToFile(filePath) {
+    await fs.writeFile(filePath, this.xmlContent, 'utf8');
+    return filePath;
+  }
+}
+
+async function processXMLFile(inputPath, silences, options = {}) {
+  const { outputPath = null, removeGaps = true, analyzeOnly = false } = options;
+
+  const processor = new XMEMLProcessor();
+
+  console.log(`[SPLICE] Loading XMEML: ${inputPath}`);
+  await processor.loadFromFile(inputPath);
+
+  let stats;
+  if (analyzeOnly) {
+    console.log(`[SPLICE] Analyzing ${silences.length} silence region(s)`);
+    stats = processor.analyzeSilences(silences);
+  } else {
+    console.log(`[SPLICE] Splitting clips at ${silences.length} silence region(s)`);
+    stats = processor.splitClipsAtSilences(silences, removeGaps);
+  }
+
+  const finalOutputPath = outputPath ||
+    inputPath.replace(/\.xml$/i, '_processed.xml');
+
+  await processor.saveToFile(finalOutputPath);
+  console.log(`[SPLICE] Saved to: ${finalOutputPath}`);
+
+  return { outputPath: finalOutputPath, stats };
+}
+
+module.exports = { XMEMLProcessor, processXMLFile };

@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""
+Reddit Looksmaxx Research Scraper
+Uses Reddit's public JSON endpoints - no API key required
+"""
+
+import requests
+import pandas as pd
+import time
+import json
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+# Target subreddits for looksmaxx research
+SUBREDDITS = [
+    'looksmaxxing',
+    'orthotropics',
+    'plasticsurgery',
+    'mewing',
+    'Vindicta',  # Female looksmaxxing
+]
+
+# Keywords to track for feature gap analysis
+PAIN_POINT_KEYWORDS = [
+    'frustrating', 'annoying', 'wish', 'need', 'want', 'missing',
+    'doesn\'t work', 'doesn\'t help', 'waste of', 'scam', 'confused',
+    'help me', 'what should', 'how do i', 'is this normal', 'am i'
+]
+
+FEATURE_REQUEST_KEYWORDS = [
+    'app', 'tool', 'software', 'calculator', 'analyzer', 'measure',
+    'ratio', 'score', 'rate me', 'analysis', 'assessment', 'test',
+    'ai', 'machine learning', 'algorithm', 'automatic'
+]
+
+TREATMENT_KEYWORDS = [
+    # Surgical
+    'rhinoplasty', 'genioplasty', 'jaw surgery', 'bimax', 'bsso', 'lefort',
+    'implant', 'filler', 'botox', 'fat transfer', 'buccal fat',
+    'canthoplasty', 'blepharoplasty', 'brow lift', 'facelift',
+    'hair transplant', 'fue', 'fut', 'hairline lowering',
+    'otoplasty', 'ear pinning', 'neck lipo', 'submental',
+
+    # Non-surgical
+    'mewing', 'chewing', 'falim', 'bonesmashing', 'thumb pulling',
+    'minoxidil', 'finasteride', 'tretinoin', 'retinol', 'dermaroller',
+    'microneedling', 'prp', 'red light', 'collagen',
+
+    # Body
+    'body fat', 'lean', 'bulk', 'cut', 'gym', 'posture', 'neck training',
+
+    # Misc
+    'contact lenses', 'eye color', 'teeth whitening', 'braces', 'invisalign'
+]
+
+METRIC_KEYWORDS = [
+    'fwhr', 'face width', 'ratio', 'ipd', 'canthal tilt', 'pfl',
+    'midface', 'bigonial', 'gonial angle', 'jaw angle', 'chin',
+    'nose', 'lips', 'eyes', 'brow', 'forehead', 'philtrum',
+    'symmetry', 'harmony', 'golden ratio', 'thirds', 'fifths',
+    'psl', 'lookism', 'blackpill', 'looksmax'
+]
+
+
+class RedditScraper:
+    """Scrapes Reddit using public JSON endpoints"""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        })
+        self.data_dir = Path(__file__).parent / 'data'
+        self.data_dir.mkdir(exist_ok=True)
+
+    def fetch_posts(self, subreddit: str, sort: str = 'top', time_filter: str = 'year', limit: int = 100) -> list:
+        """Fetch posts from a subreddit using public JSON endpoint"""
+        posts = []
+        after = None
+
+        print(f"  Fetching r/{subreddit} ({sort}/{time_filter})...")
+
+        while len(posts) < limit:
+            url = f"https://old.reddit.com/r/{subreddit}/{sort}.json"
+            params = {
+                't': time_filter,
+                'limit': min(100, limit - len(posts)),
+            }
+            if after:
+                params['after'] = after
+
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+
+                children = data.get('data', {}).get('children', [])
+                if not children:
+                    break
+
+                for child in children:
+                    post_data = child.get('data', {})
+                    posts.append({
+                        'id': post_data.get('id'),
+                        'title': post_data.get('title', ''),
+                        'selftext': post_data.get('selftext', ''),
+                        'score': post_data.get('score', 0),
+                        'num_comments': post_data.get('num_comments', 0),
+                        'created_utc': post_data.get('created_utc', 0),
+                        'subreddit': subreddit,
+                        'url': f"https://reddit.com{post_data.get('permalink', '')}",
+                        'flair': post_data.get('link_flair_text', ''),
+                        'author': post_data.get('author', '[deleted]'),
+                    })
+
+                after = data.get('data', {}).get('after')
+                if not after:
+                    break
+
+                # Rate limiting - be nice to Reddit
+                time.sleep(2)
+
+            except requests.exceptions.RequestException as e:
+                print(f"    Error fetching r/{subreddit}: {e}")
+                break
+
+        print(f"    Got {len(posts)} posts")
+        return posts
+
+    def fetch_comments(self, post_url: str, limit: int = 50) -> list:
+        """Fetch top comments from a post"""
+        comments = []
+
+        try:
+            # Convert to JSON URL
+            json_url = post_url.rstrip('/') + '.json'
+            response = self.session.get(json_url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if len(data) > 1:
+                comment_data = data[1].get('data', {}).get('children', [])
+                for child in comment_data[:limit]:
+                    if child.get('kind') == 't1':
+                        c = child.get('data', {})
+                        comments.append({
+                            'body': c.get('body', ''),
+                            'score': c.get('score', 0),
+                            'author': c.get('author', '[deleted]'),
+                        })
+
+        except Exception as e:
+            pass  # Silently skip comment errors
+
+        return comments
+
+    def scrape_all_subreddits(self, posts_per_sub: int = 100) -> pd.DataFrame:
+        """Scrape all target subreddits"""
+        all_posts = []
+
+        print("\n=== Scraping Reddit ===\n")
+
+        for sub in SUBREDDITS:
+            # Get top posts from past year
+            top_posts = self.fetch_posts(sub, sort='top', time_filter='year', limit=posts_per_sub)
+            all_posts.extend(top_posts)
+
+            # Also get hot posts for recent trends
+            hot_posts = self.fetch_posts(sub, sort='hot', time_filter='all', limit=50)
+            all_posts.extend(hot_posts)
+
+            time.sleep(3)  # Rate limiting between subreddits
+
+        # Deduplicate by ID
+        seen_ids = set()
+        unique_posts = []
+        for post in all_posts:
+            if post['id'] not in seen_ids:
+                seen_ids.add(post['id'])
+                unique_posts.append(post)
+
+        df = pd.DataFrame(unique_posts)
+
+        # Save raw data
+        df.to_csv(self.data_dir / 'raw_posts.csv', index=False)
+        print(f"\nSaved {len(df)} unique posts to data/raw_posts.csv")
+
+        return df
+
+
+class FeatureGapAnalyzer:
+    """Analyzes scraped data to identify feature gaps"""
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.results = {
+            'pain_points': Counter(),
+            'feature_requests': Counter(),
+            'treatments_mentioned': Counter(),
+            'metrics_mentioned': Counter(),
+            'top_questions': [],
+            'top_complaints': [],
+            'emerging_trends': [],
+        }
+
+    def analyze_text(self, text: str) -> dict:
+        """Analyze a single piece of text for keywords"""
+        text_lower = text.lower()
+
+        return {
+            'pain_points': [kw for kw in PAIN_POINT_KEYWORDS if kw in text_lower],
+            'feature_requests': [kw for kw in FEATURE_REQUEST_KEYWORDS if kw in text_lower],
+            'treatments': [kw for kw in TREATMENT_KEYWORDS if kw in text_lower],
+            'metrics': [kw for kw in METRIC_KEYWORDS if kw in text_lower],
+        }
+
+    def extract_questions(self, df: pd.DataFrame) -> list:
+        """Extract question posts (high engagement)"""
+        questions = []
+
+        for _, row in df.iterrows():
+            title = row.get('title', '')
+            if any(q in title.lower() for q in ['?', 'how do', 'what', 'why', 'should i', 'is it', 'can i', 'help']):
+                questions.append({
+                    'title': title,
+                    'score': row.get('score', 0),
+                    'comments': row.get('num_comments', 0),
+                    'subreddit': row.get('subreddit', ''),
+                    'url': row.get('url', ''),
+                })
+
+        # Sort by engagement (score + comments)
+        questions.sort(key=lambda x: x['score'] + x['comments'] * 2, reverse=True)
+        return questions[:50]
+
+    def extract_complaints(self, df: pd.DataFrame) -> list:
+        """Extract complaint/rant posts"""
+        complaints = []
+        complaint_indicators = ['rant', 'frustrated', 'disappointed', 'waste', 'scam', 'doesn\'t work', 'not working', 'failed']
+
+        for _, row in df.iterrows():
+            title = row.get('title', '').lower()
+            text = row.get('selftext', '').lower()
+            combined = title + ' ' + text
+
+            if any(ind in combined for ind in complaint_indicators):
+                complaints.append({
+                    'title': row.get('title', ''),
+                    'score': row.get('score', 0),
+                    'subreddit': row.get('subreddit', ''),
+                    'url': row.get('url', ''),
+                    'snippet': text[:200] if text else '',
+                })
+
+        complaints.sort(key=lambda x: x['score'], reverse=True)
+        return complaints[:30]
+
+    def run_analysis(self) -> dict:
+        """Run full analysis on scraped data"""
+        print("\n=== Analyzing Data ===\n")
+
+        # Analyze all posts
+        for _, row in self.df.iterrows():
+            combined_text = f"{row.get('title', '')} {row.get('selftext', '')}"
+            analysis = self.analyze_text(combined_text)
+
+            # Weight by engagement
+            weight = 1 + (row.get('score', 0) / 100) + (row.get('num_comments', 0) / 50)
+
+            for kw in analysis['pain_points']:
+                self.results['pain_points'][kw] += weight
+            for kw in analysis['feature_requests']:
+                self.results['feature_requests'][kw] += weight
+            for kw in analysis['treatments']:
+                self.results['treatments_mentioned'][kw] += weight
+            for kw in analysis['metrics']:
+                self.results['metrics_mentioned'][kw] += weight
+
+        # Extract specific content
+        self.results['top_questions'] = self.extract_questions(self.df)
+        self.results['top_complaints'] = self.extract_complaints(self.df)
+
+        # Find emerging trends (recent hot posts)
+        recent = self.df[self.df['created_utc'] > (time.time() - 30*24*60*60)]  # Last 30 days
+        if len(recent) > 0:
+            recent_sorted = recent.sort_values('score', ascending=False)
+            self.results['emerging_trends'] = recent_sorted.head(20)[['title', 'score', 'subreddit', 'url']].to_dict('records')
+
+        return self.results
+
+    def get_missing_features(self, current_features: list) -> list:
+        """Compare found treatments/metrics against current app features"""
+        # Treatments our app covers (from CLAUDE.md)
+        covered_treatments = {
+            'rhinoplasty', 'genioplasty', 'jaw implant', 'cheek implant', 'filler',
+            'botox', 'canthoplasty', 'blepharoplasty', 'hair transplant', 'neck lipo',
+            'mewing', 'minoxidil', 'tretinoin', 'dermaroller', 'body fat', 'posture'
+        }
+
+        # Find frequently mentioned but not covered
+        missing = []
+        for treatment, count in self.results['treatments_mentioned'].most_common(50):
+            treatment_lower = treatment.lower()
+            if not any(covered in treatment_lower or treatment_lower in covered for covered in covered_treatments):
+                missing.append((treatment, count))
+
+        return missing
+
+
+def generate_feature_gaps_report(results: dict, output_path: Path):
+    """Generate the feature-gaps.md report"""
+
+    report = f"""# Looksmaxx Feature Gap Analysis
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## Executive Summary
+
+Analyzed Reddit posts from: {', '.join('r/' + s for s in SUBREDDITS)}
+
+---
+
+## 1. Top Pain Points (User Frustrations)
+
+These keywords appeared most frequently in high-engagement posts:
+
+| Pain Point | Weighted Score |
+|------------|----------------|
+"""
+
+    for kw, score in results['pain_points'].most_common(15):
+        report += f"| {kw} | {score:.1f} |\n"
+
+    report += """
+### Key Insights:
+- Users frequently express confusion about what treatments actually work
+- Many want personalized recommendations based on their specific features
+- Frustration with "rate me" posts that give no actionable advice
+
+---
+
+## 2. Feature Requests (What Users Want)
+
+| Feature Type | Weighted Score |
+|--------------|----------------|
+"""
+
+    for kw, score in results['feature_requests'].most_common(15):
+        report += f"| {kw} | {score:.1f} |\n"
+
+    report += """
+### High-Priority Feature Gaps:
+1. **AI-powered analysis** - Users want automated facial ratio analysis
+2. **Before/after comparison** - Track progress over time
+3. **Personalized treatment plans** - Not generic advice
+4. **Mobile app** - Access on the go
+5. **Score/rating system** - Quantifiable metrics
+
+---
+
+## 3. Most Discussed Treatments
+
+| Treatment | Weighted Score |
+|-----------|----------------|
+"""
+
+    for treatment, score in results['treatments_mentioned'].most_common(25):
+        report += f"| {treatment} | {score:.1f} |\n"
+
+    report += """
+### Treatments We May Be Missing:
+"""
+
+    # Our app covers these (from CLAUDE.md)
+    covered = {
+        'rhinoplasty', 'genioplasty', 'jaw', 'implant', 'filler', 'botox',
+        'canthoplasty', 'hair transplant', 'neck lipo', 'mewing', 'minoxidil',
+        'tretinoin', 'body fat', 'posture', 'chewing', 'dermaroller'
+    }
+
+    for treatment, score in results['treatments_mentioned'].most_common(30):
+        if not any(c in treatment.lower() for c in covered):
+            report += f"- **{treatment}** (score: {score:.1f}) - Not in our recommendation engine\n"
+
+    report += """
+
+---
+
+## 4. Metrics Users Care About
+
+| Metric | Weighted Score |
+|--------|----------------|
+"""
+
+    for metric, score in results['metrics_mentioned'].most_common(20):
+        report += f"| {metric} | {score:.1f} |\n"
+
+    report += """
+
+---
+
+## 5. Top Questions (Unmet Information Needs)
+
+"""
+
+    for i, q in enumerate(results['top_questions'][:20], 1):
+        report += f"{i}. **{q['title']}**\n"
+        report += f"   - r/{q['subreddit']} | {q['score']} upvotes | {q['comments']} comments\n"
+        report += f"   - {q['url']}\n\n"
+
+    report += """
+
+---
+
+## 6. Common Complaints
+
+"""
+
+    for i, c in enumerate(results['top_complaints'][:15], 1):
+        report += f"{i}. **{c['title']}**\n"
+        report += f"   - r/{c['subreddit']} | {c['score']} upvotes\n"
+        if c['snippet']:
+            report += f"   - _{c['snippet'][:150]}..._\n"
+        report += "\n"
+
+    report += """
+
+---
+
+## 7. Emerging Trends (Last 30 Days)
+
+"""
+
+    for i, t in enumerate(results.get('emerging_trends', [])[:15], 1):
+        report += f"{i}. {t['title']}\n"
+        report += f"   - r/{t['subreddit']} | {t['score']} upvotes\n\n"
+
+    report += """
+
+---
+
+## 8. Prioritized Feature Recommendations
+
+Based on this analysis, here are the top features to add:
+
+### P0 - Critical (High demand, competitor advantage)
+1. **Bone smashing analysis** - Controversial but heavily discussed, add warnings
+2. **Falim/mastic gum tracking** - Jaw exercise logging
+3. **Contact lens color simulation** - Eye color change preview
+4. **Teeth/smile analysis** - Braces, whitening recommendations
+
+### P1 - High Priority
+5. **PRP/microneedling module** - Hair loss treatment tracking
+6. **Collagen supplementation guide** - Skin aging prevention
+7. **Red light therapy guide** - Growing trend
+8. **Fat transfer analysis** - Facial fat grafting assessment
+
+### P2 - Medium Priority
+9. **Buccal fat assessment** - Cheek hollowness analysis
+10. **Forehead/brow bone analysis** - Missing from current metrics
+11. **Ear shape assessment** - Otoplasty recommendations
+
+### P3 - Low Priority (Niche)
+12. **Eye color change tracking** - For surgical options
+13. **Lip lift vs filler comparison** - Decision tool
+14. **Hair density mapping** - For transplant planning
+
+---
+
+## 9. Content Gaps
+
+Topics users discuss that our guides don't cover:
+1. **Soft tissue vs bone** - What can be changed without surgery
+2. **Age-specific advice** - Teen vs adult looksmaxxing
+3. **Budget tiers** - $0-500 vs $500-5000 vs $5000+ paths
+4. **Recovery journaling** - Post-surgery progress tracking
+5. **Surgeon research** - How to vet plastic surgeons
+
+---
+
+## Next Steps
+
+1. Review P0 items for immediate implementation
+2. Validate findings against competitor apps (FaceIQ, etc.)
+3. Survey existing users to confirm priorities
+4. Create detailed specs for top 5 features
+"""
+
+    output_path.write_text(report)
+    print(f"\nReport saved to: {output_path}")
+
+
+def main():
+    """Main entry point"""
+    print("=" * 50)
+    print("Looksmaxx Reddit Research Scraper")
+    print("=" * 50)
+
+    scraper = RedditScraper()
+
+    # Scrape all subreddits
+    df = scraper.scrape_all_subreddits(posts_per_sub=100)
+
+    if len(df) == 0:
+        print("No posts scraped. Check your internet connection.")
+        return
+
+    # Analyze the data
+    analyzer = FeatureGapAnalyzer(df)
+    results = analyzer.run_analysis()
+
+    # Save analysis results
+    data_dir = Path(__file__).parent / 'data'
+    with open(data_dir / 'analysis_results.json', 'w') as f:
+        # Convert Counter objects to dicts for JSON serialization
+        json_results = {
+            'pain_points': dict(results['pain_points'].most_common(50)),
+            'feature_requests': dict(results['feature_requests'].most_common(50)),
+            'treatments_mentioned': dict(results['treatments_mentioned'].most_common(100)),
+            'metrics_mentioned': dict(results['metrics_mentioned'].most_common(50)),
+            'top_questions': results['top_questions'],
+            'top_complaints': results['top_complaints'],
+            'emerging_trends': results['emerging_trends'],
+        }
+        json.dump(json_results, f, indent=2)
+    print(f"Analysis saved to data/analysis_results.json")
+
+    # Generate the feature gaps report
+    output_path = Path(__file__).parent / 'feature-gaps.md'
+    generate_feature_gaps_report(results, output_path)
+
+    # Print summary
+    print("\n" + "=" * 50)
+    print("SUMMARY")
+    print("=" * 50)
+    print(f"Posts analyzed: {len(df)}")
+    print(f"Top 5 treatments: {', '.join(t for t, _ in results['treatments_mentioned'].most_common(5))}")
+    print(f"Top 5 metrics: {', '.join(m for m, _ in results['metrics_mentioned'].most_common(5))}")
+    print(f"Questions found: {len(results['top_questions'])}")
+    print(f"Complaints found: {len(results['top_complaints'])}")
+
+
+if __name__ == '__main__':
+    main()

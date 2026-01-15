@@ -1,0 +1,170 @@
+/**
+ * Security Test: Authentication Bypass Prevention
+ *
+ * Tests that the legacy x-stripe-customer-id header auth bypass
+ * is properly secured with:
+ * - Production blocking (unless explicitly enabled)
+ * - Rate limiting
+ * - Customer existence verification
+ */
+
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+
+// Test counters
+let passed = 0;
+let failed = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (error) {
+    failed++;
+    console.log(`  ✗ ${name}`);
+    console.log(`    Error: ${error.message}`);
+  }
+}
+
+function assertIncludes(source, pattern, message) {
+  if (!source.includes(pattern)) {
+    throw new Error(message || `Expected source to include: ${pattern}`);
+  }
+}
+
+// Read source files
+const rateLimiterPath = path.join(__dirname, '../middleware/rateLimiter.js');
+const rateLimiterSource = fs.readFileSync(rateLimiterPath, 'utf8');
+
+const usageTrackingPath = path.join(__dirname, '../services/usageTracking.js');
+const usageTrackingSource = fs.readFileSync(usageTrackingPath, 'utf8');
+
+console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
+console.log('║         SPLICE Security Test: Auth Bypass Prevention             ║');
+console.log('╚═══════════════════════════════════════════════════════════════════╝\n');
+
+console.log('1. Legacy Auth Production Block');
+console.log('─'.repeat(50));
+
+test('should check for production environment', () => {
+  assertIncludes(rateLimiterSource, 'isProduction', 'Should define isProduction variable');
+  assertIncludes(rateLimiterSource, "NODE_ENV === 'production'", 'Should check NODE_ENV');
+  assertIncludes(rateLimiterSource, 'RAILWAY_ENVIRONMENT', 'Should check Railway environment');
+});
+
+test('should have ALLOW_LEGACY_AUTH configuration', () => {
+  assertIncludes(rateLimiterSource, 'ALLOW_LEGACY_AUTH', 'Should have ALLOW_LEGACY_AUTH variable');
+  assertIncludes(rateLimiterSource, "process.env.ALLOW_LEGACY_AUTH", 'Should read from environment');
+});
+
+test('should block legacy auth in production by default', () => {
+  assertIncludes(rateLimiterSource, 'isProduction && !ALLOW_LEGACY_AUTH', 'Should block if production and not explicitly allowed');
+  assertIncludes(rateLimiterSource, 'Legacy auth blocked in production', 'Should log security warning');
+});
+
+test('should return 401 when legacy auth is blocked', () => {
+  assertIncludes(rateLimiterSource, 'Authentication method not supported', 'Should return clear error message');
+  assertIncludes(rateLimiterSource, 'Please use JWT authentication', 'Should guide users to JWT');
+});
+
+console.log('\n2. Legacy Auth Rate Limiting');
+console.log('─'.repeat(50));
+
+test('should implement rate limiting for legacy auth', () => {
+  assertIncludes(rateLimiterSource, 'legacyAuthAttempts', 'Should track auth attempts');
+  assertIncludes(rateLimiterSource, 'LEGACY_AUTH_WINDOW_MS', 'Should have time window');
+  assertIncludes(rateLimiterSource, 'LEGACY_AUTH_MAX_ATTEMPTS', 'Should have max attempts limit');
+});
+
+test('should have isLegacyAuthRateLimited function', () => {
+  assertIncludes(rateLimiterSource, 'function isLegacyAuthRateLimited', 'Should have rate limit check function');
+});
+
+test('should track client IP for rate limiting', () => {
+  assertIncludes(rateLimiterSource, 'req.ip', 'Should get client IP');
+  assertIncludes(rateLimiterSource, 'isLegacyAuthRateLimited(clientIp)', 'Should check rate limit by IP');
+});
+
+test('should return 429 when rate limited', () => {
+  assertIncludes(rateLimiterSource, '429', 'Should return 429 status code');
+  assertIncludes(rateLimiterSource, 'Too many authentication attempts', 'Should return rate limit message');
+});
+
+test('should log rate limit violations', () => {
+  assertIncludes(rateLimiterSource, '[SECURITY] Legacy auth rate limit exceeded', 'Should log rate limit violations');
+});
+
+console.log('\n3. Customer Existence Verification');
+console.log('─'.repeat(50));
+
+test('should import customerExists from usageTracking', () => {
+  assertIncludes(rateLimiterSource, 'customerExists', 'Should import customerExists');
+});
+
+test('should verify customer exists before accepting legacy auth', () => {
+  assertIncludes(rateLimiterSource, 'await customerExists(legacyId)', 'Should check customer exists');
+});
+
+test('should reject non-existent customers', () => {
+  assertIncludes(rateLimiterSource, 'Legacy auth attempt with non-existent customer', 'Should log non-existent customer attempts');
+  assertIncludes(rateLimiterSource, 'Customer not found', 'Should return clear error for non-existent customer');
+});
+
+test('usageTracking should export customerExists', () => {
+  assertIncludes(usageTrackingSource, 'customerExists', 'Should have customerExists function');
+  assertIncludes(usageTrackingSource, "module.exports = {", 'Should have exports');
+  // Check it's exported
+  const exportMatch = usageTrackingSource.match(/module\.exports\s*=\s*\{[\s\S]*?\}/);
+  if (!exportMatch || !exportMatch[0].includes('customerExists')) {
+    throw new Error('customerExists should be exported from usageTracking');
+  }
+});
+
+test('customerExists should use parameterized query', () => {
+  // Find the customerExists function
+  const funcMatch = usageTrackingSource.match(/async function customerExists[\s\S]*?^}/m);
+  if (!funcMatch) {
+    throw new Error('Could not find customerExists function');
+  }
+  const funcBody = funcMatch[0];
+  assertIncludes(funcBody, '$1', 'Should use parameterized query');
+  assertIncludes(funcBody, 'pool.query', 'Should use pool.query');
+});
+
+console.log('\n4. Format Validation');
+console.log('─'.repeat(50));
+
+test('should validate Stripe customer ID format', () => {
+  assertIncludes(rateLimiterSource, "match(/^cus_[a-zA-Z0-9]{14,}$/)", 'Should validate cus_ format');
+});
+
+test('should reject invalid formats', () => {
+  assertIncludes(rateLimiterSource, 'Invalid customer ID format', 'Should have format error message');
+});
+
+console.log('\n5. Security Logging');
+console.log('─'.repeat(50));
+
+test('should log security-relevant events', () => {
+  assertIncludes(rateLimiterSource, '[SECURITY]', 'Should have security log prefix');
+});
+
+test('should warn about legacy auth usage', () => {
+  assertIncludes(rateLimiterSource, 'DEPRECATED: Legacy auth header used', 'Should warn about legacy auth');
+  assertIncludes(rateLimiterSource, 'migrate to JWT', 'Should encourage migration to JWT');
+});
+
+// Summary
+console.log('\n' + '═'.repeat(55));
+console.log(`Results: ${passed} passed, ${failed} failed`);
+console.log('═'.repeat(55));
+
+if (failed > 0) {
+  console.log('\n❌ SECURITY TEST FAILED - Auth bypass vulnerabilities may exist!\n');
+  process.exit(1);
+} else {
+  console.log('\n✅ SECURITY TEST PASSED - Auth bypass protections verified!\n');
+  process.exit(0);
+}

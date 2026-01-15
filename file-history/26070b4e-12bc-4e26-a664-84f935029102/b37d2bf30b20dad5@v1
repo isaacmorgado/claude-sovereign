@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""
+RunPod Cost Tracking and Analytics
+Track GPU usage and costs over time with SQLite storage
+"""
+import json
+import sqlite3
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+# GPU pricing (per hour) - Update as needed
+GPU_PRICING = {
+    "RTX 3090": 0.44,
+    "RTX 4090": 0.69,
+    "A40": 0.79,
+    "A100 40GB": 1.14,
+    "A100 80GB": 1.89,
+    "H100 PCIe": 2.99,
+    "H100 SXM": 3.99,
+}
+
+# Model to recommended GPU mapping
+MODEL_GPU_MAP = {
+    "quick": {"gpu": "RTX 3090", "vram": 24},
+    "code": {"gpu": "A40", "vram": 48},
+    "architect": {"gpu": "A40", "vram": 48},
+    "research": {"gpu": "A100 40GB", "vram": 40},
+}
+
+
+@dataclass
+class UsageRecord:
+    timestamp: datetime
+    endpoint: str
+    model: str
+    gpu_type: str
+    duration_seconds: int
+    cost: float
+    tokens_in: int = 0
+    tokens_out: int = 0
+
+
+class CostTracker:
+    def __init__(self, db_path: str = "~/.runpod_automation/costs.db"):
+        self.db_path = Path(db_path).expanduser()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize SQLite database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+
+        # Usage tracking table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                endpoint TEXT NOT NULL,
+                model TEXT NOT NULL,
+                gpu_type TEXT NOT NULL,
+                duration_seconds INTEGER DEFAULT 0,
+                cost REAL DEFAULT 0.0,
+                tokens_in INTEGER DEFAULT 0,
+                tokens_out INTEGER DEFAULT 0
+            )
+        """)
+
+        # Session tracking (for active GPU time)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT NOT NULL,
+                start_time DATETIME,
+                end_time DATETIME,
+                gpu_type TEXT,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+
+        # Budget alerts
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL,
+                amount REAL NOT NULL,
+                alert_threshold REAL DEFAULT 0.8
+            )
+        """)
+
+        # Create indexes for faster queries
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_endpoint ON sessions(endpoint)")
+
+        conn.commit()
+        conn.close()
+
+    def log_request(self, endpoint: str, model: str, gpu_type: str,
+                    duration_seconds: int, tokens_in: int = 0, tokens_out: int = 0) -> float:
+        """
+        Log a single API request with cost calculation
+
+        Returns: calculated cost
+        """
+        hourly_rate = GPU_PRICING.get(gpu_type, 1.0)
+        cost = (duration_seconds / 3600) * hourly_rate
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO usage (endpoint, model, gpu_type, duration_seconds, cost, tokens_in, tokens_out)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (endpoint, model, gpu_type, duration_seconds, cost, tokens_in, tokens_out))
+        conn.commit()
+        conn.close()
+
+        return cost
+
+    def start_session(self, endpoint: str, gpu_type: str) -> int:
+        """Start tracking an active GPU session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute("""
+            INSERT INTO sessions (endpoint, start_time, gpu_type, status)
+            VALUES (?, ?, ?, 'active')
+        """, (endpoint, datetime.now(), gpu_type))
+        session_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return session_id
+
+    def end_session(self, session_id: int):
+        """End an active GPU session and calculate cost"""
+        conn = sqlite3.connect(self.db_path)
+
+        # Get session info
+        cursor = conn.execute(
+            "SELECT start_time, gpu_type, endpoint FROM sessions WHERE id = ?",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+
+        if row:
+            start_time = datetime.fromisoformat(row[0])
+            gpu_type = row[1]
+            endpoint = row[2]
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+
+            # Update session
+            conn.execute("""
+                UPDATE sessions SET end_time = ?, status = 'completed'
+                WHERE id = ?
+            """, (end_time, session_id))
+
+            # Log the usage
+            self.log_request(endpoint, "session", gpu_type, int(duration))
+
+        conn.commit()
+        conn.close()
+
+    def get_daily_costs(self, days: int = 7) -> Dict[str, float]:
+        """Get daily cost breakdown for the last N days"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cutoff = datetime.now() - timedelta(days=days)
+
+        cursor.execute("""
+            SELECT DATE(timestamp) as date, SUM(cost) as total_cost
+            FROM usage
+            WHERE timestamp > ?
+            GROUP BY DATE(timestamp)
+            ORDER BY date DESC
+        """, (cutoff,))
+
+        results = {row[0]: round(row[1], 4) for row in cursor.fetchall()}
+        conn.close()
+
+        return results
+
+    def get_model_breakdown(self) -> Dict[str, Dict]:
+        """Get cost breakdown by model"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT model,
+                   COUNT(*) as requests,
+                   SUM(cost) as total_cost,
+                   SUM(tokens_in) as total_tokens_in,
+                   SUM(tokens_out) as total_tokens_out,
+                   SUM(duration_seconds) as total_seconds
+            FROM usage
+            GROUP BY model
+            ORDER BY total_cost DESC
+        """)
+
+        results = {}
+        for row in cursor.fetchall():
+            results[row[0]] = {
+                "requests": row[1],
+                "cost": round(row[2], 4),
+                "tokens_in": row[3],
+                "tokens_out": row[4],
+                "hours": round(row[5] / 3600, 2)
+            }
+
+        conn.close()
+        return results
+
+    def get_today_cost(self) -> float:
+        """Get total cost for today"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        cursor.execute("""
+            SELECT COALESCE(SUM(cost), 0) FROM usage
+            WHERE DATE(timestamp) = ?
+        """, (today,))
+
+        result = cursor.fetchone()[0]
+        conn.close()
+
+        return round(result, 4)
+
+    def get_month_cost(self) -> float:
+        """Get total cost for current month"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0)
+
+        cursor.execute("""
+            SELECT COALESCE(SUM(cost), 0) FROM usage
+            WHERE timestamp >= ?
+        """, (month_start,))
+
+        result = cursor.fetchone()[0]
+        conn.close()
+
+        return round(result, 4)
+
+    def get_active_sessions(self) -> List[Dict]:
+        """Get all currently active GPU sessions"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, endpoint, start_time, gpu_type
+            FROM sessions
+            WHERE status = 'active'
+        """)
+
+        sessions = []
+        for row in cursor.fetchall():
+            start = datetime.fromisoformat(row[2])
+            duration = (datetime.now() - start).total_seconds()
+            hourly_rate = GPU_PRICING.get(row[3], 1.0)
+            current_cost = (duration / 3600) * hourly_rate
+
+            sessions.append({
+                "id": row[0],
+                "endpoint": row[1],
+                "start_time": row[2],
+                "gpu_type": row[3],
+                "duration_hours": round(duration / 3600, 2),
+                "current_cost": round(current_cost, 4)
+            })
+
+        conn.close()
+        return sessions
+
+    def set_budget(self, period: str, amount: float, alert_threshold: float = 0.8):
+        """Set a budget for daily/weekly/monthly spending"""
+        conn = sqlite3.connect(self.db_path)
+
+        # Upsert budget
+        conn.execute("""
+            INSERT OR REPLACE INTO budgets (period, amount, alert_threshold)
+            VALUES (?, ?, ?)
+        """, (period, amount, alert_threshold))
+
+        conn.commit()
+        conn.close()
+
+    def check_budget_alerts(self) -> List[Dict]:
+        """Check if any budgets are approaching their limits"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT period, amount, alert_threshold FROM budgets")
+        budgets = cursor.fetchall()
+        conn.close()
+
+        alerts = []
+
+        for period, amount, threshold in budgets:
+            if period == "daily":
+                spent = self.get_today_cost()
+            elif period == "monthly":
+                spent = self.get_month_cost()
+            else:
+                continue
+
+            percentage = spent / amount if amount > 0 else 0
+
+            if percentage >= threshold:
+                alerts.append({
+                    "period": period,
+                    "budget": amount,
+                    "spent": spent,
+                    "percentage": round(percentage * 100, 1),
+                    "status": "exceeded" if percentage >= 1.0 else "warning"
+                })
+
+        return alerts
+
+    def export_report(self, days: int = 30) -> Dict:
+        """Generate a comprehensive usage report"""
+        return {
+            "generated": datetime.now().isoformat(),
+            "period_days": days,
+            "summary": {
+                "today": self.get_today_cost(),
+                "this_month": self.get_month_cost(),
+            },
+            "daily_breakdown": self.get_daily_costs(days),
+            "model_breakdown": self.get_model_breakdown(),
+            "active_sessions": self.get_active_sessions(),
+            "budget_alerts": self.check_budget_alerts(),
+            "gpu_pricing": GPU_PRICING
+        }
+
+    def get_status_json(self) -> str:
+        """Get current status as JSON (for VS Code extension)"""
+        return json.dumps({
+            "today_cost": self.get_today_cost(),
+            "month_cost": self.get_month_cost(),
+            "active_sessions": self.get_active_sessions(),
+            "alerts": self.check_budget_alerts()
+        })
+
+
+def main():
+    """CLI interface for cost tracking"""
+    tracker = CostTracker()
+
+    if len(sys.argv) < 2:
+        print("""
+RunPod Cost Tracker
+
+USAGE:
+  python3 cost_tracker.py <command> [args]
+
+COMMANDS:
+  status              Show current cost status
+  today               Show today's spending
+  month               Show this month's spending
+  daily [days]        Show daily breakdown (default: 7 days)
+  models              Show cost breakdown by model
+  sessions            Show active GPU sessions
+  report [days]       Generate full report (default: 30 days)
+
+  set-budget <period> <amount>    Set budget (period: daily/monthly)
+  check-alerts                     Check budget alerts
+
+  log <endpoint> <model> <gpu> <seconds>    Log a request manually
+
+EXAMPLES:
+  python3 cost_tracker.py status
+  python3 cost_tracker.py daily 14
+  python3 cost_tracker.py set-budget daily 5.00
+  python3 cost_tracker.py log architect architect A40 120
+""")
+        return
+
+    command = sys.argv[1].lower()
+
+    if command == "status":
+        print(f"""
+╔══════════════════════════════════════╗
+║       RunPod Cost Status             ║
+╠══════════════════════════════════════╣
+║  Today:      ${tracker.get_today_cost():>8.2f}              ║
+║  This Month: ${tracker.get_month_cost():>8.2f}              ║
+╚══════════════════════════════════════╝
+""")
+
+        sessions = tracker.get_active_sessions()
+        if sessions:
+            print("Active Sessions:")
+            for s in sessions:
+                print(f"  • {s['endpoint']}: {s['gpu_type']} - {s['duration_hours']}hrs (${s['current_cost']:.2f})")
+
+        alerts = tracker.check_budget_alerts()
+        if alerts:
+            print("\n⚠️  Budget Alerts:")
+            for a in alerts:
+                print(f"  • {a['period'].title()}: ${a['spent']:.2f}/${a['budget']:.2f} ({a['percentage']}%)")
+
+    elif command == "today":
+        print(f"Today's cost: ${tracker.get_today_cost():.4f}")
+
+    elif command == "month":
+        print(f"This month's cost: ${tracker.get_month_cost():.4f}")
+
+    elif command == "daily":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+        costs = tracker.get_daily_costs(days)
+        print(f"\nDaily costs (last {days} days):")
+        for date, cost in costs.items():
+            print(f"  {date}: ${cost:.4f}")
+        print(f"\n  Total: ${sum(costs.values()):.4f}")
+
+    elif command == "models":
+        breakdown = tracker.get_model_breakdown()
+        print("\nCost by model:")
+        for model, stats in breakdown.items():
+            print(f"  {model}:")
+            print(f"    Requests: {stats['requests']}")
+            print(f"    Hours: {stats['hours']}")
+            print(f"    Cost: ${stats['cost']:.4f}")
+
+    elif command == "sessions":
+        sessions = tracker.get_active_sessions()
+        if not sessions:
+            print("No active sessions")
+        else:
+            print("\nActive GPU sessions:")
+            for s in sessions:
+                print(f"  [{s['id']}] {s['endpoint']}")
+                print(f"      GPU: {s['gpu_type']}")
+                print(f"      Duration: {s['duration_hours']} hours")
+                print(f"      Current cost: ${s['current_cost']:.4f}")
+
+    elif command == "report":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+        report = tracker.export_report(days)
+        print(json.dumps(report, indent=2))
+
+    elif command == "set-budget":
+        if len(sys.argv) < 4:
+            print("Usage: set-budget <daily|monthly> <amount>")
+            return
+        period = sys.argv[2]
+        amount = float(sys.argv[3])
+        tracker.set_budget(period, amount)
+        print(f"✅ Budget set: ${amount:.2f} {period}")
+
+    elif command == "check-alerts":
+        alerts = tracker.check_budget_alerts()
+        if not alerts:
+            print("✅ All budgets within limits")
+        else:
+            for a in alerts:
+                status = "🚨 EXCEEDED" if a['status'] == 'exceeded' else "⚠️  WARNING"
+                print(f"{status} {a['period'].title()}: ${a['spent']:.2f}/${a['budget']:.2f} ({a['percentage']}%)")
+
+    elif command == "log":
+        if len(sys.argv) < 6:
+            print("Usage: log <endpoint> <model> <gpu_type> <duration_seconds>")
+            return
+        endpoint, model, gpu, duration = sys.argv[2:6]
+        cost = tracker.log_request(endpoint, model, gpu, int(duration))
+        print(f"✅ Logged: {model} on {gpu} for {duration}s = ${cost:.4f}")
+
+    elif command == "json":
+        # For VS Code extension integration
+        print(tracker.get_status_json())
+
+    else:
+        print(f"Unknown command: {command}")
+        print("Run without arguments to see usage")
+
+
+if __name__ == "__main__":
+    main()

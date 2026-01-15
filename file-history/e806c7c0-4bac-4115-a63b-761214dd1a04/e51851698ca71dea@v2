@@ -1,0 +1,496 @@
+/**
+ * Human.js Face Detection Service
+ *
+ * Uses @vladmandic/human for face detection that handles:
+ * - Frontal faces (like MediaPipe)
+ * - Rotated/angled faces
+ * - Side profiles (better than MediaPipe)
+ *
+ * Human.js provides 468 3D landmarks and head pose estimation (yaw, pitch, roll)
+ */
+
+import type { Human, FaceResult, Config } from '@vladmandic/human';
+import { SIDE_PROFILE_LANDMARKS, FRONT_PROFILE_LANDMARKS } from './landmarks';
+
+// Singleton instance
+let humanInstance: Human | null = null;
+let initPromise: Promise<Human> | null = null;
+
+// Human.js configuration optimized for face landmark detection
+const humanConfig: Partial<Config> = {
+  backend: 'webgl',
+  modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
+  face: {
+    enabled: true,
+    detector: {
+      enabled: true,
+      maxDetected: 1,
+      rotation: true, // Enable rotation detection for side profiles
+      minConfidence: 0.3, // Lower threshold for profile detection
+    },
+    mesh: {
+      enabled: true,
+    },
+    iris: {
+      enabled: true,
+    },
+    description: {
+      enabled: false, // Don't need age/gender/emotion
+    },
+    emotion: {
+      enabled: false,
+    },
+  },
+  body: {
+    enabled: false,
+  },
+  hand: {
+    enabled: false,
+  },
+  gesture: {
+    enabled: false,
+  },
+  segmentation: {
+    enabled: false,
+  },
+};
+
+/**
+ * Initialize Human.js (singleton pattern)
+ */
+export async function initializeHuman(): Promise<Human> {
+  if (humanInstance) return humanInstance;
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    // Dynamic import to avoid SSR issues
+    const { Human } = await import('@vladmandic/human');
+    const human = new Human(humanConfig);
+    await human.load();
+    humanInstance = human;
+    console.log('[Human.js] Initialized successfully');
+    return human;
+  })();
+
+  return initPromise;
+}
+
+/**
+ * Check if Human.js is ready
+ */
+export function isHumanReady(): boolean {
+  return humanInstance !== null;
+}
+
+export interface HumanDetectionResult {
+  landmarks: Array<{ id: string; x: number; y: number }>;
+  confidence: number;
+  headPose: {
+    yaw: number;   // Left/right rotation (-90 to 90, 0 = frontal)
+    pitch: number; // Up/down tilt
+    roll: number;  // Head tilt
+  };
+  isProfileView: boolean;
+  faceBox: { x: number; y: number; width: number; height: number };
+}
+
+/**
+ * Human.js 468 landmark indices for key facial points
+ * Reference: https://github.com/vladmandic/human/blob/main/src/face/facemesh.ts
+ */
+const HUMAN_LANDMARK_INDICES = {
+  // Forehead/Head
+  topOfHead: 10,
+  hairline: 10,
+  glabella: 9,
+
+  // Eyes - Left (from subject's perspective)
+  leftPupil: 468,
+  leftEyeInner: 133,
+  leftEyeOuter: 33,
+  leftEyeTop: 159,
+  leftEyeBottom: 145,
+
+  // Eyes - Right
+  rightPupil: 473,
+  rightEyeInner: 362,
+  rightEyeOuter: 263,
+  rightEyeTop: 386,
+  rightEyeBottom: 374,
+
+  // Eyebrows - Left
+  leftBrowInner: 107,
+  leftBrowOuter: 70,
+  leftBrowTop: 105,
+
+  // Eyebrows - Right
+  rightBrowInner: 336,
+  rightBrowOuter: 300,
+  rightBrowTop: 334,
+
+  // Nose
+  nasion: 6,
+  noseBridge: 4,
+  noseTip: 1,
+  noseBottom: 2,
+  leftNostril: 129,
+  rightNostril: 358,
+
+  // Mouth
+  upperLipTop: 0,
+  upperLipCenter: 13,
+  lowerLipBottom: 17,
+  lowerLipCenter: 14,
+  mouthLeft: 61,
+  mouthRight: 291,
+
+  // Jaw
+  leftJawTop: 58,
+  rightJawTop: 288,
+  leftJawBottom: 172,
+  rightJawBottom: 397,
+
+  // Chin
+  chin: 152,
+  leftChin: 176,
+  rightChin: 400,
+
+  // Cheeks
+  leftCheek: 234,
+  rightCheek: 454,
+
+  // Ears (approximation from face mesh)
+  leftEar: 127,
+  rightEar: 356,
+
+  // Temples
+  leftTemple: 54,
+  rightTemple: 284,
+
+  // Side profile specific (for orbitale and porion approximation)
+  orbitaleLeft: 145, // Lower eyelid area
+  orbitaleRight: 374,
+  porionLeft: 127, // Near ear
+  porionRight: 356,
+};
+
+/**
+ * Detect face using Human.js
+ */
+export async function detectWithHuman(
+  image: HTMLImageElement | HTMLCanvasElement,
+  mode: 'front' | 'side'
+): Promise<HumanDetectionResult | null> {
+  try {
+    const human = await initializeHuman();
+    const result = await human.detect(image);
+
+    if (!result.face || result.face.length === 0) {
+      console.log('[Human.js] No face detected');
+      return null;
+    }
+
+    const face = result.face[0];
+    const mesh = face.mesh;
+
+    if (!mesh || mesh.length === 0) {
+      console.log('[Human.js] No mesh landmarks detected');
+      return null;
+    }
+
+    // Get head pose (rotation angles)
+    const headPose = {
+      yaw: face.rotation?.angle?.yaw || 0,
+      pitch: face.rotation?.angle?.pitch || 0,
+      roll: face.rotation?.angle?.roll || 0,
+    };
+
+    // Determine if this is a profile view based on yaw angle
+    // Yaw > 30 degrees suggests profile view
+    const isProfileView = Math.abs(headPose.yaw) > 30;
+
+    console.log(`[Human.js] Head pose - Yaw: ${headPose.yaw.toFixed(1)}°, Profile: ${isProfileView}`);
+
+    // Map landmarks based on mode
+    const landmarks = mode === 'front'
+      ? mapHumanToFrontLandmarks(mesh, image.width, image.height)
+      : mapHumanToSideLandmarks(mesh, image.width, image.height, headPose.yaw);
+
+    return {
+      landmarks,
+      confidence: face.score || 0.8,
+      headPose,
+      isProfileView,
+      faceBox: {
+        x: (face.box?.[0] || 0) / image.width,
+        y: (face.box?.[1] || 0) / image.height,
+        width: (face.box?.[2] || image.width) / image.width,
+        height: (face.box?.[3] || image.height) / image.height,
+      },
+    };
+  } catch (error) {
+    console.error('[Human.js] Detection error:', error);
+    return null;
+  }
+}
+
+/**
+ * Map Human.js mesh to front profile landmarks
+ */
+function mapHumanToFrontLandmarks(
+  mesh: FaceResult['mesh'],
+  imageWidth: number,
+  imageHeight: number
+): Array<{ id: string; x: number; y: number }> {
+  const getPoint = (index: number) => {
+    if (!mesh || index >= mesh.length) return { x: 0.5, y: 0.5 };
+    const point = mesh[index];
+    return {
+      x: point[0] / imageWidth,
+      y: point[1] / imageHeight,
+    };
+  };
+
+  // Map each front landmark
+  const mapping: Record<string, number> = {
+    trichion: HUMAN_LANDMARK_INDICES.hairline,
+    left_pupila: HUMAN_LANDMARK_INDICES.leftPupil,
+    left_canthus_medialis: HUMAN_LANDMARK_INDICES.leftEyeInner,
+    left_canthus_lateralis: HUMAN_LANDMARK_INDICES.leftEyeOuter,
+    left_palpebra_superior: HUMAN_LANDMARK_INDICES.leftEyeTop,
+    left_palpebra_inferior: HUMAN_LANDMARK_INDICES.leftEyeBottom,
+    right_pupila: HUMAN_LANDMARK_INDICES.rightPupil,
+    right_canthus_medialis: HUMAN_LANDMARK_INDICES.rightEyeInner,
+    right_canthus_lateralis: HUMAN_LANDMARK_INDICES.rightEyeOuter,
+    right_palpebra_superior: HUMAN_LANDMARK_INDICES.rightEyeTop,
+    right_palpebra_inferior: HUMAN_LANDMARK_INDICES.rightEyeBottom,
+    left_supercilium_medialis: HUMAN_LANDMARK_INDICES.leftBrowInner,
+    left_supercilium_apex: HUMAN_LANDMARK_INDICES.leftBrowTop,
+    left_supercilium_lateralis: HUMAN_LANDMARK_INDICES.leftBrowOuter,
+    right_supercilium_medialis: HUMAN_LANDMARK_INDICES.rightBrowInner,
+    right_supercilium_apex: HUMAN_LANDMARK_INDICES.rightBrowTop,
+    right_supercilium_lateralis: HUMAN_LANDMARK_INDICES.rightBrowOuter,
+    nasal_base: HUMAN_LANDMARK_INDICES.nasion,
+    subnasale: HUMAN_LANDMARK_INDICES.noseBottom,
+    left_ala_nasi: HUMAN_LANDMARK_INDICES.leftNostril,
+    right_ala_nasi: HUMAN_LANDMARK_INDICES.rightNostril,
+    labrale_superius: HUMAN_LANDMARK_INDICES.upperLipTop,
+    mouth_middle: HUMAN_LANDMARK_INDICES.lowerLipCenter,
+    labrale_inferius: HUMAN_LANDMARK_INDICES.lowerLipBottom,
+    left_cheilion: HUMAN_LANDMARK_INDICES.mouthLeft,
+    right_cheilion: HUMAN_LANDMARK_INDICES.mouthRight,
+    left_gonion_superior: HUMAN_LANDMARK_INDICES.leftJawTop,
+    right_gonion_superior: HUMAN_LANDMARK_INDICES.rightJawTop,
+    left_gonion_inferior: HUMAN_LANDMARK_INDICES.leftJawBottom,
+    right_gonion_inferior: HUMAN_LANDMARK_INDICES.rightJawBottom,
+    menton: HUMAN_LANDMARK_INDICES.chin,
+    left_mentum_lateralis: HUMAN_LANDMARK_INDICES.leftChin,
+    right_mentum_lateralis: HUMAN_LANDMARK_INDICES.rightChin,
+    left_zygion: HUMAN_LANDMARK_INDICES.leftCheek,
+    right_zygion: HUMAN_LANDMARK_INDICES.rightCheek,
+    left_temporal: HUMAN_LANDMARK_INDICES.leftTemple,
+    right_temporal: HUMAN_LANDMARK_INDICES.rightTemple,
+    left_auricular_lateral: HUMAN_LANDMARK_INDICES.leftEar,
+    right_auricular_lateral: HUMAN_LANDMARK_INDICES.rightEar,
+    left_cervical_lateralis: HUMAN_LANDMARK_INDICES.leftJawBottom,
+    right_cervical_lateralis: HUMAN_LANDMARK_INDICES.rightJawBottom,
+  };
+
+  return FRONT_PROFILE_LANDMARKS.map(lm => {
+    const index = mapping[lm.id];
+    if (index !== undefined) {
+      const point = getPoint(index);
+      return { id: lm.id, x: point.x, y: point.y };
+    }
+    return { id: lm.id, x: lm.x, y: lm.y };
+  });
+}
+
+/**
+ * Map Human.js mesh to side profile landmarks
+ * Uses head yaw to determine which side of face is visible
+ */
+function mapHumanToSideLandmarks(
+  mesh: FaceResult['mesh'],
+  imageWidth: number,
+  imageHeight: number,
+  yaw: number
+): Array<{ id: string; x: number; y: number }> {
+  const getPoint = (index: number) => {
+    if (!mesh || index >= mesh.length) return { x: 0.5, y: 0.5 };
+    const point = mesh[index];
+    return {
+      x: point[0] / imageWidth,
+      y: point[1] / imageHeight,
+    };
+  };
+
+  // Determine if left or right side of face is visible
+  // Positive yaw = face turned right (left side visible)
+  // Negative yaw = face turned left (right side visible)
+  const isLeftSideVisible = yaw > 0;
+
+  // Get key anchor points based on visible side
+  const eyeOuter = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftEyeOuter : HUMAN_LANDMARK_INDICES.rightEyeOuter);
+  const eyeBottom = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftEyeBottom : HUMAN_LANDMARK_INDICES.rightEyeBottom);
+  const ear = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftEar : HUMAN_LANDMARK_INDICES.rightEar);
+  const cheek = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftCheek : HUMAN_LANDMARK_INDICES.rightCheek);
+  const jawTop = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftJawTop : HUMAN_LANDMARK_INDICES.rightJawTop);
+  const jawBottom = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftJawBottom : HUMAN_LANDMARK_INDICES.rightJawBottom);
+  const nostril = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.leftNostril : HUMAN_LANDMARK_INDICES.rightNostril);
+
+  // Common points
+  const topOfHead = getPoint(HUMAN_LANDMARK_INDICES.topOfHead);
+  const glabella = getPoint(HUMAN_LANDMARK_INDICES.glabella);
+  const nasion = getPoint(HUMAN_LANDMARK_INDICES.nasion);
+  const noseBridge = getPoint(HUMAN_LANDMARK_INDICES.noseBridge);
+  const noseTip = getPoint(HUMAN_LANDMARK_INDICES.noseTip);
+  const noseBottom = getPoint(HUMAN_LANDMARK_INDICES.noseBottom);
+  const upperLip = getPoint(HUMAN_LANDMARK_INDICES.upperLipTop);
+  const lowerLip = getPoint(HUMAN_LANDMARK_INDICES.lowerLipBottom);
+  const mouthCorner = getPoint(isLeftSideVisible ? HUMAN_LANDMARK_INDICES.mouthLeft : HUMAN_LANDMARK_INDICES.mouthRight);
+  const chin = getPoint(HUMAN_LANDMARK_INDICES.chin);
+
+  // Helper for interpolation
+  const lerp = (p1: { x: number; y: number }, p2: { x: number; y: number }, t: number) => ({
+    x: p1.x + (p2.x - p1.x) * t,
+    y: p1.y + (p2.y - p1.y) * t,
+  });
+
+  // Map to our 28 side profile landmarks
+  // These are the FaceIQ landmark positions
+  const sideMapping: Record<string, { x: number; y: number }> = {
+    // 1. vertex - top of head (estimate above topOfHead)
+    vertex: { x: topOfHead.x, y: Math.max(0, topOfHead.y - 0.08) },
+
+    // 2. occiput - back of head (estimate behind ear)
+    occiput: { x: ear.x + (isLeftSideVisible ? 0.1 : -0.1), y: topOfHead.y + 0.05 },
+
+    // 3. pronasale - nose tip
+    pronasale: noseTip,
+
+    // 4. neckPoint - lower neck
+    neckPoint: { x: chin.x, y: Math.min(1, chin.y + 0.08) },
+
+    // 5. porion - ear canal opening (Frankfort Plane point)
+    porion: { x: ear.x, y: lerp(nasion, ear, 0.3).y },
+
+    // 6. orbitale - lowest orbital rim (Frankfort Plane point)
+    orbitale: eyeBottom,
+
+    // 7. tragus - ear cartilage
+    tragus: { x: ear.x + (isLeftSideVisible ? -0.02 : 0.02), y: lerp(nasion, jawTop, 0.4).y },
+
+    // 8. intertragicNotch - notch in ear
+    intertragicNotch: { x: ear.x + (isLeftSideVisible ? -0.02 : 0.02), y: lerp(nasion, jawTop, 0.6).y },
+
+    // 9. cornealApex - forward point of cornea
+    cornealApex: { x: eyeOuter.x + (isLeftSideVisible ? -0.02 : 0.02), y: lerp(eyeBottom, eyeOuter, 0.5).y },
+
+    // 10. cheekbone - zygomatic prominence
+    cheekbone: cheek,
+
+    // 11. trichion - hairline
+    trichion: { x: topOfHead.x, y: topOfHead.y + 0.02 },
+
+    // 12. glabella - between brows
+    glabella: glabella,
+
+    // 13. nasion - nasal root (Frankfort reference)
+    nasion: nasion,
+
+    // 14. rhinion - mid-dorsum of nose
+    rhinion: noseBridge,
+
+    // 15. supratip - above nose tip
+    supratip: lerp(noseBridge, noseTip, 0.7),
+
+    // 16. infratip - below nose tip
+    infratip: lerp(noseTip, noseBottom, 0.4),
+
+    // 17. columella - nasal septum
+    columella: lerp(noseTip, noseBottom, 0.6),
+
+    // 18. subnasale - base of nose
+    subnasale: noseBottom,
+
+    // 19. subalare - nostril wing
+    subalare: nostril,
+
+    // 20. labraleSuperius - upper lip
+    labraleSuperius: upperLip,
+
+    // 21. cheilion - mouth corner
+    cheilion: mouthCorner,
+
+    // 22. labraleInferius - lower lip
+    labraleInferius: lowerLip,
+
+    // 23. sublabiale - below lower lip
+    sublabiale: lerp(lowerLip, chin, 0.3),
+
+    // 24. pogonion - chin prominence
+    pogonion: { x: chin.x + (isLeftSideVisible ? -0.01 : 0.01), y: chin.y - 0.02 },
+
+    // 25. menton - chin bottom
+    menton: chin,
+
+    // 26. cervicalPoint - high neck point
+    cervicalPoint: lerp(chin, { x: ear.x, y: chin.y + 0.1 }, 0.5),
+
+    // 27. gonionTop - upper jaw angle
+    gonionTop: jawTop,
+
+    // 28. gonionBottom - lower jaw angle
+    gonionBottom: jawBottom,
+  };
+
+  return SIDE_PROFILE_LANDMARKS.map(lm => {
+    const pos = sideMapping[lm.id];
+    if (pos) {
+      return {
+        id: lm.id,
+        x: Math.max(0, Math.min(1, pos.x)),
+        y: Math.max(0, Math.min(1, pos.y)),
+      };
+    }
+    return { id: lm.id, x: lm.x, y: lm.y };
+  });
+}
+
+/**
+ * Calculate Frankfort Horizontal Plane angle
+ * The plane connecting Orbitale and Porion
+ * Returns angle in degrees (0 = horizontal)
+ */
+export function calculateFrankfortPlane(
+  landmarks: Array<{ id: string; x: number; y: number }>
+): { angle: number; orbitale: { x: number; y: number }; porion: { x: number; y: number } } | null {
+  const orbitale = landmarks.find(lm => lm.id === 'orbitale');
+  const porion = landmarks.find(lm => lm.id === 'porion');
+
+  if (!orbitale || !porion) return null;
+
+  // Calculate angle from horizontal
+  const dx = porion.x - orbitale.x;
+  const dy = porion.y - orbitale.y;
+  const angleRad = Math.atan2(dy, dx);
+  const angleDeg = angleRad * (180 / Math.PI);
+
+  return {
+    angle: angleDeg,
+    orbitale: { x: orbitale.x, y: orbitale.y },
+    porion: { x: porion.x, y: porion.y },
+  };
+}
+
+/**
+ * Dispose Human.js instance
+ */
+export function disposeHuman(): void {
+  if (humanInstance) {
+    // Human.js doesn't have explicit dispose, but we clear the reference
+    humanInstance = null;
+    initPromise = null;
+  }
+}

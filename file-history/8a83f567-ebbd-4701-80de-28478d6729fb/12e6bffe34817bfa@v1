@@ -1,0 +1,791 @@
+# FaceIQ Labs Rebuild Plan
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         FRONTEND                                 │
+│  Next.js 14+ App Router                                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │   Auth      │  │  Dashboard  │  │  Analysis   │              │
+│  │  (NextAuth) │  │   Pages     │  │   Views     │              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│         │                │                │                      │
+│  ┌──────┴────────────────┴────────────────┴──────┐              │
+│  │              MediaPipe Integration             │              │
+│  │  - FaceLandmarker (478 points front)          │              │
+│  │  - Side profile detection (106 points)         │              │
+│  └───────────────────────────────────────────────┘              │
+│         │                                                        │
+│  ┌──────┴──────────────────────────────────────┐                │
+│  │         Landmark Editor Canvas               │                │
+│  │  - Auto-detect overlay                       │                │
+│  │  - Draggable points                          │                │
+│  │  - Zoom/Pan controls                         │                │
+│  └──────────────────────────────────────────────┘                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         BACKEND                                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │  /api/faces │  │ /api/side-  │  │ /api/sub-   │              │
+│  │   CRUD      │  │  landmarks  │  │  scription  │              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│         │                │                │                      │
+│  ┌──────┴────────────────┴────────────────┴──────┐              │
+│  │              Calculation Engine               │              │
+│  │  - Facial ratios (FWHR, golden ratio)        │              │
+│  │  - Angles (nasolabial, gonial, canthal)      │              │
+│  │  - Symmetry scores                            │              │
+│  └───────────────────────────────────────────────┘              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        DATABASE                                  │
+│  Prisma + PostgreSQL (or PlanetScale)                           │
+│  - Users, Faces, Landmarks, Measurements, Subscriptions         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 1: Project Setup
+
+### 1.1 Initialize Project
+```bash
+npx create-next-app@latest faceiq-clone --typescript --tailwind --app --src-dir
+cd faceiq-clone
+
+# Install dependencies
+npm install @mediapipe/tasks-vision
+npm install next-auth @auth/prisma-adapter
+npm install @vercel/blob
+npm install prisma @prisma/client
+npm install framer-motion  # For smooth animations
+npm install zustand        # State management
+npm install react-zoom-pan-pinch  # For image zoom/pan
+```
+
+### 1.2 Database Schema (prisma/schema.prisma)
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  createdAt     DateTime  @default(now())
+  faces         Face[]
+  subscription  Subscription?
+}
+
+model Face {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id])
+
+  // Images
+  frontUrl        String?
+  sideUrl         String?
+
+  // Raw landmarks from MediaPipe
+  frontLandmarks  Json?     // Array of {x, y, z?} - 478 points
+  sideLandmarks   Json?     // Array of {x, y} - 106 points
+
+  // User-adjusted landmarks (after manual correction)
+  adjustedFrontLandmarks  Json?
+  adjustedSideLandmarks   Json?
+
+  // Calculated measurements
+  measurements    Json?     // All facial ratios and angles
+
+  // Metadata
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  status          FaceStatus @default(PENDING)
+}
+
+enum FaceStatus {
+  PENDING
+  FRONT_UPLOADED
+  FRONT_ANALYZED
+  SIDE_UPLOADED
+  SIDE_ANALYZED
+  COMPLETE
+}
+
+model Subscription {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  plan      Plan     @default(FREE)
+  expiresAt DateTime?
+}
+
+enum Plan {
+  FREE
+  PRO
+  PREMIUM
+}
+```
+
+---
+
+## Phase 2: MediaPipe Integration
+
+### 2.1 Create MediaPipe Hook (src/hooks/useFaceLandmarker.ts)
+```typescript
+import { useEffect, useRef, useState } from 'react';
+import { FaceLandmarker, FilesetResolver, DrawingUtils } from '@mediapipe/tasks-vision';
+
+interface Landmark {
+  x: number;
+  y: number;
+  z?: number;
+}
+
+export function useFaceLandmarker() {
+  const [landmarker, setLandmarker] = useState<FaceLandmarker | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    async function initLandmarker() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+        );
+
+        const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU'
+          },
+          runningMode: 'IMAGE',
+          numFaces: 1,
+          outputFacialTransformationMatrixes: true,
+          outputFaceBlendshapes: true
+        });
+
+        setLandmarker(faceLandmarker);
+        setIsLoading(false);
+      } catch (err) {
+        setError(err as Error);
+        setIsLoading(false);
+      }
+    }
+
+    initLandmarker();
+  }, []);
+
+  const detectLandmarks = async (imageElement: HTMLImageElement): Promise<Landmark[]> => {
+    if (!landmarker) throw new Error('Landmarker not initialized');
+
+    const result = landmarker.detect(imageElement);
+
+    if (result.faceLandmarks.length === 0) {
+      throw new Error('No face detected');
+    }
+
+    // Convert normalized coordinates to pixel coordinates
+    const landmarks = result.faceLandmarks[0].map(point => ({
+      x: point.x * imageElement.width,
+      y: point.y * imageElement.height,
+      z: point.z
+    }));
+
+    return landmarks;
+  };
+
+  return { detectLandmarks, isLoading, error };
+}
+```
+
+### 2.2 Key Landmark Indices (src/lib/landmarks.ts)
+```typescript
+// MediaPipe Face Landmarker - 478 points
+// These are the key indices for facial measurements
+
+export const FRONT_LANDMARKS = {
+  // Face oval (silhouette)
+  faceOval: [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109],
+
+  // Eyes
+  leftEye: {
+    outer: 33,
+    inner: 133,
+    top: 159,
+    bottom: 145,
+    center: 468  // iris center
+  },
+  rightEye: {
+    outer: 263,
+    inner: 362,
+    top: 386,
+    bottom: 374,
+    center: 473  // iris center
+  },
+
+  // Eyebrows
+  leftEyebrow: [70, 63, 105, 66, 107],
+  rightEyebrow: [300, 293, 334, 296, 336],
+
+  // Nose
+  nose: {
+    tip: 4,
+    bridge: 6,
+    leftAla: 129,
+    rightAla: 358,
+    base: 2
+  },
+
+  // Lips
+  lips: {
+    upperTop: 13,
+    upperBottom: 14,
+    lowerTop: 17,
+    lowerBottom: 0,
+    leftCorner: 61,
+    rightCorner: 291
+  },
+
+  // Face structure
+  structure: {
+    chin: 152,
+    leftCheekbone: 234,
+    rightCheekbone: 454,
+    leftJaw: 172,
+    rightJaw: 397,
+    forehead: 10,
+    glabella: 9  // between eyebrows
+  }
+};
+
+// Side profile landmarks (from their API - 106 points)
+export const SIDE_LANDMARKS = {
+  forehead: { start: 0, end: 15 },
+  nasion: 16,           // bridge of nose between eyes
+  noseBridge: { start: 17, end: 25 },
+  pronasale: 30,        // tip of nose
+  subnasale: 35,        // base of nose
+  upperLip: { start: 40, end: 50 },
+  lowerLip: { start: 51, end: 60 },
+  pogonion: 65,         // most anterior point of chin
+  menton: 70,           // lowest point of chin
+  gonion: 85,           // angle of jaw
+  tragus: 95            // ear reference point
+};
+```
+
+---
+
+## Phase 3: Landmark Editor Component
+
+### 3.1 The Core Editor (src/components/LandmarkEditor.tsx)
+```typescript
+'use client';
+
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
+
+interface Point {
+  x: number;
+  y: number;
+  id: number;
+}
+
+interface LandmarkEditorProps {
+  imageUrl: string;
+  landmarks: Point[];
+  onLandmarksChange: (landmarks: Point[]) => void;
+  editableIndices?: number[];  // Which landmarks can be edited
+}
+
+export function LandmarkEditor({
+  imageUrl,
+  landmarks,
+  onLandmarksChange,
+  editableIndices
+}: LandmarkEditorProps) {
+  const [selectedPoint, setSelectedPoint] = useState<number | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+
+  const isEditable = (index: number) => {
+    if (!editableIndices) return true;
+    return editableIndices.includes(index);
+  };
+
+  const handlePointMouseDown = (index: number, e: React.MouseEvent) => {
+    if (!isEditable(index)) return;
+    e.stopPropagation();
+    setSelectedPoint(index);
+    setIsDragging(true);
+  };
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDragging || selectedPoint === null || !containerRef.current) return;
+
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const newLandmarks = [...landmarks];
+    newLandmarks[selectedPoint] = { ...newLandmarks[selectedPoint], x, y };
+    onLandmarksChange(newLandmarks);
+  }, [isDragging, selectedPoint, landmarks, onLandmarksChange]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+    setSelectedPoint(null);
+  }, []);
+
+  // Key landmark groups for visualization
+  const landmarkGroups = {
+    eyes: [33, 133, 362, 263, 468, 473],
+    nose: [4, 6, 2, 129, 358],
+    lips: [13, 14, 61, 291],
+    jaw: [152, 172, 397, 234, 454]
+  };
+
+  const getPointColor = (index: number) => {
+    if (landmarkGroups.eyes.includes(index)) return '#3B82F6';  // blue
+    if (landmarkGroups.nose.includes(index)) return '#10B981';  // green
+    if (landmarkGroups.lips.includes(index)) return '#EF4444';  // red
+    if (landmarkGroups.jaw.includes(index)) return '#F59E0B';   // amber
+    return '#6B7280';  // gray
+  };
+
+  return (
+    <div className="relative w-full h-full bg-gray-900 rounded-lg overflow-hidden">
+      <TransformWrapper
+        disabled={isDragging}
+        minScale={0.5}
+        maxScale={4}
+        centerOnInit
+      >
+        {({ zoomIn, zoomOut, resetTransform }) => (
+          <>
+            {/* Controls */}
+            <div className="absolute top-4 right-4 z-10 flex gap-2">
+              <button
+                onClick={() => zoomIn()}
+                className="p-2 bg-white/10 rounded-lg hover:bg-white/20"
+              >
+                +
+              </button>
+              <button
+                onClick={() => zoomOut()}
+                className="p-2 bg-white/10 rounded-lg hover:bg-white/20"
+              >
+                -
+              </button>
+              <button
+                onClick={() => resetTransform()}
+                className="p-2 bg-white/10 rounded-lg hover:bg-white/20"
+              >
+                Reset
+              </button>
+            </div>
+
+            <TransformComponent>
+              <div
+                ref={containerRef}
+                className="relative"
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseUp}
+              >
+                {/* Face Image */}
+                <img
+                  ref={imageRef}
+                  src={imageUrl}
+                  alt="Face"
+                  className="max-w-full h-auto"
+                  draggable={false}
+                />
+
+                {/* Landmark Points */}
+                <svg
+                  className="absolute inset-0 w-full h-full pointer-events-none"
+                  style={{ overflow: 'visible' }}
+                >
+                  {/* Connection lines for face mesh */}
+                  {/* Add lines between related landmarks */}
+
+                  {/* Points */}
+                  {landmarks.map((point, index) => (
+                    <g key={index}>
+                      <circle
+                        cx={point.x}
+                        cy={point.y}
+                        r={selectedPoint === index ? 8 : 5}
+                        fill={getPointColor(index)}
+                        stroke="white"
+                        strokeWidth={2}
+                        className={`
+                          ${isEditable(index) ? 'cursor-grab pointer-events-auto' : 'opacity-50'}
+                          ${selectedPoint === index ? 'cursor-grabbing' : ''}
+                          transition-all duration-150
+                        `}
+                        onMouseDown={(e) => handlePointMouseDown(index, e)}
+                      />
+                      {/* Label on hover */}
+                      {selectedPoint === index && (
+                        <text
+                          x={point.x + 10}
+                          y={point.y - 10}
+                          fill="white"
+                          fontSize={12}
+                          className="pointer-events-none"
+                        >
+                          Point {index}
+                        </text>
+                      )}
+                    </g>
+                  ))}
+                </svg>
+              </div>
+            </TransformComponent>
+          </>
+        )}
+      </TransformWrapper>
+
+      {/* Instructions */}
+      <div className="absolute bottom-4 left-4 text-white/60 text-sm">
+        Drag points to adjust • Scroll to zoom • Click and drag to pan
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## Phase 4: Facial Calculations
+
+### 4.1 Measurement Functions (src/lib/calculations.ts)
+```typescript
+interface Point {
+  x: number;
+  y: number;
+}
+
+// Basic geometry
+export function distance(p1: Point, p2: Point): number {
+  return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+}
+
+export function angle(p1: Point, vertex: Point, p2: Point): number {
+  const a = distance(vertex, p1);
+  const b = distance(vertex, p2);
+  const c = distance(p1, p2);
+  const radians = Math.acos((a * a + b * b - c * c) / (2 * a * b));
+  return radians * (180 / Math.PI);  // Convert to degrees
+}
+
+export function midpoint(p1: Point, p2: Point): Point {
+  return {
+    x: (p1.x + p2.x) / 2,
+    y: (p1.y + p2.y) / 2
+  };
+}
+
+// FACIAL MEASUREMENTS
+
+export function calculateFWHR(landmarks: Point[]): number {
+  // Face Width-to-Height Ratio
+  // Width: bizygomatic (cheekbone to cheekbone)
+  // Height: upper face height (eyebrow to upper lip)
+
+  const leftCheekbone = landmarks[234];
+  const rightCheekbone = landmarks[454];
+  const eyebrowCenter = landmarks[10];
+  const upperLip = landmarks[13];
+
+  const width = distance(leftCheekbone, rightCheekbone);
+  const height = distance(eyebrowCenter, upperLip);
+
+  return width / height;
+}
+
+export function calculateFacialThirds(landmarks: Point[]): {
+  upper: number;
+  middle: number;
+  lower: number;
+  isBalanced: boolean;
+} {
+  // Ideal: Each third should be ~33%
+  const hairline = landmarks[10];  // approximation
+  const glabella = landmarks[9];   // between eyebrows
+  const subnasale = landmarks[2];  // base of nose
+  const menton = landmarks[152];   // chin
+
+  const upperThird = distance(hairline, glabella);
+  const middleThird = distance(glabella, subnasale);
+  const lowerThird = distance(subnasale, menton);
+  const total = upperThird + middleThird + lowerThird;
+
+  const upper = (upperThird / total) * 100;
+  const middle = (middleThird / total) * 100;
+  const lower = (lowerThird / total) * 100;
+
+  // Balanced if each is within 5% of 33.33%
+  const isBalanced = [upper, middle, lower].every(
+    v => Math.abs(v - 33.33) < 5
+  );
+
+  return { upper, middle, lower, isBalanced };
+}
+
+export function calculateCanthalTilt(landmarks: Point[]): number {
+  // Positive = upward tilt (considered attractive)
+  // Negative = downward tilt
+
+  const leftEyeOuter = landmarks[33];
+  const leftEyeInner = landmarks[133];
+  const rightEyeInner = landmarks[362];
+  const rightEyeOuter = landmarks[263];
+
+  // Calculate angle from horizontal for each eye
+  const leftAngle = Math.atan2(
+    leftEyeInner.y - leftEyeOuter.y,
+    leftEyeInner.x - leftEyeOuter.x
+  ) * (180 / Math.PI);
+
+  const rightAngle = Math.atan2(
+    rightEyeOuter.y - rightEyeInner.y,
+    rightEyeOuter.x - rightEyeInner.x
+  ) * (180 / Math.PI);
+
+  return (leftAngle + rightAngle) / 2;
+}
+
+export function calculateSymmetry(landmarks: Point[]): number {
+  // Compare left vs right side of face
+  // 100 = perfect symmetry
+
+  const pairs = [
+    [33, 263],   // eye outer corners
+    [133, 362],  // eye inner corners
+    [70, 300],   // eyebrow peaks
+    [234, 454],  // cheekbones
+    [172, 397],  // jaw angles
+    [129, 358],  // nose ala
+    [61, 291],   // lip corners
+  ];
+
+  // Get face center (nose tip as reference)
+  const center = landmarks[4];
+
+  let totalDifference = 0;
+
+  pairs.forEach(([leftIdx, rightIdx]) => {
+    const left = landmarks[leftIdx];
+    const right = landmarks[rightIdx];
+
+    const leftDist = distance(center, left);
+    const rightDist = distance(center, right);
+
+    const diff = Math.abs(leftDist - rightDist) / ((leftDist + rightDist) / 2);
+    totalDifference += diff;
+  });
+
+  const avgDifference = totalDifference / pairs.length;
+  return Math.max(0, 100 - (avgDifference * 100));
+}
+
+export function calculateGoldenRatio(landmarks: Point[]): number {
+  // Phi (φ) = 1.618
+  // Compare face proportions to golden ratio
+
+  const phi = 1.618;
+
+  const faceWidth = distance(landmarks[234], landmarks[454]);
+  const faceHeight = distance(landmarks[10], landmarks[152]);
+  const ratio = faceHeight / faceWidth;
+
+  // How close to phi (percentage)
+  const deviation = Math.abs(ratio - phi) / phi;
+  return Math.max(0, 100 - (deviation * 100));
+}
+
+// SIDE PROFILE MEASUREMENTS
+
+export function calculateNasofrontalAngle(sideLandmarks: Point[]): number {
+  // Angle between forehead and nose bridge
+  // Ideal: 115-130 degrees
+
+  const glabella = sideLandmarks[16];
+  const nasion = sideLandmarks[17];
+  const pronasale = sideLandmarks[30];
+
+  return angle(glabella, nasion, pronasale);
+}
+
+export function calculateNasolabialAngle(sideLandmarks: Point[]): number {
+  // Angle between nose and upper lip
+  // Ideal: 90-120 degrees (varies by gender)
+  // Male: 90-95, Female: 95-110
+
+  const columella = sideLandmarks[32];  // between nostrils
+  const subnasale = sideLandmarks[35];
+  const upperLip = sideLandmarks[42];
+
+  return angle(columella, subnasale, upperLip);
+}
+
+export function calculateGonialAngle(sideLandmarks: Point[]): number {
+  // Jaw angle
+  // Ideal: 120-130 degrees
+
+  const tragus = sideLandmarks[95];
+  const gonion = sideLandmarks[85];
+  const menton = sideLandmarks[70];
+
+  return angle(tragus, gonion, menton);
+}
+
+export function calculateChinProjection(sideLandmarks: Point[]): {
+  value: number;
+  assessment: string;
+} {
+  // Distance from subnasale vertical line to pogonion
+
+  const subnasale = sideLandmarks[35];
+  const pogonion = sideLandmarks[65];
+
+  // Positive = prominent chin, Negative = recessed
+  const projection = pogonion.x - subnasale.x;
+
+  let assessment = 'Normal';
+  if (projection > 10) assessment = 'Prominent';
+  if (projection < -5) assessment = 'Recessed';
+
+  return { value: projection, assessment };
+}
+
+// COMPREHENSIVE ANALYSIS
+
+export function analyzeFullFace(
+  frontLandmarks: Point[],
+  sideLandmarks?: Point[]
+): FaceAnalysis {
+  const analysis: FaceAnalysis = {
+    // Front face measurements
+    fwhr: calculateFWHR(frontLandmarks),
+    facialThirds: calculateFacialThirds(frontLandmarks),
+    canthalTilt: calculateCanthalTilt(frontLandmarks),
+    symmetry: calculateSymmetry(frontLandmarks),
+    goldenRatioScore: calculateGoldenRatio(frontLandmarks),
+
+    // Side profile measurements (if available)
+    sideProfile: sideLandmarks ? {
+      nasofrontalAngle: calculateNasofrontalAngle(sideLandmarks),
+      nasolabialAngle: calculateNasolabialAngle(sideLandmarks),
+      gonialAngle: calculateGonialAngle(sideLandmarks),
+      chinProjection: calculateChinProjection(sideLandmarks)
+    } : null
+  };
+
+  return analysis;
+}
+
+interface FaceAnalysis {
+  fwhr: number;
+  facialThirds: { upper: number; middle: number; lower: number; isBalanced: boolean };
+  canthalTilt: number;
+  symmetry: number;
+  goldenRatioScore: number;
+  sideProfile: {
+    nasofrontalAngle: number;
+    nasolabialAngle: number;
+    gonialAngle: number;
+    chinProjection: { value: number; assessment: string };
+  } | null;
+}
+```
+
+---
+
+## Phase 5: API Routes
+
+### 5.1 Face Analysis API (src/app/api/faces/route.ts)
+```typescript
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { prisma } from '@/lib/prisma';
+import { put } from '@vercel/blob';
+
+export async function POST(req: NextRequest) {
+  const session = await getServerSession();
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const formData = await req.formData();
+  const frontImage = formData.get('frontImage') as File;
+  const sideImage = formData.get('sideImage') as File | null;
+
+  // Upload to Vercel Blob
+  const frontBlob = await put(`faces/${Date.now()}-front.webp`, frontImage, {
+    access: 'public',
+  });
+
+  let sideBlob = null;
+  if (sideImage) {
+    sideBlob = await put(`faces/${Date.now()}-side.webp`, sideImage, {
+      access: 'public',
+    });
+  }
+
+  // Create face record
+  const user = await prisma.user.findUnique({
+    where: { email: session.user.email }
+  });
+
+  const face = await prisma.face.create({
+    data: {
+      userId: user!.id,
+      frontUrl: frontBlob.url,
+      sideUrl: sideBlob?.url,
+      status: 'FRONT_UPLOADED'
+    }
+  });
+
+  return NextResponse.json({
+    success: true,
+    face: {
+      id: face.id,
+      images: {
+        frontUrl: face.frontUrl,
+        sideUrl: face.sideUrl
+      }
+    }
+  });
+}
+```
+
+---
+
+## Next Steps After Capture
+
+Once you have the full capture:
+
+1. **Analyze the HAR** - Extract exact API request/response formats
+2. **Study the Screenshots** - Match UI to component structure
+3. **Watch the Recording** - Note timing and transitions
+4. **Compare React Tree** - Match their components to your implementation
+
+Would you like me to create any specific component in detail?

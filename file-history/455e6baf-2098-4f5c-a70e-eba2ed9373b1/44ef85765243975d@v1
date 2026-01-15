@@ -1,0 +1,799 @@
+# SPLICE AI Music Generation Feature
+
+## Executive Summary
+
+This document outlines the implementation plan for adding AI-powered music generation to SPLICE, allowing users to create copyright-free background music for their video projects directly from the Premiere Pro plugin.
+
+**Key Decision: Use Mureka.ai + ACRCloud (NOT Suno)**
+
+| Component | Choice | Reason |
+|-----------|--------|--------|
+| Music Generation API | **Mureka.ai** | Only official API, $0.015-0.03/song, reference track analysis |
+| Song Identification | **ACRCloud** | Identify songs without audio extraction |
+| Storage | **Cloudflare R2** | Zero egress fees |
+| Job Queue | **BullMQ + Upstash Redis** | Serverless, reliable |
+
+**Competitive Advantage**: SPLICE would be the **FIRST Premiere Pro plugin** with AI music generation. CapCut has this feature, but Descript, FireCut, AutoPod, and AutoCut do not.
+
+---
+
+## Table of Contents
+
+1. [Market Research](#1-market-research)
+2. [API Comparison](#2-api-comparison)
+3. [Legal Considerations](#3-legal-considerations)
+4. [Technical Architecture](#4-technical-architecture)
+5. [Implementation Phases](#5-implementation-phases)
+6. [Pricing Model](#6-pricing-model)
+7. [File Structure](#7-file-structure)
+8. [API Endpoints](#8-api-endpoints)
+9. [Database Schema](#9-database-schema)
+10. [Environment Variables](#10-environment-variables)
+11. [Dependencies](#11-dependencies)
+12. [Risk Assessment](#12-risk-assessment)
+
+---
+
+## 1. Market Research
+
+### Competitor Analysis
+
+| Platform | AI Music? | Notes |
+|----------|-----------|-------|
+| **CapCut** | Yes | Built-in text-to-music, free tier |
+| **Descript** | No | Stock library only |
+| **FireCut** | No | No music features |
+| **AutoPod** | No | Podcast-focused |
+| **AutoCut** | No | Silence/captions only |
+| **Epidemic Sound** | Partial | AI "Adapt" (customize existing tracks) |
+| **Artlist** | No | AI Suite for video/voice, not music |
+
+### Market Opportunity
+
+- **AI Music Market 2025**: $6.65 billion (27.8% CAGR to $60.44B by 2034)
+- **Video Creator Tools 2025**: $9.7 billion
+- **Creator Adoption**: 48% of self-releasing artists already use AI tools
+
+### Pain Points Solved
+
+| Challenge | Current Solution | AI Music Solution |
+|-----------|------------------|-------------------|
+| Finding fitting background music | 30-60 min per video | 30 seconds with text prompt |
+| Copyright strikes/takedowns | Risk of revenue loss | 100% royalty-free |
+| Music licensing costs | $50-500+ per track | Subscription model |
+| Custom music production | $500-5000+ per project | <$1 per track |
+
+---
+
+## 2. API Comparison
+
+### AI Music Generation APIs
+
+| Provider | API Status | Cost/Song | Reference Track | Commercial Rights | Recommendation |
+|----------|------------|-----------|-----------------|-------------------|----------------|
+| **Mureka.ai** | Official | $0.015-0.03 | Native feature | Full ownership | **PRIMARY** |
+| Suno | Unofficial only | $0.04 | Limited | License only (Suno owns) | AVOID |
+| Mubert | Official | ~$0.05 | No | Royalty-free | Backup option |
+| Beatoven.ai | Official | Usage-based | Video-aware | Perpetual | Future consideration |
+| Loudly | Official | Pay-as-you-go | No | Perpetual worldwide | Alternative |
+| AIVA | Custom pricing | Varies | No | Pro plan only | Orchestral use |
+
+### Why Mureka.ai?
+
+1. **Only Official API** - Reliable, documented, supported
+2. **Reference Track Analysis** - Users can "generate something like this song"
+3. **Lowest Cost** - $0.015-0.03 per generation
+4. **Full Commercial Rights** - Users own the output
+5. **Instrumental Endpoint** - Perfect for background music
+
+### Why NOT Suno?
+
+| Issue | Impact |
+|-------|--------|
+| No official API | Must use third-party wrappers (risk of bans) |
+| Ownership | Suno owns all output; users get license only |
+| Lawsuits | UMG/Sony/Warner suing Suno for training on copyrighted content |
+| Terms Violations | Unofficial API use violates ToS |
+| Higher Cost | $0.04/song vs Mureka's $0.015 |
+
+---
+
+## 3. Legal Considerations
+
+### YouTube Audio Extraction
+
+**YouTube Terms of Service explicitly prohibit downloading/extracting audio.**
+
+> "You may not access content through any technology or means other than the video playback pages of the Service itself"
+
+**Risks of Direct Extraction:**
+- Account termination
+- DMCA violations
+- Legal action against commercial service
+
+### Legal-Safe Approach
+
+Instead of extracting audio, we use **song identification**:
+
+```
+1. User pastes YouTube link
+2. ACRCloud identifies song via brief fingerprint (15 sec sample)
+3. Display metadata: "Shape of You by Ed Sheeran - 96 BPM, C# Minor"
+4. Use metadata to generate ORIGINAL music with similar characteristics
+5. No copyrighted audio stored or processed
+```
+
+**Why This Is Legal:**
+- Only metadata (BPM, key, mood) is used
+- Output is original composition
+- Similar to how human composers create "inspired by" works
+- Section 114(b) explicitly allows sound-alike recordings
+
+### Copyright of AI-Generated Music
+
+- **U.S. Copyright Office (Jan 2025)**: 100% AI-generated content cannot be copyrighted
+- **Best Practice**: AI assists, human makes creative choices (prompts, edits)
+- **Mureka Policy**: Users retain commercial rights on paid plans
+
+---
+
+## 4. Technical Architecture
+
+### System Overview
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  SPLICE Website │     │  SPLICE Plugin  │     │  Mobile App     │
+│   (/music page) │     │  (Music Tab)    │     │  (Future)       │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+                                 ▼
+                    ┌────────────────────────┐
+                    │    SPLICE API Server   │
+                    │    (Express.js)        │
+                    └────────────┬───────────┘
+                                 │
+         ┌───────────────────────┼───────────────────────┐
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│   ACRCloud API  │   │  Upstash Redis  │   │  PostgreSQL DB  │
+│ (Song Identity) │   │   (Job Queue)   │   │  (User Data)    │
+└─────────────────┘   └────────┬────────┘   └─────────────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │   Music Worker      │
+                    │   (Background Job)  │
+                    └────────┬────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+     │ Mureka API  │ │   FFmpeg    │ │Cloudflare R2│
+     │ (Generate)  │ │ (Process)   │ │  (Storage)  │
+     └─────────────┘ └─────────────┘ └─────────────┘
+```
+
+### User Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              USER FLOW                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. User visits SPLICE website or opens plugin Music tab                     │
+│  2. Pastes YouTube URL (e.g., https://youtube.com/watch?v=xyz)              │
+│  3. System identifies song via ACRCloud (brief fingerprint, no storage)     │
+│  4. Display: "Identified: Shape of You by Ed Sheeran - 96 BPM, C# Minor"    │
+│  5. User customizes: duration (30s-3min), mood, instruments                 │
+│  6. Clicks "Generate Music"                                                  │
+│  7. Job queued → Mureka generates (3-5 minutes)                             │
+│  8. Email notification when complete                                         │
+│  9. Music appears in plugin "My Music" library                               │
+│  10. One-click import to Premiere Pro timeline                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Storage Architecture
+
+**Cloudflare R2** (S3-compatible, zero egress)
+
+```
+bucket: splice-music
+├── {stripe_customer_id}/
+│   ├── {job_id}/
+│   │   ├── master.wav          # Full quality (44.1kHz/24-bit)
+│   │   ├── preview.mp3         # 128kbps preview for web
+│   │   └── metadata.json       # BPM, key, duration, tags
+```
+
+| Metric | Cloudflare R2 | AWS S3 |
+|--------|---------------|--------|
+| Storage | $0.015/GB/mo | $0.023/GB/mo |
+| Egress | **FREE** | $0.09/GB |
+| Free Tier | 10GB, 10M reads | 5GB, 20K reads |
+
+---
+
+## 5. Implementation Phases
+
+### Phase Overview
+
+| Phase | Description | Hours | Dependencies |
+|-------|-------------|-------|--------------|
+| 1 | Core Infrastructure | 4-6 | R2, Redis accounts |
+| 2 | Song Identification | 3-4 | ACRCloud API key |
+| 3 | Music Generation | 6-8 | Mureka API key |
+| 4 | Plugin Integration | 6-8 | Phase 3 complete |
+| 5 | Website Frontend | 8-10 | Phase 3 complete |
+| 6 | Billing Integration | 4-6 | Stripe config |
+| 7 | Testing & Polish | 6-8 | All phases |
+| **Total** | | **37-50** | |
+
+---
+
+### Phase 1: Core Infrastructure
+
+**Goal**: Set up storage, job queue, and database schema
+
+**Files to Create**:
+- `splice-backend/services/r2Storage.js` - Cloudflare R2 operations
+- `splice-backend/services/musicQueue.js` - BullMQ job queue
+- `splice-backend/migrations/001_music_generation.sql` - Database schema
+
+**Key Components**:
+
+```javascript
+// r2Storage.js - Key functions
+uploadMusic(buffer, key, metadata)     // Upload to R2
+getSignedDownloadUrl(key, expiresIn)   // Generate signed URL
+deleteMusic(key)                        // Delete file
+generateStorageKey(customerId, jobId)  // Generate unique path
+
+// musicQueue.js - Key functions
+addMusicJob(jobData)                   // Add job to queue
+getJobStatus(jobId)                    // Check job status
+```
+
+---
+
+### Phase 2: Song Identification
+
+**Goal**: Identify songs from YouTube URLs using ACRCloud
+
+**Files to Create**:
+- `splice-backend/services/songIdentification.js`
+
+**Flow**:
+1. Extract 15-second audio fingerprint via yt-dlp
+2. Send fingerprint to ACRCloud
+3. Receive metadata (title, artist, BPM, key, mood)
+4. Delete audio immediately (no storage)
+
+**API Response**:
+```json
+{
+  "success": true,
+  "song": {
+    "title": "Shape of You",
+    "artist": "Ed Sheeran",
+    "bpm": 96,
+    "key": "C# Minor",
+    "mood": "Upbeat",
+    "genres": ["Pop", "Dance"]
+  },
+  "confidence": 95
+}
+```
+
+---
+
+### Phase 3: Music Generation
+
+**Goal**: Generate music using Mureka API with background worker
+
+**Files to Create**:
+- `splice-backend/services/musicGeneration.js` - Mureka API integration
+- `splice-backend/workers/musicWorker.js` - Background job processor
+
+**Generation Flow**:
+```
+1. Build prompt from reference metadata + user preferences
+2. Submit to Mureka API
+3. Poll for completion (2-4 minutes)
+4. Download generated audio
+5. Upload to R2
+6. Update database
+7. Send notification
+```
+
+**Worker Configuration**:
+```javascript
+{
+  concurrency: 3,           // Process 3 jobs in parallel
+  attempts: 3,              // Retry 3 times on failure
+  backoff: 'exponential',   // 5s, 10s, 20s delays
+  timeout: 10 * 60 * 1000   // 10 minute max
+}
+```
+
+---
+
+### Phase 4: Plugin Integration
+
+**Goal**: Add Music tab to SPLICE plugin with library and import
+
+**Files to Create**:
+- `splice-plugin/js/music.js` - Music module
+- Updates to `splice-plugin/index.html` - Music tab UI
+
+**Key Features**:
+- YouTube URL input with real-time song identification
+- Duration/mood/instrument selectors
+- Music library with status indicators
+- One-click import to Premiere Pro timeline
+- Audio preview player
+
+---
+
+### Phase 5: Website Frontend
+
+**Goal**: Create /music page on SPLICE website
+
+**Location**: Separate website repository (Next.js)
+
+**Page Features**:
+- Hero section explaining AI music
+- YouTube URL input with preview
+- Generation parameters form
+- Real-time job status (WebSocket/polling)
+- Audio player for preview
+- Download buttons
+- Credit purchase flow
+
+---
+
+### Phase 6: Billing Integration
+
+**Goal**: Add music credits to existing billing system
+
+**Changes to Existing Files**:
+- `splice-backend/services/usageTracking.js` - Add music credit functions
+- `splice-backend/server.js` - Update webhook handler
+
+**New Functions**:
+```javascript
+getMusicBalance(stripeCustomerId)
+deductMusicCredit(stripeCustomerId)
+resetMusicCredits(stripeCustomerId, tier)
+```
+
+---
+
+### Phase 7: Testing & Polish
+
+**Goal**: Comprehensive test coverage and error handling
+
+**Files to Create**:
+- `splice-backend/tests/music-generation.test.js`
+
+**Test Coverage**:
+- Song identification (valid/invalid URLs)
+- Music generation flow (success/failure)
+- Job status polling
+- Library management (list/get/delete)
+- Credits system (deduction/overage)
+- Plugin integration patterns
+
+---
+
+## 6. Pricing Model
+
+### Credit Allocation by Tier
+
+| Tier | Monthly Price | Included Songs | Overage Rate |
+|------|---------------|----------------|--------------|
+| Starter | $19/mo | 5 | $0.50/song |
+| Pro | $49/mo | 20 | $0.30/song |
+| Team | $149/mo | 100 | $0.20/song |
+
+### Cost Analysis
+
+| Component | Cost per Song |
+|-----------|---------------|
+| Mureka API | $0.03 |
+| ACRCloud identification | $0.01 |
+| R2 storage (16MB) | $0.0002 |
+| Processing overhead | $0.01 |
+| **Total** | **~$0.05** |
+
+### Margin Analysis
+
+| Tier | Price Charged | Our Cost | Margin |
+|------|---------------|----------|--------|
+| Starter | $0.50/song | $0.05 | **90%** |
+| Pro | $0.30/song | $0.05 | **83%** |
+| Team | $0.20/song | $0.05 | **75%** |
+
+---
+
+## 7. File Structure
+
+### New Files to Create
+
+```
+splice-backend/
+├── services/
+│   ├── musicGeneration.js      # Mureka API integration
+│   ├── songIdentification.js   # ACRCloud integration
+│   ├── musicQueue.js           # BullMQ queue setup
+│   └── r2Storage.js            # Cloudflare R2 operations
+├── workers/
+│   └── musicWorker.js          # Background job processor
+├── migrations/
+│   └── 001_music_generation.sql
+└── tests/
+    └── music-generation.test.js
+
+splice-plugin/
+└── js/
+    └── music.js                # Music library UI
+
+splice-website/ (separate repo)
+└── pages/
+    └── music.tsx               # Generation interface
+```
+
+### Existing Files to Modify
+
+```
+splice-backend/
+├── server.js                   # Add music endpoints
+└── services/
+    └── usageTracking.js        # Add music credit functions
+
+splice-plugin/
+└── index.html                  # Add Music tab UI
+```
+
+---
+
+## 8. API Endpoints
+
+### Music Generation Endpoints
+
+| Method | Endpoint | Purpose | Auth |
+|--------|----------|---------|------|
+| POST | `/music/identify` | Identify song from YouTube URL | Required |
+| POST | `/music/generate` | Start music generation job | Required |
+| GET | `/music/status/:jobId` | Get job status and progress | Required |
+| GET | `/music/library` | List user's music library | Required |
+| GET | `/music/:jobId` | Get music with signed download URL | Required |
+| DELETE | `/music/:jobId` | Delete music from library | Required |
+
+### Request/Response Examples
+
+**POST /music/identify**
+```json
+// Request
+{ "youtubeUrl": "https://youtube.com/watch?v=xyz" }
+
+// Response
+{
+  "success": true,
+  "song": {
+    "title": "Shape of You",
+    "artist": "Ed Sheeran",
+    "bpm": 96,
+    "key": "C# Minor",
+    "mood": "Upbeat"
+  },
+  "confidence": 95
+}
+```
+
+**POST /music/generate**
+```json
+// Request
+{
+  "youtubeUrl": "https://youtube.com/watch?v=xyz",
+  "duration": 60,
+  "mood": "energetic",
+  "instruments": ["guitar", "drums"]
+}
+
+// Response
+{
+  "success": true,
+  "jobId": "music_1234567890_abc123",
+  "estimatedTime": "3-5 minutes",
+  "statusUrl": "/music/status/music_1234567890_abc123"
+}
+```
+
+**GET /music/:jobId**
+```json
+// Response
+{
+  "success": true,
+  "music": {
+    "id": 123,
+    "jobId": "music_1234567890_abc123",
+    "title": "Energetic Pop - Generated",
+    "duration": 60,
+    "fileSize": 5242880,
+    "downloadUrl": "https://r2.splice.ai/signed/..."
+  }
+}
+```
+
+---
+
+## 9. Database Schema
+
+### New Table: generated_music
+
+```sql
+CREATE TABLE generated_music (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id),
+  stripe_customer_id VARCHAR(255) NOT NULL,
+
+  -- Job metadata
+  job_id VARCHAR(255) UNIQUE NOT NULL,
+  status VARCHAR(50) DEFAULT 'pending',
+    -- pending, processing, completed, failed
+
+  -- Reference song info (from ACRCloud)
+  reference_song_title VARCHAR(255),
+  reference_artist VARCHAR(255),
+  reference_youtube_url TEXT,
+  reference_bpm INTEGER,
+  reference_key VARCHAR(10),
+  reference_mood VARCHAR(100),
+
+  -- Generation parameters
+  duration_seconds INTEGER DEFAULT 60,
+  instruments TEXT[],
+  mood VARCHAR(100),
+  style VARCHAR(100),
+
+  -- Mureka output
+  mureka_task_id VARCHAR(255),
+
+  -- Storage
+  r2_key VARCHAR(255),
+  file_size_bytes BIGINT,
+  audio_duration_seconds DECIMAL(10,2),
+
+  -- Metadata
+  title VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  completed_at TIMESTAMP,
+  error_message TEXT,
+
+  -- Indexes
+  CONSTRAINT valid_status CHECK (
+    status IN ('pending', 'processing', 'completed', 'failed')
+  )
+);
+
+CREATE INDEX idx_generated_music_customer ON generated_music(stripe_customer_id);
+CREATE INDEX idx_generated_music_job_id ON generated_music(job_id);
+CREATE INDEX idx_generated_music_status ON generated_music(status);
+```
+
+### Users Table Additions
+
+```sql
+ALTER TABLE users
+ADD COLUMN music_credits_remaining INTEGER DEFAULT 5,
+ADD COLUMN music_credits_total INTEGER DEFAULT 5;
+```
+
+---
+
+## 10. Environment Variables
+
+### Required API Keys
+
+```bash
+# Mureka API (music generation)
+MUREKA_API_KEY=your_mureka_api_key
+
+# ACRCloud (song identification)
+ACRCLOUD_ACCESS_KEY=your_acrcloud_access_key
+ACRCLOUD_ACCESS_SECRET=your_acrcloud_access_secret
+ACRCLOUD_HOST=identify-us-west-2.acrcloud.com
+
+# Cloudflare R2 (storage)
+R2_ACCOUNT_ID=your_r2_account_id
+R2_ACCESS_KEY_ID=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
+R2_BUCKET_NAME=splice-music
+
+# Upstash Redis (job queue)
+UPSTASH_REDIS_URL=redis://default:password@endpoint.upstash.io:6379
+```
+
+### Getting API Keys
+
+| Service | URL | Free Tier |
+|---------|-----|-----------|
+| Mureka | https://platform.mureka.ai | 100 credits on signup |
+| ACRCloud | https://www.acrcloud.com | 100 queries/day |
+| Cloudflare R2 | https://dash.cloudflare.com | 10GB storage, 10M reads |
+| Upstash Redis | https://upstash.com | 10K commands/day |
+
+---
+
+## 11. Dependencies
+
+### NPM Packages
+
+```bash
+cd splice-backend
+npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner bullmq ioredis
+```
+
+| Package | Purpose | Version |
+|---------|---------|---------|
+| @aws-sdk/client-s3 | R2 storage (S3-compatible) | ^3.x |
+| @aws-sdk/s3-request-presigner | Signed URLs | ^3.x |
+| bullmq | Job queue | ^5.x |
+| ioredis | Redis client | ^5.x |
+
+### System Dependencies
+
+```bash
+# macOS
+brew install yt-dlp ffmpeg
+
+# Linux (Ubuntu/Debian)
+pip install yt-dlp
+apt-get install ffmpeg
+```
+
+---
+
+## 12. Risk Assessment
+
+### Technical Risks
+
+| Risk | Probability | Impact | Mitigation |
+|------|-------------|--------|------------|
+| Mureka API downtime | Low | High | Fallback to Mubert API |
+| ACRCloud song not found | Medium | Low | Allow manual style input |
+| R2 upload failure | Low | Medium | Retry mechanism (3 attempts) |
+| Worker crash | Low | Medium | BullMQ auto-restart |
+| Long generation time | Medium | Low | Progress updates, timeout handling |
+
+### Legal Risks
+
+| Risk | Probability | Impact | Mitigation |
+|------|-------------|--------|------------|
+| YouTube TOS complaint | Low | Medium | No audio extraction, fingerprint only |
+| Copyright claim on output | Very Low | High | Use Mureka (original compositions) |
+| User uploads copyrighted content | Low | Medium | ToS disclaimers |
+
+### Business Risks
+
+| Risk | Probability | Impact | Mitigation |
+|------|-------------|--------|------------|
+| Low adoption | Medium | Medium | Include free tier credits |
+| Cost overrun | Low | Medium | Per-song pricing model |
+| Competition launches similar | Medium | Low | First-mover advantage |
+
+---
+
+## Next Steps
+
+1. **Set up accounts** and obtain API keys for:
+   - Mureka.ai (music generation)
+   - ACRCloud (song identification)
+   - Cloudflare R2 (storage)
+   - Upstash (Redis)
+
+2. **Start Phase 1** implementation:
+   - Create R2 storage service
+   - Set up BullMQ queue
+   - Run database migration
+
+3. **Iterate through phases** 2-7
+
+---
+
+## Appendix: Code Snippets
+
+### R2 Storage Service (r2Storage.js)
+
+```javascript
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+const s3Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+  }
+});
+
+async function uploadMusic(buffer, key, metadata = {}) {
+  await s3Client.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: 'audio/wav'
+  }));
+  return { success: true, key };
+}
+
+async function getSignedDownloadUrl(key, expiresIn = 3600) {
+  return await getSignedUrl(s3Client, new GetObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  }), { expiresIn });
+}
+```
+
+### Music Queue Service (musicQueue.js)
+
+```javascript
+const { Queue } = require('bullmq');
+const IORedis = require('ioredis');
+
+const connection = new IORedis(process.env.UPSTASH_REDIS_URL, {
+  maxRetriesPerRequest: null
+});
+
+const musicQueue = new Queue('music-generation', {
+  connection,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 }
+  }
+});
+
+async function addMusicJob(jobData) {
+  return await musicQueue.add('generate', jobData, {
+    jobId: jobData.jobId
+  });
+}
+```
+
+### Plugin Music Import
+
+```javascript
+async function importMusicToTimeline(jobId) {
+  // Get download URL
+  const response = await fetch(`${getBackendUrl()}/music/${jobId}`, {
+    headers: getAuthHeaders()
+  });
+  const { music } = await response.json();
+
+  // Download to temp
+  const tempPath = await downloadToTemp(music.downloadUrl, `${jobId}.wav`);
+
+  // Import to Premiere Pro
+  const project = await pproBuilder.Project.getActiveProject();
+  const imported = await project.importFiles([tempPath]);
+
+  // Insert at playhead
+  const sequence = await pproBuilder.Sequence.getActiveSequence();
+  const playhead = await sequence.getPlayerPosition();
+  await editor.insertClip(imported[0], audioTrack, playhead);
+}
+```
+
+---
+
+*Document created: December 26, 2025*
+*Version: 1.0*
+*Author: SPLICE Development Team*

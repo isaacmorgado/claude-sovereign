@@ -1,0 +1,503 @@
+     1→/**
+     2→ * JWT Authentication Middleware
+     3→ *
+     4→ * Replaces insecure x-stripe-customer-id header with JWT tokens.
+     5→ * Tokens are signed with a secret and contain the customer ID.
+     6→ *
+     7→ * Token Blacklist:
+     8→ * - Primary: Upstash Redis with automatic TTL-based expiry
+     9→ * - Fallback: In-memory Map (for development or Redis failures)
+    10→ */
+    11→
+    12→const jwt = require('jsonwebtoken');
+    13→const crypto = require('crypto');
+    14→const authLogger = require('../utils/authLogger');
+    15→const redis = require('../services/redisClient');
+    16→
+    17→// JWT configuration
+    18→const JWT_SECRET = process.env.JWT_SECRET || 'splice-dev-secret-change-in-production';
+    19→const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
+    20→const JWT_REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || '7d';
+    21→
+    22→// Redis key prefix for blacklisted tokens
+    23→const BLACKLIST_KEY_PREFIX = 'token:blacklist:';
+    24→
+    25→// Check if running in production
+    26→const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+    27→
+    28→// Warn if using default secret in production
+    29→if (isProduction && JWT_SECRET === 'splice-dev-secret-change-in-production') {
+    30→  console.error('[SECURITY] CRITICAL: JWT_SECRET not set in production! Set JWT_SECRET environment variable.');
+    31→  console.error('[SECURITY] Exiting process to prevent insecure operation.');
+    32→  process.exit(1);
+    33→}
+    34→
+    35→/**
+    36→ * Fallback Token Blacklist (In-Memory)
+    37→ * Used when Redis is unavailable. Maps jti -> expiration timestamp.
+    38→ */
+    39→const fallbackBlacklist = new Map();
+    40→
+    41→// Track if we're using fallback mode
+    42→let usingFallback = false;
+    43→
+    44→// Cleanup interval for expired fallback blacklist entries (every 15 minutes)
+    45→const BLACKLIST_CLEANUP_INTERVAL = 15 * 60 * 1000;
+    46→
+    47→/**
+    48→ * Clean up expired entries from the fallback blacklist
+    49→ * Only runs when using in-memory fallback
+    50→ */
+    51→function cleanupFallbackBlacklist() {
+    52→  if (!usingFallback || fallbackBlacklist.size === 0) {
+    53→    return;
+    54→  }
+    55→
+    56→  const now = Math.floor(Date.now() / 1000);
+    57→  let cleanedCount = 0;
+    58→
+    59→  for (const [jti, exp] of fallbackBlacklist.entries()) {
+    60→    if (exp <= now) {
+    61→      fallbackBlacklist.delete(jti);
+    62→      cleanedCount++;
+    63→    }
+    64→  }
+    65→
+    66→  if (cleanedCount > 0) {
+    67→    authLogger.logBlacklistCleanup(cleanedCount, fallbackBlacklist.size);
+    68→  }
+    69→}
+    70→
+    71→// Start periodic cleanup for fallback (unref to allow process exit)
+    72→const cleanupTimer = setInterval(cleanupFallbackBlacklist, BLACKLIST_CLEANUP_INTERVAL);
+    73→if (cleanupTimer.unref) {
+    74→  cleanupTimer.unref();
+    75→}
+    76→
+    77→/**
+    78→ * Add a token to the blacklist
+    79→ * Uses Redis with automatic TTL, falls back to in-memory if Redis unavailable
+    80→ * @param {string} jti - JWT ID claim
+    81→ * @param {number} exp - Token expiration timestamp (Unix seconds)
+    82→ * @param {Object} options - Additional options for logging
+    83→ * @param {string} options.userId - User ID for logging
+    84→ * @param {string} options.reason - Reason for revocation (logout, security, admin)
+    85→ * @returns {Promise<boolean>} True if successfully blacklisted
+    86→ */
+    87→async function blacklistToken(jti, exp, options = {}) {
+    88→  if (!jti) {
+    89→    console.warn('[Auth] Cannot blacklist token without jti');
+    90→    return false;
+    91→  }
+    92→
+    93→  const now = Math.floor(Date.now() / 1000);
+    94→  const ttlSeconds = Math.max(exp - now, 1); // At least 1 second TTL
+    95→
+    96→  // Try Redis first
+    97→  if (redis.isRedisAvailable()) {
+    98→    try {
+    99→      const key = `${BLACKLIST_KEY_PREFIX}${jti}`;
+   100→      const success = await redis.set(key, exp, ttlSeconds);
+   101→
+   102→      if (success) {
+   103→        console.log(`[Auth] Token blacklisted in Redis: ${jti.slice(0, 8)}..., TTL: ${ttlSeconds}s`);
+   104→        usingFallback = false;
+   105→        // Log token revocation with structured logging
+   106→        authLogger.logTokenRevoked(options.userId || 'unknown', jti, options.reason || 'logout');
+   107→        return true;
+   108→      }
+   109→    } catch (err) {
+   110→      console.error('[Auth] Redis blacklist failed, using fallback:', err.message);
+   111→    }
+   112→  }
+   113→
+   114→  // Fallback to in-memory
+   115→  usingFallback = true;
+   116→  fallbackBlacklist.set(jti, exp);
+   117→  console.log(`[Auth] Token blacklisted in memory (fallback): ${jti.slice(0, 8)}..., expires at ${new Date(exp * 1000).toISOString()}`);
+   118→
+   119→  // Log token revocation with structured logging
+   120→  authLogger.logTokenRevoked(options.userId || 'unknown', jti, options.reason || 'logout');
+   121→  return true;
+   122→}
+   123→
+   124→/**
+   125→ * Check if a token is blacklisted
+   126→ * Checks Redis first, then fallback in-memory store
+   127→ * @param {string} jti - JWT ID claim
+   128→ * @returns {Promise<boolean>} True if token is blacklisted
+   129→ */
+   130→async function isTokenBlacklisted(jti) {
+   131→  if (!jti) {
+   132→    return false;
+   133→  }
+   134→
+   135→  // Try Redis first
+   136→  if (redis.isRedisAvailable()) {
+   137→    try {
+   138→      const key = `${BLACKLIST_KEY_PREFIX}${jti}`;
+   139→      const exists = await redis.exists(key);
+   140→
+   141→      if (exists) {
+   142→        return true;
+   143→      }
+   144→
+   145→      // Also check fallback in case token was blacklisted during Redis downtime
+   146→      // and Redis is now back up
+   147→      if (fallbackBlacklist.has(jti)) {
+   148→        // Migrate to Redis if token still valid
+   149→        const exp = fallbackBlacklist.get(jti);
+   150→        const now = Math.floor(Date.now() / 1000);
+   151→        if (exp > now) {
+   152→          const ttlSeconds = exp - now;
+   153→          await redis.set(key, exp, ttlSeconds);
+   154→          fallbackBlacklist.delete(jti);
+   155→          console.log(`[Auth] Migrated blacklist entry to Redis: ${jti.slice(0, 8)}...`);
+   156→        } else {
+   157→          // Expired, remove from fallback
+   158→          fallbackBlacklist.delete(jti);
+   159→        }
+   160→        return true;
+   161→      }
+   162→
+   163→      return false;
+   164→    } catch (err) {
+   165→      console.error('[Auth] Redis blacklist check failed, checking fallback:', err.message);
+   166→    }
+   167→  }
+   168→
+   169→  // Fallback to in-memory check
+   170→  if (fallbackBlacklist.has(jti)) {
+   171→    const exp = fallbackBlacklist.get(jti);
+   172→    const now = Math.floor(Date.now() / 1000);
+   173→    if (exp > now) {
+   174→      return true;
+   175→    }
+   176→    // Expired, remove it
+   177→    fallbackBlacklist.delete(jti);
+   178→  }
+   179→
+   180→  return false;
+   181→}
+   182→
+   183→/**
+   184→ * Get blacklist statistics (for monitoring)
+   185→ * @returns {Promise<Object>} { storage, redisConnected, fallbackSize, fallbackEntries, usingFallback }
+   186→ */
+   187→async function getBlacklistStats() {
+   188→  const redisAvailable = redis.isRedisAvailable();
+   189→  const redisStatus = redis.getRedisStatus();
+   190→
+   191→  return {
+   192→    storage: redisAvailable ? 'redis' : 'memory',
+   193→    redisConnected: redisStatus.connected,
+   194→    redisError: redisStatus.error,
+   195→    fallbackSize: fallbackBlacklist.size,
+   196→    fallbackEntries: Array.from(fallbackBlacklist.entries()).slice(0, 10), // First 10 for debugging
+   197→    usingFallback
+   198→  };
+   199→}
+   200→
+   201→/**
+   202→ * Generate a JWT token for a customer
+   203→ * @param {string} stripeCustomerId - Stripe customer ID (cus_xxx)
+   204→ * @param {Object} options - Additional options
+   205→ * @param {string} options.tier - User's subscription tier
+   206→ * @param {string} options.email - User's email (optional)
+   207→ * @returns {Object} { token, expiresIn }
+   208→ */
+   209→function generateToken(stripeCustomerId, options = {}) {
+   210→  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+   211→    throw new Error('Invalid Stripe customer ID');
+   212→  }
+   213→
+   214→  const payload = {
+   215→    sub: stripeCustomerId,
+   216→    type: 'access',
+   217→    tier: options.tier || 'starter',
+   218→    iat: Math.floor(Date.now() / 1000),
+   219→    jti: crypto.randomUUID() // Unique token identifier for blacklisting
+   220→  };
+   221→
+   222→  if (options.email) {
+   223→    payload.email = options.email;
+   224→  }
+   225→
+   226→  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+   227→
+   228→  return {
+   229→    token,
+   230→    expiresIn: JWT_EXPIRES_IN,
+   231→    tokenType: 'Bearer'
+   232→  };
+   233→}
+   234→
+   235→/**
+   236→ * Generate a refresh token for a customer
+   237→ * @param {string} stripeCustomerId - Stripe customer ID
+   238→ * @returns {Object} { refreshToken, expiresIn }
+   239→ */
+   240→function generateRefreshToken(stripeCustomerId) {
+   241→  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+   242→    throw new Error('Invalid Stripe customer ID');
+   243→  }
+   244→
+   245→  const payload = {
+   246→    sub: stripeCustomerId,
+   247→    type: 'refresh',
+   248→    iat: Math.floor(Date.now() / 1000),
+   249→    jti: crypto.randomUUID() // Unique token identifier for blacklisting
+   250→  };
+   251→
+   252→  const refreshToken = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_REFRESH_EXPIRES_IN });
+   253→
+   254→  return {
+   255→    refreshToken,
+   256→    expiresIn: JWT_REFRESH_EXPIRES_IN
+   257→  };
+   258→}
+   259→
+   260→/**
+   261→ * Verify and decode a JWT token (async version)
+   262→ * Checks both JWT signature validity and token blacklist status via Redis
+   263→ * @param {string} token - JWT token to verify
+   264→ * @param {Object} options - Verification options
+   265→ * @param {boolean} options.checkBlacklist - Whether to check token blacklist (default: true)
+   266→ * @param {Object} options.req - Express request object for logging (optional)
+   267→ * @returns {Promise<Object|null>} Decoded payload or null if invalid/revoked
+   268→ */
+   269→async function verifyToken(token, options = {}) {
+   270→  const { checkBlacklist = true, req = null } = options;
+   271→
+   272→  try {
+   273→    const decoded = jwt.verify(token, JWT_SECRET);
+   274→
+   275→    // Check if token has been revoked (blacklisted) - async Redis check
+   276→    if (checkBlacklist && decoded.jti) {
+   277→      const isBlacklisted = await isTokenBlacklisted(decoded.jti);
+   278→      if (isBlacklisted) {
+   279→        if (req) {
+   280→          authLogger.logTokenBlacklisted(req, decoded.jti);
+   281→        }
+   282→        return null;
+   283→      }
+   284→    }
+   285→
+   286→    return decoded;
+   287→  } catch (err) {
+   288→    // Log specific error types for debugging
+   289→    if (err.name === 'TokenExpiredError') {
+   290→      if (req) {
+   291→        authLogger.logTokenExpired(req);
+   292→      }
+   293→    } else if (err.name === 'JsonWebTokenError') {
+   294→      if (req) {
+   295→        authLogger.logTokenInvalid(req, err.message);
+   296→      }
+   297→    }
+   298→    return null;
+   299→  }
+   300→}
+   301→
+   302→/**
+   303→ * Synchronous token verification (for cases where async is not possible)
+   304→ * Does NOT check blacklist - use verifyToken() for full verification
+   305→ * @param {string} token - JWT token to verify
+   306→ * @returns {Object|null} Decoded payload or null if invalid
+   307→ */
+   308→function verifyTokenSync(token) {
+   309→  try {
+   310→    return jwt.verify(token, JWT_SECRET);
+   311→  } catch {
+   312→    return null;
+   313→  }
+   314→}
+   315→
+   316→/**
+   317→ * Extract Bearer token from Authorization header
+   318→ * @param {string} authHeader - Authorization header value
+   319→ * @returns {string|null} Token or null if not found
+   320→ */
+   321→function extractBearerToken(authHeader) {
+   322→  if (!authHeader || typeof authHeader !== 'string') {
+   323→    return null;
+   324→  }
+   325→
+   326→  const parts = authHeader.split(' ');
+   327→  if (parts.length !== 2 || parts[0].toLowerCase() !== 'bearer') {
+   328→    return null;
+   329→  }
+   330→
+   331→  return parts[1];
+   332→}
+   333→
+   334→/**
+   335→ * Middleware to authenticate JWT tokens
+   336→ * Sets req.stripeCustomerId if valid token found
+   337→ *
+   338→ * Supports both:
+   339→ * - Authorization: Bearer <token> (preferred)
+   340→ * - x-stripe-customer-id header (legacy, will be deprecated)
+   341→ */
+   342→async function authenticateToken(req, res, next) {
+   343→  // First, try JWT token from Authorization header
+   344→  const authHeader = req.headers['authorization'];
+   345→  const token = extractBearerToken(authHeader);
+   346→
+   347→  if (token) {
+   348→    // First verify JWT signature without blacklist check to get specific error messages
+   349→    const decoded = verifyTokenSync(token);
+   350→
+   351→    if (!decoded || !decoded.sub) {
+   352→      // Token is invalid or expired (signature failed)
+   353→      authLogger.logTokenInvalid(req, 'Invalid or expired token');
+   354→      return res.status(401).json({
+   355→        error: 'Invalid or expired token',
+   356→        message: 'Please log in again to continue'
+   357→      });
+   358→    }
+   359→
+   360→    // Check if token has been revoked (blacklisted) - async Redis check
+   361→    if (decoded.jti) {
+   362→      const isBlacklisted = await isTokenBlacklisted(decoded.jti);
+   363→      if (isBlacklisted) {
+   364→        authLogger.logTokenBlacklisted(req, decoded.jti);
+   365→        return res.status(401).json({
+   366→          error: 'Token has been revoked',
+   367→          message: 'This session has been logged out. Please log in again.'
+   368→        });
+   369→      }
+   370→    }
+   371→
+   372→    // Token is valid and not revoked
+   373→    req.stripeCustomerId = decoded.sub;
+   374→    req.tokenData = decoded;
+   375→    req.rawToken = token; // Store raw token for logout
+   376→    return next();
+   377→  }
+   378→
+   379→  // Fallback: Legacy x-stripe-customer-id header (for backward compatibility)
+   380→  // This will be deprecated in future versions
+   381→  const legacyCustomerId = req.headers['x-stripe-customer-id'];
+   382→  if (legacyCustomerId) {
+   383→    // Log deprecation warning with structured logging (once per request)
+   384→    if (!req._legacyAuthWarned) {
+   385→      authLogger.logLegacyAuthUsed(req, legacyCustomerId);
+   386→      req._legacyAuthWarned = true;
+   387→    }
+   388→
+   389→    // Validate format
+   390→    if (!legacyCustomerId.startsWith('cus_')) {
+   391→      authLogger.logTokenInvalid(req, 'Invalid legacy customer ID format');
+   392→      return res.status(401).json({
+   393→        error: 'Invalid customer ID format',
+   394→        message: 'Customer ID must start with cus_'
+   395→      });
+   396→    }
+   397→
+   398→    req.stripeCustomerId = legacyCustomerId;
+   399→    req.isLegacyAuth = true;
+   400→    return next();
+   401→  }
+   402→
+   403→  // No authentication provided
+   404→  return res.status(401).json({
+   405→    error: 'Authentication required',
+   406→    message: 'Please provide a valid Bearer token in the Authorization header'
+   407→  });
+   408→}
+   409→
+   410→/**
+   411→ * Optional authentication middleware
+   412→ * Allows unauthenticated access but sets req.stripeCustomerId if token present
+   413→ */
+   414→async function optionalAuthentication(req, res, next) {
+   415→  const authHeader = req.headers['authorization'];
+   416→  const token = extractBearerToken(authHeader);
+   417→
+   418→  if (token) {
+   419→    const decoded = await verifyToken(token);
+   420→    if (decoded && decoded.sub) {
+   421→      req.stripeCustomerId = decoded.sub;
+   422→      req.tokenData = decoded;
+   423→    }
+   424→  } else {
+   425→    // Check legacy header
+   426→    const legacyCustomerId = req.headers['x-stripe-customer-id'];
+   427→    if (legacyCustomerId && legacyCustomerId.startsWith('cus_')) {
+   428→      req.stripeCustomerId = legacyCustomerId;
+   429→      req.isLegacyAuth = true;
+   430→    }
+   431→  }
+   432→
+   433→  next();
+   434→}
+   435→
+   436→/**
+   437→ * Mask sensitive data for logging
+   438→ * @param {string} key - License key or other sensitive string
+   439→ * @returns {string} Masked string (e.g., "SPLICE-ABC1-****-****-****")
+   440→ */
+   441→function maskSensitiveData(data) {
+   442→  if (!data || typeof data !== 'string') {
+   443→    return '****';
+   444→  }
+   445→
+   446→  // For license keys (SPLICE-XXXX-XXXX-XXXX-XXXX format)
+   447→  if (data.startsWith('SPLICE-')) {
+   448→    const parts = data.split('-');
+   449→    if (parts.length === 5) {
+   450→      return `${parts[0]}-${parts[1]}-****-****-****`;
+   451→    }
+   452→  }
+   453→
+   454→  // For customer IDs (cus_xxxx format)
+   455→  if (data.startsWith('cus_')) {
+   456→    if (data.length > 10) {
+   457→      return `cus_${data.slice(4, 8)}****`;
+   458→    }
+   459→    return 'cus_****';
+   460→  }
+   461→
+   462→  // For JWTs (eyJ... format)
+   463→  if (data.startsWith('eyJ')) {
+   464→    return `${data.slice(0, 10)}...****`;
+   465→  }
+   466→
+   467→  // For emails
+   468→  if (data.includes('@')) {
+   469→    const [local, domain] = data.split('@');
+   470→    const maskedLocal = local.length > 2 ? `${local[0]}***${local[local.length-1]}` : '***';
+   471→    return `${maskedLocal}@${domain}`;
+   472→  }
+   473→
+   474→  // Generic masking - show first 4 chars
+   475→  if (data.length > 8) {
+   476→    return `${data.slice(0, 4)}****`;
+   477→  }
+   478→
+   479→  return '****';
+   480→}
+   481→
+   482→module.exports = {
+   483→  generateToken,
+   484→  generateRefreshToken,
+   485→  verifyToken,
+   486→  verifyTokenSync,
+   487→  extractBearerToken,
+   488→  authenticateToken,
+   489→  optionalAuthentication,
+   490→  maskSensitiveData,
+   491→  // Token blacklist functions
+   492→  blacklistToken,
+   493→  isTokenBlacklisted,
+   494→  getBlacklistStats,
+   495→  // Structured logging
+   496→  authLogger,
+   497→  // Constants
+   498→  JWT_SECRET,
+   499→  JWT_EXPIRES_IN
+   500→};
+   501→
+
+</system-reminder>

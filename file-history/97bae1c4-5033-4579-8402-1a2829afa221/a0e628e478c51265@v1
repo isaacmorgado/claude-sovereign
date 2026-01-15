@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+AI Face Generator Automation Script
+Generates diverse faces using Somake AI for facial landmark analysis
+"""
+
+import asyncio
+import json
+import os
+from pathlib import Path
+from playwright.async_api import async_playwright
+import time
+
+# Configuration
+OUTPUT_DIR = Path("/Users/imorgado/Desktop/face_generation/generated_faces")
+PROMPTS_FILE = Path("/Users/imorgado/Desktop/face_generation/prompts.json")
+SOMAKE_URL = "https://www.somake.ai/tools/face-generator"
+
+# Delays (in seconds) - adjust based on generation speed
+GENERATION_WAIT = 30  # Wait for image to generate
+PAGE_LOAD_WAIT = 5
+
+
+async def generate_face(page, prompt: str, filename: str, output_dir: Path):
+    """Generate a single face using the prompt"""
+    print(f"\n{'='*60}")
+    print(f"Generating: {filename}")
+    print(f"Prompt: {prompt[:80]}...")
+
+    try:
+        # Navigate to the page (refresh for each generation to clear state)
+        await page.goto(SOMAKE_URL, wait_until="networkidle")
+        await asyncio.sleep(PAGE_LOAD_WAIT)
+
+        # Find and clear the prompt input field
+        # Try common selectors for text input
+        selectors_to_try = [
+            'textarea[placeholder*="describe"]',
+            'textarea[placeholder*="prompt"]',
+            'textarea',
+            'input[type="text"][placeholder*="describe"]',
+            'input[type="text"]',
+            '[contenteditable="true"]',
+        ]
+
+        prompt_input = None
+        for selector in selectors_to_try:
+            try:
+                prompt_input = await page.wait_for_selector(selector, timeout=5000)
+                if prompt_input:
+                    break
+            except:
+                continue
+
+        if not prompt_input:
+            print(f"ERROR: Could not find prompt input field")
+            return False
+
+        # Clear and enter the prompt
+        await prompt_input.click()
+        await prompt_input.fill("")
+        await prompt_input.fill(prompt)
+        await asyncio.sleep(1)
+
+        # Find and click the generate button
+        generate_selectors = [
+            'button:has-text("Generate")',
+            'button:has-text("Create")',
+            'button:has-text("Submit")',
+            'button[type="submit"]',
+            '.generate-btn',
+            '#generate-btn',
+        ]
+
+        generate_btn = None
+        for selector in generate_selectors:
+            try:
+                generate_btn = await page.wait_for_selector(selector, timeout=3000)
+                if generate_btn:
+                    break
+            except:
+                continue
+
+        if not generate_btn:
+            print(f"ERROR: Could not find generate button")
+            return False
+
+        await generate_btn.click()
+        print(f"Clicked generate, waiting {GENERATION_WAIT}s for image...")
+
+        # Wait for generation to complete
+        await asyncio.sleep(GENERATION_WAIT)
+
+        # Find the generated image
+        image_selectors = [
+            'img[src*="blob:"]',
+            'img[src*="generated"]',
+            'img[src*="output"]',
+            '.generated-image img',
+            '.output-image img',
+            '.result img',
+            'img[alt*="generated"]',
+        ]
+
+        image_element = None
+        for selector in image_selectors:
+            try:
+                image_element = await page.wait_for_selector(selector, timeout=5000)
+                if image_element:
+                    # Verify it's a valid image
+                    src = await image_element.get_attribute('src')
+                    if src and ('blob:' in src or 'http' in src):
+                        break
+            except:
+                continue
+
+        if not image_element:
+            # Try to find any new image on the page
+            images = await page.query_selector_all('img')
+            for img in images:
+                src = await img.get_attribute('src')
+                if src and ('blob:' in src or 'data:' in src or 'generated' in src.lower()):
+                    image_element = img
+                    break
+
+        if not image_element:
+            print(f"ERROR: Could not find generated image")
+            # Take a screenshot for debugging
+            await page.screenshot(path=output_dir / f"debug_{filename}.png")
+            return False
+
+        # Try to download the image
+        # Method 1: Click download button if exists
+        download_selectors = [
+            'button:has-text("Download")',
+            'a:has-text("Download")',
+            '[download]',
+            '.download-btn',
+        ]
+
+        downloaded = False
+        for selector in download_selectors:
+            try:
+                download_btn = await page.query_selector(selector)
+                if download_btn:
+                    async with page.expect_download(timeout=10000) as download_info:
+                        await download_btn.click()
+                    download = await download_info.value
+
+                    # Save with our filename
+                    save_path = output_dir / filename
+                    await download.save_as(save_path)
+                    print(f"SUCCESS: Downloaded to {save_path}")
+                    downloaded = True
+                    break
+            except Exception as e:
+                continue
+
+        # Method 2: Right-click save or screenshot the image
+        if not downloaded:
+            try:
+                # Get image src and download via page context
+                src = await image_element.get_attribute('src')
+
+                if src.startswith('data:'):
+                    # Base64 encoded image
+                    import base64
+                    header, data = src.split(',', 1)
+                    image_data = base64.b64decode(data)
+                    save_path = output_dir / filename.replace('.webp', '.png')
+                    with open(save_path, 'wb') as f:
+                        f.write(image_data)
+                    print(f"SUCCESS: Saved base64 image to {save_path}")
+                    downloaded = True
+                elif src.startswith('blob:'):
+                    # Blob URL - need to screenshot the element
+                    save_path = output_dir / filename.replace('.webp', '.png')
+                    await image_element.screenshot(path=save_path)
+                    print(f"SUCCESS: Screenshot saved to {save_path}")
+                    downloaded = True
+                else:
+                    # Regular URL - download it
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(src) as response:
+                            if response.status == 200:
+                                image_data = await response.read()
+                                save_path = output_dir / filename.replace('.webp', '.png')
+                                with open(save_path, 'wb') as f:
+                                    f.write(image_data)
+                                print(f"SUCCESS: Downloaded URL to {save_path}")
+                                downloaded = True
+            except Exception as e:
+                print(f"ERROR downloading: {e}")
+
+        return downloaded
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
+
+
+async def main():
+    """Main function to generate all faces"""
+
+    # Create output directory
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load prompts
+    with open(PROMPTS_FILE, 'r') as f:
+        data = json.load(f)
+
+    prompts = data['prompts']
+    print(f"Loaded {len(prompts)} prompts")
+
+    # Track results
+    results = {
+        'success': [],
+        'failed': []
+    }
+
+    async with async_playwright() as p:
+        # Launch browser (non-headless so you can see what's happening)
+        browser = await p.chromium.launch(
+            headless=False,
+            slow_mo=500  # Slow down for visibility
+        )
+
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            accept_downloads=True
+        )
+
+        page = await context.new_page()
+
+        # Process each prompt
+        for i, prompt_data in enumerate(prompts):
+            print(f"\n[{i+1}/{len(prompts)}] Processing {prompt_data['ethnicity']} {prompt_data['gender']} {prompt_data['view']}")
+
+            success = await generate_face(
+                page,
+                prompt_data['prompt'],
+                prompt_data['filename'],
+                OUTPUT_DIR
+            )
+
+            if success:
+                results['success'].append(prompt_data['filename'])
+            else:
+                results['failed'].append(prompt_data['filename'])
+
+            # Small delay between generations
+            await asyncio.sleep(2)
+
+        await browser.close()
+
+    # Print summary
+    print("\n" + "="*60)
+    print("GENERATION COMPLETE")
+    print("="*60)
+    print(f"Success: {len(results['success'])}/{len(prompts)}")
+    print(f"Failed: {len(results['failed'])}/{len(prompts)}")
+
+    if results['failed']:
+        print("\nFailed files:")
+        for f in results['failed']:
+            print(f"  - {f}")
+
+    # Save results
+    with open(OUTPUT_DIR / 'results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nGenerated faces saved to: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

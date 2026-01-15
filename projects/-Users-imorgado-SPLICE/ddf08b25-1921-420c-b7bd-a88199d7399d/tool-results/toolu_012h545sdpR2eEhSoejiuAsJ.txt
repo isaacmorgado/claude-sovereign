@@ -1,0 +1,637 @@
+     1→/**
+     2→ * Auth Routes
+     3→ *
+     4→ * Authentication endpoints (login, refresh, logout, csrf-token, email verification)
+     5→ *
+     6→ * SECURITY: Enhanced with endpoint-specific rate limiting for sensitive operations
+     7→ * HIGH-003: Added IP-based rate limiting for email verification endpoints
+     8→ * MEDIUM-004: Redis-backed verification codes for horizontal scaling
+     9→ */
+    10→
+    11→const express = require('express');
+    12→const crypto = require('crypto');
+    13→const { rateLimit } = require('express-rate-limit');
+    14→const { csrfTokenHandler, validateCsrfToken } = require('../middleware/csrf');
+    15→const { endpointRateLimit } = require('../middleware/rateLimiter');
+    16→const authLogger = require('../utils/authLogger');
+    17→const redis = require('../services/redisClient');
+    18→
+    19→// ============================================================================
+    20→// HIGH-003: IP-Based Rate Limiting for Email Verification
+    21→// Prevents abuse of email verification endpoints regardless of email
+    22→// ============================================================================
+    23→
+    24→/**
+    25→ * IP-based rate limiter for email verification endpoints
+    26→ * Limits: 5 requests per 15 minutes per IP address
+    27→ */
+    28→const emailVerificationLimiter = rateLimit({
+    29→  windowMs: 15 * 60 * 1000, // 15 minutes
+    30→  max: 5, // 5 requests per IP per window
+    31→  keyGenerator: (req) => {
+    32→    // Use X-Forwarded-For header in production (behind proxy)
+    33→    return req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
+    34→  },
+    35→  message: {
+    36→    error: 'Too many verification attempts',
+    37→    message: 'Too many verification requests from this IP. Please try again later.',
+    38→    retryAfter: 15 * 60 // 15 minutes in seconds
+    39→  },
+    40→  standardHeaders: true, // Return rate limit info in RateLimit-* headers
+    41→  legacyHeaders: false, // Disable X-RateLimit-* headers
+    42→  handler: (req, res, next, options) => {
+    43→    console.warn(`[Auth] IP rate limit exceeded for email verification: ${req.ip}`);
+    44→    res.status(429).json(options.message);
+    45→  }
+    46→});
+    47→
+    48→// ============================================================================
+    49→// Email Verification Code Storage
+    50→// MEDIUM-004: Redis-backed storage for horizontal scaling
+    51→// Fallback to in-memory storage when Redis is unavailable
+    52→// ============================================================================
+    53→
+    54→// Fallback in-memory storage (used when Redis is unavailable)
+    55→const fallbackVerificationCodes = new Map();
+    56→const fallbackLastSendTime = new Map();
+    57→
+    58→// Verification code expiry time (10 minutes = 600 seconds)
+    59→const VERIFICATION_CODE_TTL_SECONDS = 600;
+    60→const VERIFICATION_CODE_EXPIRY_MS = VERIFICATION_CODE_TTL_SECONDS * 1000;
+    61→
+    62→// Maximum verification attempts before code is invalidated
+    63→const MAX_VERIFICATION_ATTEMPTS = 5;
+    64→
+    65→// Rate limiting: minimum time between sending codes to same email (60 seconds)
+    66→const SEND_CODE_COOLDOWN_SECONDS = 60;
+    67→const SEND_CODE_COOLDOWN_MS = SEND_CODE_COOLDOWN_SECONDS * 1000;
+    68→
+    69→// Redis key prefixes
+    70→const REDIS_KEY_VERIFY = 'verify:';
+    71→const REDIS_KEY_SEND_TIME = 'verify:sendtime:';
+    72→
+    73→/**
+    74→ * Generate a 6-digit verification code
+    75→ * @returns {string} 6-digit code
+    76→ */
+    77→function generateVerificationCode() {
+    78→  // Generate cryptographically secure random 6-digit code
+    79→  const code = crypto.randomInt(100000, 999999).toString();
+    80→  return code;
+    81→}
+    82→
+    83→/**
+    84→ * Store a verification code for an email (Redis-backed with fallback)
+    85→ * @param {string} email - Email address
+    86→ * @param {string} code - Verification code
+    87→ * @returns {Promise<void>}
+    88→ */
+    89→async function storeVerificationCode(email, code) {
+    90→  const normalizedEmail = email.toLowerCase().trim();
+    91→  const data = {
+    92→    code,
+    93→    createdAt: Date.now(),
+    94→    attempts: 0
+    95→  };
+    96→
+    97→  // Try Redis first
+    98→  if (redis.isRedisAvailable()) {
+    99→    try {
+   100→      const verifyKey = `${REDIS_KEY_VERIFY}${normalizedEmail}`;
+   101→      const sendTimeKey = `${REDIS_KEY_SEND_TIME}${normalizedEmail}`;
+   102→      
+   103→      await redis.set(verifyKey, data, VERIFICATION_CODE_TTL_SECONDS);
+   104→      await redis.set(sendTimeKey, Date.now(), SEND_CODE_COOLDOWN_SECONDS * 2); // Keep send time a bit longer
+   105→      return;
+   106→    } catch (err) {
+   107→      console.warn('[Auth] Redis store failed, using fallback:', err.message);
+   108→    }
+   109→  }
+   110→
+   111→  // Fallback to in-memory storage
+   112→  fallbackVerificationCodes.set(normalizedEmail, {
+   113→    ...data,
+   114→    expires: Date.now() + VERIFICATION_CODE_EXPIRY_MS
+   115→  });
+   116→  fallbackLastSendTime.set(normalizedEmail, Date.now());
+   117→}
+   118→
+   119→/**
+   120→ * Verify a code for an email (Redis-backed with fallback)
+   121→ * @param {string} email - Email address
+   122→ * @param {string} code - Code to verify
+   123→ * @returns {Promise<{ valid: boolean, error?: string }>}
+   124→ */
+   125→async function verifyCode(email, code) {
+   126→  const normalizedEmail = email.toLowerCase().trim();
+   127→
+   128→  // Try Redis first
+   129→  if (redis.isRedisAvailable()) {
+   130→    try {
+   131→      const verifyKey = `${REDIS_KEY_VERIFY}${normalizedEmail}`;
+   132→      const stored = await redis.get(verifyKey);
+   133→
+   134→      if (!stored) {
+   135→        return { valid: false, error: 'No verification code found. Please request a new one.' };
+   136→      }
+   137→
+   138→      // Increment attempt counter
+   139→      stored.attempts = (stored.attempts || 0) + 1;
+   140→
+   141→      // Check if too many attempts
+   142→      if (stored.attempts > MAX_VERIFICATION_ATTEMPTS) {
+   143→        await redis.del(verifyKey);
+   144→        return { valid: false, error: 'Too many failed attempts. Please request a new code.' };
+   145→      }
+   146→
+   147→      // Check if code matches
+   148→      if (stored.code !== code) {
+   149→        // Update attempts count in Redis (keep remaining TTL)
+   150→        const ttl = await redis.ttl(verifyKey);
+   151→        if (ttl > 0) {
+   152→          await redis.set(verifyKey, stored, ttl);
+   153→        }
+   154→        return { valid: false, error: `Invalid verification code. ${MAX_VERIFICATION_ATTEMPTS - stored.attempts} attempts remaining.` };
+   155→      }
+   156→
+   157→      // Code is valid - remove it (single use)
+   158→      await redis.del(verifyKey);
+   159→      return { valid: true };
+   160→    } catch (err) {
+   161→      console.warn('[Auth] Redis verify failed, using fallback:', err.message);
+   162→    }
+   163→  }
+   164→
+   165→  // Fallback to in-memory storage
+   166→  const stored = fallbackVerificationCodes.get(normalizedEmail);
+   167→
+   168→  if (!stored) {
+   169→    return { valid: false, error: 'No verification code found. Please request a new one.' };
+   170→  }
+   171→
+   172→  // Check if expired
+   173→  if (Date.now() > stored.expires) {
+   174→    fallbackVerificationCodes.delete(normalizedEmail);
+   175→    return { valid: false, error: 'Verification code has expired. Please request a new one.' };
+   176→  }
+   177→
+   178→  // Increment attempt counter
+   179→  stored.attempts++;
+   180→
+   181→  // Check if too many attempts
+   182→  if (stored.attempts > MAX_VERIFICATION_ATTEMPTS) {
+   183→    fallbackVerificationCodes.delete(normalizedEmail);
+   184→    return { valid: false, error: 'Too many failed attempts. Please request a new code.' };
+   185→  }
+   186→
+   187→  // Check if code matches
+   188→  if (stored.code !== code) {
+   189→    fallbackVerificationCodes.set(normalizedEmail, stored);
+   190→    return { valid: false, error: `Invalid verification code. ${MAX_VERIFICATION_ATTEMPTS - stored.attempts} attempts remaining.` };
+   191→  }
+   192→
+   193→  // Code is valid - remove it (single use)
+   194→  fallbackVerificationCodes.delete(normalizedEmail);
+   195→  return { valid: true };
+   196→}
+   197→
+   198→/**
+   199→ * Check if we can send a new code to an email (rate limiting, Redis-backed)
+   200→ * @param {string} email - Email address
+   201→ * @returns {Promise<{ allowed: boolean, waitSeconds?: number }>}
+   202→ */
+   203→async function canSendCode(email) {
+   204→  const normalizedEmail = email.toLowerCase().trim();
+   205→
+   206→  // Try Redis first
+   207→  if (redis.isRedisAvailable()) {
+   208→    try {
+   209→      const sendTimeKey = `${REDIS_KEY_SEND_TIME}${normalizedEmail}`;
+   210→      const lastSent = await redis.get(sendTimeKey);
+   211→
+   212→      if (!lastSent) {
+   213→        return { allowed: true };
+   214→      }
+   215→
+   216→      const elapsed = Date.now() - lastSent;
+   217→      if (elapsed < SEND_CODE_COOLDOWN_MS) {
+   218→        const waitSeconds = Math.ceil((SEND_CODE_COOLDOWN_MS - elapsed) / 1000);
+   219→        return { allowed: false, waitSeconds };
+   220→      }
+   221→
+   222→      return { allowed: true };
+   223→    } catch (err) {
+   224→      console.warn('[Auth] Redis canSendCode failed, using fallback:', err.message);
+   225→    }
+   226→  }
+   227→
+   228→  // Fallback to in-memory storage
+   229→  const lastSent = fallbackLastSendTime.get(normalizedEmail);
+   230→
+   231→  if (!lastSent) {
+   232→    return { allowed: true };
+   233→  }
+   234→
+   235→  const elapsed = Date.now() - lastSent;
+   236→  if (elapsed < SEND_CODE_COOLDOWN_MS) {
+   237→    const waitSeconds = Math.ceil((SEND_CODE_COOLDOWN_MS - elapsed) / 1000);
+   238→    return { allowed: false, waitSeconds };
+   239→  }
+   240→
+   241→  return { allowed: true };
+   242→}
+   243→
+   244→// Cleanup for fallback in-memory storage (only needed when Redis is unavailable)
+   245→// Redis handles expiration automatically via TTL
+   246→function cleanupFallbackStorage() {
+   247→  const now = Date.now();
+   248→  let cleanedCount = 0;
+   249→
+   250→  for (const [email, data] of fallbackVerificationCodes.entries()) {
+   251→    if (data.expires <= now) {
+   252→      fallbackVerificationCodes.delete(email);
+   253→      cleanedCount++;
+   254→    }
+   255→  }
+   256→
+   257→  // Also clean up old lastSendTime entries (older than 1 hour)
+   258→  const oneHourAgo = now - (60 * 60 * 1000);
+   259→  for (const [email, time] of fallbackLastSendTime.entries()) {
+   260→    if (time < oneHourAgo) {
+   261→      fallbackLastSendTime.delete(email);
+   262→    }
+   263→  }
+   264→
+   265→  if (cleanedCount > 0) {
+   266→    console.log(`[Auth] Fallback storage cleanup: removed ${cleanedCount} expired codes`);
+   267→  }
+   268→}
+   269→
+   270→// Start periodic cleanup for fallback storage (unref to allow process exit)
+   271→const cleanupTimer = setInterval(cleanupFallbackStorage, 5 * 60 * 1000);
+   272→if (cleanupTimer.unref) {
+   273→  cleanupTimer.unref();
+   274→}
+   275→
+   276→/**
+   277→ * Validate email format
+   278→ * @param {string} email - Email to validate
+   279→ * @returns {boolean}
+   280→ */
+   281→function isValidEmail(email) {
+   282→  if (!email || typeof email !== 'string') return false;
+   283→  // Basic email validation regex
+   284→  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+   285→  return emailRegex.test(email.trim());
+   286→}
+   287→
+   288→/**
+   289→ * Create auth routes
+   290→ * @param {Object} options - Route configuration options
+   291→ * @param {Object} options.middleware - Shared middleware (authenticateToken)
+   292→ * @param {Object} options.services - Shared services (usageTracking, licenseService, emailService)
+   293→ * @param {Object} options.authHelpers - Auth helper functions
+   294→ * @returns {express.Router}
+   295→ */
+   296→function createAuthRoutes(options = {}) {
+   297→  const router = express.Router();
+   298→  const { authenticateToken } = options.middleware || {};
+   299→  const { generateToken, generateRefreshToken, verifyToken, maskSensitiveData, blacklistToken } = options.authHelpers || {};
+   300→  const { usageTracking, licenseService, emailService } = options.services || {};
+   301→
+   302→  /**
+   303→   * GET /csrf-token - Generate and return a CSRF token
+   304→   *
+   305→   * SECURITY: This endpoint provides CSRF tokens for state-changing requests.
+   306→   * The token is returned in both the response body and an HttpOnly cookie.
+   307→   * Clients must include the token in the X-CSRF-Token header for POST/PUT/DELETE requests.
+   308→   */
+   309→  router.get('/csrf-token', csrfTokenHandler);
+   310→
+   311→  /**
+   312→   * POST /login - Authenticate with license key and get JWT token
+   313→   *
+   314→   * SECURITY: This is the primary authentication endpoint.
+   315→   * Validates license key and returns a JWT token for API access.
+   316→   * NOTE: CSRF disabled - license key auth is not vulnerable to CSRF
+   317→   * (user must know the key, it's not auto-submitted like cookies)
+   318→   */
+   319→  router.post('/login', async (req, res) => {
+   320→    const { licenseKey } = req.body;
+   321→
+   322→    if (!licenseKey) {
+   323→      authLogger.logLoginFailed(req, 'missing_license_key', { licenseKey: null });
+   324→      return res.status(400).json({
+   325→        error: 'License key required',
+   326→        message: 'Please provide your license key to log in'
+   327→      });
+   328→    }
+   329→
+   330→    try {
+   331→      // Validate and activate the license key
+   332→      const licenseResult = await licenseService.activateLicenseKey(licenseKey);
+   333→
+   334→      if (!licenseResult.success) {
+   335→        authLogger.logLoginFailed(req, licenseResult.error || 'invalid_license_key', { licenseKey });
+   336→        return res.status(401).json({
+   337→          error: 'Invalid license key',
+   338→          message: licenseResult.error || 'The license key is invalid or expired'
+   339→        });
+   340→      }
+   341→
+   342→      // Get user's tier and balance
+   343→      const balance = await usageTracking.getBalance(licenseResult.customerId);
+   344→
+   345→      // Generate JWT tokens
+   346→      const tokenResult = generateToken(licenseResult.customerId, {
+   347→        tier: balance.tier,
+   348→        email: licenseResult.email
+   349→      });
+   350→      const refreshResult = generateRefreshToken(licenseResult.customerId);
+   351→
+   352→      // Log successful login with structured logging
+   353→      authLogger.logLoginSuccess(req, licenseResult.customerId, {
+   354→        email: licenseResult.email,
+   355→        tier: balance.tier
+   356→      });
+   357→
+   358→      res.json({
+   359→        success: true,
+   360→        token: tokenResult.token,
+   361→        tokenType: tokenResult.tokenType,
+   362→        expiresIn: tokenResult.expiresIn,
+   363→        refreshToken: refreshResult.refreshToken,
+   364→        customerId: licenseResult.customerId,
+   365→        tier: balance.tier,
+   366→        hoursRemaining: balance.hoursRemaining
+   367→      });
+   368→    } catch (err) {
+   369→      authLogger.logLoginFailed(req, `server_error: ${err.message}`, { licenseKey });
+   370→      res.status(500).json({ error: 'Authentication failed. Please try again.' });
+   371→    }
+   372→  });
+   373→
+   374→  /**
+   375→   * POST /refresh - Refresh an expired JWT token
+   376→   *
+   377→   * Uses a refresh token to get a new access token.
+   378→   * NOTE: CSRF disabled for cross-domain compatibility during beta.
+   379→   */
+   380→  router.post('/refresh', async (req, res) => {
+   381→    const { refreshToken } = req.body;
+   382→
+   383→    if (!refreshToken) {
+   384→      authLogger.logTokenRefreshFailed(req, 'missing_refresh_token');
+   385→      return res.status(400).json({
+   386→        error: 'Refresh token required'
+   387→      });
+   388→    }
+   389→
+   390→    try {
+   391→      const decoded = await verifyToken(refreshToken, { req });
+   392→
+   393→      if (!decoded || decoded.type !== 'refresh') {
+   394→        authLogger.logTokenRefreshFailed(req, 'invalid_or_wrong_token_type');
+   395→        return res.status(401).json({
+   396→          error: 'Invalid refresh token',
+   397→          message: 'Please log in again'
+   398→        });
+   399→      }
+   400→
+   401→      // Get current user info
+   402→      const balance = await usageTracking.getBalance(decoded.sub);
+   403→
+   404→      // Generate new access token
+   405→      const tokenResult = generateToken(decoded.sub, {
+   406→        tier: balance.tier
+   407→      });
+   408→
+   409→      // Log successful token refresh
+   410→      authLogger.logTokenRefreshSuccess(req, decoded.sub);
+   411→
+   412→      res.json({
+   413→        success: true,
+   414→        token: tokenResult.token,
+   415→        tokenType: tokenResult.tokenType,
+   416→        expiresIn: tokenResult.expiresIn
+   417→      });
+   418→    } catch (err) {
+   419→      authLogger.logTokenRefreshFailed(req, `server_error: ${err.message}`);
+   420→      res.status(401).json({
+   421→        error: 'Failed to refresh token',
+   422→        message: 'Please log in again'
+   423→      });
+   424→    }
+   425→  });
+   426→
+   427→  /**
+   428→   * POST /logout - Invalidate tokens by adding to blacklist
+   429→   *
+   430→   * Adds the current token's jti to the blacklist so it cannot be reused.
+   431→   * Also accepts an optional refreshToken to revoke both tokens at once.
+   432→   * CSRF protection applied to prevent forced logout attacks.
+   433→   */
+   434→  router.post('/logout', validateCsrfToken, authenticateToken, async (req, res) => {
+   435→    const { refreshToken } = req.body;
+   436→    let refreshTokenRevoked = false;
+   437→
+   438→    // Blacklist the access token using the blacklistToken function from authHelpers
+   439→    if (req.tokenData && req.tokenData.jti && req.tokenData.exp) {
+   440→      if (blacklistToken) {
+   441→        await blacklistToken(req.tokenData.jti, req.tokenData.exp, {
+   442→          userId: req.stripeCustomerId,
+   443→          reason: 'logout'
+   444→        });
+   445→      } else {
+   446→        console.warn('[Auth] Logout: blacklistToken function not available');
+   447→      }
+   448→    } else {
+   449→      // Token doesn't have jti - log warning but continue
+   450→      // This handles tokens generated before jti was added
+   451→      console.warn('[Auth] Logout: token missing jti or exp, cannot blacklist access token');
+   452→    }
+   453→
+   454→    // Optionally blacklist the refresh token too
+   455→    if (refreshToken && blacklistToken) {
+   456→      // Use checkBlacklist: false to allow decoding already-blacklisted refresh tokens
+   457→      const decoded = await verifyToken(refreshToken, { checkBlacklist: false });
+   458→      if (decoded && decoded.jti && decoded.exp) {
+   459→        await blacklistToken(decoded.jti, decoded.exp, {
+   460→          userId: req.stripeCustomerId,
+   461→          reason: 'logout_refresh'
+   462→        });
+   463→        refreshTokenRevoked = true;
+   464→      }
+   465→    }
+   466→
+   467→    // Log successful logout with structured logging
+   468→    authLogger.logLogoutSuccess(req, req.stripeCustomerId, {
+   469→      jti: req.tokenData?.jti,
+   470→      refreshTokenRevoked
+   471→    });
+   472→
+   473→    res.json({
+   474→      success: true,
+   475→      message: 'Logged out successfully'
+   476→    });
+   477→  });
+   478→
+   479→  // ==========================================================================
+   480→  // Email Verification Endpoints
+   481→  // ==========================================================================
+   482→
+   483→  /**
+   484→   * POST /send-verification - Send a verification code to an email address
+   485→   *
+   486→   * Request body: { email: string }
+   487→   * Response: { success: boolean, message: string, expiresInMinutes?: number }
+   488→   *
+   489→   * SECURITY: Rate limited to prevent abuse. CSRF protection applied.
+   490→   * HIGH-003: Added IP-based rate limiting (5 requests per 15 minutes per IP)
+   491→   */
+   492→  router.post('/send-verification', emailVerificationLimiter, validateCsrfToken, async (req, res) => {
+   493→    const { email } = req.body;
+   494→
+   495→    // Validate email
+   496→    if (!email) {
+   497→      return res.status(400).json({
+   498→        error: 'Email required',
+   499→        message: 'Please provide an email address'
+   500→      });
+   501→    }
+   502→
+   503→    if (!isValidEmail(email)) {
+   504→      return res.status(400).json({
+   505→        error: 'Invalid email',
+   506→        message: 'Please provide a valid email address'
+   507→      });
+   508→    }
+   509→
+   510→    // Check rate limiting (async - Redis backed)
+   511→    const rateCheck = await canSendCode(email);
+   512→    if (!rateCheck.allowed) {
+   513→      return res.status(429).json({
+   514→        error: 'Too many requests',
+   515→        message: `Please wait ${rateCheck.waitSeconds} seconds before requesting a new code`,
+   516→        waitSeconds: rateCheck.waitSeconds
+   517→      });
+   518→    }
+   519→
+   520→    try {
+   521→      // Generate and store verification code (async - Redis backed)
+   522→      const code = generateVerificationCode();
+   523→      await storeVerificationCode(email, code);
+   524→
+   525→      // Send verification email
+   526→      if (emailService && emailService.sendEmailVerificationCode) {
+   527→        await emailService.sendEmailVerificationCode(email, code, 10);
+   528→        console.log(`[Auth] Verification code sent to ${maskSensitiveData(email)}`);
+   529→      } else {
+   530→        // Fallback for development - log to console
+   531→        console.log(`[Auth] Verification code for ${email}: ${code} (emailService not configured)`);
+   532→      }
+   533→
+   534→      res.json({
+   535→        success: true,
+   536→        message: 'Verification code sent. Please check your email.',
+   537→        expiresInMinutes: 10
+   538→      });
+   539→    } catch (err) {
+   540→      console.error('[Auth] Send verification error:', err.message);
+   541→      res.status(500).json({
+   542→        error: 'Failed to send verification code',
+   543→        message: 'Please try again later'
+   544→      });
+   545→    }
+   546→  });
+   547→
+   548→  /**
+   549→   * POST /verify-email - Verify an email address with a code
+   550→   *
+   551→   * Request body: { email: string, code: string }
+   552→   * Response: { success: boolean, verified: boolean, message?: string, error?: string }
+   553→   *
+   554→   * SECURITY: Limited attempts per code. CSRF protection applied.
+   555→   * HIGH-003: Added IP-based rate limiting (5 requests per 15 minutes per IP)
+   556→   */
+   557→  router.post('/verify-email', emailVerificationLimiter, validateCsrfToken, async (req, res) => {
+   558→    const { email, code } = req.body;
+   559→
+   560→    // Validate inputs
+   561→    if (!email) {
+   562→      return res.status(400).json({
+   563→        error: 'Email required',
+   564→        message: 'Please provide an email address'
+   565→      });
+   566→    }
+   567→
+   568→    if (!code) {
+   569→      return res.status(400).json({
+   570→        error: 'Code required',
+   571→        message: 'Please provide the verification code'
+   572→      });
+   573→    }
+   574→
+   575→    if (!isValidEmail(email)) {
+   576→      return res.status(400).json({
+   577→        error: 'Invalid email',
+   578→        message: 'Please provide a valid email address'
+   579→      });
+   580→    }
+   581→
+   582→    // Validate code format (6 digits)
+   583→    const codeStr = String(code).trim();
+   584→    if (!/^\d{6}$/.test(codeStr)) {
+   585→      return res.status(400).json({
+   586→        error: 'Invalid code format',
+   587→        message: 'Verification code must be 6 digits'
+   588→      });
+   589→    }
+   590→
+   591→    try {
+   592→      // Verify the code (async - Redis backed)
+   593→      const result = await verifyCode(email, codeStr);
+   594→
+   595→      if (!result.valid) {
+   596→        return res.status(400).json({
+   597→          success: false,
+   598→          verified: false,
+   599→          error: 'Verification failed',
+   600→          message: result.error
+   601→        });
+   602→      }
+   603→
+   604→      // Mark email as verified in the database
+   605→      if (usageTracking && usageTracking.markEmailVerified) {
+   606→        const dbResult = await usageTracking.markEmailVerified(email);
+   607→        if (!dbResult.success) {
+   608→          console.warn(`[Auth] Failed to persist email verification: ${dbResult.error}`);
+   609→        }
+   610→      }
+   611→
+   612→      console.log(`[Auth] Email verified: ${maskSensitiveData(email)}`);
+   613→
+   614→      // Email verified successfully
+   615→      res.json({
+   616→        success: true,
+   617→        verified: true,
+   618→        message: 'Email verified successfully'
+   619→      });
+   620→    } catch (err) {
+   621→      console.error('[Auth] Verify email error:', err.message);
+   622→      res.status(500).json({
+   623→        error: 'Verification failed',
+   624→        message: 'Please try again later'
+   625→      });
+   626→    }
+   627→  });
+   628→
+   629→  return router;
+   630→}
+   631→
+   632→module.exports = createAuthRoutes;
+   633→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

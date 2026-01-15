@@ -1,0 +1,147 @@
+/**
+ * Rate Limiter Middleware
+ *
+ * Checks if user has sufficient credits before processing.
+ * Uses atomic credit reservation to prevent race conditions.
+ * Returns 402 Payment Required if insufficient credits.
+ */
+
+const {
+  hasCredits,
+  deductUsage,
+  getBalance,
+  reserveCredits,
+  confirmReservation,
+  releaseReservation
+} = require('../services/usageTracking');
+
+// Default estimated duration for reservation (1 minute = 60 seconds)
+const DEFAULT_RESERVATION_SECONDS = 60;
+
+/**
+ * Middleware to check and atomically reserve credits before processing
+ *
+ * Expects req.stripeCustomerId to be set by auth middleware
+ * Uses req.estimatedDuration (in seconds) for pre-check, defaults to 60s
+ *
+ * This middleware uses SELECT...FOR UPDATE to prevent race conditions
+ * where multiple concurrent requests could all pass credit check.
+ */
+function requireCredits(options = {}) {
+  const { endpoint = 'unknown', estimatedSeconds = DEFAULT_RESERVATION_SECONDS } = options;
+
+  return async (req, res, next) => {
+    const stripeCustomerId = req.stripeCustomerId || req.headers['x-stripe-customer-id'];
+
+    if (!stripeCustomerId) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Missing Stripe customer ID'
+      });
+    }
+
+    // Store for later use
+    req.stripeCustomerId = stripeCustomerId;
+
+    // Determine estimated duration - use request value, option value, or default
+    const estSeconds = req.estimatedDuration || estimatedSeconds;
+
+    try {
+      // Atomically reserve credits using SELECT...FOR UPDATE
+      const reservation = await reserveCredits(stripeCustomerId, estSeconds, endpoint);
+
+      if (!reservation.success) {
+        // Reservation failed - not enough credits
+        const balance = await getBalance(stripeCustomerId);
+        return res.status(402).json({
+          error: 'Insufficient credits',
+          message: 'Please upgrade your plan or wait for your next billing cycle',
+          balance: {
+            hoursRemaining: balance.hoursRemaining,
+            tier: balance.tier
+          }
+        });
+      }
+
+      // Store reservation info for confirmation/release
+      req.reservation = {
+        id: reservation.reservationId,
+        seconds: estSeconds,
+        hoursReserved: reservation.hoursReserved
+      };
+
+      // Attach helper function to confirm usage with actual duration
+      // This adjusts the reservation if actual duration differs
+      req.deductUsage = async (actualDurationSeconds) => {
+        return await confirmReservation(
+          stripeCustomerId,
+          actualDurationSeconds,
+          estSeconds,
+          endpoint
+        );
+      };
+
+      // Attach helper function to release reservation on failure
+      req.releaseReservation = async (reason = 'processing_failed') => {
+        return await releaseReservation(stripeCustomerId, estSeconds, endpoint, reason);
+      };
+
+      // Hook into response to auto-release on error responses
+      const originalSend = res.send.bind(res);
+      res.send = function(body) {
+        // If response is an error (4xx/5xx) and no usage was confirmed, release reservation
+        if (res.statusCode >= 400 && req.reservation && !req.usageConfirmed) {
+          releaseReservation(stripeCustomerId, estSeconds, endpoint, `error_${res.statusCode}`)
+            .catch(err => console.error('[RateLimiter] Failed to release reservation:', err));
+        }
+        return originalSend(body);
+      };
+
+      next();
+    } catch (err) {
+      console.error('[RateLimiter] Error reserving credits:', err);
+      return res.status(500).json({
+        error: 'Credit check failed',
+        message: err.message
+      });
+    }
+  };
+}
+
+/**
+ * Middleware to track usage after successful response
+ *
+ * Call this after processing to deduct actual usage
+ */
+function trackUsage(endpoint = 'unknown') {
+  return async (req, res, next) => {
+    // Store original json method
+    const originalJson = res.json.bind(res);
+
+    // Override json to track usage on success
+    res.json = async (data) => {
+      // Only deduct on successful responses
+      if (res.statusCode >= 200 && res.statusCode < 300 && req.audioDuration) {
+        try {
+          const balance = await deductUsage(
+            req.stripeCustomerId,
+            req.audioDuration,
+            endpoint
+          );
+          // Attach updated balance to response
+          data.balance = balance;
+        } catch (err) {
+          console.error('[RateLimiter] Error deducting usage:', err);
+        }
+      }
+      return originalJson(data);
+    };
+
+    next();
+  };
+}
+
+module.exports = {
+  requireCredits,
+  trackUsage
+};

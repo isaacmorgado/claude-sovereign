@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+Facial Landmark Image Generator
+
+This script takes face images and generates cropped images with light blue circle
+markers at specific facial landmarks, similar to the male_white reference images.
+
+Usage:
+    python generate_landmark_images.py --input BLONDEFRONT.png --output-prefix blonde_front
+"""
+
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import numpy as np
+from pathlib import Path
+import argparse
+import urllib.request
+import os
+
+# Model file path
+MODEL_PATH = Path(__file__).parent / "face_landmarker.task"
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+
+def download_model():
+    """Download the face landmarker model if not present."""
+    if not MODEL_PATH.exists():
+        print(f"Downloading face landmarker model...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print(f"Model downloaded to {MODEL_PATH}")
+
+
+# MediaPipe landmark indices mapped to anatomical points
+# These indices are based on the 478-point face mesh model (468 + 10 iris landmarks)
+FRONT_LANDMARKS = {
+    # Eyes - Left (from viewer's perspective, subject's right)
+    "leftEyePupil": 468,  # Left iris center
+    "leftEyeMedialCanthus": 133,  # Inner corner of left eye
+    "leftEyeLateralCanthus": 33,  # Outer corner of left eye
+    "leftEyeUpperEyelid": 159,  # Upper eyelid center
+    "leftEyeLowerEyelid": 145,  # Lower eyelid center
+    "leftUpperEyelidCrease": 157,  # Upper eyelid crease
+    "leftEyelidHoodEnd": 130,  # Eyelid hood end
+
+    # Eyes - Right (from viewer's perspective, subject's left)
+    "rightEyePupil": 473,  # Right iris center
+    "rightEyeMedialCanthus": 362,  # Inner corner of right eye
+    "rightEyeLateralCanthus": 263,  # Outer corner of right eye
+    "rightEyeUpperEyelid": 386,  # Upper eyelid center
+    "rightEyeLowerEyelid": 374,  # Lower eyelid center
+    "rightUpperEyelidCrease": 384,  # Upper eyelid crease
+    "rightEyelidHoodEnd": 359,  # Eyelid hood end
+
+    # Eyebrows - Left
+    "leftBrowHead": 107,  # Inner start of left brow
+    "leftBrowInnerCorner": 66,  # Inner corner
+    "leftBrowArch": 105,  # Arch of brow
+    "leftBrowPeak": 63,  # Peak/highest point
+    "leftBrowTail": 70,  # Outer end of brow
+
+    # Eyebrows - Right
+    "rightBrowHead": 336,  # Inner start of right brow
+    "rightBrowInnerCorner": 296,  # Inner corner
+    "rightBrowArch": 334,  # Arch of brow
+    "rightBrowPeak": 293,  # Peak/highest point
+    "rightBrowTail": 300,  # Outer end of brow
+
+    # Nose
+    "leftNoseBridge": 122,  # Left side of nose bridge
+    "rightNoseBridge": 351,  # Right side of nose bridge
+    "noseBottom": 2,  # Tip of nose / bottom
+    "noseLeft": 240,  # Left nostril
+    "noseRight": 460,  # Right nostril
+    "nasalBase": 4,  # Base of nose (columella base)
+
+    # Mouth
+    "cupidsBow": 0,  # Center of upper lip (cupid's bow)
+    "innerCupidsBow": 13,  # Inner cupid's bow
+    "mouthLeft": 61,  # Left corner of mouth
+    "mouthRight": 291,  # Right corner of mouth
+    "mouthMiddle": 14,  # Middle of lips
+    "lowerLip": 17,  # Center of lower lip
+
+    # Chin
+    "chinBottom": 152,  # Bottom of chin (menton)
+    "chinLeft": 172,  # Left side of chin
+    "chinRight": 397,  # Right side of chin
+
+    # Jaw/Gonion
+    "leftTopGonion": 116,  # Left jaw angle top
+    "leftBottomGonion": 135,  # Left jaw angle bottom
+    "rightTopGonion": 345,  # Right jaw angle top
+    "rightBottomGonion": 364,  # Right jaw angle bottom
+
+    # Cheeks
+    "leftCheek": 50,  # Left cheekbone area
+    "rightCheek": 280,  # Right cheekbone area
+
+    # Temples
+    "leftTemple": 54,  # Left temple
+    "rightTemple": 284,  # Right temple
+
+    # Ears (approximate - face mesh doesn't have precise ear points)
+    "leftOuterEar": 127,  # Near left ear
+    "rightOuterEar": 356,  # Near right ear
+
+    # Forehead/Hairline
+    "hairline": 10,  # Center of forehead/hairline
+
+    # Neck (approximate using chin landmarks)
+    "neckLeft": 214,  # Left neck area
+    "neckRight": 434,  # Right neck area
+}
+
+SIDE_LANDMARKS = {
+    # Side profile landmarks - these work best with side-facing images
+    "glabella": 9,  # Between eyebrows
+    "nasion": 168,  # Bridge of nose (top)
+    "forehead": 10,  # Forehead center
+    "cornealApex": 468,  # Eye/cornea (use iris center)
+    "orbitale": 145,  # Lower eye orbit
+    "cheekbone": 50,  # Cheekbone prominence
+    "columella": 4,  # Base of nose
+    "infratip": 5,  # Below nose tip
+    "labraleSuperius": 0,  # Upper lip
+    "labraleInferius": 17,  # Lower lip
+    "cheilion": 61,  # Corner of mouth
+    "menton": 152,  # Chin bottom
+    "gonionTop": 116,  # Jaw angle top
+    "gonionBottom": 135,  # Jaw angle bottom
+    "cervicalPoint": 152,  # Neck/chin junction (approximate)
+    "neckPoint": 175,  # Neck area
+    "intertragicNotch": 127,  # Ear area
+    "occiput": 10,  # Back of head (approximate)
+    "upperEyelid": 159,  # Upper eyelid
+    "lowerEyelid": 145,  # Lower eyelid
+    "eyelidEnd": 33,  # Outer eyelid
+}
+
+# Crop regions for each landmark (x_offset, y_offset, width, height as ratios of face size)
+CROP_CONFIGS = {
+    # Eye regions - smaller crops focused on eyes
+    "leftEyePupil": {"size": 0.25, "aspect": 1.3},
+    "rightEyePupil": {"size": 0.25, "aspect": 1.3},
+    "leftEyeMedialCanthus": {"size": 0.2, "aspect": 1.2},
+    "rightEyeMedialCanthus": {"size": 0.2, "aspect": 1.2},
+    "leftEyeLateralCanthus": {"size": 0.2, "aspect": 1.2},
+    "rightEyeLateralCanthus": {"size": 0.2, "aspect": 1.2},
+    "leftEyeUpperEyelid": {"size": 0.22, "aspect": 1.3},
+    "rightEyeUpperEyelid": {"size": 0.22, "aspect": 1.3},
+    "leftEyeLowerEyelid": {"size": 0.22, "aspect": 1.3},
+    "rightEyeLowerEyelid": {"size": 0.22, "aspect": 1.3},
+    "leftUpperEyelidCrease": {"size": 0.25, "aspect": 1.3},
+    "rightUpperEyelidCrease": {"size": 0.25, "aspect": 1.3},
+    "leftEyelidHoodEnd": {"size": 0.25, "aspect": 1.3},
+    "rightEyelidHoodEnd": {"size": 0.25, "aspect": 1.3},
+
+    # Brow regions
+    "leftBrowHead": {"size": 0.22, "aspect": 1.2},
+    "rightBrowHead": {"size": 0.22, "aspect": 1.2},
+    "leftBrowInnerCorner": {"size": 0.22, "aspect": 1.2},
+    "rightBrowInnerCorner": {"size": 0.22, "aspect": 1.2},
+    "leftBrowArch": {"size": 0.22, "aspect": 1.2},
+    "rightBrowArch": {"size": 0.22, "aspect": 1.2},
+    "leftBrowPeak": {"size": 0.22, "aspect": 1.2},
+    "rightBrowPeak": {"size": 0.22, "aspect": 1.2},
+    "leftBrowTail": {"size": 0.25, "aspect": 1.3},
+    "rightBrowTail": {"size": 0.25, "aspect": 1.3},
+
+    # Nose regions
+    "leftNoseBridge": {"size": 0.25, "aspect": 1.2},
+    "rightNoseBridge": {"size": 0.25, "aspect": 1.2},
+    "noseBottom": {"size": 0.2, "aspect": 1.0},
+    "noseLeft": {"size": 0.18, "aspect": 1.0},
+    "noseRight": {"size": 0.18, "aspect": 1.0},
+    "nasalBase": {"size": 0.22, "aspect": 1.1},
+
+    # Mouth regions
+    "cupidsBow": {"size": 0.18, "aspect": 1.2},
+    "innerCupidsBow": {"size": 0.25, "aspect": 1.4},
+    "mouthLeft": {"size": 0.18, "aspect": 1.1},
+    "mouthRight": {"size": 0.18, "aspect": 1.1},
+    "mouthMiddle": {"size": 0.18, "aspect": 1.2},
+    "lowerLip": {"size": 0.18, "aspect": 1.2},
+
+    # Chin regions
+    "chinBottom": {"size": 0.2, "aspect": 1.1},
+    "chinLeft": {"size": 0.18, "aspect": 1.0},
+    "chinRight": {"size": 0.18, "aspect": 1.0},
+
+    # Jaw regions
+    "leftTopGonion": {"size": 0.2, "aspect": 1.1},
+    "leftBottomGonion": {"size": 0.2, "aspect": 1.1},
+    "rightTopGonion": {"size": 0.2, "aspect": 1.1},
+    "rightBottomGonion": {"size": 0.2, "aspect": 1.1},
+
+    # Cheek regions
+    "leftCheek": {"size": 0.25, "aspect": 1.2},
+    "rightCheek": {"size": 0.25, "aspect": 1.2},
+
+    # Temple regions
+    "leftTemple": {"size": 0.28, "aspect": 1.3},
+    "rightTemple": {"size": 0.28, "aspect": 1.3},
+
+    # Ear regions
+    "leftOuterEar": {"size": 0.28, "aspect": 1.2},
+    "rightOuterEar": {"size": 0.28, "aspect": 1.2},
+
+    # Hairline
+    "hairline": {"size": 0.35, "aspect": 1.4},
+
+    # Neck regions
+    "neckLeft": {"size": 0.22, "aspect": 1.0},
+    "neckRight": {"size": 0.22, "aspect": 1.0},
+
+    # Side profile defaults
+    "glabella": {"size": 0.25, "aspect": 1.2},
+    "nasion": {"size": 0.25, "aspect": 1.2},
+    "forehead": {"size": 0.3, "aspect": 1.3},
+    "cornealApex": {"size": 0.25, "aspect": 1.2},
+    "orbitale": {"size": 0.22, "aspect": 1.2},
+    "cheekbone": {"size": 0.25, "aspect": 1.2},
+    "columella": {"size": 0.22, "aspect": 1.1},
+    "infratip": {"size": 0.2, "aspect": 1.0},
+    "labraleSuperius": {"size": 0.2, "aspect": 1.1},
+    "labraleInferius": {"size": 0.2, "aspect": 1.1},
+    "cheilion": {"size": 0.2, "aspect": 1.1},
+    "menton": {"size": 0.22, "aspect": 1.1},
+    "gonionTop": {"size": 0.22, "aspect": 1.1},
+    "gonionBottom": {"size": 0.22, "aspect": 1.1},
+    "cervicalPoint": {"size": 0.22, "aspect": 1.0},
+    "neckPoint": {"size": 0.22, "aspect": 1.0},
+    "intertragicNotch": {"size": 0.25, "aspect": 1.2},
+    "occiput": {"size": 0.3, "aspect": 1.3},
+    "upperEyelid": {"size": 0.22, "aspect": 1.3},
+    "lowerEyelid": {"size": 0.22, "aspect": 1.3},
+    "eyelidEnd": {"size": 0.22, "aspect": 1.2},
+}
+
+
+def detect_landmarks(image_path: str, is_side_profile: bool = False):
+    """
+    Detect facial landmarks in the given image using MediaPipe Tasks API.
+
+    Args:
+        image_path: Path to the image file
+        is_side_profile: Whether the image is a side profile
+
+    Returns:
+        Tuple of (image, landmarks_dict, image_height, image_width)
+    """
+    # Ensure model is downloaded
+    download_model()
+
+    # Create FaceLandmarker
+    base_options = python.BaseOptions(model_asset_path=str(MODEL_PATH))
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1
+    )
+    detector = vision.FaceLandmarker.create_from_options(options)
+
+    # Load image
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not load image: {image_path}")
+
+    h, w = image.shape[:2]
+
+    # Convert to MediaPipe Image format
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    # Detect landmarks
+    detection_result = detector.detect(mp_image)
+
+    if not detection_result.face_landmarks:
+        raise ValueError(f"No face detected in {image_path}")
+
+    face_landmarks = detection_result.face_landmarks[0]
+
+    # Convert landmarks to pixel coordinates
+    landmarks_dict = {}
+    landmark_mapping = SIDE_LANDMARKS if is_side_profile else FRONT_LANDMARKS
+
+    for name, idx in landmark_mapping.items():
+        if idx < len(face_landmarks):
+            lm = face_landmarks[idx]
+            x = int(lm.x * w)
+            y = int(lm.y * h)
+            landmarks_dict[name] = (x, y)
+
+    return image, landmarks_dict, h, w
+
+
+def create_cropped_image(image, landmark_pos, landmark_name, img_height, img_width,
+                         circle_color=(255, 191, 0), circle_radius=8, circle_thickness=-1):
+    """
+    Create a cropped image around a landmark with a circle marker.
+
+    Args:
+        image: Original image (BGR)
+        landmark_pos: (x, y) position of the landmark
+        landmark_name: Name of the landmark for crop configuration
+        img_height: Height of original image
+        img_width: Width of original image
+        circle_color: BGR color for the circle (default: light blue)
+        circle_radius: Radius of the circle marker
+        circle_thickness: Thickness of circle (-1 for filled)
+
+    Returns:
+        Cropped image with circle marker
+    """
+    x, y = landmark_pos
+
+    # Get crop configuration
+    config = CROP_CONFIGS.get(landmark_name, {"size": 0.25, "aspect": 1.2})
+    size_ratio = config["size"]
+    aspect_ratio = config["aspect"]
+
+    # Calculate crop dimensions based on face size
+    face_size = min(img_height, img_width)
+    crop_height = int(face_size * size_ratio)
+    crop_width = int(crop_height * aspect_ratio)
+
+    # Calculate crop boundaries centered on landmark
+    x1 = max(0, x - crop_width // 2)
+    y1 = max(0, y - crop_height // 2)
+    x2 = min(img_width, x1 + crop_width)
+    y2 = min(img_height, y1 + crop_height)
+
+    # Adjust if crop goes beyond image boundaries
+    if x2 - x1 < crop_width:
+        x1 = max(0, x2 - crop_width)
+    if y2 - y1 < crop_height:
+        y1 = max(0, y2 - crop_height)
+
+    # Create a copy of the image and draw the circle
+    image_with_marker = image.copy()
+    cv2.circle(image_with_marker, (x, y), circle_radius, circle_color, circle_thickness)
+
+    # Crop the image
+    cropped = image_with_marker[y1:y2, x1:x2]
+
+    return cropped
+
+
+def process_image(input_path: str, output_dir: str, output_prefix: str,
+                  is_side_profile: bool = False, output_format: str = "webp"):
+    """
+    Process a single image and generate all landmark crops.
+
+    Args:
+        input_path: Path to input image
+        output_dir: Directory to save output images
+        output_prefix: Prefix for output filenames
+        is_side_profile: Whether the image is a side profile
+        output_format: Output image format (webp, png, jpg)
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"Processing: {input_path}")
+
+    # Detect landmarks
+    image, landmarks, h, w = detect_landmarks(input_path, is_side_profile)
+
+    print(f"  Detected {len(landmarks)} landmarks")
+
+    # Light blue color in BGR format
+    light_blue = (255, 191, 0)  # BGR for light blue
+
+    # Generate cropped images for each landmark
+    for landmark_name, pos in landmarks.items():
+        try:
+            cropped = create_cropped_image(
+                image, pos, landmark_name, h, w,
+                circle_color=light_blue,
+                circle_radius=8,
+                circle_thickness=-1  # Filled circle
+            )
+
+            output_filename = f"{output_prefix}_{landmark_name}.{output_format}"
+            output_file = output_path / output_filename
+
+            cv2.imwrite(str(output_file), cropped)
+            print(f"  Created: {output_filename}")
+
+        except Exception as e:
+            print(f"  Error processing {landmark_name}: {e}")
+
+    print(f"  Completed: {len(landmarks)} images generated")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate facial landmark images with markers"
+    )
+    parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Input image path"
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default="./output",
+        help="Output directory (default: ./output)"
+    )
+    parser.add_argument(
+        "--output-prefix", "-p",
+        required=True,
+        help="Prefix for output filenames (e.g., 'blonde_front')"
+    )
+    parser.add_argument(
+        "--side-profile", "-s",
+        action="store_true",
+        help="Process as side profile image"
+    )
+    parser.add_argument(
+        "--format", "-f",
+        default="webp",
+        choices=["webp", "png", "jpg"],
+        help="Output image format (default: webp)"
+    )
+
+    args = parser.parse_args()
+
+    process_image(
+        args.input,
+        args.output_dir,
+        args.output_prefix,
+        args.side_profile,
+        args.format
+    )
+
+
+if __name__ == "__main__":
+    main()

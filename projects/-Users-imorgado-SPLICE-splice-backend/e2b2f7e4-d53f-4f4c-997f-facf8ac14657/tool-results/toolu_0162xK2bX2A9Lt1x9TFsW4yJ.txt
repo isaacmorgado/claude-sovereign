@@ -1,0 +1,287 @@
+The file /Users/imorgado/SPLICE/splice-cep/panel/js/config.js has been updated. Here's the result of running `cat -n` on a snippet of the edited file:
+   427→
+   428→// Fields that contain sensitive data and should be encrypted
+   429→const SENSITIVE_FIELDS = ['customerId', 'licenseKey', 'accessToken', 'refreshToken'];
+   430→
+   431→// ============================================================================
+   432→// ENCRYPTION HELPERS FOR SENSITIVE DATA (CEP-CRIT-002 FIX)
+   433→// Uses AES-GCM encryption via Web Crypto API for proper security
+   434→// ============================================================================
+   435→
+   436→// Encryption constants
+   437→const SPLICE_ENCRYPTION = {
+   438→    ALGORITHM: 'AES-GCM',
+   439→    KEY_LENGTH: 256,
+   440→    IV_LENGTH: 12,
+   441→    TAG_LENGTH: 128,
+   442→    SALT: 'SPLICE_PANEL_SALT_v1', // Static salt for key derivation
+   443→    ITERATIONS: 100000,
+   444→    PREFIX: 'ENC:v1:'  // Prefix to identify encrypted values
+   445→};
+   446→
+   447→// Cached encryption key (derived once per session)
+   448→let _encryptionKey = null;
+   449→
+   450→/**
+   451→ * Get or derive the encryption key from a machine-specific identifier
+   452→ * Uses PBKDF2 to derive a strong key from available identifiers
+   453→ * @returns {Promise<CryptoKey>} The derived encryption key
+   454→ */
+   455→async function getEncryptionKey() {
+   456→    if (_encryptionKey) {
+   457→        return _encryptionKey;
+   458→    }
+   459→
+   460→    try {
+   461→        // Use a combination of identifiers for key derivation
+   462→        // In CEP, we use localStorage ID + app version as the key material
+   463→        let keyMaterial = localStorage.getItem('splice_device_id');
+   464→        if (!keyMaterial) {
+   465→            // Generate a random device ID on first use
+   466→            keyMaterial = crypto.randomUUID ? crypto.randomUUID() :
+   467→                'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+   468→                    const r = Math.random() * 16 | 0;
+   469→                    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+   470→                    return v.toString(16);
+   471→                });
+   472→            localStorage.setItem('splice_device_id', keyMaterial);
+   473→        }
+   474→
+   475→        const encoder = new TextEncoder();
+   476→        const keyData = encoder.encode(keyMaterial + SPLICE_ENCRYPTION.SALT);
+   477→
+   478→        // Import the key material for PBKDF2
+   479→        const baseKey = await crypto.subtle.importKey(
+   480→            'raw',
+   481→            keyData,
+   482→            'PBKDF2',
+   483→            false,
+   484→            ['deriveKey']
+   485→        );
+   486→
+   487→        // Derive the actual AES key
+   488→        _encryptionKey = await crypto.subtle.deriveKey(
+   489→            {
+   490→                name: 'PBKDF2',
+   491→                salt: encoder.encode(SPLICE_ENCRYPTION.SALT),
+   492→                iterations: SPLICE_ENCRYPTION.ITERATIONS,
+   493→                hash: 'SHA-256'
+   494→            },
+   495→            baseKey,
+   496→            {
+   497→                name: SPLICE_ENCRYPTION.ALGORITHM,
+   498→                length: SPLICE_ENCRYPTION.KEY_LENGTH
+   499→            },
+   500→            false,
+   501→            ['encrypt', 'decrypt']
+   502→        );
+   503→
+   504→        return _encryptionKey;
+   505→    } catch (e) {
+   506→        debugLog('[Config] Key derivation error:', e);
+   507→        return null;
+   508→    }
+   509→}
+   510→
+   511→/**
+   512→ * Encrypt data for secure localStorage storage using AES-GCM
+   513→ *
+   514→ * @param {any} data - Data to encrypt
+   515→ * @returns {Promise<string|null>} Encrypted string with prefix or null on error
+   516→ */
+   517→async function encryptForStorageAsync(data) {
+   518→    try {
+   519→        if (data === null || data === undefined) {
+   520→            return null;
+   521→        }
+   522→
+   523→        const key = await getEncryptionKey();
+   524→        if (!key) {
+   525→            // Fallback to legacy encoding if crypto not available
+   526→            debugLog('[Config] Crypto not available, using legacy encoding');
+   527→            return legacyEncode(data);
+   528→        }
+   529→
+   530→        const encoder = new TextEncoder();
+   531→        const jsonStr = JSON.stringify(data);
+   532→        const plaintext = encoder.encode(jsonStr);
+   533→
+   534→        // Generate random IV
+   535→        const iv = crypto.getRandomValues(new Uint8Array(SPLICE_ENCRYPTION.IV_LENGTH));
+   536→
+   537→        // Encrypt
+   538→        const ciphertext = await crypto.subtle.encrypt(
+   539→            {
+   540→                name: SPLICE_ENCRYPTION.ALGORITHM,
+   541→                iv: iv,
+   542→                tagLength: SPLICE_ENCRYPTION.TAG_LENGTH
+   543→            },
+   544→            key,
+   545→            plaintext
+   546→        );
+   547→
+   548→        // Combine IV + ciphertext and encode as base64
+   549→        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+   550→        combined.set(iv);
+   551→        combined.set(new Uint8Array(ciphertext), iv.length);
+   552→
+   553→        // Convert to base64 with prefix
+   554→        const base64 = btoa(String.fromCharCode(...combined));
+   555→        return SPLICE_ENCRYPTION.PREFIX + base64;
+   556→    } catch (e) {
+   557→        debugLog('[Config] Encryption error:', e);
+   558→        return legacyEncode(data);
+   559→    }
+   560→}
+   561→
+   562→/**
+   563→ * Decrypt data from localStorage using AES-GCM
+   564→ *
+   565→ * @param {string} data - Encrypted string
+   566→ * @returns {Promise<any|null>} Decrypted data or null on error
+   567→ */
+   568→async function decryptFromStorageAsync(data) {
+   569→    try {
+   570→        if (!data || typeof data !== 'string') {
+   571→            return null;
+   572→        }
+   573→
+   574→        // Check if this is the new encrypted format
+   575→        if (!data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+   576→            // Try legacy decoding for backward compatibility
+   577→            return legacyDecode(data);
+   578→        }
+   579→
+   580→        const key = await getEncryptionKey();
+   581→        if (!key) {
+   582→            debugLog('[Config] Crypto not available for decryption');
+   583→            return null;
+   584→        }
+   585→
+   586→        // Remove prefix and decode base64
+   587→        const base64Data = data.slice(SPLICE_ENCRYPTION.PREFIX.length);
+   588→        const combined = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+   589→
+   590→        // Extract IV and ciphertext
+   591→        const iv = combined.slice(0, SPLICE_ENCRYPTION.IV_LENGTH);
+   592→        const ciphertext = combined.slice(SPLICE_ENCRYPTION.IV_LENGTH);
+   593→
+   594→        // Decrypt
+   595→        const plaintext = await crypto.subtle.decrypt(
+   596→            {
+   597→                name: SPLICE_ENCRYPTION.ALGORITHM,
+   598→                iv: iv,
+   599→                tagLength: SPLICE_ENCRYPTION.TAG_LENGTH
+   600→            },
+   601→            key,
+   602→            ciphertext
+   603→        );
+   604→
+   605→        const decoder = new TextDecoder();
+   606→        const jsonStr = decoder.decode(plaintext);
+   607→        return JSON.parse(jsonStr);
+   608→    } catch (e) {
+   609→        // Try legacy decoding as fallback
+   610→        return legacyDecode(data);
+   611→    }
+   612→}
+   613→
+   614→/**
+   615→ * Legacy encoding (Base64) for backward compatibility
+   616→ * @param {any} data - Data to encode
+   617→ * @returns {string|null} Encoded string
+   618→ */
+   619→function legacyEncode(data) {
+   620→    try {
+   621→        if (data === null || data === undefined) {
+   622→            return null;
+   623→        }
+   624→        const jsonStr = JSON.stringify(data);
+   625→        const encoded = encodeURIComponent(jsonStr);
+   626→        return btoa(encoded);
+   627→    } catch (e) {
+   628→        return null;
+   629→    }
+   630→}
+   631→
+   632→/**
+   633→ * Legacy decoding (Base64) for backward compatibility
+   634→ * @param {string} data - Encoded string
+   635→ * @returns {any|null} Decoded data
+   636→ */
+   637→function legacyDecode(data) {
+   638→    try {
+   639→        if (!data || typeof data !== 'string') {
+   640→            return null;
+   641→        }
+   642→        // Skip if it has the encryption prefix
+   643→        if (data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+   644→            return null;
+   645→        }
+   646→        const decoded = atob(data);
+   647→        const jsonStr = decodeURIComponent(decoded);
+   648→        return JSON.parse(jsonStr);
+   649→    } catch (e) {
+   650→        return null;
+   651→    }
+   652→}
+   653→
+   654→/**
+   655→ * Synchronous wrapper for encryption (starts async operation)
+   656→ * For backward compatibility with existing sync code
+   657→ * @param {any} data - Data to encode
+   658→ * @returns {string|null} Encoded string (legacy format until async completes)
+   659→ */
+   660→function encryptForStorage(data) {
+   661→    // Return legacy encoding synchronously
+   662→    // The async version should be preferred for new code
+   663→    return legacyEncode(data);
+   664→}
+   665→
+   666→/**
+   667→ * Synchronous wrapper for decryption
+   668→ * For backward compatibility with existing sync code
+   669→ * @param {string} data - Encoded string
+   670→ * @returns {any|null} Decoded data
+   671→ */
+   672→function decryptFromStorage(data) {
+   673→    // Handle new encrypted format by returning null (needs async)
+   674→    if (data && data.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+   675→        debugLog('[Config] Encrypted data requires async decryption');
+   676→        return null;
+   677→    }
+   678→    return legacyDecode(data);
+   679→}
+   680→
+   681→/**
+   682→ * Check if a value appears to be encrypted
+   683→ *
+   684→ * @param {any} value - Value to check
+   685→ * @returns {boolean} True if value appears to be encrypted
+   686→ */
+   687→function isEncryptedValue(value) {
+   688→    if (!value || typeof value !== 'string') {
+   689→        return false;
+   690→    }
+   691→    // New encryption format
+   692→    if (value.startsWith(SPLICE_ENCRYPTION.PREFIX)) {
+   693→        return true;
+   694→    }
+   695→    // Unencrypted values typically start with known patterns
+   696→    if (value.startsWith('cus_') || value.startsWith('SPLICE-')) {
+   697→        return false;
+   698→    }
+   699→    // Check if it's legacy base64 encoded JSON
+   700→    try {
+   701→        const decoded = atob(value);
+   702→        const jsonStr = decodeURIComponent(decoded);
+   703→        JSON.parse(jsonStr);
+   704→        return true;
+   705→    } catch {
+   706→        return false;
+   707→    }
+   708→}
+   709→
+   710→/**
+   711→ * Encrypt sensitive fields in settings object
+   712→ *

@@ -1,0 +1,609 @@
+import * as vscode from 'vscode';
+import axios from 'axios';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
+
+// GPU Pricing (hourly rates)
+const GPU_PRICING: Record<string, number> = {
+    'RTX 3090': 0.44,
+    'RTX 4090': 0.69,
+    'A40': 0.79,
+    'A100 40GB': 1.14,
+    'A100 80GB': 1.89,
+    'H100 PCIe': 2.99,
+    'H100 SXM': 3.99,
+};
+
+interface EndpointStatus {
+    id: string;
+    name: string;
+    status: 'READY' | 'IDLE' | 'INITIALIZING' | 'THROTTLED' | 'UNHEALTHY';
+    workersRunning: number;
+    workersIdle: number;
+    gpuType: string;
+    hourlyRate: number;
+    sessionStartTime?: Date;
+    currentCost: number;
+}
+
+interface RunPodEndpoint {
+    id: string;
+    name: string;
+    status: string;
+    workersRunning: number;
+    workersIdle: number;
+    gpuIds?: string;
+    templateId?: string;
+}
+
+class RunPodMonitor {
+    private statusBarItem: vscode.StatusBarItem;
+    private costStatusBarItem: vscode.StatusBarItem;
+    private endpoints: Map<string, EndpointStatus> = new Map();
+    private refreshTimer: NodeJS.Timeout | null = null;
+    private sessionCosts: Map<string, { startTime: Date; accumulated: number }> = new Map();
+    private outputChannel: vscode.OutputChannel;
+
+    constructor(private context: vscode.ExtensionContext) {
+        // Main status bar item
+        this.statusBarItem = vscode.window.createStatusBarItem(
+            vscode.StatusBarAlignment.Right,
+            100
+        );
+        this.statusBarItem.command = 'runpod.showStatus';
+        this.statusBarItem.tooltip = 'Click for RunPod GPU control';
+
+        // Cost status bar item
+        this.costStatusBarItem = vscode.window.createStatusBarItem(
+            vscode.StatusBarAlignment.Right,
+            99
+        );
+        this.costStatusBarItem.command = 'runpod.showCosts';
+
+        // Output channel for logs
+        this.outputChannel = vscode.window.createOutputChannel('RunPod GPU Monitor');
+
+        context.subscriptions.push(this.statusBarItem);
+        context.subscriptions.push(this.costStatusBarItem);
+        context.subscriptions.push(this.outputChannel);
+    }
+
+    private getApiKey(): string | undefined {
+        const config = vscode.workspace.getConfiguration('runpod');
+        return config.get<string>('apiKey') || process.env.RUNPOD_API_KEY;
+    }
+
+    private getRefreshInterval(): number {
+        const config = vscode.workspace.getConfiguration('runpod');
+        return (config.get<number>('refreshInterval') || 30) * 1000;
+    }
+
+    async start(): Promise<void> {
+        this.statusBarItem.text = '$(sync~spin) RunPod...';
+        this.statusBarItem.show();
+
+        await this.refresh();
+
+        // Start periodic refresh
+        const interval = this.getRefreshInterval();
+        this.refreshTimer = setInterval(() => this.refresh(), interval);
+
+        this.log('RunPod GPU Monitor started');
+    }
+
+    async stop(): Promise<void> {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+        this.statusBarItem.hide();
+        this.costStatusBarItem.hide();
+        this.log('RunPod GPU Monitor stopped');
+    }
+
+    async refresh(): Promise<void> {
+        const apiKey = this.getApiKey();
+
+        if (!apiKey) {
+            this.statusBarItem.text = '$(alert) RunPod: No API Key';
+            this.statusBarItem.tooltip = 'Click to configure API key';
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            this.costStatusBarItem.hide();
+            return;
+        }
+
+        try {
+            const endpoints = await this.fetchEndpoints(apiKey);
+            this.updateEndpointStatuses(endpoints);
+            this.updateStatusBar();
+            this.updateCostStatusBar();
+        } catch (error) {
+            this.statusBarItem.text = '$(error) RunPod: Error';
+            this.statusBarItem.tooltip = `Error: ${error}`;
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+            this.log(`Error refreshing: ${error}`);
+        }
+    }
+
+    private async fetchEndpoints(apiKey: string): Promise<RunPodEndpoint[]> {
+        const response = await axios.post(
+            'https://api.runpod.io/graphql',
+            {
+                query: `
+                    query {
+                        myself {
+                            serverlessDiscount
+                            endpoints {
+                                id
+                                name
+                                status
+                                workersRunning
+                                workersIdle
+                                gpuIds
+                                templateId
+                            }
+                        }
+                    }
+                `
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        return response.data?.data?.myself?.endpoints || [];
+    }
+
+    private updateEndpointStatuses(rawEndpoints: RunPodEndpoint[]): void {
+        const now = new Date();
+
+        for (const ep of rawEndpoints) {
+            const existing = this.endpoints.get(ep.id);
+            const gpuType = this.inferGpuType(ep);
+            const hourlyRate = GPU_PRICING[gpuType] || 1.0;
+
+            // Track session costs
+            const isActive = ep.workersRunning > 0;
+            let sessionCost = existing?.currentCost || 0;
+
+            if (isActive) {
+                const session = this.sessionCosts.get(ep.id);
+                if (!session) {
+                    // New session started
+                    this.sessionCosts.set(ep.id, { startTime: now, accumulated: 0 });
+                } else {
+                    // Calculate running cost
+                    const durationHours = (now.getTime() - session.startTime.getTime()) / 3600000;
+                    sessionCost = session.accumulated + (durationHours * hourlyRate * ep.workersRunning);
+                }
+            } else {
+                // Session ended, accumulate cost
+                const session = this.sessionCosts.get(ep.id);
+                if (session && existing?.workersRunning && existing.workersRunning > 0) {
+                    const durationHours = (now.getTime() - session.startTime.getTime()) / 3600000;
+                    session.accumulated += durationHours * hourlyRate * existing.workersRunning;
+                    this.sessionCosts.delete(ep.id);
+                }
+            }
+
+            this.endpoints.set(ep.id, {
+                id: ep.id,
+                name: ep.name || ep.id.slice(0, 8),
+                status: ep.status as EndpointStatus['status'],
+                workersRunning: ep.workersRunning,
+                workersIdle: ep.workersIdle,
+                gpuType,
+                hourlyRate,
+                currentCost: sessionCost
+            });
+        }
+    }
+
+    private inferGpuType(endpoint: RunPodEndpoint): string {
+        // Try to infer from gpuIds or config
+        const config = vscode.workspace.getConfiguration('runpod');
+        const endpointConfigs = config.get<Record<string, { gpu?: string }>>('endpoints') || {};
+
+        if (endpointConfigs[endpoint.id]?.gpu) {
+            return endpointConfigs[endpoint.id].gpu!;
+        }
+
+        // Default inference based on common patterns
+        return 'A40'; // Default assumption
+    }
+
+    private updateStatusBar(): void {
+        const active = Array.from(this.endpoints.values()).filter(e => e.workersRunning > 0);
+        const total = this.endpoints.size;
+
+        if (active.length > 0) {
+            this.statusBarItem.text = `$(vm-running) RunPod: ${active.length}/${total} Active`;
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
+        } else {
+            this.statusBarItem.text = `$(vm) RunPod: ${total} Idle`;
+            this.statusBarItem.backgroundColor = undefined;
+        }
+
+        // Build tooltip
+        const tooltipLines = ['RunPod GPU Endpoints\n'];
+        for (const ep of this.endpoints.values()) {
+            const icon = ep.workersRunning > 0 ? '🟢' : '⚫';
+            tooltipLines.push(`${icon} ${ep.name}: ${ep.gpuType}`);
+            if (ep.workersRunning > 0) {
+                tooltipLines.push(`   Workers: ${ep.workersRunning} | $${ep.currentCost.toFixed(2)}`);
+            }
+        }
+        tooltipLines.push('\nClick for controls');
+        this.statusBarItem.tooltip = new vscode.MarkdownString(tooltipLines.join('\n'));
+    }
+
+    private updateCostStatusBar(): void {
+        const config = vscode.workspace.getConfiguration('runpod');
+        if (!config.get<boolean>('showCostInStatusBar')) {
+            this.costStatusBarItem.hide();
+            return;
+        }
+
+        const totalCost = Array.from(this.endpoints.values())
+            .reduce((sum, ep) => sum + ep.currentCost, 0);
+
+        if (totalCost > 0) {
+            this.costStatusBarItem.text = `$(credit-card) $${totalCost.toFixed(2)}`;
+            this.costStatusBarItem.tooltip = 'Current session costs - Click for details';
+            this.costStatusBarItem.show();
+        } else {
+            this.costStatusBarItem.hide();
+        }
+    }
+
+    async showStatusQuickPick(): Promise<void> {
+        const items: vscode.QuickPickItem[] = [];
+
+        // Add endpoint controls
+        for (const ep of this.endpoints.values()) {
+            const isActive = ep.workersRunning > 0;
+            const icon = isActive ? '$(debug-stop)' : '$(play)';
+            const action = isActive ? 'Pause' : 'Resume';
+            const costInfo = isActive ? ` | $${ep.currentCost.toFixed(2)}` : '';
+
+            items.push({
+                label: `${icon} ${ep.name}`,
+                description: `${ep.gpuType} | $${ep.hourlyRate}/hr${costInfo}`,
+                detail: isActive
+                    ? `${ep.workersRunning} workers running - Click to pause`
+                    : 'Idle - Click to resume'
+            });
+        }
+
+        items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+        items.push({ label: '$(stop-circle) Pause All Endpoints', description: 'Stop all running workers' });
+        items.push({ label: '$(play-circle) Resume All Endpoints', description: 'Start all endpoints' });
+        items.push({ label: '$(graph) View Cost Report', description: 'Open detailed cost analysis' });
+        items.push({ label: '$(refresh) Refresh Status', description: 'Force status refresh' });
+
+        const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: 'RunPod GPU Control',
+            matchOnDescription: true
+        });
+
+        if (!selected) return;
+
+        if (selected.label.includes('Pause All')) {
+            await this.pauseAllEndpoints();
+        } else if (selected.label.includes('Resume All')) {
+            await this.resumeAllEndpoints();
+        } else if (selected.label.includes('Cost Report')) {
+            await this.showCostReport();
+        } else if (selected.label.includes('Refresh')) {
+            await this.refresh();
+        } else {
+            // Individual endpoint action
+            const epName = selected.label.replace(/^\$\([^)]+\)\s*/, '');
+            const endpoint = Array.from(this.endpoints.values()).find(e => e.name === epName);
+            if (endpoint) {
+                if (endpoint.workersRunning > 0) {
+                    await this.pauseEndpoint(endpoint.id);
+                } else {
+                    await this.resumeEndpoint(endpoint.id);
+                }
+            }
+        }
+    }
+
+    async pauseEndpoint(endpointId: string): Promise<void> {
+        const apiKey = this.getApiKey();
+        if (!apiKey) {
+            vscode.window.showErrorMessage('RunPod API key not configured');
+            return;
+        }
+
+        try {
+            await axios.post(
+                'https://api.runpod.io/graphql',
+                {
+                    query: `
+                        mutation {
+                            updateEndpointMinWorkers(input: {
+                                endpointId: "${endpointId}",
+                                minWorkers: 0
+                            }) {
+                                id
+                            }
+                        }
+                    `
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+
+            vscode.window.showInformationMessage('Endpoint paused');
+            await this.logCost(endpointId, 'pause');
+            await this.refresh();
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to pause endpoint: ${error}`);
+            this.log(`Pause error: ${error}`);
+        }
+    }
+
+    async resumeEndpoint(endpointId: string): Promise<void> {
+        const apiKey = this.getApiKey();
+        if (!apiKey) {
+            vscode.window.showErrorMessage('RunPod API key not configured');
+            return;
+        }
+
+        try {
+            await axios.post(
+                'https://api.runpod.io/graphql',
+                {
+                    query: `
+                        mutation {
+                            updateEndpointMinWorkers(input: {
+                                endpointId: "${endpointId}",
+                                minWorkers: 1
+                            }) {
+                                id
+                            }
+                        }
+                    `
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+
+            // Track session start
+            this.sessionCosts.set(endpointId, { startTime: new Date(), accumulated: 0 });
+
+            vscode.window.showInformationMessage('Endpoint resumed');
+            await this.refresh();
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to resume endpoint: ${error}`);
+            this.log(`Resume error: ${error}`);
+        }
+    }
+
+    async pauseAllEndpoints(): Promise<void> {
+        const active = Array.from(this.endpoints.values()).filter(e => e.workersRunning > 0);
+
+        if (active.length === 0) {
+            vscode.window.showInformationMessage('No active endpoints to pause');
+            return;
+        }
+
+        const confirm = await vscode.window.showWarningMessage(
+            `Pause ${active.length} active endpoint(s)?`,
+            'Yes', 'No'
+        );
+
+        if (confirm !== 'Yes') return;
+
+        for (const ep of active) {
+            await this.pauseEndpoint(ep.id);
+        }
+    }
+
+    async resumeAllEndpoints(): Promise<void> {
+        const idle = Array.from(this.endpoints.values()).filter(e => e.workersRunning === 0);
+
+        if (idle.length === 0) {
+            vscode.window.showInformationMessage('All endpoints are already running');
+            return;
+        }
+
+        const confirm = await vscode.window.showWarningMessage(
+            `Resume ${idle.length} endpoint(s)? This will incur GPU costs.`,
+            'Yes', 'No'
+        );
+
+        if (confirm !== 'Yes') return;
+
+        for (const ep of idle) {
+            await this.resumeEndpoint(ep.id);
+        }
+    }
+
+    async showCostReport(): Promise<void> {
+        // Try to use cost_tracker.py for detailed report
+        const config = vscode.workspace.getConfiguration('runpod');
+        const trackerPath = config.get<string>('costTrackerPath') || '~/cost_tracker.py';
+        const expandedPath = trackerPath.replace('~', process.env.HOME || '');
+
+        try {
+            const { stdout } = await execAsync(`python3 "${expandedPath}" report`);
+
+            const doc = await vscode.workspace.openTextDocument({
+                content: stdout,
+                language: 'json'
+            });
+            await vscode.window.showTextDocument(doc);
+        } catch {
+            // Fallback to inline report
+            let report = '# RunPod Cost Report\n\n';
+            report += `Generated: ${new Date().toISOString()}\n\n`;
+            report += '## Current Session\n\n';
+
+            let totalCost = 0;
+            for (const ep of this.endpoints.values()) {
+                report += `### ${ep.name}\n`;
+                report += `- GPU: ${ep.gpuType} ($${ep.hourlyRate}/hr)\n`;
+                report += `- Status: ${ep.workersRunning > 0 ? 'Active' : 'Idle'}\n`;
+                report += `- Session Cost: $${ep.currentCost.toFixed(4)}\n\n`;
+                totalCost += ep.currentCost;
+            }
+
+            report += `## Total: $${totalCost.toFixed(4)}\n`;
+
+            const doc = await vscode.workspace.openTextDocument({
+                content: report,
+                language: 'markdown'
+            });
+            await vscode.window.showTextDocument(doc);
+        }
+    }
+
+    private async logCost(endpointId: string, action: string): Promise<void> {
+        const endpoint = this.endpoints.get(endpointId);
+        if (!endpoint || endpoint.currentCost === 0) return;
+
+        const config = vscode.workspace.getConfiguration('runpod');
+        const trackerPath = config.get<string>('costTrackerPath') || '~/cost_tracker.py';
+        const expandedPath = trackerPath.replace('~', process.env.HOME || '');
+
+        try {
+            const duration = Math.round(endpoint.currentCost / endpoint.hourlyRate * 3600);
+            await execAsync(
+                `python3 "${expandedPath}" log "${endpointId}" "${endpoint.name}" "${endpoint.gpuType}" ${duration}`
+            );
+            this.log(`Logged cost for ${endpoint.name}: $${endpoint.currentCost.toFixed(4)}`);
+        } catch (error) {
+            this.log(`Failed to log cost: ${error}`);
+        }
+    }
+
+    private log(message: string): void {
+        const timestamp = new Date().toISOString();
+        this.outputChannel.appendLine(`[${timestamp}] ${message}`);
+    }
+
+    getEndpoints(): Map<string, EndpointStatus> {
+        return this.endpoints;
+    }
+}
+
+let monitor: RunPodMonitor | null = null;
+
+export function activate(context: vscode.ExtensionContext) {
+    console.log('RunPod GPU Monitor activating...');
+
+    monitor = new RunPodMonitor(context);
+    monitor.start();
+
+    // Register commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.showStatus', () => {
+            monitor?.showStatusQuickPick();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.pauseAll', () => {
+            monitor?.pauseAllEndpoints();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.resumeAll', () => {
+            monitor?.resumeAllEndpoints();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.pauseEndpoint', async () => {
+            if (!monitor) return;
+
+            const endpoints = Array.from(monitor.getEndpoints().values())
+                .filter(e => e.workersRunning > 0);
+
+            if (endpoints.length === 0) {
+                vscode.window.showInformationMessage('No active endpoints to pause');
+                return;
+            }
+
+            const items = endpoints.map(e => ({
+                label: e.name,
+                description: `${e.gpuType} | $${e.currentCost.toFixed(2)}`
+            }));
+
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select endpoint to pause'
+            });
+
+            if (selected) {
+                const ep = endpoints.find(e => e.name === selected.label);
+                if (ep) await monitor.pauseEndpoint(ep.id);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.resumeEndpoint', async () => {
+            if (!monitor) return;
+
+            const endpoints = Array.from(monitor.getEndpoints().values())
+                .filter(e => e.workersRunning === 0);
+
+            if (endpoints.length === 0) {
+                vscode.window.showInformationMessage('All endpoints are already running');
+                return;
+            }
+
+            const items = endpoints.map(e => ({
+                label: e.name,
+                description: `${e.gpuType} | $${e.hourlyRate}/hr`
+            }));
+
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select endpoint to resume'
+            });
+
+            if (selected) {
+                const ep = endpoints.find(e => e.name === selected.label);
+                if (ep) await monitor.resumeEndpoint(ep.id);
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.showCosts', () => {
+            monitor?.showCostReport();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('runpod.refresh', () => {
+            monitor?.refresh();
+        })
+    );
+
+    console.log('RunPod GPU Monitor activated');
+}
+
+export function deactivate() {
+    if (monitor) {
+        monitor.stop();
+        monitor = null;
+    }
+}

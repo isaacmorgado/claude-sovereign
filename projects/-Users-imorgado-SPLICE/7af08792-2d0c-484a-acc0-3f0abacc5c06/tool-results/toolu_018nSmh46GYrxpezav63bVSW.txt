@@ -1,0 +1,154 @@
+   350→                  license_key: licenseResult.key,
+   351→                  license_generated_at: new Date().toISOString()
+   352→                }
+   353→              });
+   354→              console.log(`[SPLICE] Stored license key in Stripe metadata for subscription ${subscription.id}`);
+   355→            } catch (stripeErr) {
+   356→              console.error(`[SPLICE] Failed to store license key in Stripe metadata:`, stripeErr.message);
+   357→            }
+   358→
+   359→            // Get customer email and send license key
+   360→            try {
+   361→              const customer = await stripe.customers.retrieve(customerId);
+   362→              if (customer.email) {
+   363→                // SECURITY: Mask sensitive data in logs
+   364→                console.log(`[SPLICE] License key ready for delivery to ${maskSensitiveData(customer.email)}: ${maskSensitiveData(licenseResult.key)}`);
+   365→                // TODO: Integrate with email service (SendGrid, SES, etc.)
+   366→                // await sendLicenseKeyEmail(customer.email, licenseResult.key, tier);
+   367→
+   368→                // Store email in database for reference
+   369→                await usageTracking.updateTier(customerId, tier, customer.email);
+   370→              } else {
+   371→                console.warn(`[SPLICE] No email found for customer ${customerId}`);
+   372→              }
+   373→            } catch (emailErr) {
+   374→              console.error(`[SPLICE] Error getting customer email:`, emailErr.message);
+   375→            }
+   376→          } else {
+   377→            // CRITICAL: License generation failed - return 500 to trigger Stripe retry
+   378→            const errorMsg = `Failed to generate license key after ${maxRetries} attempts: ${licenseResult?.error || 'Unknown error'}`;
+   379→            console.error(`[SPLICE] ${errorMsg}`);
+   380→            return res.status(500).json({ error: errorMsg });
+   381→          }
+   382→        }
+   383→        break;
+   384→      }
+   385→
+   386→      case 'customer.subscription.deleted': {
+   387→        const subscription = event.data.object;
+   388→        const customerId = subscription.customer;
+   389→
+   390→        // Validate customerId
+   391→        if (!customerId) {
+   392→          console.error('[SPLICE] Missing customer ID in subscription.deleted event');
+   393→          return res.status(400).json({ error: 'Missing customer ID' });
+   394→        }
+   395→
+   396→        // Downgrade to cancelled (0 hours)
+   397→        await usageTracking.updateTier(customerId, 'cancelled');
+   398→        console.log(`[SPLICE] Subscription cancelled for customer ${customerId}`);
+   399→        break;
+   400→      }
+   401→
+   402→      case 'invoice.payment_succeeded': {
+   403→        const invoice = event.data.object;
+   404→        const customerId = invoice.customer;
+   405→        const subscriptionId = invoice.subscription;
+   406→
+   407→        // Validate customerId
+   408→        if (!customerId) {
+   409→          console.error('[SPLICE] Missing customer ID in invoice event');
+   410→          return res.status(400).json({ error: 'Missing customer ID' });
+   411→        }
+   412→
+   413→        // Reset hours on successful payment (new billing period)
+   414→        let tier = 'starter';
+   415→        if (subscriptionId) {
+   416→          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+   417→          const priceId = subscription.items?.data?.[0]?.price?.id;
+   418→          tier = getTierFromPriceId(priceId);
+   419→
+   420→          await usageTracking.resetHours(customerId, tier);
+   421→          console.log(`[SPLICE] Reset hours for customer ${customerId} (tier: ${tier})`);
+   422→        }
+   423→
+   424→        // Check for affiliate coupon and record commission
+   425→        const discount = invoice.discount;
+   426→        if (discount && discount.coupon) {
+   427→          const couponId = discount.coupon.id;
+   428→          // Check if this is an affiliate code (like JIMMYN)
+   429→          if (referralService.AFFILIATE_CODES[couponId]) {
+   430→            const amountPaid = invoice.amount_paid / 100; // Convert cents to dollars
+   431→            await referralService.recordAffiliateCommission(
+   432→              couponId,
+   433→              customerId,
+   434→              amountPaid,
+   435→              tier
+   436→            );
+   437→            console.log(`[SPLICE] Recorded affiliate commission for ${couponId}`);
+   438→          }
+   439→        }
+   440→        break;
+   441→      }
+   442→
+   443→      case 'invoice.payment_failed': {
+   444→        const invoice = event.data.object;
+   445→        const customerId = invoice.customer;
+   446→        const attemptCount = invoice.attempt_count || 1;
+   447→
+   448→        // Validate customerId
+   449→        if (!customerId) {
+   450→          console.error('[SPLICE] Missing customer ID in payment_failed event');
+   451→          return res.status(400).json({ error: 'Missing customer ID' });
+   452→        }
+   453→
+   454→        console.warn(`[SPLICE] Payment failed for customer ${customerId} (attempt ${attemptCount})`);
+   455→
+   456→        // Stripe will retry automatically per retry settings
+   457→        // On final failure, Stripe will cancel subscription which triggers customer.subscription.deleted
+   458→        // For now, just log and potentially notify user
+   459→        if (attemptCount >= 3) {
+   460→          console.error(`[SPLICE] Final payment attempt failed for customer ${customerId}`);
+   461→          // TODO: Send warning email to customer about impending cancellation
+   462→        }
+   463→        break;
+   464→      }
+   465→
+   466→      case 'customer.deleted': {
+   467→        const customer = event.data.object;
+   468→        const customerId = customer.id;
+   469→
+   470→        // Validate customerId
+   471→        if (!customerId) {
+   472→          console.error('[SPLICE] Missing customer ID in customer.deleted event');
+   473→          return res.status(400).json({ error: 'Missing customer ID' });
+   474→        }
+   475→
+   476→        // Clean up user data - downgrade to cancelled
+   477→        await usageTracking.updateTier(customerId, 'cancelled');
+   478→        console.log(`[SPLICE] Customer deleted: ${customerId}`);
+   479→        break;
+   480→      }
+   481→
+   482→      default:
+   483→        console.log(`[SPLICE] Unhandled event type: ${event.type}`);
+   484→    }
+   485→
+   486→    // Record event as processed (idempotency)
+   487→    await usageTracking.recordWebhookEvent(event.id, event.type);
+   488→
+   489→    res.json({ received: true });
+   490→  } catch (err) {
+   491→    console.error('[SPLICE] Webhook handler error:', err);
+   492→    res.status(500).json({ error: err.message });
+   493→  }
+   494→});
+   495→
+   496→// Parse JSON body for all other routes
+   497→// SECURITY: Limit JSON body size to prevent DoS attacks
+   498→app.use(express.json({ limit: '10mb' }));
+   499→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

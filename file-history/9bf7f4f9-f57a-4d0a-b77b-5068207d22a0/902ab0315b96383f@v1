@@ -1,0 +1,273 @@
+/**
+ * Multitrack Routes
+ *
+ * Multitrack/Multicam analysis endpoints
+ */
+
+const express = require('express');
+const fs = require('fs');
+const { isFFprobeInstalled } = require('../services/ffprobeSilence');
+const {
+  analyzeMultitrack,
+  autoBalanceMultitrack,
+  advancedBalanceMultitrack
+} = require('../services/multitrackAnalysis');
+
+/**
+ * Create multitrack routes
+ * @param {Object} options - Route configuration options
+ * @param {Object} options.middleware - Shared middleware (requireCredits)
+ * @returns {express.Router}
+ */
+function createMultitrackRoutes(options = {}) {
+  const router = express.Router();
+  const { requireCredits, requireFeature } = options.middleware || {};
+
+  /**
+   * POST / - Analyze multiple audio tracks for multicam editing
+   *
+   * Analyzes audio levels across multiple tracks to determine optimal
+   * video angle selection based on who is speaking.
+   *
+   * Options:
+   * - audioPaths: Array of paths to audio files (one per speaker) - required
+   * - speakerNames: Array of speaker names (optional)
+   * - videoTrackMapping: Object mapping speaker index to video track { 0: 0, 1: 1 }
+   * - minShotDuration: Minimum seconds before next cut (default: 2.0)
+   * - switchingFrequency: How often to allow cuts 0-100 (default: 50)
+   * - wideShotEnabled: Enable wide shot detection (default: true)
+   * - wideShotPercentage: Target % of wide shots (default: 20)
+   * - wideShotTracks: Video track indices for wide shots
+   * - cutawayEnabled: Enable cutaway insertion (default: false)
+   * - cutawayTracks: Video track indices for cutaways
+   * - speakerBoosts: Per-speaker dB adjustments { "Speaker 1": 5 }
+   */
+  router.post('/', requireCredits({ endpoint: 'multitrack' }), async (req, res) => {
+    const {
+      audioPaths,
+      speakerNames,
+      videoTrackMapping = {},
+      minShotDuration = 2.0,
+      switchingFrequency = 50,
+      wideShotEnabled = true,
+      wideShotPercentage = 20,
+      wideShotTracks = [],
+      cutawayEnabled = false,
+      cutawayTracks = [],
+      speakerBoosts = {},
+      frameRate = 30
+    } = req.body;
+
+    // Validate audioPaths
+    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length === 0) {
+      return res.status(400).json({ error: 'audioPaths array is required (at least 1 path)' });
+    }
+
+    // Validate all files exist
+    for (const audioPath of audioPaths) {
+      if (!fs.existsSync(audioPath)) {
+        return res.status(404).json({ error: `File not found: ${audioPath}` });
+      }
+    }
+
+    // Check FFprobe availability
+    const ffprobeAvailable = await isFFprobeInstalled();
+    if (!ffprobeAvailable) {
+      return res.status(500).json({
+        error: 'FFprobe not installed. Run: brew install ffmpeg'
+      });
+    }
+
+    console.log(`[SPLICE] Multitrack analysis: ${audioPaths.length} track(s)`);
+
+    try {
+      const result = await analyzeMultitrack(audioPaths, {
+        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+        videoTrackMapping,
+        minShotDuration,
+        switchingFrequency,
+        wideShotEnabled,
+        wideShotPercentage,
+        wideShotTracks,
+        cutawayEnabled,
+        cutawayTracks,
+        speakerBoosts,
+        frameRate
+      });
+
+      // Deduct usage based on total duration (use longest track)
+      const audioDuration = result.metadata?.totalDuration || 0;
+      let balance = null;
+      if (audioDuration > 0 && req.deductUsage) {
+        balance = await req.deductUsage(audioDuration);
+      }
+
+      res.json({
+        success: true,
+        ...result,
+        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+      });
+    } catch (err) {
+      console.error('[SPLICE] Multitrack analysis error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /auto-balance - Auto-balance speaker screentime
+   *
+   * Automatically adjusts speaker boosts to achieve equal screentime distribution.
+   * Runs multiple iterations to find optimal parameters.
+   */
+  router.post('/auto-balance', requireCredits({ endpoint: 'multitrack-auto-balance' }), async (req, res) => {
+    const {
+      audioPaths,
+      speakerNames,
+      videoTrackMapping = {},
+      minShotDuration = 2.0,
+      switchingFrequency = 50,
+      wideShotEnabled = false, // Disable wide shots for balance calc
+      frameRate = 30
+    } = req.body;
+
+    // Validate audioPaths
+    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length < 2) {
+      return res.status(400).json({ error: 'audioPaths array requires at least 2 tracks for balancing' });
+    }
+
+    // Validate all files exist
+    for (const audioPath of audioPaths) {
+      if (!fs.existsSync(audioPath)) {
+        return res.status(404).json({ error: `File not found: ${audioPath}` });
+      }
+    }
+
+    // Check FFprobe availability
+    const ffprobeAvailable = await isFFprobeInstalled();
+    if (!ffprobeAvailable) {
+      return res.status(500).json({
+        error: 'FFprobe not installed. Run: brew install ffmpeg'
+      });
+    }
+
+    console.log(`[SPLICE] Auto-balancing multitrack: ${audioPaths.length} track(s)`);
+
+    try {
+      const result = await autoBalanceMultitrack(audioPaths, {
+        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+        videoTrackMapping,
+        minShotDuration,
+        switchingFrequency,
+        wideShotEnabled,
+        frameRate
+      });
+
+      // Deduct usage based on total duration
+      const audioDuration = result.metadata?.totalDuration || 0;
+      let balance = null;
+      if (audioDuration > 0 && req.deductUsage) {
+        balance = await req.deductUsage(audioDuration);
+      }
+
+      res.json({
+        success: true,
+        ...result,
+        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+      });
+    } catch (err) {
+      console.error('[SPLICE] Auto-balance error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /advanced-balance - Advanced GA-optimized balancing
+   *
+   * Uses genetic algorithm optimization with constraints:
+   * - maxConsecutiveSeconds: Prevent single speaker dominating too long
+   * - momentumFactor: Reduce rapid switching between speakers
+   * - targetDistribution: Custom target percentages per speaker
+   */
+  router.post('/advanced-balance', requireCredits({ endpoint: 'multitrack-advanced' }), async (req, res) => {
+    const {
+      audioPaths,
+      speakerNames,
+      videoTrackMapping = {},
+      minShotDuration = 2.0,
+      switchingFrequency = 50,
+      frameRate = 30,
+      // Advanced options
+      maxConsecutiveSeconds = 30,
+      momentumFactor = 0.7,
+      populationSize = 20,
+      generations = 10,
+      targetDistribution = null
+    } = req.body;
+
+    // Validate audioPaths
+    if (!audioPaths || !Array.isArray(audioPaths) || audioPaths.length < 2) {
+      return res.status(400).json({ error: 'audioPaths array requires at least 2 tracks for balancing' });
+    }
+
+    // Validate all files exist
+    for (const audioPath of audioPaths) {
+      if (!fs.existsSync(audioPath)) {
+        return res.status(404).json({ error: `File not found: ${audioPath}` });
+      }
+    }
+
+    // Validate constraints
+    if (maxConsecutiveSeconds < 5 || maxConsecutiveSeconds > 120) {
+      return res.status(400).json({ error: 'maxConsecutiveSeconds must be between 5 and 120' });
+    }
+    if (momentumFactor < 0 || momentumFactor > 1) {
+      return res.status(400).json({ error: 'momentumFactor must be between 0 and 1' });
+    }
+
+    // Check FFprobe availability
+    const ffprobeAvailable = await isFFprobeInstalled();
+    if (!ffprobeAvailable) {
+      return res.status(500).json({
+        error: 'FFprobe not installed. Run: brew install ffmpeg'
+      });
+    }
+
+    console.log(`[SPLICE] Advanced balancing multitrack: ${audioPaths.length} track(s)`);
+    console.log(`  - Max consecutive: ${maxConsecutiveSeconds}s, Momentum: ${momentumFactor}`);
+
+    try {
+      const result = await advancedBalanceMultitrack(audioPaths, {
+        speakerNames: speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+        videoTrackMapping,
+        minShotDuration,
+        switchingFrequency,
+        frameRate,
+        maxConsecutiveSeconds,
+        momentumFactor,
+        populationSize,
+        generations,
+        targetDistribution
+      });
+
+      // Deduct usage based on total duration
+      const audioDuration = result.metadata?.totalDuration || 0;
+      let balance = null;
+      if (audioDuration > 0 && req.deductUsage) {
+        balance = await req.deductUsage(audioDuration);
+      }
+
+      res.json({
+        success: true,
+        ...result,
+        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+      });
+    } catch (err) {
+      console.error('[SPLICE] Advanced balance error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  return router;
+}
+
+module.exports = createMultitrackRoutes;

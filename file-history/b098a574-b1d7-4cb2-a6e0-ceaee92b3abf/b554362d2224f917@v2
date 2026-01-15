@@ -1,0 +1,188 @@
+import { NextRequest, NextResponse } from "next/server";
+import Stripe from "stripe";
+
+// Lazy initialization to avoid errors during build
+let stripe: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!stripe) {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      throw new Error("STRIPE_SECRET_KEY is not configured");
+    }
+    stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+  return stripe;
+}
+
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || "";
+
+// Backend API URL for forwarding events
+const BACKEND_API_URL =
+  process.env.BACKEND_API_URL || "https://splice-api-production.up.railway.app";
+
+export async function POST(request: NextRequest) {
+  const body = await request.text();
+  const signature = request.headers.get("stripe-signature");
+
+  if (!signature) {
+    return NextResponse.json(
+      { error: "Missing stripe-signature header" },
+      { status: 400 }
+    );
+  }
+
+  let event: Stripe.Event;
+
+  try {
+    event = getStripe().webhooks.constructEvent(body, signature, webhookSecret);
+  } catch (error) {
+    console.error("Webhook signature verification failed:", error);
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Webhook signature verification failed",
+      },
+      { status: 400 }
+    );
+  }
+
+  // Handle the event
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        await handleCheckoutComplete(session);
+        break;
+      }
+
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionUpdate(subscription);
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionCanceled(subscription);
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object as Stripe.Invoice;
+        await handleInvoicePaid(invoice);
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice;
+        await handleInvoicePaymentFailed(invoice);
+        break;
+      }
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    // Forward the event to the backend API for processing
+    await forwardToBackend(event);
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error("Error processing webhook:", error);
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Error processing webhook",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+async function handleCheckoutComplete(session: Stripe.Checkout.Session) {
+  console.log("Checkout completed:", {
+    sessionId: session.id,
+    customerEmail: session.customer_details?.email,
+    plan: session.metadata?.plan,
+    subscriptionId: session.subscription,
+  });
+
+  // Here you could:
+  // - Send welcome email
+  // - Provision user account
+  // - Grant access to the plugin
+}
+
+async function handleSubscriptionUpdate(subscription: Stripe.Subscription) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sub = subscription as any;
+  console.log("Subscription updated:", {
+    subscriptionId: subscription.id,
+    status: subscription.status,
+    customerId: subscription.customer,
+    currentPeriodEnd: sub.current_period_end
+      ? new Date(sub.current_period_end * 1000)
+      : null,
+  });
+
+  // Here you could:
+  // - Update user's plan in database
+  // - Adjust feature access
+}
+
+async function handleSubscriptionCanceled(subscription: Stripe.Subscription) {
+  console.log("Subscription canceled:", {
+    subscriptionId: subscription.id,
+    customerId: subscription.customer,
+  });
+
+  // Here you could:
+  // - Revoke access at end of billing period
+  // - Send cancellation confirmation
+  // - Trigger win-back campaign
+}
+
+async function handleInvoicePaid(invoice: Stripe.Invoice) {
+  console.log("Invoice paid:", {
+    invoiceId: invoice.id,
+    customerId: invoice.customer,
+    amount: invoice.amount_paid,
+  });
+
+  // Here you could:
+  // - Send receipt
+  // - Reset usage limits
+  // - Update billing history
+}
+
+async function handleInvoicePaymentFailed(invoice: Stripe.Invoice) {
+  console.log("Invoice payment failed:", {
+    invoiceId: invoice.id,
+    customerId: invoice.customer,
+    amount: invoice.amount_due,
+  });
+
+  // Here you could:
+  // - Send payment failure notification
+  // - Retry payment
+  // - Pause account if needed
+}
+
+async function forwardToBackend(event: Stripe.Event) {
+  try {
+    const response = await fetch(`${BACKEND_API_URL}/webhooks/stripe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Webhook-Source": "splice-website",
+      },
+      body: JSON.stringify(event),
+    });
+
+    if (!response.ok) {
+      console.error("Failed to forward webhook to backend:", await response.text());
+    }
+  } catch (error) {
+    console.error("Error forwarding webhook to backend:", error);
+  }
+}

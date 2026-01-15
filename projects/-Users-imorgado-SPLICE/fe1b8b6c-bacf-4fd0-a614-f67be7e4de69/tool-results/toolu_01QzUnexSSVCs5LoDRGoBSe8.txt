@@ -1,0 +1,335 @@
+     1→#!/bin/bash
+     2→#
+     3→# SPLICE Plugin - macOS PKG Installer Build Script
+     4→# Builds a signed .pkg installer using pkgbuild and productbuild
+     5→#
+     6→
+     7→set -e
+     8→
+     9→# Script directory
+    10→SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    11→PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    12→INSTALLER_DIR="$SCRIPT_DIR"
+    13→
+    14→# Source directories
+    15→CEP_SOURCE="$PROJECT_ROOT/splice-cep"
+    16→UXP_SOURCE="$PROJECT_ROOT/splice-plugin"
+    17→SHARED_ASSETS="$SCRIPT_DIR/../shared/assets"
+    18→
+    19→# Build directories
+    20→BUILD_DIR="$INSTALLER_DIR/build"
+    21→STAGING_DIR="$BUILD_DIR/staging"
+    22→OUTPUT_DIR="$PROJECT_ROOT/dist"
+    23→
+    24→# Version info
+    25→VERSION_FILE="$SCRIPT_DIR/../shared/version.json"
+    26→if [ -f "$VERSION_FILE" ]; then
+    27→    VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$VERSION_FILE" | cut -d'"' -f4)
+    28→else
+    29→    VERSION="6.0.3"
+    30→fi
+    31→
+    32→# Package identifiers
+    33→BUNDLE_ID="com.splice.panel"
+    34→CEP_PKG_ID="${BUNDLE_ID}.cep"
+    35→UXP_PKG_ID="${BUNDLE_ID}.uxp"
+    36→
+    37→# Signing identity (set via environment or parameter)
+    38→SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
+    39→NOTARIZE="${NOTARIZE:-false}"
+    40→APPLE_ID="${APPLE_ID:-}"
+    41→TEAM_ID="${TEAM_ID:-}"
+    42→APP_PASSWORD="${APP_PASSWORD:-}"
+    43→
+    44→# Output filenames
+    45→PKG_NAME="SPLICE-Installer-${VERSION}.pkg"
+    46→UNSIGNED_PKG_NAME="SPLICE-Installer-${VERSION}-unsigned.pkg"
+    47→
+    48→# Colors for output
+    49→RED='\033[0;31m'
+    50→GREEN='\033[0;32m'
+    51→YELLOW='\033[1;33m'
+    52→NC='\033[0m' # No Color
+    53→
+    54→log_info() {
+    55→    echo -e "${GREEN}[INFO]${NC} $1"
+    56→}
+    57→
+    58→log_warn() {
+    59→    echo -e "${YELLOW}[WARN]${NC} $1"
+    60→}
+    61→
+    62→log_error() {
+    63→    echo -e "${RED}[ERROR]${NC} $1"
+    64→}
+    65→
+    66→# Show usage
+    67→usage() {
+    68→    echo "Usage: $0 [OPTIONS]"
+    69→    echo ""
+    70→    echo "Options:"
+    71→    echo "  --sign IDENTITY     Sign package with Developer ID Installer certificate"
+    72→    echo "  --notarize          Notarize the signed package (requires --sign)"
+    73→    echo "  --apple-id EMAIL    Apple ID for notarization"
+    74→    echo "  --team-id ID        Team ID for notarization"
+    75→    echo "  --password PWD      App-specific password for notarization"
+    76→    echo "  --help              Show this help message"
+    77→    echo ""
+    78→    echo "Environment variables:"
+    79→    echo "  SIGNING_IDENTITY    Developer ID Installer certificate name"
+    80→    echo "  NOTARIZE            Set to 'true' to notarize"
+    81→    echo "  APPLE_ID            Apple ID email"
+    82→    echo "  TEAM_ID             Apple Developer Team ID"
+    83→    echo "  APP_PASSWORD        App-specific password for notarization"
+    84→    exit 1
+    85→}
+    86→
+    87→# Parse arguments
+    88→while [[ $# -gt 0 ]]; do
+    89→    case $1 in
+    90→        --sign)
+    91→            SIGNING_IDENTITY="$2"
+    92→            shift 2
+    93→            ;;
+    94→        --notarize)
+    95→            NOTARIZE="true"
+    96→            shift
+    97→            ;;
+    98→        --apple-id)
+    99→            APPLE_ID="$2"
+   100→            shift 2
+   101→            ;;
+   102→        --team-id)
+   103→            TEAM_ID="$2"
+   104→            shift 2
+   105→            ;;
+   106→        --password)
+   107→            APP_PASSWORD="$2"
+   108→            shift 2
+   109→            ;;
+   110→        --help)
+   111→            usage
+   112→            ;;
+   113→        *)
+   114→            log_error "Unknown option: $1"
+   115→            usage
+   116→            ;;
+   117→    esac
+   118→done
+   119→
+   120→# Cleanup previous builds
+   121→cleanup() {
+   122→    log_info "Cleaning up previous builds..."
+   123→    rm -rf "$BUILD_DIR"
+   124→    mkdir -p "$BUILD_DIR"
+   125→    mkdir -p "$STAGING_DIR"
+   126→    mkdir -p "$OUTPUT_DIR"
+   127→}
+   128→
+   129→# Stage CEP extension files
+   130→stage_cep() {
+   131→    log_info "Staging CEP extension..."
+   132→    
+   133→    if [ ! -d "$CEP_SOURCE" ]; then
+   134→        log_error "CEP source directory not found: $CEP_SOURCE"
+   135→        exit 1
+   136→    fi
+   137→    
+   138→    # Create staging structure
+   139→    local cep_staging="$STAGING_DIR/cep/tmp/splice-installer/cep"
+   140→    mkdir -p "$cep_staging"
+   141→    
+   142→    # Copy CEP extension files
+   143→    cp -R "$CEP_SOURCE/CSXS" "$cep_staging/"
+   144→    cp -R "$CEP_SOURCE/jsx" "$cep_staging/"
+   145→    cp -R "$CEP_SOURCE/panel" "$cep_staging/"
+   146→    
+   147→    # Copy additional files if they exist
+   148→    [ -f "$CEP_SOURCE/.debug" ] && cp "$CEP_SOURCE/.debug" "$cep_staging/"
+   149→    [ -f "$CEP_SOURCE/mimetype" ] && cp "$CEP_SOURCE/mimetype" "$cep_staging/"
+   150→    
+   151→    log_info "CEP extension staged"
+   152→}
+   153→
+   154→# Stage UXP plugin files and create CCX
+   155→stage_uxp() {
+   156→    log_info "Staging UXP plugin..."
+   157→    
+   158→    if [ ! -d "$UXP_SOURCE" ]; then
+   159→        log_warn "UXP source directory not found: $UXP_SOURCE"
+   160→        log_warn "Skipping UXP plugin packaging"
+   161→        return 0
+   162→    fi
+   163→    
+   164→    # Create staging structure
+   165→    local uxp_staging="$STAGING_DIR/uxp/tmp/splice-installer"
+   166→    mkdir -p "$uxp_staging"
+   167→    
+   168→    # Create CCX package (essentially a zip with .ccx extension)
+   169→    local ccx_temp="$BUILD_DIR/ccx-temp"
+   170→    mkdir -p "$ccx_temp"
+   171→    
+   172→    # Copy UXP plugin files
+   173→    cp -R "$UXP_SOURCE"/* "$ccx_temp/"
+   174→    
+   175→    # Create the CCX file
+   176→    pushd "$ccx_temp" > /dev/null
+   177→    zip -r "$uxp_staging/splice-uxp.ccx" . -x "*.DS_Store" -x "__MACOSX/*"
+   178→    popd > /dev/null
+   179→    
+   180→    rm -rf "$ccx_temp"
+   181→    
+   182→    log_info "UXP plugin staged as CCX"
+   183→}
+   184→
+   185→# Build component packages
+   186→build_component_packages() {
+   187→    log_info "Building component packages..."
+   188→    
+   189→    # Build CEP package
+   190→    pkgbuild \
+   191→        --root "$STAGING_DIR/cep" \
+   192→        --identifier "$CEP_PKG_ID" \
+   193→        --version "$VERSION" \
+   194→        --scripts "$INSTALLER_DIR/scripts" \
+   195→        "$BUILD_DIR/splice-cep.pkg"
+   196→    
+   197→    log_info "CEP component package created"
+   198→    
+   199→    # Build UXP package if CCX was created
+   200→    if [ -f "$STAGING_DIR/uxp/tmp/splice-installer/splice-uxp.ccx" ]; then
+   201→        pkgbuild \
+   202→            --root "$STAGING_DIR/uxp" \
+   203→            --identifier "$UXP_PKG_ID" \
+   204→            --version "$VERSION" \
+   205→            "$BUILD_DIR/splice-uxp.pkg"
+   206→        
+   207→        log_info "UXP component package created"
+   208→    fi
+   209→}
+   210→
+   211→# Build product archive
+   212→build_product() {
+   213→    log_info "Building product archive..."
+   214→    
+   215→    # Prepare resources directory
+   216→    local resources_dir="$BUILD_DIR/resources"
+   217→    mkdir -p "$resources_dir"
+   218→    
+   219→    # Copy installer UI resources
+   220→    cp "$INSTALLER_DIR/resources/"*.html "$resources_dir/" 2>/dev/null || true
+   221→    
+   222→    # Copy shared assets
+   223→    if [ -d "$SHARED_ASSETS" ]; then
+   224→        cp "$SHARED_ASSETS/"* "$resources_dir/" 2>/dev/null || true
+   225→    fi
+   226→    
+   227→    # Update distribution.xml with actual package references
+   228→    local dist_xml="$BUILD_DIR/distribution.xml"
+   229→    cp "$INSTALLER_DIR/distribution.xml" "$dist_xml"
+   230→    
+   231→    # Replace version placeholder
+   232→    sed -i '' "s/version=\"6.0.3\"/version=\"$VERSION\"/g" "$dist_xml"
+   233→    
+   234→    # Build the product
+   235→    local output_pkg="$OUTPUT_DIR/$UNSIGNED_PKG_NAME"
+   236→    
+   237→    productbuild \
+   238→        --distribution "$dist_xml" \
+   239→        --resources "$resources_dir" \
+   240→        --package-path "$BUILD_DIR" \
+   241→        "$output_pkg"
+   242→    
+   243→    log_info "Unsigned package created: $output_pkg"
+   244→}
+   245→
+   246→# Sign the package
+   247→sign_package() {
+   248→    if [ -z "$SIGNING_IDENTITY" ]; then
+   249→        log_warn "No signing identity provided, skipping signing"
+   250→        log_warn "Package will show 'unidentified developer' warning on macOS"
+   251→        
+   252→        # Rename unsigned package if not signing
+   253→        mv "$OUTPUT_DIR/$UNSIGNED_PKG_NAME" "$OUTPUT_DIR/$PKG_NAME"
+   254→        return 0
+   255→    fi
+   256→    
+   257→    log_info "Signing package with identity: $SIGNING_IDENTITY"
+   258→    
+   259→    local unsigned_pkg="$OUTPUT_DIR/$UNSIGNED_PKG_NAME"
+   260→    local signed_pkg="$OUTPUT_DIR/$PKG_NAME"
+   261→    
+   262→    productsign \
+   263→        --sign "$SIGNING_IDENTITY" \
+   264→        "$unsigned_pkg" \
+   265→        "$signed_pkg"
+   266→    
+   267→    # Verify signature
+   268→    pkgutil --check-signature "$signed_pkg"
+   269→    
+   270→    # Remove unsigned package
+   271→    rm "$unsigned_pkg"
+   272→    
+   273→    log_info "Package signed successfully: $signed_pkg"
+   274→}
+   275→
+   276→# Notarize the package
+   277→notarize_package() {
+   278→    if [ "$NOTARIZE" != "true" ]; then
+   279→        log_info "Skipping notarization"
+   280→        return 0
+   281→    fi
+   282→    
+   283→    if [ -z "$APPLE_ID" ] || [ -z "$TEAM_ID" ] || [ -z "$APP_PASSWORD" ]; then
+   284→        log_error "Notarization requires APPLE_ID, TEAM_ID, and APP_PASSWORD"
+   285→        exit 1
+   286→    fi
+   287→    
+   288→    log_info "Notarizing package..."
+   289→    
+   290→    local pkg_path="$OUTPUT_DIR/$PKG_NAME"
+   291→    
+   292→    # Submit for notarization
+   293→    xcrun notarytool submit "$pkg_path" \
+   294→        --apple-id "$APPLE_ID" \
+   295→        --team-id "$TEAM_ID" \
+   296→        --password "$APP_PASSWORD" \
+   297→        --wait
+   298→    
+   299→    # Staple the notarization ticket
+   300→    log_info "Stapling notarization ticket..."
+   301→    xcrun stapler staple "$pkg_path"
+   302→    
+   303→    # Verify stapling
+   304→    xcrun stapler validate "$pkg_path"
+   305→    
+   306→    log_info "Package notarized and stapled successfully"
+   307→}
+   308→
+   309→# Main build process
+   310→main() {
+   311→    echo "========================================"
+   312→    echo "SPLICE macOS Installer Build"
+   313→    echo "Version: $VERSION"
+   314→    echo "========================================"
+   315→    echo ""
+   316→    
+   317→    cleanup
+   318→    stage_cep
+   319→    stage_uxp
+   320→    build_component_packages
+   321→    build_product
+   322→    sign_package
+   323→    notarize_package
+   324→    
+   325→    echo ""
+   326→    echo "========================================"
+   327→    log_info "Build complete!"
+   328→    echo "Output: $OUTPUT_DIR/$PKG_NAME"
+   329→    echo "========================================"
+   330→}
+   331→
+   332→main
+   333→
+
+</system-reminder>

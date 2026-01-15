@@ -1,0 +1,404 @@
+     1→     1→"""
+     2→     2→Forum router - Categories, Sub-Forums, Posts, Comments, Votes, Reports
+     3→     3→
+     4→     4→Rate Limits:
+     5→     5→- Posts: 5 per minute per user
+     6→     6→- Comments: 20 per minute per user
+     7→     7→- Votes: 30 per minute per user
+     8→     8→- Reports: 10 per hour per user
+     9→     9→"""
+    10→    10→
+    11→    11→from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+    12→    12→from sqlalchemy.ext.asyncio import AsyncSession
+    13→    13→from sqlalchemy import select, func, and_, or_, desc
+    14→    14→from sqlalchemy.orm import selectinload
+    15→    15→from uuid import UUID
+    16→    16→from typing import Optional, List
+    17→    17→from datetime import datetime, timezone
+    18→    18→
+    19→    19→from app.database import get_db
+    20→    20→from app.core.rate_limit import limiter, ForumRateLimits
+    21→    21→from app.models.user import User, UserRole
+    22→    22→from app.models.forum import (
+    23→    23→    ForumIssueCategory, ForumSubForum, ForumPost, ForumComment,
+    24→    24→    ForumVote, ForumReport, FlawToForumMapping, ArchetypeForumMapping,
+    25→    25→    ForumBookmark, VoteType, TargetType, ReportStatus, ReportReason
+    26→    26→)
+    27→    27→from app.services.auth import get_current_user, get_current_user_optional
+    28→    28→from app.schemas.forum import (
+    29→    29→    CategoryResponse, CategoryListResponse, SubForumResponse,
+    30→    30→    PostCreate, PostUpdate, PostResponse, PostListItem,
+    31→    31→    PostListResponse, CommentCreate, CommentUpdate, CommentResponse,
+    32→    32→    VoteRequest, VoteResponse, ReportCreate, ReportResponse,
+    33→    33→    GuideSectionResponse, SortOrder, PostAuthor, RecommendedForumResponse,
+    34→    34→    ArchetypeForumRecommendation, ForumSearchResult, ForumSearchResponse,
+    35→    35→    SearchResultType, BookmarkToggleResponse, BookmarkedPostsResponse
+    36→    36→)
+    37→    37→
+    38→    38→router = APIRouter(prefix="/forum", tags=["forum"])
+    39→    39→
+    40→    40→PAGE_SIZE = 20
+    41→    41→MAX_COMMENT_DEPTH = 5
+    42→    42→
+    43→    43→
+    44→    44→# === CATEGORIES ===
+    45→    45→
+    46→    46→@router.get("/categories", response_model=List[CategoryResponse])
+    47→    47→async def list_categories(db: AsyncSession = Depends(get_db)):
+    48→    48→    """List all active forum categories with sub-forums and post counts.
+    49→    49→
+    50→    50→    Optimized to use only 2 queries instead of N+1 pattern.
+    51→    51→    """
+    52→    52→    # Query 1: Get all categories with sub-forums
+    53→    53→    query = (
+    54→    54→        select(ForumIssueCategory)
+    55→    55→        .options(selectinload(ForumIssueCategory.sub_forums))
+    56→    56→        .where(ForumIssueCategory.is_active == True)
+    57→    57→        .order_by(ForumIssueCategory.display_order)
+    58→    58→    )
+    59→    59→    result = await db.execute(query)
+    60→    60→    categories = result.scalars().all()
+    61→    61→
+    62→    62→    # Query 2: Get ALL sub-forum post counts in ONE query (batched)
+    63→    63→    sf_counts_query = (
+    64→    64→        select(
+    65→    65→            ForumPost.sub_forum_id,
+    66→    66→            func.count(ForumPost.id).label('post_count')
+    67→    67→        )
+    68→    68→        .where(
+    69→    69→            ForumPost.is_deleted == False,
+    70→    70→            ForumPost.is_approved == True
+    71→    71→        )
+    72→    72→        .group_by(ForumPost.sub_forum_id)
+    73→    73→    )
+    74→    74→    sf_counts_result = await db.execute(sf_counts_query)
+    75→    75→    sf_counts = {row[0]: row[1] for row in sf_counts_result}
+    76→    76→
+    77→    77→    # Build response using pre-fetched counts (no additional queries)
+    78→    78→    response = []
+    79→    79→    for cat in categories:
+    80→    80→        cat_post_count = 0
+    81→    81→        sub_forums = []
+    82→    82→
+    83→    83→        for sf in sorted(cat.sub_forums, key=lambda x: x.display_order):
+    84→    84→            if sf.is_active:
+    85→    85→                sf_post_count = sf_counts.get(sf.id, 0)
+    86→    86→                cat_post_count += sf_post_count
+    87→    87→
+    88→    88→                sub_forums.append(SubForumResponse(
+    89→    89→                    id=sf.id,
+    90→    90→                    name=sf.name,
+    91→    91→                    slug=sf.slug,
+    92→    92→                    description=sf.description,
+    93→    93→                    icon=sf.icon,
+    94→    94→                    display_order=sf.display_order,
+    95→    95→                    post_count=sf_post_count
+    96→    96→                ))
+    97→    97→
+    98→    98→        response.append(CategoryResponse(
+    99→    99→            id=cat.id,
+   100→   100→            name=cat.name,
+   101→   101→            slug=cat.slug,
+   102→   102→            description=cat.description,
+   103→   103→            icon=cat.icon,
+   104→   104→            display_order=cat.display_order,
+   105→   105→            post_count=cat_post_count,
+   106→   106→            sub_forums=sub_forums
+   107→   107→        ))
+   108→   108→
+   109→   109→    return response
+   110→   110→
+   111→   111→
+   112→   112→@router.get("/categories/{slug}", response_model=CategoryResponse)
+   113→   113→async def get_category(
+   114→   114→    slug: str,
+   115→   115→    db: AsyncSession = Depends(get_db)
+   116→   116→):
+   117→   117→    """Get a single category by slug with its sub-forums.
+   118→   118→
+   119→   119→    Optimized to use only 2 queries instead of N+1 pattern.
+   120→   120→    """
+   121→   121→    # Query 1: Get category with sub-forums
+   122→   122→    query = (
+   123→   123→        select(ForumIssueCategory)
+   124→   124→        .options(selectinload(ForumIssueCategory.sub_forums))
+   125→   125→        .where(ForumIssueCategory.slug == slug, ForumIssueCategory.is_active == True)
+   126→   126→    )
+   127→   127→    result = await db.execute(query)
+   128→   128→    cat = result.scalar_one_or_none()
+   129→   129→
+   130→   130→    if not cat:
+   131→   131→        raise HTTPException(status_code=404, detail="Category not found")
+   132→   132→
+   133→   133→    # Get sub-forum IDs for this category
+   134→   134→    sf_ids = [sf.id for sf in cat.sub_forums if sf.is_active]
+   135→   135→
+   136→   136→    # Query 2: Get post counts for all sub-forums in this category (batched)
+   137→   137→    sf_counts = {}
+   138→   138→    if sf_ids:
+   139→   139→        sf_counts_query = (
+   140→   140→            select(
+   141→   141→                ForumPost.sub_forum_id,
+   142→   142→                func.count(ForumPost.id).label('post_count')
+   143→   143→            )
+   144→   144→            .where(
+   145→   145→                ForumPost.sub_forum_id.in_(sf_ids),
+   146→   146→                ForumPost.is_deleted == False,
+   147→   147→                ForumPost.is_approved == True
+   148→   148→            )
+   149→   149→            .group_by(ForumPost.sub_forum_id)
+   150→   150→        )
+   151→   151→        sf_counts_result = await db.execute(sf_counts_query)
+   152→   152→        sf_counts = {row[0]: row[1] for row in sf_counts_result}
+   153→   153→
+   154→   154→    # Build sub-forums list using pre-fetched counts
+   155→   155→    cat_post_count = 0
+   156→   156→    sub_forums = []
+   157→   157→    for sf in sorted(cat.sub_forums, key=lambda x: x.display_order):
+   158→   158→        if sf.is_active:
+   159→   159→            sf_post_count = sf_counts.get(sf.id, 0)
+   160→   160→            cat_post_count += sf_post_count
+   161→   161→
+   162→   162→            sub_forums.append(SubForumResponse(
+   163→   163→                id=sf.id,
+   164→   164→                name=sf.name,
+   165→   165→                slug=sf.slug,
+   166→   166→                description=sf.description,
+   167→   167→                icon=sf.icon,
+   168→   168→                display_order=sf.display_order,
+   169→   169→                post_count=sf_post_count
+   170→   170→            ))
+   171→   171→
+   172→   172→    return CategoryResponse(
+   173→   173→        id=cat.id,
+   174→   174→        name=cat.name,
+   175→   175→        slug=cat.slug,
+   176→   176→        description=cat.description,
+   177→   177→        icon=cat.icon,
+   178→   178→        display_order=cat.display_order,
+   179→   179→        post_count=cat_post_count,
+   180→   180→        sub_forums=sub_forums
+   181→   181→    )
+   182→   182→
+   183→   183→
+   184→   184→# === SEARCH ===
+   185→   185→
+   186→   186→@router.get("/search", response_model=ForumSearchResponse)
+   187→   187→async def search_forum(
+   188→   188→    q: str = Query(..., min_length=2, max_length=100, description="Search query"),
+   189→   189→    type: str = Query("all", description="Search type: posts, comments, or all"),
+   190→   190→    limit: int = Query(20, ge=1, le=50),
+   191→   191→    offset: int = Query(0, ge=0),
+   192→   192→    db: AsyncSession = Depends(get_db)
+   193→   193→):
+   194→   194→    """Search forum posts and comments using ILIKE pattern matching.
+   195→   195→
+   196→   196→    - Search by title, content for posts
+   197→   197→    - Search by content for comments
+   198→   198→    - Results sorted by vote_count DESC, created_at DESC
+   199→   199→    """
+   200→   200→    search_pattern = f"%{q}%"
+   201→   201→    results = []
+   202→   202→    total_count = 0
+   203→   203→
+   204→   204→    if type in ("posts", "all"):
+   205→   205→        # Search posts by title and content
+   206→   206→        post_query = (
+   207→   207→            select(ForumPost)
+   208→   208→            .options(
+   209→   209→                selectinload(ForumPost.author),
+   210→   210→                selectinload(ForumPost.sub_forum).selectinload(ForumSubForum.issue_category)
+   211→   211→            )
+   212→   212→            .where(
+   213→   213→                ForumPost.is_deleted == False,
+   214→   214→                ForumPost.is_approved == True,
+   215→   215→                or_(
+   216→   216→                    ForumPost.title.ilike(search_pattern),
+   217→   217→                    ForumPost.content.ilike(search_pattern)
+   218→   218→                )
+   219→   219→            )
+   220→   220→            .order_by(ForumPost.vote_count.desc(), ForumPost.created_at.desc())
+   221→   221→        )
+   222→   222→
+   223→   223→        # Count posts
+   224→   224→        post_count_query = (
+   225→   225→            select(func.count(ForumPost.id))
+   226→   226→            .where(
+   227→   227→                ForumPost.is_deleted == False,
+   228→   228→                ForumPost.is_approved == True,
+   229→   229→                or_(
+   230→   230→                    ForumPost.title.ilike(search_pattern),
+   231→   231→                    ForumPost.content.ilike(search_pattern)
+   232→   232→                )
+   233→   233→            )
+   234→   234→        )
+   235→   235→        post_count_result = await db.execute(post_count_query)
+   236→   236→        post_count = post_count_result.scalar() or 0
+   237→   237→
+   238→   238→        if type == "posts":
+   239→   239→            total_count = post_count
+   240→   240→            post_query = post_query.offset(offset).limit(limit)
+   241→   241→        else:
+   242→   242→            total_count += post_count
+   243→   243→            # For "all", we get all posts first then merge with comments
+   244→   244→            post_query = post_query.limit(limit * 2)  # Get more to merge
+   245→   245→
+   246→   246→        post_result = await db.execute(post_query)
+   247→   247→        posts = post_result.scalars().all()
+   248→   248→
+   249→   249→        for post in posts:
+   250→   250→            content_preview = post.content[:200] + "..." if len(post.content) > 200 else post.content
+   251→   251→            results.append(ForumSearchResult(
+   252→   252→                id=post.id,
+   253→   253→                type=SearchResultType.POST,
+   254→   254→                title=post.title,
+   255→   255→                content_preview=content_preview,
+   256→   256→                post_id=None,
+   257→   257→                post_title=None,
+   258→   258→                author=PostAuthor(id=post.author.id, username=post.author.username),
+   259→   259→                vote_count=post.vote_count,
+   260→   260→                category_slug=post.sub_forum.issue_category.slug if post.sub_forum and post.sub_forum.issue_category else "",
+   261→   261→                sub_forum_slug=post.sub_forum.slug if post.sub_forum else "",
+   262→   262→                created_at=post.created_at
+   263→   263→            ))
+   264→   264→
+   265→   265→    if type in ("comments", "all"):
+   266→   266→        # Search comments by content
+   267→   267→        comment_query = (
+   268→   268→            select(ForumComment)
+   269→   269→            .options(
+   270→   270→                selectinload(ForumComment.author),
+   271→   271→                selectinload(ForumComment.post).selectinload(ForumPost.sub_forum).selectinload(ForumSubForum.issue_category)
+   272→   272→            )
+   273→   273→            .where(
+   274→   274→                ForumComment.is_deleted == False,
+   275→   275→                ForumComment.content.ilike(search_pattern)
+   276→   276→            )
+   277→   277→            .order_by(ForumComment.vote_count.desc(), ForumComment.created_at.desc())
+   278→   278→        )
+   279→   279→
+   280→   280→        # Count comments
+   281→   281→        comment_count_query = (
+   282→   282→            select(func.count(ForumComment.id))
+   283→   283→            .where(
+   284→   284→                ForumComment.is_deleted == False,
+   285→   285→                ForumComment.content.ilike(search_pattern)
+   286→   286→            )
+   287→   287→        )
+   288→   288→        comment_count_result = await db.execute(comment_count_query)
+   289→   289→        comment_count = comment_count_result.scalar() or 0
+   290→   290→
+   291→   291→        if type == "comments":
+   292→   292→            total_count = comment_count
+   293→   293→            comment_query = comment_query.offset(offset).limit(limit)
+   294→   294→        else:
+   295→   295→            total_count += comment_count
+   296→   296→            comment_query = comment_query.limit(limit * 2)
+   297→   297→
+   298→   298→        comment_result = await db.execute(comment_query)
+   299→   299→        comments = comment_result.scalars().all()
+   300→   300→
+   301→   301→        for comment in comments:
+   302→   302→            content_preview = comment.content[:200] + "..." if len(comment.content) > 200 else comment.content
+   303→   303→            post = comment.post
+   304→   304→            if post and post.sub_forum:
+   305→   305→                category_slug = post.sub_forum.issue_category.slug if post.sub_forum.issue_category else ""
+   306→   306→                sub_forum_slug = post.sub_forum.slug
+   307→   307→            else:
+   308→   308→                category_slug = ""
+   309→   309→                sub_forum_slug = ""
+   310→   310→
+   311→   311→            results.append(ForumSearchResult(
+   312→   312→                id=comment.id,
+   313→   313→                type=SearchResultType.COMMENT,
+   314→   314→                title=None,
+   315→   315→                content_preview=content_preview,
+   316→   316→                post_id=comment.post_id,
+   317→   317→                post_title=post.title if post else None,
+   318→   318→                author=PostAuthor(id=comment.author.id, username=comment.author.username),
+   319→   319→                vote_count=comment.vote_count,
+   320→   320→                category_slug=category_slug,
+   321→   321→                sub_forum_slug=sub_forum_slug,
+   322→   322→                created_at=comment.created_at
+   323→   323→            ))
+   324→   324→
+   325→   325→    # For "all" type, sort merged results by vote_count and created_at, then paginate
+   326→   326→    if type == "all":
+   327→   327→        results.sort(key=lambda x: (-x.vote_count, x.created_at), reverse=False)
+   328→   328→        results.sort(key=lambda x: x.vote_count, reverse=True)
+   329→   329→        results = results[offset:offset + limit]
+   330→   330→
+   331→   331→    return ForumSearchResponse(
+   332→   332→        results=results,
+   333→   333→        total_count=total_count,
+   334→   334→        query=q,
+   335→   335→        search_type=type,
+   336→   336→        has_more=offset + limit < total_count
+   337→   337→    )
+   338→   338→
+   339→   339→
+   340→   340→@router.get("/recommended", response_model=List[RecommendedForumResponse])
+   341→   341→async def get_recommended_forums(
+   342→   342→    flaws: str = Query(..., description="Comma-separated list of flaw IDs"),
+   343→   343→    db: AsyncSession = Depends(get_db)
+   344→   344→):
+   345→   345→    """Get recommended forums based on detected flaws."""
+   346→   346→    flaw_list = [f.strip() for f in flaws.split(",") if f.strip()]
+   347→   347→
+   348→   348→    if not flaw_list:
+   349→   349→        return []
+   350→   350→
+   351→   351→    # Find mappings for these flaws
+   352→   352→    query = (
+   353→   353→        select(FlawToForumMapping)
+   354→   354→        .options(selectinload(FlawToForumMapping.issue_category))
+   355→   355→        .where(FlawToForumMapping.flaw_id.in_(flaw_list))
+   356→   356→        .order_by(FlawToForumMapping.priority)
+   357→   357→    )
+   358→   358→
+   359→   359→    result = await db.execute(query)
+   360→   360→    mappings = result.scalars().all()
+   361→   361→
+   362→   362→    # Group by category
+   363→   363→    category_flaws = {}
+   364→   364→    for mapping in mappings:
+   365→   365→        cat_id = mapping.issue_category_id
+   366→   366→        if cat_id not in category_flaws:
+   367→   367→            category_flaws[cat_id] = {
+   368→   368→                "category": mapping.issue_category,
+   369→   369→                "flaws": [],
+   370→   370→                "priority": mapping.priority
+   371→   371→            }
+   372→   372→        category_flaws[cat_id]["flaws"].append(mapping.flaw_id)
+   373→   373→        # Use lowest priority (1 = primary)
+   374→   374→        if mapping.priority < category_flaws[cat_id]["priority"]:
+   375→   375→            category_flaws[cat_id]["priority"] = mapping.priority
+   376→   376→
+   377→   377→    # Build response sorted by priority
+   378→   378→    response = []
+   379→   379→    for cat_data in sorted(category_flaws.values(), key=lambda x: x["priority"]):
+   380→   380→        cat = cat_data["category"]
+   381→   381→        response.append(RecommendedForumResponse(
+   382→   382→            category=CategoryListResponse(
+   383→   383→                id=cat.id,
+   384→   384→                name=cat.name,
+   385→   385→                slug=cat.slug,
+   386→   386→                description=cat.description,
+   387→   387→                icon=cat.icon,
+   388→   388→                display_order=cat.display_order,
+   389→   389→                post_count=0
+   390→   390→            ),
+   391→   391→            matched_flaws=cat_data["flaws"],
+   392→   392→            priority=cat_data["priority"]
+   393→   393→        ))
+   394→   394→
+   395→   395→    return response
+   396→   396→
+   397→   397→
+   398→   398→@router.get("/archetype-recommendations", response_model=List[ArchetypeForumRecommendation])
+   399→   399→async def get_archetype_forum_recommendations(
+   400→   400→    archetype: str = Query(..., description="Archetype category (Softboy, Prettyboy, RobustPrettyboy, Chad, Hypermasculine, Exotic)"),
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

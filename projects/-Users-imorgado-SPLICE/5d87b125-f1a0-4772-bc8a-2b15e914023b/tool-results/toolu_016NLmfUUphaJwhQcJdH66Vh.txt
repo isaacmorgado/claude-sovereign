@@ -1,0 +1,1243 @@
+     1→/**
+     2→ * SPLICE Direct DOM Sequence Builder (v3.5)
+     3→ *
+     4→ * Builds sequences directly using UXP DOM APIs.
+     5→ * No XML export/import required - zero manual steps.
+     6→ *
+     7→ * Key APIs:
+     8→ * - SequenceEditor.createInsertProjectItemAction() - Insert clips at timecode
+     9→ * - ProjectItem.createSetColorLabelAction(index) - Color clips (set BEFORE insert)
+    10→ * - TrackItem.createSetInPointAction/OutPointAction() - Set in/out points
+    11→ * - project.executeTransaction(actions) - Batch execute atomically
+    12→ */
+    13→
+    14→const pproBuilder = require('premierepro');
+    15→
+    16→// No TICKS_PER_SECOND constant - we use native TickTime API instead
+    17→// This avoids variable collision with config.js
+    18→
+    19→// ProjectItemType fallback - UXP API versions may store enums differently
+    20→// Define explicitly to avoid undefined errors when pproBuilder.Constants is missing
+    21→const ProjectItemType = pproBuilder?.Constants?.ProjectItemType || {
+    22→  CLIP: 1,
+    23→  BIN: 2,
+    24→  ROOT: 3,
+    25→  FILE: 4
+    26→};
+    27→
+    28→// TrackItemType fallback - for getTrackItems() calls
+    29→const TrackItemType = pproBuilder?.Constants?.TrackItemType || {
+    30→  CLIP: 1,
+    31→  TRANSITION: 2
+    32→};
+    33→
+    34→// Color label indices in Premiere Pro
+    35→const COLOR_LABELS = {
+    36→  NONE: 0,
+    37→  VIOLET: 1,    // Purple
+    38→  IRIS: 2,      // Light purple
+    39→  CARIBBEAN: 3, // Teal
+    40→  LAVENDER: 4,  // Light lavender
+    41→  CERULEAN: 5,  // Light blue
+    42→  FOREST: 6,    // Dark green
+    43→  ROSE: 7,      // Pink
+    44→  MANGO: 8,     // Orange
+    45→  PURPLE: 9,    // Dark purple
+    46→  BLUE: 10,     // Blue
+    47→  TEAL: 11,     // Teal/Cyan
+    48→  MAGENTA: 12,  // Magenta
+    49→  TAN: 13,      // Tan/Brown
+    50→  GREEN: 14,    // Green
+    51→  BROWN: 15,    // Dark brown
+    52→  YELLOW: 16    // Yellow
+    53→};
+    54→
+    55→// SPLICE color scheme for cut list clips (Phase 1 enhancement)
+    56→const SPLICE_COLORS = {
+    57→  SPEECH: COLOR_LABELS.GREEN,       // Green for speech/takes
+    58→  SILENCE: COLOR_LABELS.VIOLET,     // Purple for silence segments (if kept)
+    59→  BEST_TAKE: COLOR_LABELS.CERULEAN, // Light blue for best take
+    60→  TAKE: COLOR_LABELS.LAVENDER,      // Lavender for regular takes
+    61→  WIDE_SHOT: COLOR_LABELS.YELLOW,   // Yellow for wide shots
+    62→  SPEAKER_A: COLOR_LABELS.MANGO,    // Orange for speaker A
+    63→  SPEAKER_B: COLOR_LABELS.CARIBBEAN // Teal for speaker B
+    64→};
+    65→
+    66→// Map color hint strings from backend to color indices
+    67→const COLOR_HINT_MAP = {
+    68→  'green': COLOR_LABELS.GREEN,
+    69→  'violet': COLOR_LABELS.VIOLET,
+    70→  'cerulean': COLOR_LABELS.CERULEAN,
+    71→  'lavender': COLOR_LABELS.LAVENDER,
+    72→  'yellow': COLOR_LABELS.YELLOW,
+    73→  'mango': COLOR_LABELS.MANGO,
+    74→  'caribbean': COLOR_LABELS.CARIBBEAN,
+    75→  'none': COLOR_LABELS.NONE
+    76→};
+    77→
+    78→// Project item cache for O(1) lookups (PERF-006 optimization)
+    79→// Cleared when project changes or explicitly reset
+    80→const projectItemCache = {
+    81→  byName: new Map(),
+    82→  byPath: new Map(),
+    83→  projectId: null
+    84→};
+    85→
+    86→/**
+    87→ * Build project item cache for fast lookups
+    88→ * @param {Object} project - The active project
+    89→ */
+    90→async function buildProjectItemCache(project) {
+    91→  // Clear existing cache
+    92→  projectItemCache.byName.clear();
+    93→  projectItemCache.byPath.clear();
+    94→  projectItemCache.projectId = project?.guid || null;
+    95→
+    96→  if (!project) return;
+    97→
+    98→  const rootItem = await project.getRootItem();
+    99→  await cacheItemsRecursively(rootItem);
+   100→  console.log(`[Builder] Project cache built: ${projectItemCache.byName.size} items by name, ${projectItemCache.byPath.size} items by path`);
+   101→}
+   102→
+   103→/**
+   104→ * Recursively cache all project items
+   105→ * @param {Object} item - Current item to cache
+   106→ */
+   107→async function cacheItemsRecursively(item) {
+   108→  if (!item || !item.children) return;
+   109→  if (item.children.numItems === 0) return;
+   110→
+   111→  for (let i = 0; i < item.children.numItems; i++) {
+   112→    const child = item.children[i];
+   113→
+   114→    // Cache by name (may have duplicates, first wins)
+   115→    if (child.name && !projectItemCache.byName.has(child.name)) {
+   116→      projectItemCache.byName.set(child.name, child);
+   117→    }
+   118→
+   119→    // Cache by path if available
+   120→    if (child.treePath) {
+   121→      projectItemCache.byPath.set(child.treePath, child);
+   122→    }
+   123→    // Also try to get file path for media items
+   124→    try {
+   125→      const filePath = await child.getMediaPath?.();
+   126→      if (filePath) {
+   127→        projectItemCache.byPath.set(filePath, child);
+   128→      }
+   129→    } catch {
+   130→      // Ignore - not all items have media paths
+   131→    }
+   132→
+   133→    // Recurse into bins
+   134→    if (child.type === ProjectItemType.BIN) {
+   135→      await cacheItemsRecursively(child);
+   136→    }
+   137→  }
+   138→}
+   139→
+   140→/**
+   141→ * Clear the project item cache
+   142→ */
+   143→function clearProjectItemCache() {
+   144→  projectItemCache.byName.clear();
+   145→  projectItemCache.byPath.clear();
+   146→  projectItemCache.projectId = null;
+   147→}
+   148→
+   149→/**
+   150→ * Find a project item by name in the project bin
+   151→ * Uses cache for O(1) lookups after initial build
+   152→ * @param {Object} project - The active project
+   153→ * @param {string} name - Name of the clip to find
+   154→ * @returns {Promise<Object|null>} The project item or null
+   155→ */
+   156→async function findProjectItemByName(project, name) {
+   157→  // Check cache first (O(1) lookup)
+   158→  if (projectItemCache.projectId === project?.guid && projectItemCache.byName.has(name)) {
+   159→    return projectItemCache.byName.get(name);
+   160→  }
+   161→
+   162→  // Build cache if not built for this project
+   163→  if (projectItemCache.projectId !== project?.guid) {
+   164→    await buildProjectItemCache(project);
+   165→    if (projectItemCache.byName.has(name)) {
+   166→      return projectItemCache.byName.get(name);
+   167→    }
+   168→  }
+   169→
+   170→  // Fallback to recursive search (cache miss)
+   171→  const rootItem = await project.getRootItem();
+   172→  return await searchItemRecursively(rootItem, name);
+   173→}
+   174→
+   175→/**
+   176→ * Recursively search for an item in the project bin
+   177→ * @param {Object} item - Current item to search
+   178→ * @param {string} name - Name to search for
+   179→ * @returns {Promise<Object|null>} The found item or null
+   180→ */
+   181→async function searchItemRecursively(item, name) {
+   182→  if (!item || !item.children) return null;
+   183→
+   184→  if (item.children.numItems === 0) return null;
+   185→
+   186→  for (let i = 0; i < item.children.numItems; i++) {
+   187→    const child = item.children[i];
+   188→
+   189→    // Check name using property access
+   190→    if (child.name === name) {
+   191→      return child;
+   192→    }
+   193→
+   194→    // Check if it's a bin (Type 2) and search recursively
+   195→    if (child.type === ProjectItemType.BIN) {
+   196→      const found = await searchItemRecursively(child, name);
+   197→      if (found) return found;
+   198→    }
+   199→  }
+   200→
+   201→  return null;
+   202→}
+   203→
+   204→/**
+   205→ * Find project item by file path
+   206→ * Uses cache for O(1) lookups after initial build
+   207→ * @param {Object} project - The active project
+   208→ * @param {string} filePath - Full path to the media file
+   209→ * @returns {Promise<Object|null>} The project item or null
+   210→ */
+   211→async function findProjectItemByPath(project, filePath) {
+   212→  // Check cache first (O(1) lookup)
+   213→  if (projectItemCache.projectId === project?.guid && projectItemCache.byPath.has(filePath)) {
+   214→    return projectItemCache.byPath.get(filePath);
+   215→  }
+   216→
+   217→  // Build cache if not built for this project
+   218→  if (projectItemCache.projectId !== project?.guid) {
+   219→    await buildProjectItemCache(project);
+   220→    if (projectItemCache.byPath.has(filePath)) {
+   221→      return projectItemCache.byPath.get(filePath);
+   222→    }
+   223→  }
+   224→
+   225→  // Fallback to recursive search (cache miss)
+   226→  const rootItem = await project.getRootItem();
+   227→  return await searchItemByPathRecursively(rootItem, filePath);
+   228→}
+   229→
+   230→/**
+   231→ * Recursively search for an item by its file path
+   232→ * @param {Object} item - Current item to search
+   233→ * @param {string} filePath - Path to search for
+   234→ * @returns {Promise<Object|null>} The found item or null
+   235→ */
+   236→async function searchItemByPathRecursively(item, filePath) {
+   237→  if (!item || !item.children) return null;
+   238→
+   239→  if (item.children.numItems === 0) return null;
+   240→
+   241→  for (let i = 0; i < item.children.numItems; i++) {
+   242→    const child = item.children[i];
+   243→
+   244→    // Check if this item has a matching path (using property access)
+   245→    if (child.treePath === filePath) {
+   246→      return child;
+   247→    }
+   248→
+   249→    // Check if it's a bin (Type 2) and search recursively
+   250→    if (child.type === ProjectItemType.BIN) {
+   251→      const found = await searchItemByPathRecursively(child, filePath);
+   252→      if (found) return found;
+   253→    }
+   254→  }
+   255→
+   256→  return null;
+   257→}
+   258→
+   259→/**
+   260→ * Create a new sequence from a cut list
+   261→ * @param {Object} cutList - The cut list from backend
+   262→ * @param {Object} options - Build options
+   263→ * @returns {Promise<{success: boolean, sequence?: Object, error?: string, stats?: Object}>}
+   264→ */
+   265→async function buildSequenceFromCutList(cutList, options = {}) {
+   266→  const stats = {
+   267→    clipsInserted: 0,
+   268→    totalDuration: 0,
+   269→    errors: []
+   270→  };
+   271→
+   272→  try {
+   273→    const context = await getActiveSequence();
+   274→    if (!context) {
+   275→      return { success: false, error: 'No project or sequence open' };
+   276→    }
+   277→
+   278→    const { project, sequence } = context;
+   279→
+   280→    // Create new sequence with "_SPLICE" suffix by cloning the existing sequence
+   281→    const originalName = sequence.name;
+   282→    const newSequenceName = `${originalName}_SPLICE`;
+   283→
+   284→    // Clone the existing sequence to preserve settings
+   285→    let newSequence = null;
+   286→    try {
+   287→      await project.lockedAccess(async () => {
+   288→        await project.executeTransaction((compoundAction) => {
+   289→          const cloneAction = sequence.createCloneAction();
+   290→          compoundAction.addAction(cloneAction);
+   291→        }, 'SPLICE: Clone Sequence');
+   292→      });
+   293→    } catch (cloneErr) {
+   294→      console.error('[SPLICE Builder] Failed to clone sequence:', cloneErr);
+   295→      return { success: false, error: `Failed to clone sequence: ${cloneErr.message}`, stats };
+   296→    }
+   297→
+   298→    // Find the newly created sequence (it will have the same name as original)
+   299→    // We need to rename it
+   300→    const sequences = await project.getSequences();
+   301→    for (const seq of sequences) {
+   302→      const name = seq.name;
+   303→      if (name === originalName && seq !== sequence) {
+   304→        newSequence = seq;
+   305→        // Rename the cloned sequence
+   306→        try {
+   307→          await project.lockedAccess(async () => {
+   308→            await project.executeTransaction((compoundAction) => {
+   309→              const renameAction = newSequence.createSetNameAction(newSequenceName);
+   310→              compoundAction.addAction(renameAction);
+   311→            }, 'SPLICE: Rename Cloned Sequence');
+   312→          });
+   313→        } catch (renameErr) {
+   314→          console.error('[SPLICE Builder] Failed to rename sequence:', renameErr);
+   315→          // Continue anyway - sequence was cloned, just has wrong name
+   316→        }
+   317→        break;
+   318→      }
+   319→    }
+   320→
+   321→    if (!newSequence) {
+   322→      // Fallback: create a new sequence from scratch
+   323→      newSequence = await project.createSequence(newSequenceName);
+   324→      if (!newSequence) {
+   325→        return { success: false, error: 'Failed to create new sequence' };
+   326→      }
+   327→    }
+   328→
+   329→    // Get the sequence editor for inserting clips
+   330→    const editor = await pproBuilder.SequenceEditor.getEditor(newSequence);
+   331→    if (!editor) {
+   332→      return { success: false, error: 'Failed to get sequence editor' };
+   333→    }
+   334→
+   335→    // Process cut list segments
+   336→    const segments = cutList.segments || [];
+   337→    if (segments.length === 0) {
+   338→      return { success: false, error: 'Cut list has no segments' };
+   339→    }
+   340→
+   341→    // Prepare segment data for insertion
+   342→    const segmentsToInsert = [];
+   343→    let currentPositionSeconds = 0;
+   344→
+   345→    for (const segment of segments) {
+   346→      try {
+   347→        // Find the source project item
+   348→        const sourceItem = await findProjectItemByPath(project, segment.sourcePath)
+   349→          || await findProjectItemByName(project, segment.sourceName);
+   350→
+   351→        if (!sourceItem) {
+   352→          stats.errors.push(`Source not found: ${segment.sourceName || segment.sourcePath}`);
+   353→          continue;
+   354→        }
+   355→
+   356→        // Create TickTime objects directly from seconds (no TICKS_PER_SECOND needed)
+   357→        const inPoint = pproBuilder.TickTime.createWithSeconds(segment.inPoint);
+   358→        const outPoint = pproBuilder.TickTime.createWithSeconds(segment.outPoint);
+   359→        const position = pproBuilder.TickTime.createWithSeconds(currentPositionSeconds);
+   360→
+   361→        // Handle J-cut/L-cut audio offsets if present
+   362→        let audioInPoint = inPoint;
+   363→        let audioOutPoint = outPoint;
+   364→
+   365→        if (segment.audioInPoint !== undefined) {
+   366→          audioInPoint = pproBuilder.TickTime.createWithSeconds(segment.audioInPoint);
+   367→        }
+   368→        if (segment.audioOutPoint !== undefined) {
+   369→          audioOutPoint = pproBuilder.TickTime.createWithSeconds(segment.audioOutPoint);
+   370→        }
+   371→
+   372→        // Calculate duration in seconds for next position
+   373→        const durationSeconds = segment.outPoint - segment.inPoint;
+   374→
+   375→        // Determine color based on segment type and color hint (Phase 1)
+   376→        const colorIndex = getColorForSegment(segment.type, segment.colorHint);
+   377→
+   378→        segmentsToInsert.push({
+   379→          sourceItem,
+   380→          positionTime: position,
+   381→          inPoint,
+   382→          outPoint,
+   383→          audioInPoint,
+   384→          audioOutPoint,
+   385→          hasAudioOffset: segment.audioInPoint !== undefined || segment.audioOutPoint !== undefined,
+   386→          colorIndex,
+   387→          // Phase 1: Take labeling
+   388→          takeLabel: segment.takeLabel || null,
+   389→          takeNumber: segment.takeNumber || null
+   390→        });
+   391→
+   392→        // Update position for next clip
+   393→        currentPositionSeconds += durationSeconds;
+   394→        stats.totalDuration += durationSeconds;
+   395→
+   396→      } catch (err) {
+   397→        stats.errors.push(`Error processing segment: ${err.message}`);
+   398→        console.error('[SPLICE Builder] Segment error:', err);
+   399→      }
+   400→    }
+   401→
+   402→    if (segmentsToInsert.length === 0) {
+   403→      return { success: false, error: 'No valid segments to insert' };
+   404→    }
+   405→
+   406→    // Clear the new sequence first (it's a clone, so it has content)
+   407→    // We'll insert clips from scratch
+   408→    await clearSequence(newSequence);
+   409→
+   410→    // Execute all insert actions in a single transaction
+   411→    try {
+   412→      await project.lockedAccess(async () => {
+   413→        await project.executeTransaction((compoundAction) => {
+   414→          for (const segData of segmentsToInsert) {
+   415→            // Set color on source item if needed
+   416→            if (segData.colorIndex !== null) {
+   417→              const colorAction = segData.sourceItem.createSetColorLabelAction(segData.colorIndex);
+   418→              compoundAction.addAction(colorAction);
+   419→            }
+   420→
+   421→            // Use the pre-created TickTime object (no conversion needed)
+   422→            const insertTime = segData.positionTime;
+   423→
+   424→            // Create insert action (must be done inside transaction)
+   425→            const insertAction = editor.createInsertProjectItemAction(
+   426→              segData.sourceItem,
+   427→              insertTime,
+   428→              0,  // Video track index
+   429→              0,  // Audio track index
+   430→              false // Don't limit shift - insert on all tracks
+   431→            );
+   432→            compoundAction.addAction(insertAction);
+   433→          }
+   434→        }, 'SPLICE: Build Sequence from Cut List');
+   435→      });
+   436→    } catch (insertErr) {
+   437→      console.error('[SPLICE Builder] Failed to insert clips:', insertErr);
+   438→      return { success: false, error: `Failed to insert clips: ${insertErr.message}`, stats };
+   439→    }
+   440→
+   441→    stats.clipsInserted = segmentsToInsert.length;
+   442→
+   443→    // Set in/out points for each track item (must be done after insert)
+   444→    await setTrackItemInOutPoints(newSequence, segmentsToInsert);
+   445→
+   446→    // Apply take labels (Phase 1 feature)
+   447→    await applyTakeLabels(newSequence, segmentsToInsert);
+   448→
+   449→    console.log(`[SPLICE Builder] Built sequence with ${stats.clipsInserted} clips`);
+   450→
+   451→    return {
+   452→      success: true,
+   453→      sequence: newSequence,
+   454→      sequenceName: newSequenceName,
+   455→      stats
+   456→    };
+   457→
+   458→  } catch (err) {
+   459→    console.error('[SPLICE Builder] Build error:', err);
+   460→    return { success: false, error: err.message, stats };
+   461→  }
+   462→}
+   463→
+   464→/**
+   465→ * Get color index for a segment
+   466→ * Prefers colorHint from backend, falls back to type-based coloring
+   467→ * @param {string} type - Segment type (speech, silence, best_take, etc.)
+   468→ * @param {string} [colorHint] - Optional color hint from backend
+   469→ * @returns {number|null} Color label index or null for no color
+   470→ */
+   471→function getColorForSegment(type, colorHint) {
+   472→  // Use color hint if provided
+   473→  if (colorHint && COLOR_HINT_MAP[colorHint] !== undefined) {
+   474→    return COLOR_HINT_MAP[colorHint];
+   475→  }
+   476→
+   477→  // Fallback to type-based coloring
+   478→  switch (type) {
+   479→    case 'speech':
+   480→      return SPLICE_COLORS.SPEECH;
+   481→    case 'take':
+   482→      return SPLICE_COLORS.TAKE;
+   483→    case 'best_take':
+   484→      return SPLICE_COLORS.BEST_TAKE;
+   485→    case 'silence':
+   486→      return SPLICE_COLORS.SILENCE;
+   487→    case 'wide_shot':
+   488→      return SPLICE_COLORS.WIDE_SHOT;
+   489→    case 'speaker_a':
+   490→      return SPLICE_COLORS.SPEAKER_A;
+   491→    case 'speaker_b':
+   492→      return SPLICE_COLORS.SPEAKER_B;
+   493→    default:
+   494→      return null;
+   495→  }
+   496→}
+   497→
+   498→// Legacy alias for backwards compatibility
+   499→function getColorForSegmentType(type) {
+   500→  return getColorForSegment(type, null);
+   501→}
+   502→
+   503→/**
+   504→ * Clear all clips from a sequence
+   505→ * @param {Object} sequence - The sequence to clear
+   506→ */
+   507→async function clearSequence(sequence) {
+   508→  try {
+   509→    const project = await pproBuilder.Project.getActiveProject();
+   510→
+   511→    // Get all video tracks
+   512→    const videoTrackCount = await sequence.getVideoTrackCount();
+   513→    const audioTrackCount = await sequence.getAudioTrackCount();
+   514→
+   515→    const itemsToDelete = [];
+   516→
+   517→    // Collect all video track items
+   518→    for (let i = 0; i < videoTrackCount; i++) {
+   519→      const track = await sequence.getVideoTrack(i);
+   520→      if (track) {
+   521→        const items = await track.getTrackItems(TrackItemType.CLIP, false);
+   522→        if (items) {
+   523→          itemsToDelete.push(...items);
+   524→        }
+   525→      }
+   526→    }
+   527→
+   528→    // Collect all audio track items
+   529→    for (let i = 0; i < audioTrackCount; i++) {
+   530→      const track = await sequence.getAudioTrack(i);
+   531→      if (track) {
+   532→        const items = await track.getTrackItems(TrackItemType.CLIP, false);
+   533→        if (items) {
+   534→          itemsToDelete.push(...items);
+   535→        }
+   536→      }
+   537→    }
+   538→
+   539→    // Delete all items in one transaction
+   540→    if (itemsToDelete.length > 0) {
+   541→      try {
+   542→        await project.lockedAccess(async () => {
+   543→          await project.executeTransaction((compoundAction) => {
+   544→            for (const item of itemsToDelete) {
+   545→              const deleteAction = item.createRemoveAction();
+   546→              compoundAction.addAction(deleteAction);
+   547→            }
+   548→          }, 'SPLICE: Clear Sequence');
+   549→        });
+   550→      } catch (clearErr) {
+   551→        console.error('[SPLICE Builder] Failed to clear sequence:', clearErr);
+   552→        // Non-fatal - continue with insert
+   553→      }
+   554→    }
+   555→  } catch (err) {
+   556→    console.error('[SPLICE Builder] Error clearing sequence:', err);
+   557→  }
+   558→}
+   559→
+   560→/**
+   561→ * Set in/out points for track items after insertion
+   562→ * Handles J-cut/L-cut audio offsets by setting different in/out points for audio tracks
+   563→ * @param {Object} sequence - The sequence containing the clips
+   564→ * @param {Array} segmentsToInsert - The segment data with in/out points
+   565→ */
+   566→async function setTrackItemInOutPoints(sequence, segmentsToInsert) {
+   567→  try {
+   568→    // Get video track
+   569→    const videoTrack = await sequence.getVideoTrack(0);
+   570→    if (!videoTrack) return;
+   571→
+   572→    const videoTrackItems = await videoTrack.getTrackItems(TrackItemType.CLIP, false);
+   573→    if (!videoTrackItems || videoTrackItems.length === 0) return;
+   574→
+   575→    // Get audio track for J-cut/L-cut handling
+   576→    const audioTrack = await sequence.getAudioTrack(0);
+   577→    const audioTrackItems = audioTrack
+   578→      ? await audioTrack.getTrackItems(TrackItemType.CLIP, false)
+   579→      : null;
+   580→
+   581→    const project = await pproBuilder.Project.getActiveProject();
+   582→
+   583→    // Match track items with segments (in order)
+   584→    const itemCount = Math.min(videoTrackItems.length, segmentsToInsert.length);
+   585→
+   586→    if (itemCount > 0) {
+   587→      try {
+   588→        await project.lockedAccess(async () => {
+   589→          await project.executeTransaction((compoundAction) => {
+   590→            for (let i = 0; i < itemCount; i++) {
+   591→              const videoItem = videoTrackItems[i];
+   592→              const segData = segmentsToInsert[i];
+   593→
+   594→              // Set video in/out points
+   595→              const videoInAction = videoItem.createSetInPointAction(segData.inPoint);
+   596→              const videoOutAction = videoItem.createSetOutPointAction(segData.outPoint);
+   597→              compoundAction.addAction(videoInAction);
+   598→              compoundAction.addAction(videoOutAction);
+   599→
+   600→              // Set audio in/out points (may differ for J-cut/L-cut)
+   601→              if (audioTrackItems && audioTrackItems[i]) {
+   602→                const audioItem = audioTrackItems[i];
+   603→
+   604→                if (segData.hasAudioOffset) {
+   605→                  // J-cut/L-cut: use different audio in/out points
+   606→                  const audioInAction = audioItem.createSetInPointAction(segData.audioInPoint);
+   607→                  const audioOutAction = audioItem.createSetOutPointAction(segData.audioOutPoint);
+   608→                  compoundAction.addAction(audioInAction);
+   609→                  compoundAction.addAction(audioOutAction);
+   610→                } else {
+   611→                  // Same as video
+   612→                  const audioInAction = audioItem.createSetInPointAction(segData.inPoint);
+   613→                  const audioOutAction = audioItem.createSetOutPointAction(segData.outPoint);
+   614→                  compoundAction.addAction(audioInAction);
+   615→                  compoundAction.addAction(audioOutAction);
+   616→                }
+   617→              }
+   618→            }
+   619→          }, 'SPLICE: Set In/Out Points');
+   620→        });
+   621→      } catch (inOutErr) {
+   622→        console.error('[SPLICE Builder] Failed to set in/out points:', inOutErr);
+   623→        // Non-fatal - clips are inserted but may have wrong in/out points
+   624→      }
+   625→    }
+   626→
+   627→  } catch (err) {
+   628→    console.error('[SPLICE Builder] Error setting in/out points:', err);
+   629→  }
+   630→}
+   631→
+   632→/**
+   633→ * Apply take labels to track items (Phase 1 feature)
+   634→ * Sets clip names to include take numbers and short labels
+   635→ * @param {Object} sequence - The sequence containing the clips
+   636→ * @param {Array} segmentsToInsert - The segment data with take labels
+   637→ */
+   638→async function applyTakeLabels(sequence, segmentsToInsert) {
+   639→  // Check if any segments have take labels
+   640→  const hasLabels = segmentsToInsert.some(seg => seg.takeLabel);
+   641→  if (!hasLabels) {
+   642→    console.log('[SPLICE Builder] No take labels to apply');
+   643→    return;
+   644→  }
+   645→
+   646→  try {
+   647→    // Get video track
+   648→    const videoTrack = await sequence.getVideoTrack(0);
+   649→    if (!videoTrack) return;
+   650→
+   651→    const videoTrackItems = await videoTrack.getTrackItems(TrackItemType.CLIP, false);
+   652→    if (!videoTrackItems || videoTrackItems.length === 0) return;
+   653→
+   654→    const project = await pproBuilder.Project.getActiveProject();
+   655→    const itemCount = Math.min(videoTrackItems.length, segmentsToInsert.length);
+   656→
+   657→    let labelsApplied = 0;
+   658→
+   659→    if (itemCount > 0) {
+   660→      try {
+   661→        await project.lockedAccess(async () => {
+   662→          await project.executeTransaction((compoundAction) => {
+   663→            for (let i = 0; i < itemCount; i++) {
+   664→              const segData = segmentsToInsert[i];
+   665→
+   666→              // Only apply label if segment has a take label
+   667→              if (segData.takeLabel) {
+   668→                const videoItem = videoTrackItems[i];
+   669→
+   670→                // Set clip name using the take label
+   671→                // Note: createSetNameAction may not exist on all track items
+   672→                // Fallback: set marker on the clip
+   673→                try {
+   674→                  if (typeof videoItem.createSetNameAction === 'function') {
+   675→                    const nameAction = videoItem.createSetNameAction(segData.takeLabel);
+   676→                    compoundAction.addAction(nameAction);
+   677→                    labelsApplied++;
+   678→                  }
+   679→                } catch (nameErr) {
+   680→                  // createSetNameAction not available - silently skip
+   681→                  console.log('[SPLICE Builder] Take label not supported for this clip');
+   682→                }
+   683→              }
+   684→            }
+   685→          }, 'SPLICE: Apply Take Labels');
+   686→        });
+   687→
+   688→        console.log(`[SPLICE Builder] Applied ${labelsApplied} take labels`);
+   689→      } catch (labelErr) {
+   690→        console.error('[SPLICE Builder] Failed to apply take labels:', labelErr);
+   691→        // Non-fatal - clips are inserted but without labels
+   692→      }
+   693→    }
+   694→
+   695→  } catch (err) {
+   696→    console.error('[SPLICE Builder] Error applying take labels:', err);
+   697→  }
+   698→}
+   699→
+   700→/**
+   701→ * Build sequence from detected silences and takes
+   702→ * Convenience wrapper that creates cut list from detection results
+   703→ * @param {Array} silences - Detected silence segments
+   704→ * @param {Array} takes - Detected speech takes
+   705→ * @param {Object} sourceClip - Source project item
+   706→ * @returns {Promise<Object>} Build result
+   707→ */
+   708→async function buildSequenceFromDetection(silences, takes, sourceClip) {
+   709→  // Create cut list from detection results
+   710→  // Keep speech segments, remove silences
+   711→  const segments = [];
+   712→
+   713→  // Get source clip info (using synchronous property access)
+   714→  const sourceName = sourceClip.name;
+   715→  const sourcePath = sourceClip.treePath;
+   716→
+   717→  // Get clip duration
+   718→  const durationObj = await sourceClip.getDuration();
+   719→  const durationSecs = durationObj ? durationObj.seconds : 0;
+   720→
+   721→  // Sort silences by start time
+   722→  const sortedSilences = [...silences].sort((a, b) => a.start - b.start);
+   723→
+   724→  // Build segments from gaps between silences (speech segments)
+   725→  let lastEnd = 0;
+   726→
+   727→  for (const silence of sortedSilences) {
+   728→    // Add speech segment before this silence
+   729→    if (silence.start > lastEnd) {
+   730→      segments.push({
+   731→        type: 'speech',
+   732→        sourceName,
+   733→        sourcePath,
+   734→        inPoint: lastEnd,
+   735→        outPoint: silence.start
+   736→      });
+   737→    }
+   738→    lastEnd = silence.end;
+   739→  }
+   740→
+   741→  // Add final segment after last silence
+   742→  if (lastEnd < durationSecs) {
+   743→    segments.push({
+   744→      type: 'speech',
+   745→      sourceName,
+   746→      sourcePath,
+   747→      inPoint: lastEnd,
+   748→      outPoint: durationSecs
+   749→    });
+   750→  }
+   751→
+   752→  // Build the cut list
+   753→  const cutList = {
+   754→    version: '3.5',
+   755→    source: sourceName,
+   756→    segments,
+   757→    metadata: {
+   758→      silencesRemoved: silences.length,
+   759→      takesDetected: takes?.length || 0,
+   760→      generatedAt: new Date().toISOString()
+   761→    }
+   762→  };
+   763→
+   764→  return await buildSequenceFromCutList(cutList);
+   765→}
+   766→
+   767→/**
+   768→ * Apply cut list to existing sequence (in-place edit)
+   769→ * Alternative to creating new sequence
+   770→ * @param {Object} cutList - The cut list from backend
+   771→ * @returns {Promise<Object>} Result object
+   772→ */
+   773→async function applyCutListToSequence(cutList) {
+   774→  // TODO: Implement in-place editing as alternative to new sequence
+   775→  // This would use razor cuts on existing clips rather than rebuilding
+   776→  return { success: false, error: 'In-place editing not yet implemented' };
+   777→}
+   778→
+   779→/**
+   780→ * Apply zoom keyframes to the active sequence (Phase 3)
+   781→ * Uses adjustment layer for non-destructive zoom effects.
+   782→ *
+   783→ * NOTE: Premiere Pro UXP API for keyframe manipulation is limited.
+   784→ * This implementation creates markers at zoom points as a workaround.
+   785→ * Full keyframe support requires Motion Graphics Template (MOGRT) or
+   786→ * After Effects integration.
+   787→ *
+   788→ * @param {Array} zoomPoints - Array of zoom point objects
+   789→ * @returns {Promise<{success: boolean, count?: number, error?: string}>}
+   790→ */
+   791→async function applyZoomKeyframes(zoomPoints) {
+   792→  if (!zoomPoints || zoomPoints.length === 0) {
+   793→    return { success: false, error: 'No zoom points provided' };
+   794→  }
+   795→
+   796→  try {
+   797→    const context = await getActiveSequence();
+   798→    if (!context) {
+   799→      return { success: false, error: 'No project or sequence open' };
+   800→    }
+   801→
+   802→    const { project, sequence } = context;
+   803→    let appliedCount = 0;
+   804→
+   805→    // Premiere Pro UXP doesn't expose direct keyframe APIs for motion effects.
+   806→    // Workaround: Create markers at zoom points that can be used with MOGRT or manually.
+   807→    // Alternative: Use QE DOM for more control (requires different access).
+   808→
+   809→    try {
+   810→      await project.lockedAccess(async () => {
+   811→        for (const zoom of zoomPoints) {
+   812→          try {
+   813→            // Create marker at zoom point
+   814→            const time = pproBuilder.TickTime.createWithSeconds(zoom.startTime);
+   815→            const marker = await sequence.createMarker(time);
+   816→
+   817→            if (marker) {
+   818→              // Set marker properties to indicate zoom effect
+   819→              const zoomLabel = `Zoom ${zoom.scale}% @ ${zoom.startTime.toFixed(2)}s`;
+   820→              await marker.setName(`ZOOM: ${zoom.scale}%`);
+   821→              await marker.setComment(`Duration: ${zoom.duration}s | Easing: ${zoom.easing} | ${zoom.reason}`);
+   822→              // Yellow color for zoom markers
+   823→              await marker.setColor(6);
+   824→              appliedCount++;
+   825→            }
+   826→          } catch (markerErr) {
+   827→            console.warn('[SPLICE Builder] Failed to create zoom marker:', markerErr);
+   828→          }
+   829→        }
+   830→      });
+   831→    } catch (accessErr) {
+   832→      console.error('[SPLICE Builder] Failed to access project:', accessErr);
+   833→      return { success: false, error: `Project access failed: ${accessErr.message}` };
+   834→    }
+   835→
+   836→    console.log(`[SPLICE Builder] Created ${appliedCount} zoom markers`);
+   837→
+   838→    return {
+   839→      success: true,
+   840→      count: appliedCount,
+   841→      note: 'Zoom markers created. Apply motion effect manually or use MOGRT template.'
+   842→    };
+   843→
+   844→  } catch (err) {
+   845→    console.error('[SPLICE Builder] Zoom keyframes error:', err);
+   846→    return { success: false, error: err.message };
+   847→  }
+   848→}
+   849→
+   850→/**
+   851→ * Add chapter markers to the sequence (Phase 3)
+   852→ * @param {Array} chapters - Array of chapter objects
+   853→ * @returns {Promise<{success: boolean, count?: number, error?: string}>}
+   854→ */
+   855→async function applyChapterMarkers(chapters) {
+   856→  if (!chapters || chapters.length === 0) {
+   857→    return { success: false, error: 'No chapters provided' };
+   858→  }
+   859→
+   860→  try {
+   861→    const context = await getActiveSequence();
+   862→    if (!context) {
+   863→      return { success: false, error: 'No project or sequence open' };
+   864→    }
+   865→
+   866→    const { project, sequence } = context;
+   867→    let appliedCount = 0;
+   868→
+   869→    try {
+   870→      await project.lockedAccess(async () => {
+   871→        for (const chapter of chapters) {
+   872→          try {
+   873→            const time = pproBuilder.TickTime.createWithSeconds(chapter.startTime);
+   874→            const marker = await sequence.createMarker(time);
+   875→
+   876→            if (marker) {
+   877→              await marker.setName(chapter.title);
+   878→              if (chapter.description) {
+   879→                await marker.setComment(chapter.description);
+   880→              }
+   881→              // Blue color for chapter markers
+   882→              await marker.setColor(4);
+   883→              appliedCount++;
+   884→            }
+   885→          } catch (markerErr) {
+   886→            console.warn('[SPLICE Builder] Failed to create chapter marker:', markerErr);
+   887→          }
+   888→        }
+   889→      });
+   890→    } catch (accessErr) {
+   891→      console.error('[SPLICE Builder] Failed to access project:', accessErr);
+   892→      return { success: false, error: `Project access failed: ${accessErr.message}` };
+   893→    }
+   894→
+   895→    console.log(`[SPLICE Builder] Created ${appliedCount} chapter markers`);
+   896→
+   897→    return {
+   898→      success: true,
+   899→      count: appliedCount
+   900→    };
+   901→
+   902→  } catch (err) {
+   903→    console.error('[SPLICE Builder] Chapter markers error:', err);
+   904→    return { success: false, error: err.message };
+   905→  }
+   906→}
+   907→
+   908→/**
+   909→ * Insert bleep audio files into the timeline (Phase 3 - Firecut Parity)
+   910→ *
+   911→ * For each bleep, imports the audio file into the project and inserts it
+   912→ * on a specified audio track at the profanity timestamp.
+   913→ *
+   914→ * @param {Array} bleeps - Array of bleep objects with {path, segmentStart, segmentEnd}
+   915→ * @param {Object} options - Insertion options
+   916→ * @param {number} options.audioTrackIndex - Audio track to insert on (default: 1 for overlay)
+   917→ * @returns {Promise<{success: boolean, insertedCount?: number, error?: string}>}
+   918→ */
+   919→async function insertBleepAudio(bleeps, options = {}) {
+   920→  if (!bleeps || bleeps.length === 0) {
+   921→    return { success: false, error: 'No bleeps provided' };
+   922→  }
+   923→
+   924→  const { audioTrackIndex = 1 } = options;
+   925→
+   926→  try {
+   927→    const context = await getActiveSequence();
+   928→    if (!context) {
+   929→      return { success: false, error: 'No project or sequence open' };
+   930→    }
+   931→
+   932→    const { project, sequence } = context;
+   933→    let insertedCount = 0;
+   934→    const errors = [];
+   935→
+   936→    // Get sequence editor
+   937→    const editor = await pproBuilder.SequenceEditor.getEditor(sequence);
+   938→    if (!editor) {
+   939→      return { success: false, error: 'Failed to get sequence editor' };
+   940→    }
+   941→
+   942→    // Import and insert each bleep
+   943→    for (const bleep of bleeps) {
+   944→      if (!bleep.success || !bleep.path) {
+   945→        errors.push(`Skipped bleep at ${bleep.segmentStart}: no valid file`);
+   946→        continue;
+   947→      }
+   948→
+   949→      try {
+   950→        // Import the bleep audio file into the project
+   951→        const importedItem = await project.importFile(bleep.path);
+   952→
+   953→        if (!importedItem) {
+   954→          errors.push(`Failed to import bleep: ${bleep.path}`);
+   955→          continue;
+   956→        }
+   957→
+   958→        // Create insert time
+   959→        const insertTime = pproBuilder.TickTime.createWithSeconds(bleep.segmentStart);
+   960→
+   961→        // Insert on audio track (video track = -1 means audio only)
+   962→        await project.lockedAccess(async () => {
+   963→          await project.executeTransaction((compoundAction) => {
+   964→            const insertAction = editor.createInsertProjectItemAction(
+   965→              importedItem,
+   966→              insertTime,
+   967→              -1,              // No video track
+   968→              audioTrackIndex, // Audio track for bleep overlay
+   969→              true             // Limit shift to this track
+   970→            );
+   971→            compoundAction.addAction(insertAction);
+   972→          }, `SPLICE: Insert Bleep at ${bleep.segmentStart.toFixed(2)}s`);
+   973→        });
+   974→
+   975→        insertedCount++;
+   976→        console.log(`[SPLICE Builder] Inserted bleep at ${bleep.segmentStart.toFixed(2)}s`);
+   977→
+   978→      } catch (bleepErr) {
+   979→        errors.push(`Error inserting bleep at ${bleep.segmentStart}: ${bleepErr.message}`);
+   980→        console.error('[SPLICE Builder] Bleep insertion error:', bleepErr);
+   981→      }
+   982→    }
+   983→
+   984→    console.log(`[SPLICE Builder] Inserted ${insertedCount}/${bleeps.length} bleeps`);
+   985→
+   986→    return {
+   987→      success: insertedCount > 0,
+   988→      insertedCount,
+   989→      totalBleeps: bleeps.length,
+   990→      errors: errors.length > 0 ? errors : undefined
+   991→    };
+   992→
+   993→  } catch (err) {
+   994→    console.error('[SPLICE Builder] Bleep insertion error:', err);
+   995→    return { success: false, error: err.message };
+   996→  }
+   997→}
+   998→
+   999→/**
+  1000→ * Apply profanity bleeps to timeline
+  1001→ *
+  1002→ * Convenience function that combines bleep generation and insertion.
+  1003→ * Calls backend to generate bleeps, then inserts them into the timeline.
+  1004→ *
+  1005→ * @param {Array} profanitySegments - Array of {start, end, word} profanity segments
+  1006→ * @param {Object} options - Options for bleep generation and insertion
+  1007→ * @returns {Promise<{success: boolean, insertedCount?: number, error?: string}>}
+  1008→ */
+  1009→async function applyProfanityBleeps(profanitySegments, options = {}) {
+  1010→  const { bleepType = 'standard', volume = 0.5, audioTrackIndex = 1 } = options;
+  1011→
+  1012→  if (!profanitySegments || profanitySegments.length === 0) {
+  1013→    return { success: false, error: 'No profanity segments provided' };
+  1014→  }
+  1015→
+  1016→  console.log(`[SPLICE Builder] Applying ${profanitySegments.length} profanity bleeps`);
+  1017→
+  1018→  try {
+  1019→    // Format segments for the API
+  1020→    const segments = profanitySegments.map(seg => ({
+  1021→      start: seg.start,
+  1022→      end: seg.end
+  1023→    }));
+  1024→
+  1025→    // Call backend to generate bleep files
+  1026→    const apiUrl = window.getBackendUrl ? window.getBackendUrl() : 'https://127.0.0.1:3847';
+  1027→    const headers = window.getAuthHeaders ? window.getAuthHeaders() : { 'Content-Type': 'application/json' };
+  1028→
+  1029→    const response = await fetch(`${apiUrl}/profanity/generate-bleeps`, {
+  1030→      method: 'POST',
+  1031→      headers,
+  1032→      body: JSON.stringify({ segments, bleepType, volume })
+  1033→    });
+  1034→
+  1035→    if (!response.ok) {
+  1036→      const errorData = await response.json().catch(() => ({}));
+  1037→      throw new Error(errorData.error || `Failed to generate bleeps: ${response.status}`);
+  1038→    }
+  1039→
+  1040→    const data = await response.json();
+  1041→
+  1042→    if (!data.success || !data.bleeps || data.bleeps.length === 0) {
+  1043→      return { success: false, error: 'No bleeps generated' };
+  1044→    }
+  1045→
+  1046→    // Insert bleeps into timeline
+  1047→    const result = await insertBleepAudio(data.bleeps, { audioTrackIndex });
+  1048→
+  1049→    return result;
+  1050→
+  1051→  } catch (err) {
+  1052→    console.error('[SPLICE Builder] Apply profanity bleeps error:', err);
+  1053→    return { success: false, error: err.message };
+  1054→  }
+  1055→}
+  1056→
+  1057→/**
+  1058→ * Insert chapter dividers into the timeline
+  1059→ *
+  1060→ * Creates visual chapter separator clips with title text at chapter boundaries.
+  1061→ * Uses title graphics or color mattes with text overlays.
+  1062→ *
+  1063→ * @param {Array} dividers - Array of divider objects from backend
+  1064→ * @param {Object} options - Insertion options
+  1065→ * @returns {Promise<{success: boolean, insertedCount?: number, error?: string}>}
+  1066→ */
+  1067→async function insertChapterDividers(dividers, options = {}) {
+  1068→  const { videoTrackIndex = 1, createMarkers = true } = options;
+  1069→
+  1070→  if (!dividers || dividers.length === 0) {
+  1071→    return { success: false, error: 'No dividers provided' };
+  1072→  }
+  1073→
+  1074→  console.log(`[SPLICE Builder] Inserting ${dividers.length} chapter dividers`);
+  1075→
+  1076→  try {
+  1077→    const { app, Constants, TickTime, Sequence } = require('premierepro');
+  1078→    const project = app.project;
+  1079→    const seq = project.activeSequence;
+  1080→
+  1081→    if (!seq) {
+  1082→      return { success: false, error: 'No active sequence' };
+  1083→    }
+  1084→
+  1085→    let insertedCount = 0;
+  1086→    const TICKS_PER_SECOND = 254016000000;
+  1087→
+  1088→    // Get video track
+  1089→    const videoTrack = seq.videoTracks[videoTrackIndex];
+  1090→    if (!videoTrack) {
+  1091→      return { success: false, error: `Video track ${videoTrackIndex} not found` };
+  1092→    }
+  1093→
+  1094→    await project.executeTransaction(async () => {
+  1095→      for (const divider of dividers) {
+  1096→        try {
+  1097→          // Create marker for each divider
+  1098→          if (createMarkers && divider.markerData) {
+  1099→            const marker = seq.markers.createMarker(divider.insertTime);
+  1100→            if (marker) {
+  1101→              marker.name = divider.markerData.name;
+  1102→              marker.comments = divider.markerData.comment;
+  1103→              // Set color if supported
+  1104→              if (typeof marker.setColorByIndex === 'function') {
+  1105→                marker.setColorByIndex(divider.markerData.colorIndex || 5);
+  1106→              }
+  1107→            }
+  1108→          }
+  1109→
+  1110→          // Note: Full MOGRT insertion requires a .mogrt template file
+  1111→          // For now, we create markers with divider metadata
+  1112→          // The user can apply their own MOGRT template at marker locations
+  1113→
+  1114→          insertedCount++;
+  1115→        } catch (err) {
+  1116→          console.warn(`[SPLICE Builder] Failed to insert divider at ${divider.insertTime}:`, err);
+  1117→        }
+  1118→      }
+  1119→    });
+  1120→
+  1121→    console.log(`[SPLICE Builder] Inserted ${insertedCount} chapter dividers`);
+  1122→
+  1123→    return {
+  1124→      success: true,
+  1125→      insertedCount,
+  1126→      message: `Created ${insertedCount} chapter divider markers. Apply your MOGRT template at marked locations.`
+  1127→    };
+  1128→
+  1129→  } catch (err) {
+  1130→    console.error('[SPLICE Builder] Insert chapter dividers error:', err);
+  1131→    return { success: false, error: err.message };
+  1132→  }
+  1133→}
+  1134→
+  1135→/**
+  1136→ * Apply chapter dividers from backend
+  1137→ *
+  1138→ * Fetches divider data from backend and inserts into timeline.
+  1139→ *
+  1140→ * @param {Array} chapters - Array of chapter objects
+  1141→ * @param {Object} settings - Divider style settings
+  1142→ * @param {Object} options - Insertion options
+  1143→ * @returns {Promise<{success: boolean, insertedCount?: number, error?: string}>}
+  1144→ */
+  1145→async function applyChapterDividers(chapters, settings = {}, options = {}) {
+  1146→  if (!chapters || chapters.length === 0) {
+  1147→    return { success: false, error: 'No chapters provided' };
+  1148→  }
+  1149→
+  1150→  console.log(`[SPLICE Builder] Applying dividers for ${chapters.length} chapters`);
+  1151→
+  1152→  try {
+  1153→    // Call backend to generate divider data
+  1154→    const apiUrl = window.getBackendUrl ? window.getBackendUrl() : 'https://127.0.0.1:3847';
+  1155→    const headers = window.getAuthHeaders ? window.getAuthHeaders() : { 'Content-Type': 'application/json' };
+  1156→
+  1157→    const response = await fetch(`${apiUrl}/chapters/dividers`, {
+  1158→      method: 'POST',
+  1159→      headers,
+  1160→      body: JSON.stringify({ chapters, settings })
+  1161→    });
+  1162→
+  1163→    if (!response.ok) {
+  1164→      const errorData = await response.json().catch(() => ({}));
+  1165→      throw new Error(errorData.error || `Failed to generate dividers: ${response.status}`);
+  1166→    }
+  1167→
+  1168→    const data = await response.json();
+  1169→
+  1170→    if (!data.success || !data.dividers || data.dividers.length === 0) {
+  1171→      return { success: false, error: 'No dividers generated' };
+  1172→    }
+  1173→
+  1174→    // Insert dividers into timeline
+  1175→    const result = await insertChapterDividers(data.dividers, options);
+  1176→
+  1177→    return {
+  1178→      ...result,
+  1179→      dividerData: data.dividers,
+  1180→      settings: data.settings
+  1181→    };
+  1182→
+  1183→  } catch (err) {
+  1184→    console.error('[SPLICE Builder] Apply chapter dividers error:', err);
+  1185→    return { success: false, error: err.message };
+  1186→  }
+  1187→}
+  1188→
+  1189→/**
+  1190→ * Get available divider presets from backend
+  1191→ * @returns {Promise<Object>} Preset options
+  1192→ */
+  1193→async function getChapterDividerPresets() {
+  1194→  try {
+  1195→    const apiUrl = window.getBackendUrl ? window.getBackendUrl() : 'https://127.0.0.1:3847';
+  1196→
+  1197→    const response = await fetch(`${apiUrl}/chapters/dividers/presets`);
+  1198→
+  1199→    if (!response.ok) {
+  1200→      throw new Error(`Failed to fetch presets: ${response.status}`);
+  1201→    }
+  1202→
+  1203→    return await response.json();
+  1204→  } catch (err) {
+  1205→    console.error('[SPLICE Builder] Get divider presets error:', err);
+  1206→    // Return defaults on error
+  1207→    return {
+  1208→      styles: [{ id: 'gradient', name: 'Gradient' }],
+  1209→      colorSchemes: [{ id: 'blue', name: 'Blue' }],
+  1210→      positions: [{ id: 'center', name: 'Center' }],
+  1211→      defaults: { duration: 3, style: 'gradient', colorScheme: 'blue' }
+  1212→    };
+  1213→  }
+  1214→}
+  1215→
+  1216→// Export functions for use in main.js
+  1217→window.spliceBuilder = {
+  1218→  buildSequenceFromCutList,
+  1219→  buildSequenceFromDetection,
+  1220→  applyCutListToSequence,
+  1221→  applyTakeLabels,
+  1222→  applyZoomKeyframes,
+  1223→  applyChapterMarkers,
+  1224→  // Bleep insertion
+  1225→  insertBleepAudio,
+  1226→  applyProfanityBleeps,
+  1227→  // Chapter dividers
+  1228→  insertChapterDividers,
+  1229→  applyChapterDividers,
+  1230→  getChapterDividerPresets,
+  1231→  findProjectItemByName,
+  1232→  findProjectItemByPath,
+  1233→  getColorForSegment,
+  1234→  clearProjectItemCache,  // PERF-006: Clear cache when project changes
+  1235→  COLOR_LABELS,
+  1236→  SPLICE_COLORS,
+  1237→  COLOR_HINT_MAP
+  1238→};
+  1239→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

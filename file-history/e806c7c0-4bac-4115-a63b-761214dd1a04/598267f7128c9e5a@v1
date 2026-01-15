@@ -1,0 +1,152 @@
+"""
+Payments router - Stripe checkout and webhooks
+"""
+
+import stripe
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from uuid import uuid4
+
+from app.config import get_settings
+from app.database import get_db
+from app.models.user import User
+from app.models.payment import Payment
+from app.services.auth import get_current_user
+
+router = APIRouter(prefix="/payments", tags=["payments"])
+settings = get_settings()
+
+# Initialize Stripe
+stripe.api_key = settings.stripe_secret_key
+
+# Plan pricing (in cents)
+PLAN_PRICES = {
+    "basic": 999,   # $9.99
+    "pro": 2999,    # $29.99
+}
+
+
+@router.post("/checkout")
+async def create_checkout_session(
+    plan: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Create Stripe checkout session for plan upgrade"""
+    if plan not in PLAN_PRICES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid plan. Choose from: {list(PLAN_PRICES.keys())}"
+        )
+
+    try:
+        # Create or get Stripe customer
+        if not current_user.stripe_customer_id:
+            customer = stripe.Customer.create(
+                email=current_user.email,
+                metadata={"user_id": str(current_user.id)}
+            )
+            customer_id = customer.id
+        else:
+            customer_id = current_user.stripe_customer_id
+
+        # Create checkout session
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": f"LOOKSMAXX {plan.title()} Plan",
+                    },
+                    "unit_amount": PLAN_PRICES[plan],
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=f"{settings.frontend_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{settings.frontend_url}/payment/cancel",
+            metadata={
+                "user_id": str(current_user.id),
+                "plan": plan,
+            }
+        )
+
+        return {"checkout_url": session.url, "session_id": session.id}
+
+    except stripe.error.StripeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@router.post("/webhook")
+async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """Handle Stripe webhooks"""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, settings.stripe_webhook_secret
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Handle checkout.session.completed
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session["metadata"]["user_id"]
+        plan = session["metadata"]["plan"]
+
+        # Update user plan
+        result = await db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+
+        if user:
+            user.plan = plan
+            user.stripe_customer_id = session["customer"]
+
+            # Record payment
+            payment = Payment(
+                id=uuid4(),
+                user_id=user.id,
+                stripe_payment_id=session["payment_intent"],
+                stripe_session_id=session["id"],
+                amount=session["amount_total"],
+                currency=session["currency"],
+                status="completed",
+            )
+            db.add(payment)
+            await db.commit()
+
+    return {"received": True}
+
+
+@router.get("/history")
+async def payment_history(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get payment history for current user"""
+    result = await db.execute(
+        select(Payment)
+        .where(Payment.user_id == current_user.id)
+        .order_by(Payment.created_at.desc())
+    )
+    payments = result.scalars().all()
+
+    return [
+        {
+            "id": str(p.id),
+            "amount": p.amount / 100,  # Convert cents to dollars
+            "currency": p.currency,
+            "status": p.status,
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in payments
+    ]

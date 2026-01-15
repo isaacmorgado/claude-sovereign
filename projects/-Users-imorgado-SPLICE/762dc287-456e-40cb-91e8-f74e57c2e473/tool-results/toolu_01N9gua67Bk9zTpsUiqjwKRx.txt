@@ -1,0 +1,274 @@
+The file /Users/imorgado/SPLICE/splice-backend/server.js has been updated. Here's the result of running `cat -n` on a snippet of the edited file:
+  1395→    res.status(500).json({ error: err.message });
+  1396→  }
+  1397→});
+  1398→
+  1399→// =============================================================================
+  1400→// Batch Processing Routes
+  1401→// =============================================================================
+  1402→
+  1403→// In-memory job queue for batch processing
+  1404→const batchJobs = new Map();
+  1405→
+  1406→/**
+  1407→ * Generate a unique job ID
+  1408→ */
+  1409→function generateJobId() {
+  1410→  return `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  1411→}
+  1412→
+  1413→/**
+  1414→ * POST /batch/silences - Process multiple files for silence detection
+  1415→ *
+  1416→ * Creates a batch job that processes multiple audio files.
+  1417→ * Returns a job ID for tracking progress.
+  1418→ *
+  1419→ * Body:
+  1420→ * - files: Array of file paths to process
+  1421→ * - options: Detection options (sensitivity, threshold, etc.)
+  1422→ */
+  1423→app.post('/batch/silences', async (req, res) => {
+  1424→  const { files, options = {} } = req.body;
+  1425→
+  1426→  if (!files || !Array.isArray(files) || files.length === 0) {
+  1427→    return res.status(400).json({ error: 'files array is required' });
+  1428→  }
+  1429→
+  1430→  // Validate all files exist
+  1431→  const missingFiles = files.filter(f => !fs.existsSync(f));
+  1432→  if (missingFiles.length > 0) {
+  1433→    return res.status(404).json({
+  1434→      error: 'Some files not found',
+  1435→      missingFiles
+  1436→    });
+  1437→  }
+  1438→
+  1439→  const jobId = generateJobId();
+  1440→
+  1441→  // Initialize job
+  1442→  const job = {
+  1443→    id: jobId,
+  1444→    type: 'silences',
+  1445→    status: 'processing',
+  1446→    createdAt: new Date().toISOString(),
+  1447→    files: files.map(f => ({
+  1448→      path: f,
+  1449→      status: 'pending',
+  1450→      result: null,
+  1451→      error: null
+  1452→    })),
+  1453→    options,
+  1454→    progress: {
+  1455→      total: files.length,
+  1456→      completed: 0,
+  1457→      failed: 0,
+  1458→      percentage: 0
+  1459→    },
+  1460→    results: [],
+  1461→    errors: []
+  1462→  };
+  1463→
+  1464→  batchJobs.set(jobId, job);
+  1465→  console.log(`[SPLICE] Batch job ${jobId} created with ${files.length} files`);
+  1466→
+  1467→  // Start processing in background
+  1468→  processBatchJob(jobId);
+  1469→
+  1470→  res.json({
+  1471→    success: true,
+  1472→    jobId,
+  1473→    message: `Batch job created with ${files.length} files`,
+  1474→    statusUrl: `/batch/status/${jobId}`
+  1475→  });
+  1476→});
+  1477→
+  1478→/**
+  1479→ * Process a batch job (runs in background)
+  1480→ */
+  1481→async function processBatchJob(jobId) {
+  1482→  const job = batchJobs.get(jobId);
+  1483→  if (!job) return;
+  1484→
+  1485→  const { sensitivity, ...manualOptions } = job.options;
+  1486→
+  1487→  // Build detection options
+  1488→  let detectionOptions = {};
+  1489→  if (typeof sensitivity === 'number') {
+  1490→    detectionOptions = sensitivityToParams(sensitivity);
+  1491→  } else {
+  1492→    detectionOptions = {
+  1493→      threshold: manualOptions.threshold ?? -30,
+  1494→      minSilenceLength: manualOptions.minSilenceLength ?? 0.5,
+  1495→      paddingStart: manualOptions.paddingStart ?? 0.1,
+  1496→      paddingEnd: manualOptions.paddingEnd ?? 0.05,
+  1497→      autoThreshold: manualOptions.autoThreshold ?? false
+  1498→    };
+  1499→  }
+  1500→
+  1501→  // Process files sequentially to avoid overwhelming the system
+  1502→  for (let i = 0; i < job.files.length; i++) {
+  1503→    const fileEntry = job.files[i];
+  1504→    fileEntry.status = 'processing';
+  1505→
+  1506→    try {
+  1507→      const result = await detectSilencesRMS(fileEntry.path, detectionOptions);
+  1508→
+  1509→      fileEntry.status = 'completed';
+  1510→      fileEntry.result = {
+  1511→        silences: result.silences,
+  1512→        count: result.silences.length,
+  1513→        totalSilenceDuration: result.metadata.totalSilenceDuration,
+  1514→        audioDuration: result.metadata.audioDuration
+  1515→      };
+  1516→
+  1517→      job.results.push({
+  1518→        file: fileEntry.path,
+  1519→        ...fileEntry.result
+  1520→      });
+  1521→
+  1522→      job.progress.completed++;
+  1523→      console.log(`[SPLICE] Batch ${jobId}: ${i + 1}/${job.files.length} completed`);
+  1524→    } catch (err) {
+  1525→      fileEntry.status = 'failed';
+  1526→      fileEntry.error = err.message;
+  1527→
+  1528→      job.errors.push({
+  1529→        file: fileEntry.path,
+  1530→        error: err.message
+  1531→      });
+  1532→
+  1533→      job.progress.failed++;
+  1534→      console.error(`[SPLICE] Batch ${jobId}: ${fileEntry.path} failed:`, err.message);
+  1535→    }
+  1536→
+  1537→    // Update progress
+  1538→    job.progress.percentage = Math.round(
+  1539→      ((job.progress.completed + job.progress.failed) / job.progress.total) * 100
+  1540→    );
+  1541→  }
+  1542→
+  1543→  // Mark job as complete
+  1544→  job.status = job.progress.failed === job.progress.total ? 'failed' :
+  1545→               job.progress.failed > 0 ? 'completed_with_errors' : 'completed';
+  1546→  job.completedAt = new Date().toISOString();
+  1547→
+  1548→  console.log(`[SPLICE] Batch job ${jobId} ${job.status}`);
+  1549→}
+  1550→
+  1551→/**
+  1552→ * GET /batch/status/:jobId - Get batch job status and results
+  1553→ */
+  1554→app.get('/batch/status/:jobId', (req, res) => {
+  1555→  const { jobId } = req.params;
+  1556→  const job = batchJobs.get(jobId);
+  1557→
+  1558→  if (!job) {
+  1559→    return res.status(404).json({ error: 'Job not found' });
+  1560→  }
+  1561→
+  1562→  res.json({
+  1563→    success: true,
+  1564→    job: {
+  1565→      id: job.id,
+  1566→      type: job.type,
+  1567→      status: job.status,
+  1568→      createdAt: job.createdAt,
+  1569→      completedAt: job.completedAt,
+  1570→      progress: job.progress,
+  1571→      files: job.files.map(f => ({
+  1572→        path: f.path,
+  1573→        status: f.status,
+  1574→        silenceCount: f.result?.count,
+  1575→        error: f.error
+  1576→      }))
+  1577→    }
+  1578→  });
+  1579→});
+  1580→
+  1581→/**
+  1582→ * GET /batch/results/:jobId - Get full results for a completed batch job
+  1583→ */
+  1584→app.get('/batch/results/:jobId', (req, res) => {
+  1585→  const { jobId } = req.params;
+  1586→  const job = batchJobs.get(jobId);
+  1587→
+  1588→  if (!job) {
+  1589→    return res.status(404).json({ error: 'Job not found' });
+  1590→  }
+  1591→
+  1592→  if (job.status === 'processing') {
+  1593→    return res.status(202).json({
+  1594→      success: false,
+  1595→      message: 'Job still processing',
+  1596→      progress: job.progress
+  1597→    });
+  1598→  }
+  1599→
+  1600→  res.json({
+  1601→    success: true,
+  1602→    jobId: job.id,
+  1603→    status: job.status,
+  1604→    progress: job.progress,
+  1605→    results: job.results,
+  1606→    errors: job.errors,
+  1607→    summary: {
+  1608→      totalFiles: job.progress.total,
+  1609→      successful: job.progress.completed,
+  1610→      failed: job.progress.failed,
+  1611→      totalSilences: job.results.reduce((sum, r) => sum + (r.count || 0), 0),
+  1612→      totalSilenceDuration: job.results.reduce((sum, r) => sum + (r.totalSilenceDuration || 0), 0)
+  1613→    }
+  1614→  });
+  1615→});
+  1616→
+  1617→/**
+  1618→ * DELETE /batch/:jobId - Cancel or delete a batch job
+  1619→ */
+  1620→app.delete('/batch/:jobId', (req, res) => {
+  1621→  const { jobId } = req.params;
+  1622→  const job = batchJobs.get(jobId);
+  1623→
+  1624→  if (!job) {
+  1625→    return res.status(404).json({ error: 'Job not found' });
+  1626→  }
+  1627→
+  1628→  // Note: This doesn't actually cancel in-progress processing
+  1629→  // but prevents the job from being queried
+  1630→  batchJobs.delete(jobId);
+  1631→
+  1632→  res.json({
+  1633→    success: true,
+  1634→    message: `Job ${jobId} deleted`
+  1635→  });
+  1636→});
+  1637→
+  1638→/**
+  1639→ * GET /batch/jobs - List all batch jobs
+  1640→ */
+  1641→app.get('/batch/jobs', (req, res) => {
+  1642→  const jobs = Array.from(batchJobs.values()).map(job => ({
+  1643→    id: job.id,
+  1644→    type: job.type,
+  1645→    status: job.status,
+  1646→    createdAt: job.createdAt,
+  1647→    completedAt: job.completedAt,
+  1648→    progress: job.progress
+  1649→  }));
+  1650→
+  1651→  // Sort by creation date (newest first)
+  1652→  jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  1653→
+  1654→  res.json({
+  1655→    success: true,
+  1656→    count: jobs.length,
+  1657→    jobs
+  1658→  });
+  1659→});
+  1660→
+  1661→// =============================================================================
+  1662→// Billing & Credits Routes
+  1663→// =============================================================================
+  1664→
+  1665→/**
+  1666→ * GET /credits - Get user's credit balance
+  1667→ *

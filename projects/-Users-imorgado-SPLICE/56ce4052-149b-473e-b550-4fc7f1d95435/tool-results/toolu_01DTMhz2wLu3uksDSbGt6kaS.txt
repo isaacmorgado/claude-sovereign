@@ -1,0 +1,286 @@
+     1→/**
+     2→ * SPLICE CEP Credits Display Module
+     3→ *
+     4→ * Fetches and displays user's remaining hours from the billing backend.
+     5→ * Port of UXP credits.js for CEP compatibility.
+     6→ */
+     7→
+     8→// Track fetch error state for retry UI
+     9→let lastCreditsError = null;
+    10→let creditsRetryCount = 0;
+    11→const MAX_CREDITS_RETRIES = 3;
+    12→
+    13→// Store current credits globally for access checks
+    14→let currentCredits = null;
+    15→
+    16→// Store interval reference for cleanup
+    17→let creditsRefreshInterval = null;
+    18→
+    19→/**
+    20→ * Fetch user's credit balance from backend
+    21→ * @returns {Promise<Object | null>} Credit data including isolation hours, or error object
+    22→ */
+    23→async function fetchCredits() {
+    24→    const settings = getSettings();
+    25→    const customerId = settings.customerId;
+    26→
+    27→    if (!customerId) {
+    28→        console.log('[SPLICE] No customerId configured - credits display disabled');
+    29→        lastCreditsError = null;
+    30→        return null;
+    31→    }
+    32→
+    33→    try {
+    34→        const response = await fetchWithTimeout(`${getBackendUrl()}/credits`, {
+    35→            method: 'GET',
+    36→            headers: {
+    37→                'x-stripe-customer-id': customerId
+    38→            }
+    39→        }, SPLICE_CONFIG.FETCH_TIMEOUT);
+    40→
+    41→        if (!response.ok) {
+    42→            const errorMsg = await parseErrorResponse(response);
+    43→            console.error('[SPLICE] Credits fetch failed:', errorMsg);
+    44→            lastCreditsError = errorMsg;
+    45→            return { _error: true, message: errorMsg };
+    46→        }
+    47→
+    48→        const data = await response.json();
+    49→        lastCreditsError = null;
+    50→        creditsRetryCount = 0;
+    51→        return {
+    52→            hoursRemaining: data.hoursRemaining || 0,
+    53→            hoursTotal: data.hoursTotal || 0,
+    54→            tierName: data.tierName || 'Free',
+    55→            tier: data.tier || 'starter',
+    56→            // Isolation hours
+    57→            isolationHoursRemaining: data.isolationHoursRemaining || 0,
+    58→            isolationHoursTotal: data.isolationHoursTotal || 0,
+    59→            hasIsolationAccess: data.hasIsolationAccess || false,
+    60→            isolationOverageRate: data.isolationOverageRate || 0.08,
+    61→            // Trial info
+    62→            trialDaysRemaining: data.trialDaysRemaining || null,
+    63→            isOnTrial: data.isOnTrial || false
+    64→        };
+    65→    } catch (err) {
+    66→        console.error('[SPLICE] Credits fetch error:', err);
+    67→        lastCreditsError = err.message || 'Connection failed';
+    68→        return { _error: true, message: lastCreditsError };
+    69→    }
+    70→}
+    71→
+    72→/**
+    73→ * Clear the credits cache (call on logout)
+    74→ */
+    75→function clearCreditsCache() {
+    76→    currentCredits = null;
+    77→    lastCreditsError = null;
+    78→    creditsRetryCount = 0;
+    79→    console.log('[SPLICE] Credits cache cleared');
+    80→}
+    81→
+    82→/**
+    83→ * Update the credit display in the UI
+    84→ * @param {Object|null} credits - Credit data, error object, or null if unavailable
+    85→ */
+    86→function updateCreditDisplay(credits) {
+    87→    const creditBadge = document.getElementById('creditBadge');
+    88→    if (!creditBadge) return;
+    89→
+    90→    // Handle no customer ID configured
+    91→    if (!credits) {
+    92→        currentCredits = null;
+    93→        creditBadge.style.display = 'flex';
+    94→        creditBadge.textContent = 'Login';
+    95→        creditBadge.title = 'Click to enter license key';
+    96→        creditBadge.classList.remove('ok', 'low');
+    97→        creditBadge.classList.add('login');
+    98→        return;
+    99→    }
+   100→
+   101→    // Handle error state - show error badge with retry
+   102→    if (credits._error) {
+   103→        currentCredits = null;
+   104→        creditBadge.style.display = 'flex';
+   105→        creditBadge.textContent = 'Retry';
+   106→        creditBadge.title = `Error: ${credits.message}\nClick to retry`;
+   107→        creditBadge.classList.remove('ok', 'low', 'login');
+   108→        creditBadge.classList.add('error');
+   109→        return;
+   110→    }
+   111→
+   112→    // Normal credit display
+   113→    currentCredits = credits;
+   114→    creditBadge.style.display = 'flex';
+   115→
+   116→    // Show referral promo when logged in
+   117→    const referralPromo = document.getElementById('referralPromo');
+   118→    if (referralPromo) {
+   119→        referralPromo.classList.remove('hidden');
+   120→    }
+   121→
+   122→    // Show trial status if on trial
+   123→    if (credits.isOnTrial && credits.trialDaysRemaining) {
+   124→        creditBadge.textContent = `Trial: ${credits.trialDaysRemaining}d`;
+   125→        creditBadge.classList.remove('error', 'login', 'ok', 'low');
+   126→        creditBadge.classList.add('trial');
+   127→    } else {
+   128→        creditBadge.textContent = `${credits.hoursRemaining.toFixed(1)} hrs`;
+   129→        creditBadge.classList.remove('error', 'login', 'trial');
+   130→    }
+   131→
+   132→    // Build tooltip with isolation info if available
+   133→    let tooltip = `${credits.tierName}: ${credits.hoursRemaining.toFixed(1)} / ${credits.hoursTotal} hours`;
+   134→    if (credits.isOnTrial && credits.trialDaysRemaining) {
+   135→        tooltip = `Trial: ${credits.trialDaysRemaining} days remaining\n` + tooltip;
+   136→    }
+   137→    if (credits.hasIsolationAccess) {
+   138→        tooltip += `\nIsolation: ${(credits.isolationHoursRemaining * 60).toFixed(0)} / ${(credits.isolationHoursTotal * 60).toFixed(0)} min`;
+   139→    }
+   140→    creditBadge.title = tooltip;
+   141→
+   142→    // Color based on remaining hours
+   143→    if (credits.hoursRemaining <= 1) {
+   144→        creditBadge.classList.add('low');
+   145→        creditBadge.classList.remove('ok');
+   146→    } else {
+   147→        creditBadge.classList.add('ok');
+   148→        creditBadge.classList.remove('low');
+   149→    }
+   150→
+   151→    // Update isolation checkbox state based on tier access
+   152→    updateIsolationCheckboxState(credits);
+   153→}
+   154→
+   155→/**
+   156→ * Update the isolation checkbox based on tier access
+   157→ */
+   158→function updateIsolationCheckboxState(credits) {
+   159→    const isolatedCheckbox = document.getElementById('sourceIsolated');
+   160→    const tierBadge = isolatedCheckbox?.parentElement?.querySelector('.tier-badge');
+   161→
+   162→    if (!isolatedCheckbox) return;
+   163→
+   164→    if (!credits || !credits.hasIsolationAccess) {
+   165→        // Disable isolation for non-Pro/Team users
+   166→        isolatedCheckbox.disabled = true;
+   167→        isolatedCheckbox.checked = false;
+   168→        if (tierBadge) {
+   169→            tierBadge.textContent = 'Pro+';
+   170→            tierBadge.style.opacity = '1';
+   171→        }
+   172→    } else {
+   173→        // Enable isolation for Pro/Team users
+   174→        isolatedCheckbox.disabled = false;
+   175→        if (tierBadge) {
+   176→            // Show remaining isolation time
+   177→            const minsRemaining = (credits.isolationHoursRemaining * 60).toFixed(0);
+   178→            tierBadge.textContent = `${minsRemaining} min`;
+   179→            tierBadge.style.opacity = credits.isolationHoursRemaining > 0 ? '1' : '0.6';
+   180→        }
+   181→    }
+   182→}
+   183→
+   184→/**
+   185→ * Check if user can use isolation and get cost estimate
+   186→ * @param {number} estimatedMinutes - Estimated audio duration in minutes
+   187→ * @returns {Object} Access info with allowed, message, overageCost
+   188→ */
+   189→function checkIsolationAccess(estimatedMinutes = 0) {
+   190→    if (!currentCredits) {
+   191→        return { allowed: false, message: 'Credits not loaded', overageCost: 0 };
+   192→    }
+   193→
+   194→    if (!currentCredits.hasIsolationAccess) {
+   195→        return {
+   196→            allowed: false,
+   197→            message: 'Vocal isolation requires Pro or Team tier',
+   198→            upgradeRequired: true,
+   199→            overageCost: 0
+   200→        };
+   201→    }
+   202→
+   203→    const estimatedHours = estimatedMinutes / 60;
+   204→    const remaining = currentCredits.isolationHoursRemaining;
+   205→
+   206→    if (remaining >= estimatedHours) {
+   207→        return {
+   208→            allowed: true,
+   209→            message: `Using ${estimatedMinutes.toFixed(1)} min of included isolation time`,
+   210→            overageCost: 0
+   211→        };
+   212→    }
+   213→
+   214→    // Calculate overage
+   215→    const overageMinutes = estimatedMinutes - (remaining * 60);
+   216→    const overageCost = overageMinutes * currentCredits.isolationOverageRate;
+   217→
+   218→    return {
+   219→        allowed: true,
+   220→        message: `${remaining > 0 ? `${(remaining * 60).toFixed(0)} included + ` : ''}${overageMinutes.toFixed(0)} min overage ($${overageCost.toFixed(2)})`,
+   221→        overageCost,
+   222→        overageMinutes
+   223→    };
+   224→}
+   225→
+   226→/**
+   227→ * Get current credits (for access checks)
+   228→ */
+   229→function getCurrentCredits() {
+   230→    return currentCredits;
+   231→}
+   232→
+   233→/**
+   234→ * Initialize credits display
+   235→ * Fetches credits on load and sets up periodic refresh
+   236→ */
+   237→async function initCredits() {
+   238→    // Clear any existing interval to prevent duplicates
+   239→    if (creditsRefreshInterval) {
+   240→        clearInterval(creditsRefreshInterval);
+   241→    }
+   242→
+   243→    // Initial fetch
+   244→    const credits = await fetchCredits();
+   245→    updateCreditDisplay(credits);
+   246→
+   247→    // Refresh credits every 5 minutes
+   248→    creditsRefreshInterval = setInterval(async () => {
+   249→        const refreshedCredits = await fetchCredits();
+   250→        updateCreditDisplay(refreshedCredits);
+   251→    }, 5 * 60 * 1000);
+   252→}
+   253→
+   254→/**
+   255→ * Cleanup credits module - call on plugin unload
+   256→ */
+   257→function cleanupCredits() {
+   258→    if (creditsRefreshInterval) {
+   259→        clearInterval(creditsRefreshInterval);
+   260→        creditsRefreshInterval = null;
+   261→    }
+   262→}
+   263→
+   264→/**
+   265→ * Manually refresh credits (e.g., after a processing operation)
+   266→ */
+   267→async function refreshCredits() {
+   268→    const credits = await fetchCredits();
+   269→    updateCreditDisplay(credits);
+   270→    return credits;
+   271→}
+   272→
+   273→// Export for window access
+   274→window.fetchCredits = fetchCredits;
+   275→window.clearCreditsCache = clearCreditsCache;
+   276→window.updateCreditDisplay = updateCreditDisplay;
+   277→window.checkIsolationAccess = checkIsolationAccess;
+   278→window.getCurrentCredits = getCurrentCredits;
+   279→window.initCredits = initCredits;
+   280→window.cleanupCredits = cleanupCredits;
+   281→window.refreshCredits = refreshCredits;
+   282→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

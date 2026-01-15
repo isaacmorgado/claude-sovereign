@@ -1,0 +1,725 @@
+/**
+ * Multitrack/Multicam Analysis Service
+ *
+ * Analyzes multiple audio tracks to determine optimal video angle selection.
+ * Based on Fireside's proven multicam editing approach.
+ *
+ * Features:
+ * - Per-speaker RMS audio level analysis
+ * - Noise floor subtraction for cleaner detection
+ * - Automatic video angle selection based on loudest speaker
+ * - Wide shot detection (multiple speakers talking)
+ * - Cutaway insertion for long clips
+ * - Speaker screentime balancing
+ * - Gaussian smoothing to reduce spurious cuts
+ */
+
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
+
+const execAsync = promisify(exec);
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const DEFAULT_OPTIONS = {
+  // Analysis parameters
+  analysisWindowMs: 100,       // RMS window size in milliseconds
+  smoothingWindow: 5,          // Gaussian blur kernel size (frames)
+
+  // Switching parameters
+  switchingFrequency: 50,      // How often to allow cuts (0-100)
+  minShotDuration: 2.0,        // Minimum seconds before next cut
+  speakerBoosts: {},           // Per-speaker dB adjustments
+
+  // Wide shot parameters
+  wideShotEnabled: true,
+  wideShotPercentage: 20,      // Target % of time in wide shots
+  wideShotTolerance: 6,        // dB tolerance for multiple speaker detection
+
+  // Cutaway parameters
+  cutawayEnabled: false,
+  cutawayMinDuration: 1.5,
+  cutawayMaxDuration: 4.0,
+  cutawayTracks: [],           // Video track indices for cutaways
+
+  // Output
+  frameRate: 30
+};
+
+// =============================================================================
+// Core Analysis
+// =============================================================================
+
+/**
+ * Analyze multiple audio tracks for multicam editing
+ *
+ * @param {Array<string>} audioPaths - Paths to audio files (one per speaker)
+ * @param {Object} options - Analysis options
+ * @returns {Promise<Object>} Analysis results with switching decisions
+ */
+async function analyzeMultitrack(audioPaths, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  console.log(`[SPLICE Multitrack] Analyzing ${audioPaths.length} audio track(s)`);
+
+  // Step 1: Extract RMS levels for each track
+  const trackLevels = await Promise.all(
+    audioPaths.map((audioPath, i) =>
+      extractTrackLevels(audioPath, {
+        windowMs: opts.analysisWindowMs,
+        speakerName: opts.speakerNames?.[i] || `Speaker ${i + 1}`
+      })
+    )
+  );
+
+  // Validate all tracks have same duration
+  const durations = trackLevels.map(t => t.duration);
+  const maxDuration = Math.max(...durations);
+  const minDuration = Math.min(...durations);
+  if (maxDuration - minDuration > 1) {
+    console.warn('[SPLICE Multitrack] Track durations differ significantly');
+  }
+
+  // Step 2: Calculate noise floor and clean up levels
+  const cleanedLevels = cleanupAudioLevels(trackLevels, opts);
+
+  // Step 3: Apply speaker boosts
+  const boostedLevels = applySpeakerBoosts(cleanedLevels, opts.speakerBoosts);
+
+  // Step 4: Apply Gaussian smoothing
+  const smoothedLevels = opts.smoothingWindow > 0
+    ? smoothAudioLevels(boostedLevels, opts.smoothingWindow)
+    : boostedLevels;
+
+  // Step 5: Generate switching decisions
+  const decisions = generateSwitchingDecisions(smoothedLevels, {
+    videoTrackMapping: opts.videoTrackMapping,
+    minShotDuration: opts.minShotDuration,
+    switchingFrequency: opts.switchingFrequency,
+    wideShotEnabled: opts.wideShotEnabled,
+    wideShotTolerance: opts.wideShotTolerance,
+    wideShotTracks: opts.wideShotTracks,
+    frameRate: opts.frameRate
+  });
+
+  // Step 6: Fine-tune wide shot percentage
+  const tunedDecisions = opts.wideShotEnabled
+    ? tuneWideShotPercentage(decisions, opts.wideShotPercentage)
+    : decisions;
+
+  // Step 7: Insert cutaways if enabled
+  const finalDecisions = opts.cutawayEnabled
+    ? insertCutaways(tunedDecisions, {
+        cutawayTracks: opts.cutawayTracks,
+        minDuration: opts.cutawayMinDuration,
+        maxDuration: opts.cutawayMaxDuration
+      })
+    : tunedDecisions;
+
+  // Step 8: Calculate statistics
+  const stats = calculateMultitrackStats(finalDecisions, trackLevels[0].duration);
+
+  console.log(`[SPLICE Multitrack] Generated ${finalDecisions.length} switching decision(s)`);
+
+  return {
+    decisions: finalDecisions,
+    metadata: {
+      trackCount: audioPaths.length,
+      speakerNames: opts.speakerNames || audioPaths.map((_, i) => `Speaker ${i + 1}`),
+      duration: maxDuration,
+      frameRate: opts.frameRate,
+      ...stats
+    },
+    levels: {
+      raw: trackLevels.map(t => ({ speaker: t.speakerName, sampleCount: t.levels.length })),
+      // Don't include full level data in response (too large)
+    }
+  };
+}
+
+// =============================================================================
+// Audio Level Extraction
+// =============================================================================
+
+/**
+ * Extract RMS levels from audio file
+ *
+ * @param {string} audioPath - Path to audio file
+ * @param {Object} options - Extraction options
+ * @returns {Promise<Object>} Track levels with timing
+ */
+async function extractTrackLevels(audioPath, options = {}) {
+  const { windowMs = 100, speakerName = 'Unknown' } = options;
+
+  console.log(`[SPLICE Multitrack] Extracting levels: ${speakerName}`);
+
+  // Get audio info
+  const infoCmd = `ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,duration -of json "${audioPath}"`;
+  let sampleRate = 48000;
+  let duration = 0;
+
+  try {
+    const { stdout } = await execAsync(infoCmd);
+    const info = JSON.parse(stdout);
+    if (info.streams?.[0]) {
+      sampleRate = parseInt(info.streams[0].sample_rate) || 48000;
+      duration = parseFloat(info.streams[0].duration) || 0;
+    }
+  } catch (err) {
+    console.warn(`[SPLICE Multitrack] Could not get audio info: ${err.message}`);
+  }
+
+  // Get duration from format if not in stream
+  if (!duration) {
+    try {
+      const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`;
+      const { stdout } = await execAsync(durationCmd);
+      duration = parseFloat(stdout.trim()) || 0;
+    } catch (err) {
+      console.warn(`[SPLICE Multitrack] Could not get duration: ${err.message}`);
+    }
+  }
+
+  // Extract audio and calculate RMS per window
+  const tempFile = path.join('/tmp', `splice_multitrack_${Date.now()}_${Math.random().toString(36).slice(2)}.raw`);
+
+  try {
+    // Convert to mono, 16kHz for faster processing
+    const extractCmd = `ffmpeg -y -i "${audioPath}" -ac 1 -ar 16000 -f s16le -acodec pcm_s16le "${tempFile}" 2>/dev/null`;
+    await execAsync(extractCmd, { maxBuffer: 100 * 1024 * 1024 });
+
+    const rawData = fs.readFileSync(tempFile);
+    const samples = new Float32Array(rawData.length / 2);
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = rawData.readInt16LE(i * 2) / 32768.0;
+    }
+
+    // Calculate RMS per window
+    const windowSamples = Math.floor((windowMs / 1000) * 16000);
+    const hopSamples = windowSamples; // Non-overlapping windows
+    const numWindows = Math.floor(samples.length / hopSamples);
+
+    const levels = new Float32Array(numWindows);
+    const times = new Float32Array(numWindows);
+
+    for (let i = 0; i < numWindows; i++) {
+      const start = i * hopSamples;
+      const end = Math.min(start + windowSamples, samples.length);
+
+      let sumSquares = 0;
+      for (let j = start; j < end; j++) {
+        sumSquares += samples[j] * samples[j];
+      }
+
+      const rms = Math.sqrt(sumSquares / (end - start));
+      const dbfs = rms > 0 ? 20 * Math.log10(rms) : -100;
+
+      levels[i] = Math.max(-100, dbfs);
+      times[i] = (start / 16000);
+    }
+
+    fs.unlinkSync(tempFile);
+
+    return { levels, times, duration, speakerName, sampleRate: 16000 };
+  } catch (err) {
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    throw new Error(`Failed to extract track levels: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// Level Processing
+// =============================================================================
+
+/**
+ * Clean up audio levels by subtracting noise floor
+ *
+ * @param {Array} trackLevels - Array of track level objects
+ * @param {Object} options - Cleanup options
+ * @returns {Array} Cleaned level arrays
+ */
+function cleanupAudioLevels(trackLevels, options = {}) {
+  const numTracks = trackLevels.length;
+  const numSamples = trackLevels[0].levels.length;
+
+  // Calculate average level (noise floor estimate)
+  const averageLevels = new Float32Array(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    let sum = 0;
+    for (let t = 0; t < numTracks; t++) {
+      sum += trackLevels[t].levels[i];
+    }
+    averageLevels[i] = sum / numTracks;
+  }
+
+  // Subtract average from each track (relative loudness)
+  const cleaned = trackLevels.map(track => {
+    const cleanedLevels = new Float32Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+      // Normalize to -100 to 0 range
+      cleanedLevels[i] = Math.max(-100, Math.min(0, track.levels[i] - averageLevels[i]));
+    }
+    return {
+      ...track,
+      levels: cleanedLevels
+    };
+  });
+
+  return cleaned;
+}
+
+/**
+ * Apply per-speaker dB boosts
+ *
+ * @param {Array} trackLevels - Cleaned track levels
+ * @param {Object} boosts - Speaker boost mapping { "Speaker 1": 5, ... }
+ * @returns {Array} Boosted levels
+ */
+function applySpeakerBoosts(trackLevels, boosts = {}) {
+  return trackLevels.map(track => {
+    const boost = boosts[track.speakerName] || 0;
+    if (boost === 0) return track;
+
+    const boostedLevels = new Float32Array(track.levels.length);
+    for (let i = 0; i < track.levels.length; i++) {
+      boostedLevels[i] = Math.max(-100, Math.min(0, track.levels[i] + boost));
+    }
+
+    return { ...track, levels: boostedLevels };
+  });
+}
+
+/**
+ * Apply Gaussian smoothing to reduce noise
+ *
+ * @param {Array} trackLevels - Track levels
+ * @param {number} windowSize - Gaussian kernel size
+ * @returns {Array} Smoothed levels
+ */
+function smoothAudioLevels(trackLevels, windowSize = 5) {
+  const kernel = generateGaussianKernel(windowSize);
+
+  return trackLevels.map(track => {
+    const smoothed = applyConvolution(track.levels, kernel);
+    return { ...track, levels: smoothed };
+  });
+}
+
+/**
+ * Generate Gaussian kernel
+ */
+function generateGaussianKernel(size) {
+  const sigma = size / 3;
+  const kernel = new Float32Array(size);
+  const half = Math.floor(size / 2);
+  let sum = 0;
+
+  for (let i = 0; i < size; i++) {
+    const x = i - half;
+    kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
+    sum += kernel[i];
+  }
+
+  // Normalize
+  for (let i = 0; i < size; i++) {
+    kernel[i] /= sum;
+  }
+
+  return kernel;
+}
+
+/**
+ * Apply 1D convolution
+ */
+function applyConvolution(data, kernel) {
+  const result = new Float32Array(data.length);
+  const half = Math.floor(kernel.length / 2);
+
+  for (let i = 0; i < data.length; i++) {
+    let sum = 0;
+    for (let j = 0; j < kernel.length; j++) {
+      const idx = i + j - half;
+      if (idx >= 0 && idx < data.length) {
+        sum += data[idx] * kernel[j];
+      }
+    }
+    result[i] = sum;
+  }
+
+  return result;
+}
+
+// =============================================================================
+// Switching Decision Generation
+// =============================================================================
+
+/**
+ * Generate video switching decisions based on audio levels
+ *
+ * @param {Array} trackLevels - Processed track levels
+ * @param {Object} options - Decision options
+ * @returns {Array} Switching decisions
+ */
+function generateSwitchingDecisions(trackLevels, options = {}) {
+  const {
+    videoTrackMapping = {},
+    minShotDuration = 2.0,
+    switchingFrequency = 50,
+    wideShotEnabled = true,
+    wideShotTolerance = 6,
+    wideShotTracks = [],
+    frameRate = 30
+  } = options;
+
+  const numSamples = trackLevels[0].levels.length;
+  const times = trackLevels[0].times;
+  const decisions = [];
+
+  // Calculate min samples between cuts based on switching frequency
+  const minSamplesPerCut = Math.ceil(minShotDuration / (times[1] - times[0]));
+  const switchingCooldown = Math.ceil(minSamplesPerCut * (1 - switchingFrequency / 100));
+
+  let currentSpeaker = -1;
+  let currentDecisionStart = 0;
+  let lastSwitchSample = 0;
+
+  for (let i = 0; i < numSamples; i++) {
+    // Find loudest speaker
+    let maxLevel = -100;
+    let loudestSpeaker = 0;
+    let speakersAboveThreshold = [];
+
+    for (let t = 0; t < trackLevels.length; t++) {
+      const level = trackLevels[t].levels[i];
+      if (level > maxLevel) {
+        maxLevel = level;
+        loudestSpeaker = t;
+      }
+
+      // Track speakers within tolerance of max (for wide shot detection)
+      if (wideShotEnabled && level >= maxLevel - wideShotTolerance) {
+        speakersAboveThreshold.push(t);
+      }
+    }
+
+    // Determine if this should be a wide shot
+    const isWideShot = wideShotEnabled && speakersAboveThreshold.length >= 2;
+    const effectiveSpeaker = isWideShot ? -1 : loudestSpeaker; // -1 = wide shot
+
+    // Check if we should switch
+    const canSwitch = (i - lastSwitchSample) >= switchingCooldown;
+    const shouldSwitch = canSwitch && effectiveSpeaker !== currentSpeaker;
+
+    if (shouldSwitch || i === 0) {
+      // Close previous decision
+      if (i > 0 && decisions.length > 0) {
+        decisions[decisions.length - 1].endTime = times[i];
+        decisions[decisions.length - 1].endSample = i;
+      }
+
+      // Start new decision
+      const speakerName = isWideShot
+        ? 'Wide Shot'
+        : trackLevels[loudestSpeaker].speakerName;
+
+      const videoTrack = isWideShot
+        ? (wideShotTracks[0] ?? 0)
+        : (videoTrackMapping[loudestSpeaker] ?? loudestSpeaker);
+
+      decisions.push({
+        speakerIndex: effectiveSpeaker,
+        speakerName,
+        speakers: speakersAboveThreshold.map(s => trackLevels[s].speakerName),
+        videoTrack,
+        startTime: times[i],
+        startSample: i,
+        endTime: times[numSamples - 1],
+        endSample: numSamples - 1,
+        isWideShot,
+        reason: isWideShot ? 'Multiple speakers' : 'Loudest speaker'
+      });
+
+      currentSpeaker = effectiveSpeaker;
+      lastSwitchSample = i;
+    }
+  }
+
+  // Finalize last decision
+  if (decisions.length > 0) {
+    decisions[decisions.length - 1].endTime = times[numSamples - 1];
+    decisions[decisions.length - 1].endSample = numSamples - 1;
+  }
+
+  // Add duration to each decision
+  return decisions.map(d => ({
+    ...d,
+    duration: parseFloat((d.endTime - d.startTime).toFixed(3))
+  }));
+}
+
+// =============================================================================
+// Wide Shot Tuning
+// =============================================================================
+
+/**
+ * Fine-tune wide shot percentage using tolerance adjustment
+ *
+ * @param {Array} decisions - Initial decisions
+ * @param {number} targetPercentage - Target wide shot percentage
+ * @returns {Array} Tuned decisions
+ */
+function tuneWideShotPercentage(decisions, targetPercentage) {
+  const totalDuration = decisions.reduce((sum, d) => sum + d.duration, 0);
+  const currentWideTime = decisions
+    .filter(d => d.isWideShot)
+    .reduce((sum, d) => sum + d.duration, 0);
+  const currentPercentage = (currentWideTime / totalDuration) * 100;
+
+  // If within 5% of target, don't adjust
+  if (Math.abs(currentPercentage - targetPercentage) <= 5) {
+    return decisions;
+  }
+
+  console.log(`[SPLICE Multitrack] Wide shot: ${currentPercentage.toFixed(1)}% (target: ${targetPercentage}%)`);
+
+  // Simple approach: mark some single-speaker decisions as wide shots
+  // or vice versa based on whether we need more or fewer wide shots
+  // (Full implementation would re-run with adjusted tolerance)
+
+  return decisions; // Return as-is for now
+}
+
+// =============================================================================
+// Cutaway Insertion
+// =============================================================================
+
+/**
+ * Insert cutaways into long clips
+ *
+ * @param {Array} decisions - Switching decisions
+ * @param {Object} options - Cutaway options
+ * @returns {Array} Decisions with cutaways inserted
+ */
+function insertCutaways(decisions, options = {}) {
+  const {
+    cutawayTracks = [],
+    minDuration = 1.5,
+    maxDuration = 4.0,
+    maxClipDuration = 30 // Insert cutaway if clip longer than this
+  } = options;
+
+  if (cutawayTracks.length === 0) return decisions;
+
+  const result = [];
+
+  for (const decision of decisions) {
+    if (decision.duration <= maxClipDuration) {
+      result.push(decision);
+      continue;
+    }
+
+    // Split long clip with cutaways
+    const numCutaways = Math.floor(decision.duration / maxClipDuration);
+    const interval = decision.duration / (numCutaways + 1);
+
+    let currentStart = decision.startTime;
+
+    for (let i = 0; i < numCutaways; i++) {
+      // Add main clip segment
+      const cutawayStart = currentStart + interval - minDuration / 2;
+      const cutawayDuration = minDuration + Math.random() * (maxDuration - minDuration);
+      const cutawayEnd = cutawayStart + cutawayDuration;
+
+      result.push({
+        ...decision,
+        startTime: currentStart,
+        endTime: cutawayStart,
+        duration: cutawayStart - currentStart
+      });
+
+      // Add cutaway
+      const cutawayTrack = cutawayTracks[i % cutawayTracks.length];
+      result.push({
+        speakerIndex: -2, // Special index for cutaway
+        speakerName: 'Cutaway',
+        speakers: [],
+        videoTrack: cutawayTrack,
+        startTime: cutawayStart,
+        endTime: cutawayEnd,
+        duration: cutawayDuration,
+        isWideShot: false,
+        isCutaway: true,
+        reason: 'Cutaway insert'
+      });
+
+      currentStart = cutawayEnd;
+    }
+
+    // Add final segment
+    result.push({
+      ...decision,
+      startTime: currentStart,
+      endTime: decision.endTime,
+      duration: decision.endTime - currentStart
+    });
+  }
+
+  return result;
+}
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+/**
+ * Calculate multitrack analysis statistics
+ *
+ * @param {Array} decisions - Final decisions
+ * @param {number} totalDuration - Total audio duration
+ * @returns {Object} Statistics
+ */
+function calculateMultitrackStats(decisions, totalDuration) {
+  const speakerTimes = {};
+  let wideShotTime = 0;
+  let cutawayTime = 0;
+
+  for (const d of decisions) {
+    if (d.isCutaway) {
+      cutawayTime += d.duration;
+    } else if (d.isWideShot) {
+      wideShotTime += d.duration;
+    } else {
+      speakerTimes[d.speakerName] = (speakerTimes[d.speakerName] || 0) + d.duration;
+    }
+  }
+
+  const speakerPercentages = {};
+  for (const [speaker, time] of Object.entries(speakerTimes)) {
+    speakerPercentages[speaker] = parseFloat(((time / totalDuration) * 100).toFixed(1));
+  }
+
+  return {
+    decisionCount: decisions.length,
+    wideShotPercentage: parseFloat(((wideShotTime / totalDuration) * 100).toFixed(1)),
+    cutawayPercentage: parseFloat(((cutawayTime / totalDuration) * 100).toFixed(1)),
+    speakerPercentages,
+    averageShotDuration: parseFloat((totalDuration / decisions.length).toFixed(2))
+  };
+}
+
+// =============================================================================
+// Auto-Balance Optimizer
+// =============================================================================
+
+/**
+ * Auto-balance speaker screentime
+ * Adjusts speaker boosts to achieve equal distribution
+ *
+ * @param {Array<string>} audioPaths - Audio file paths
+ * @param {Object} options - Base analysis options
+ * @returns {Promise<Object>} Optimized analysis with best parameters
+ */
+async function autoBalanceMultitrack(audioPaths, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const numSpeakers = audioPaths.length;
+  const targetShare = 100 / numSpeakers;
+
+  console.log(`[SPLICE Multitrack] Auto-balancing for ${numSpeakers} speakers (target: ${targetShare.toFixed(1)}% each)`);
+
+  // Run initial analysis
+  let bestResult = await analyzeMultitrack(audioPaths, opts);
+  let bestError = calculateDistributionError(bestResult.metadata.speakerPercentages, targetShare);
+
+  // Iterative optimization
+  const maxIterations = 10;
+  const boostStep = 3; // dB step
+
+  for (let iter = 0; iter < maxIterations; iter++) {
+    // Find most over/under-represented speakers
+    const percentages = bestResult.metadata.speakerPercentages;
+    let maxOver = { speaker: null, diff: 0 };
+    let maxUnder = { speaker: null, diff: 0 };
+
+    for (const [speaker, pct] of Object.entries(percentages)) {
+      const diff = pct - targetShare;
+      if (diff > maxOver.diff) maxOver = { speaker, diff };
+      if (diff < maxUnder.diff) maxUnder = { speaker, diff };
+    }
+
+    if (Math.abs(maxOver.diff) < 1 && Math.abs(maxUnder.diff) < 1) {
+      console.log(`[SPLICE Multitrack] Converged at iteration ${iter + 1}`);
+      break;
+    }
+
+    // Adjust boosts
+    const newBoosts = { ...opts.speakerBoosts };
+    if (maxOver.speaker) {
+      newBoosts[maxOver.speaker] = (newBoosts[maxOver.speaker] || 0) - boostStep;
+    }
+    if (maxUnder.speaker) {
+      newBoosts[maxUnder.speaker] = (newBoosts[maxUnder.speaker] || 0) + boostStep;
+    }
+
+    // Run analysis with new boosts
+    const testResult = await analyzeMultitrack(audioPaths, { ...opts, speakerBoosts: newBoosts });
+    const testError = calculateDistributionError(testResult.metadata.speakerPercentages, targetShare);
+
+    if (testError < bestError) {
+      bestResult = testResult;
+      bestError = testError;
+      opts.speakerBoosts = newBoosts;
+      console.log(`[SPLICE Multitrack] Iteration ${iter + 1}: error ${testError.toFixed(2)}%`);
+    }
+  }
+
+  return {
+    ...bestResult,
+    optimized: true,
+    speakerBoosts: opts.speakerBoosts,
+    finalError: bestError
+  };
+}
+
+/**
+ * Calculate distribution error (max absolute deviation from target)
+ */
+function calculateDistributionError(percentages, targetShare) {
+  let maxError = 0;
+  for (const pct of Object.values(percentages)) {
+    maxError = Math.max(maxError, Math.abs(pct - targetShare));
+  }
+  return maxError;
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
+module.exports = {
+  // Core analysis
+  analyzeMultitrack,
+  extractTrackLevels,
+
+  // Level processing
+  cleanupAudioLevels,
+  applySpeakerBoosts,
+  smoothAudioLevels,
+
+  // Decision generation
+  generateSwitchingDecisions,
+  tuneWideShotPercentage,
+  insertCutaways,
+
+  // Auto-balance
+  autoBalanceMultitrack,
+
+  // Statistics
+  calculateMultitrackStats,
+
+  // Config
+  DEFAULT_OPTIONS
+};

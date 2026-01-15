@@ -1,0 +1,261 @@
+     1→/**
+     2→ * Analyze Routes
+     3→ *
+     4→ * Main analysis and transcription endpoints
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const fs = require('fs');
+     9→const { transcribeAudio, transcribeFull } = require('../services/transcription');
+    10→const { detectTakes } = require('../services/takeDetection');
+    11→const { isolateVocals, isReplicateConfigured } = require('../services/vocalIsolation');
+    12→const { getAudioDuration } = require('../services/ffprobeSilence');
+    13→const { alignToFrameFloor, alignToFrameCeil } = require('../services/cutListGenerator');
+    14→const { validateAudioPath } = require('../services/securityUtils');
+    15→
+    16→/**
+    17→ * Create analyze routes
+    18→ * @param {Object} options - Route configuration options
+    19→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    20→ * @param {Object} options.services - Shared services (usageTracking)
+    21→ * @returns {express.Router}
+    22→ */
+    23→function createAnalyzeRoutes(options = {}) {
+    24→  const router = express.Router();
+    25→  const { requireCredits } = options.middleware || {};
+    26→  const { usageTracking } = options.services || {};
+    27→
+    28→  /**
+    29→   * POST /analyze - Main analysis endpoint
+    30→   *
+    31→   * Pipeline:
+    32→   * 1. Validate input (wavPath)
+    33→   * 2. Slice 4: Transcribe audio with Whisper
+    34→   * 3. Slice 5: Detect takes with GPT-4o-mini
+    35→   * 4. Return combined results
+    36→   */
+    37→  router.post('/analyze', requireCredits({ endpoint: 'analyze' }), async (req, res) => {
+    38→    const { wavPath } = req.body;
+    39→
+    40→    // Validate input
+    41→    if (!wavPath) {
+    42→      return res.status(400).json({ error: 'wavPath is required' });
+    43→    }
+    44→
+    45→    // SECURITY: Validate path to prevent path traversal attacks
+    46→    const pathValidation = await validateAudioPath(wavPath);
+    47→    if (!pathValidation.valid) {
+    48→      return res.status(400).json({ error: pathValidation.error });
+    49→    }
+    50→    const validatedPath = pathValidation.path;
+    51→
+    52→    console.log(`[SPLICE] Analyzing: ${validatedPath}`);
+    53→
+    54→    try {
+    55→      // Slice 4 - GPT-4o-mini transcription
+    56→      const transcript = await transcribeAudio(validatedPath);
+    57→
+    58→      // Slice 5 - GPT-4o-mini take detection
+    59→      const takes = await detectTakes(transcript);
+    60→
+    61→      // Deduct usage based on audio duration
+    62→      const audioDuration = transcript.duration || 0;
+    63→      let balance = null;
+    64→      if (audioDuration > 0 && req.deductUsage) {
+    65→        balance = await req.deductUsage(audioDuration);
+    66→      }
+    67→
+    68→      res.json({
+    69→        success: true,
+    70→        wavPath: validatedPath,
+    71→        transcript,
+    72→        takes,
+    73→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+    74→      });
+    75→    } catch (err) {
+    76→      console.error('[SPLICE] Error:', err);
+    77→      res.status(500).json({ error: err.message });
+    78→    }
+    79→  });
+    80→
+    81→  /**
+    82→   * POST /transcribe/word-level - Get frame-aligned word-level timestamps
+    83→   *
+    84→   * Returns word-level timestamps with optional frame alignment for precise editing.
+    85→   * Uses the unified transcription cache (same API call as /analyze).
+    86→   *
+    87→   * Body:
+    88→   * - wavPath: Path to audio file
+    89→   * - frameRate: Optional frame rate for alignment (23.976, 24, 29.97, 30, 60)
+    90→   *
+    91→   * Returns:
+    92→   * - words: Array of {word, start, end, startAligned?, endAligned?}
+    93→   * - text: Full transcript text
+    94→   * - duration: Audio duration in seconds
+    95→   */
+    96→  router.post('/transcribe/word-level', requireCredits({ endpoint: 'transcribe-word-level' }), async (req, res) => {
+    97→    const { wavPath, frameRate = 0 } = req.body;
+    98→
+    99→    if (!wavPath) {
+   100→      return res.status(400).json({ error: 'wavPath is required' });
+   101→    }
+   102→
+   103→    // SECURITY: Validate path to prevent path traversal attacks
+   104→    const pathValidation = await validateAudioPath(wavPath);
+   105→    if (!pathValidation.valid) {
+   106→      return res.status(400).json({ error: pathValidation.error });
+   107→    }
+   108→    const validatedPath = pathValidation.path;
+   109→
+   110→    console.log(`[SPLICE] Word-level transcription: ${validatedPath} (frameRate: ${frameRate || 'none'})`);
+   111→
+   112→    try {
+   113→      // Use unified transcription (gets both segments and words in one API call)
+   114→      const full = await transcribeFull(validatedPath);
+   115→
+   116→      // Apply frame alignment if requested
+   117→      let words = full.words || [];
+   118→      const hasFrameAlignment = frameRate > 0;
+   119→
+   120→      if (hasFrameAlignment) {
+   121→        words = words.map(w => ({
+   122→          word: w.word,
+   123→          start: w.start,
+   124→          end: w.end,
+   125→          // Add frame-aligned versions
+   126→          startAligned: parseFloat(alignToFrameFloor(w.start, frameRate).toFixed(6)),
+   127→          endAligned: parseFloat(alignToFrameCeil(w.end, frameRate).toFixed(6))
+   128→        }));
+   129→        console.log(`[SPLICE] Applied ${frameRate}fps frame alignment to ${words.length} words`);
+   130→      }
+   131→
+   132→      // Deduct usage based on audio duration
+   133→      const audioDuration = full.duration || 0;
+   134→      let balance = null;
+   135→      if (audioDuration > 0 && req.deductUsage) {
+   136→        balance = await req.deductUsage(audioDuration);
+   137→      }
+   138→
+   139→      res.json({
+   140→        success: true,
+   141→        wavPath: validatedPath,
+   142→        text: full.text,
+   143→        words,
+   144→        wordCount: words.length,
+   145→        duration: full.duration,
+   146→        language: full.language,
+   147→        frameAligned: hasFrameAlignment,
+   148→        frameRate: hasFrameAlignment ? frameRate : null,
+   149→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   150→      });
+   151→    } catch (err) {
+   152→      console.error('[SPLICE] Word-level transcription error:', err);
+   153→      res.status(500).json({ error: err.message });
+   154→    }
+   155→  });
+   156→
+   157→  /**
+   158→   * POST /isolate-vocals - Isolate vocals from audio using Demucs
+   159→   *
+   160→   * Uses Replicate's Demucs model to separate vocals from background audio.
+   161→   * Cost: ~$0.015/min of audio
+   162→   *
+   163→   * Tier access:
+   164→   * - Starter: No access (upgrade required)
+   165→   * - Pro: 2 hours included, then $0.08/min overage
+   166→   * - Team: 5 hours included, then $0.08/min overage
+   167→   */
+   168→  router.post('/isolate-vocals', requireCredits({ endpoint: 'isolate-vocals' }), async (req, res) => {
+   169→    const { audioPath, stem = 'vocals', outputDir = null } = req.body;
+   170→    const stripeCustomerId = req.headers['x-stripe-customer-id'];
+   171→
+   172→    if (!audioPath) {
+   173→      return res.status(400).json({ error: 'audioPath is required' });
+   174→    }
+   175→
+   176→    if (!fs.existsSync(audioPath)) {
+   177→      return res.status(404).json({ error: `File not found: ${audioPath}` });
+   178→    }
+   179→
+   180→    // Check Replicate configuration
+   181→    if (!isReplicateConfigured()) {
+   182→      return res.status(500).json({
+   183→        error: 'Replicate API not configured. Set REPLICATE_API_TOKEN in .env'
+   184→      });
+   185→    }
+   186→
+   187→    // Get audio duration for billing
+   188→    let audioDurationSeconds = 0;
+   189→    try {
+   190→      audioDurationSeconds = await getAudioDuration(audioPath);
+   191→    } catch (err) {
+   192→      console.warn('[SPLICE] Could not get audio duration:', err.message);
+   193→    }
+   194→
+   195→    const audioDurationMinutes = audioDurationSeconds / 60;
+   196→
+   197→    // Check isolation access if customer ID provided
+   198→    if (stripeCustomerId && usageTracking) {
+   199→      const accessCheck = await usageTracking.checkIsolationAccess(stripeCustomerId, audioDurationMinutes);
+   200→
+   201→      if (!accessCheck.allowed) {
+   202→        return res.status(403).json({
+   203→          error: accessCheck.message,
+   204→          reason: accessCheck.reason,
+   205→          upgradeRequired: accessCheck.reason === 'upgrade_required'
+   206→        });
+   207→      }
+   208→
+   209→      console.log(`[SPLICE] Isolation access: ${accessCheck.message}`);
+   210→    }
+   211→
+   212→    console.log(`[SPLICE] Isolating vocals: ${audioPath} (${audioDurationMinutes.toFixed(1)} min)`);
+   213→
+   214→    try {
+   215→      const result = await isolateVocals(audioPath, {
+   216→        stem,
+   217→        outputDir: outputDir || undefined
+   218→      });
+   219→
+   220→      // Deduct isolation usage if customer ID provided
+   221→      let usageInfo = null;
+   222→      if (stripeCustomerId && usageTracking) {
+   223→        usageInfo = await usageTracking.deductIsolationUsage(
+   224→          stripeCustomerId,
+   225→          audioDurationSeconds,
+   226→          'isolate-vocals'
+   227→        );
+   228→        console.log(`[SPLICE] Isolation usage deducted: ${audioDurationMinutes.toFixed(1)} min`);
+   229→        if (usageInfo.isolationUsed?.overageCost > 0) {
+   230→          console.log(`[SPLICE] Overage cost: $${usageInfo.isolationUsed.overageCost.toFixed(2)}`);
+   231→        }
+   232→      }
+   233→
+   234→      res.json({
+   235→        success: true,
+   236→        inputPath: audioPath,
+   237→        outputPath: result.outputPath,
+   238→        stem: result.stem,
+   239→        processingTime: result.processingTime,
+   240→        availableStems: result.allStems,
+   241→        audioDurationMinutes,
+   242→        usage: usageInfo ? {
+   243→          isolationHoursRemaining: usageInfo.isolationHoursRemaining,
+   244→          overageCost: usageInfo.isolationUsed?.overageCost || 0
+   245→        } : null
+   246→      });
+   247→    } catch (err) {
+   248→      console.error('[SPLICE] Vocal isolation error:', err);
+   249→      res.status(500).json({ error: err.message });
+   250→    }
+   251→  });
+   252→
+   253→  return router;
+   254→}
+   255→
+   256→module.exports = createAnalyzeRoutes;
+   257→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

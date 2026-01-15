@@ -1,0 +1,307 @@
+/**
+ * HAR Capture - Captures network traffic in HAR (HTTP Archive) format
+ */
+
+class HarCapture {
+  constructor() {
+    this.entries = [];
+    this.startTime = new Date();
+  }
+
+  /**
+   * Add a response entry to the HAR log
+   */
+  async addEntry(response) {
+    try {
+      const request = response.request();
+      const timing = response.timing || {};
+
+      // Get request headers
+      const requestHeaders = [];
+      const reqHeaders = await request.allHeaders();
+      for (const [name, value] of Object.entries(reqHeaders)) {
+        requestHeaders.push({ name, value });
+      }
+
+      // Get response headers
+      const responseHeaders = [];
+      const respHeaders = response.headers();
+      for (const [name, value] of Object.entries(respHeaders)) {
+        responseHeaders.push({ name, value });
+      }
+
+      // Calculate sizes
+      const headersSize = JSON.stringify(requestHeaders).length;
+
+      // Get post data if present
+      let postData = null;
+      if (request.method() === 'POST' || request.method() === 'PUT') {
+        try {
+          const body = request.postData();
+          if (body) {
+            postData = {
+              mimeType: reqHeaders['content-type'] || 'application/octet-stream',
+              text: body,
+            };
+          }
+        } catch {
+          // No post data available
+        }
+      }
+
+      // Get response body
+      let responseContent = {
+        size: 0,
+        mimeType: respHeaders['content-type'] || 'application/octet-stream',
+        text: '',
+      };
+
+      try {
+        const contentType = respHeaders['content-type'] || '';
+
+        // Only capture text-based responses and JSON
+        if (
+          contentType.includes('text') ||
+          contentType.includes('json') ||
+          contentType.includes('javascript') ||
+          contentType.includes('xml')
+        ) {
+          const body = await response.text().catch(() => '');
+          responseContent.text = body;
+          responseContent.size = Buffer.byteLength(body);
+        } else {
+          // For binary content, just record the size
+          const body = await response.body().catch(() => Buffer.alloc(0));
+          responseContent.size = body.length;
+          responseContent.encoding = 'base64';
+          // Don't include binary data in HAR to keep file size reasonable
+        }
+      } catch {
+        // Response body not available
+      }
+
+      const entry = {
+        startedDateTime: new Date().toISOString(),
+        time: timing.responseEnd || 0,
+        request: {
+          method: request.method(),
+          url: request.url(),
+          httpVersion: 'HTTP/1.1',
+          headers: requestHeaders,
+          queryString: this.parseQueryString(request.url()),
+          cookies: this.parseCookies(reqHeaders['cookie'] || ''),
+          headersSize: headersSize,
+          bodySize: postData ? postData.text.length : 0,
+          postData: postData,
+        },
+        response: {
+          status: response.status(),
+          statusText: response.statusText(),
+          httpVersion: 'HTTP/1.1',
+          headers: responseHeaders,
+          cookies: this.parseSetCookies(respHeaders['set-cookie'] || ''),
+          content: responseContent,
+          redirectURL: respHeaders['location'] || '',
+          headersSize: JSON.stringify(responseHeaders).length,
+          bodySize: responseContent.size,
+        },
+        cache: {},
+        timings: {
+          blocked: timing.domainLookupStart || 0,
+          dns: (timing.domainLookupEnd || 0) - (timing.domainLookupStart || 0),
+          connect: (timing.connectEnd || 0) - (timing.connectStart || 0),
+          ssl: (timing.secureConnectionStart || 0) > 0
+            ? (timing.connectEnd || 0) - (timing.secureConnectionStart || 0)
+            : -1,
+          send: (timing.requestStart || 0) - (timing.connectEnd || 0),
+          wait: (timing.responseStart || 0) - (timing.requestStart || 0),
+          receive: (timing.responseEnd || 0) - (timing.responseStart || 0),
+        },
+        serverIPAddress: '',
+        connection: '',
+        comment: '',
+      };
+
+      this.entries.push(entry);
+    } catch (error) {
+      // Silently handle HAR entry errors
+    }
+  }
+
+  /**
+   * Parse URL query string into HAR format
+   */
+  parseQueryString(url) {
+    try {
+      const parsed = new URL(url);
+      const queryParams = [];
+      for (const [name, value] of parsed.searchParams) {
+        queryParams.push({ name, value });
+      }
+      return queryParams;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Parse cookies from Cookie header
+   */
+  parseCookies(cookieHeader) {
+    if (!cookieHeader) return [];
+
+    return cookieHeader.split(';').map(cookie => {
+      const [name, ...valueParts] = cookie.trim().split('=');
+      return {
+        name: name.trim(),
+        value: valueParts.join('='),
+      };
+    }).filter(c => c.name);
+  }
+
+  /**
+   * Parse Set-Cookie response headers
+   */
+  parseSetCookies(setCookieHeader) {
+    if (!setCookieHeader) return [];
+
+    const cookies = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+
+    return cookies.map(cookie => {
+      const parts = cookie.split(';');
+      const [name, ...valueParts] = parts[0].split('=');
+
+      const cookieObj = {
+        name: name.trim(),
+        value: valueParts.join('='),
+        path: '/',
+        domain: '',
+        expires: null,
+        httpOnly: false,
+        secure: false,
+      };
+
+      // Parse cookie attributes
+      for (const part of parts.slice(1)) {
+        const [attr, attrValue] = part.trim().split('=');
+        const attrLower = attr.toLowerCase();
+
+        if (attrLower === 'path') cookieObj.path = attrValue || '/';
+        else if (attrLower === 'domain') cookieObj.domain = attrValue || '';
+        else if (attrLower === 'expires') cookieObj.expires = attrValue || null;
+        else if (attrLower === 'httponly') cookieObj.httpOnly = true;
+        else if (attrLower === 'secure') cookieObj.secure = true;
+      }
+
+      return cookieObj;
+    }).filter(c => c.name);
+  }
+
+  /**
+   * Generate the complete HAR file
+   */
+  generate(pageUrl) {
+    return {
+      log: {
+        version: '1.2',
+        creator: {
+          name: 'Website Cloner',
+          version: '1.0.0',
+          comment: 'Captured using Playwright',
+        },
+        browser: {
+          name: 'Chromium',
+          version: '',
+        },
+        pages: [
+          {
+            startedDateTime: this.startTime.toISOString(),
+            id: 'page_1',
+            title: pageUrl,
+            pageTimings: {
+              onContentLoad: -1,
+              onLoad: -1,
+            },
+          },
+        ],
+        entries: this.entries.map(entry => ({
+          ...entry,
+          pageref: 'page_1',
+        })),
+        comment: `Captured ${this.entries.length} requests from ${pageUrl}`,
+      },
+    };
+  }
+
+  /**
+   * Get statistics about captured traffic
+   */
+  getStats() {
+    const stats = {
+      totalRequests: this.entries.length,
+      byMethod: {},
+      byStatus: {},
+      byContentType: {},
+      totalTransferred: 0,
+      apiCalls: 0,
+    };
+
+    for (const entry of this.entries) {
+      // By method
+      const method = entry.request.method;
+      stats.byMethod[method] = (stats.byMethod[method] || 0) + 1;
+
+      // By status
+      const status = entry.response.status;
+      const statusGroup = `${Math.floor(status / 100)}xx`;
+      stats.byStatus[statusGroup] = (stats.byStatus[statusGroup] || 0) + 1;
+
+      // By content type
+      const contentType = entry.response.content.mimeType.split(';')[0].trim();
+      stats.byContentType[contentType] = (stats.byContentType[contentType] || 0) + 1;
+
+      // Total size
+      stats.totalTransferred += entry.response.bodySize || 0;
+
+      // API calls
+      if (entry.request.url.includes('/api/') || contentType === 'application/json') {
+        stats.apiCalls++;
+      }
+    }
+
+    return stats;
+  }
+
+  /**
+   * Filter entries by criteria
+   */
+  filter(criteria) {
+    return this.entries.filter(entry => {
+      if (criteria.method && entry.request.method !== criteria.method) return false;
+      if (criteria.status && entry.response.status !== criteria.status) return false;
+      if (criteria.urlPattern && !entry.request.url.includes(criteria.urlPattern)) return false;
+      if (criteria.contentType && !entry.response.content.mimeType.includes(criteria.contentType)) return false;
+      return true;
+    });
+  }
+
+  /**
+   * Get all API responses
+   */
+  getApiResponses() {
+    return this.entries
+      .filter(entry =>
+        entry.request.url.includes('/api/') ||
+        entry.response.content.mimeType.includes('application/json')
+      )
+      .map(entry => ({
+        url: entry.request.url,
+        method: entry.request.method,
+        status: entry.response.status,
+        requestBody: entry.request.postData?.text,
+        responseBody: entry.response.content.text,
+      }));
+  }
+}
+
+module.exports = HarCapture;

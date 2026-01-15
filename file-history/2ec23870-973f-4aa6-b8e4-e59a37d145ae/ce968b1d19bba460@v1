@@ -1,0 +1,334 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @fileoverview Manages background agent task execution, similar to Claude Code's Task tool.
+ * Allows spawning agents in the background and retrieving their output later.
+ */
+
+import { randomUUID } from 'node:crypto';
+import type { Config } from '../config/config.js';
+import type { AgentDefinition, AgentInputs, OutputObject } from './types.js';
+import { LocalAgentExecutor } from './local-executor.js';
+import { debugLogger } from '../utils/debugLogger.js';
+
+/**
+ * Status of a background agent task.
+ */
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'error' | 'cancelled';
+
+/**
+ * Represents a background agent task.
+ */
+export interface AgentTask {
+  /** Unique identifier for the task. */
+  id: string;
+  /** Name of the agent executing the task. */
+  agentName: string;
+  /** Display name of the agent (if different from name). */
+  agentDisplayName?: string;
+  /** Current status of the task. */
+  status: TaskStatus;
+  /** When the task was created. */
+  createdAt: Date;
+  /** When the task started executing. */
+  startedAt?: Date;
+  /** When the task completed (successfully or with error). */
+  completedAt?: Date;
+  /** The result if the task completed successfully. */
+  result?: OutputObject;
+  /** Error message if the task failed. */
+  error?: string;
+  /** The inputs provided to the agent. */
+  inputs: AgentInputs;
+}
+
+/**
+ * Options for retrieving task output.
+ */
+export interface GetOutputOptions {
+  /** Whether to block and wait for completion. Default: true. */
+  block?: boolean;
+  /** Maximum time to wait in milliseconds. Default: 30000. */
+  timeout?: number;
+}
+
+/**
+ * Result of spawning a background task.
+ */
+export interface SpawnResult {
+  /** The unique task ID. */
+  taskId: string;
+  /** Status message. */
+  status: 'spawned';
+}
+
+/**
+ * Manages background agent task execution.
+ * Provides a way to spawn agents in the background and retrieve their output later.
+ */
+export class AgentTaskManager {
+  private readonly tasks = new Map<string, AgentTask>();
+  private readonly abortControllers = new Map<string, AbortController>();
+  private readonly completionPromises = new Map<string, Promise<void>>();
+  private readonly completionResolvers = new Map<string, () => void>();
+
+  constructor(private readonly config: Config) {}
+
+  /**
+   * Spawns an agent to run in the background.
+   * Returns immediately with a task ID that can be used to check status later.
+   *
+   * @param definition The agent definition to execute.
+   * @param inputs The inputs to provide to the agent.
+   * @returns The task ID and spawn status.
+   */
+  async spawnBackground(
+    definition: AgentDefinition,
+    inputs: AgentInputs,
+  ): Promise<SpawnResult> {
+    const taskId = randomUUID();
+    const abortController = new AbortController();
+
+    const task: AgentTask = {
+      id: taskId,
+      agentName: definition.name,
+      agentDisplayName: definition.displayName,
+      status: 'pending',
+      createdAt: new Date(),
+      inputs,
+    };
+
+    this.tasks.set(taskId, task);
+    this.abortControllers.set(taskId, abortController);
+
+    // Create a promise that resolves when the task completes
+    let resolver: () => void;
+    const completionPromise = new Promise<void>((resolve) => {
+      resolver = resolve;
+    });
+    this.completionPromises.set(taskId, completionPromise);
+    this.completionResolvers.set(taskId, resolver!);
+
+    // Run in background (don't await)
+    this.executeInBackground(taskId, definition, inputs, abortController.signal);
+
+    debugLogger.log(`[AgentTaskManager] Spawned background task ${taskId} for agent '${definition.name}'`);
+
+    return { taskId, status: 'spawned' };
+  }
+
+  /**
+   * Executes an agent in the background.
+   * This method is intentionally not awaited by spawnBackground.
+   */
+  private async executeInBackground(
+    taskId: string,
+    definition: AgentDefinition,
+    inputs: AgentInputs,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      debugLogger.warn(`[AgentTaskManager] Task ${taskId} not found during execution`);
+      return;
+    }
+
+    task.status = 'running';
+    task.startedAt = new Date();
+
+    try {
+      if (definition.kind !== 'local') {
+        throw new Error(`Background execution only supports local agents. Agent '${definition.name}' is of kind '${definition.kind}'.`);
+      }
+
+      const executor = await LocalAgentExecutor.create(
+        definition,
+        this.config,
+        // Activity callback - could be used for streaming in future
+        () => {},
+      );
+
+      const result = await executor.run(inputs, signal);
+
+      task.status = 'completed';
+      task.result = result;
+      task.completedAt = new Date();
+
+      debugLogger.log(`[AgentTaskManager] Task ${taskId} completed successfully`);
+    } catch (error) {
+      if (signal.aborted) {
+        task.status = 'cancelled';
+        task.error = 'Task was cancelled';
+      } else {
+        task.status = 'error';
+        task.error = error instanceof Error ? error.message : String(error);
+      }
+      task.completedAt = new Date();
+
+      debugLogger.warn(`[AgentTaskManager] Task ${taskId} failed: ${task.error}`);
+    } finally {
+      // Notify waiters that the task is complete
+      const resolver = this.completionResolvers.get(taskId);
+      if (resolver) {
+        resolver();
+        this.completionResolvers.delete(taskId);
+      }
+    }
+  }
+
+  /**
+   * Gets the output/status of a task.
+   *
+   * @param taskId The task ID to query.
+   * @param options Options for retrieving output.
+   * @returns The task with current status and result (if available).
+   */
+  async getOutput(taskId: string, options: GetOutputOptions = {}): Promise<AgentTask> {
+    const { block = true, timeout = 30000 } = options;
+
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      throw new Error(`Task '${taskId}' not found`);
+    }
+
+    // If not blocking or task is already complete, return immediately
+    if (!block || task.status === 'completed' || task.status === 'error' || task.status === 'cancelled') {
+      return { ...task };
+    }
+
+    // Wait for completion with timeout
+    const completionPromise = this.completionPromises.get(taskId);
+    if (completionPromise) {
+      const timeoutPromise = new Promise<void>((_, reject) => {
+        setTimeout(() => reject(new Error(`Timeout waiting for task '${taskId}'`)), timeout);
+      });
+
+      try {
+        await Promise.race([completionPromise, timeoutPromise]);
+      } catch (error) {
+        // On timeout, return current status
+        if (error instanceof Error && error.message.includes('Timeout')) {
+          return { ...task };
+        }
+        throw error;
+      }
+    }
+
+    // Return the updated task
+    const updatedTask = this.tasks.get(taskId);
+    return updatedTask ? { ...updatedTask } : task;
+  }
+
+  /**
+   * Cancels a running task.
+   *
+   * @param taskId The task ID to cancel.
+   * @returns True if the task was cancelled, false if it was not running.
+   */
+  cancelTask(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      throw new Error(`Task '${taskId}' not found`);
+    }
+
+    if (task.status !== 'pending' && task.status !== 'running') {
+      return false;
+    }
+
+    const abortController = this.abortControllers.get(taskId);
+    if (abortController) {
+      abortController.abort();
+      debugLogger.log(`[AgentTaskManager] Cancelled task ${taskId}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Lists all tasks.
+   *
+   * @returns Array of all tasks.
+   */
+  listTasks(): AgentTask[] {
+    return Array.from(this.tasks.values()).map((task) => ({ ...task }));
+  }
+
+  /**
+   * Lists tasks filtered by status.
+   *
+   * @param status The status to filter by.
+   * @returns Array of tasks with the specified status.
+   */
+  listTasksByStatus(status: TaskStatus): AgentTask[] {
+    return this.listTasks().filter((task) => task.status === status);
+  }
+
+  /**
+   * Clears completed, errored, or cancelled tasks from the manager.
+   * Running and pending tasks are preserved.
+   */
+  clearFinishedTasks(): void {
+    for (const [taskId, task] of this.tasks) {
+      if (task.status === 'completed' || task.status === 'error' || task.status === 'cancelled') {
+        this.tasks.delete(taskId);
+        this.abortControllers.delete(taskId);
+        this.completionPromises.delete(taskId);
+        this.completionResolvers.delete(taskId);
+      }
+    }
+    debugLogger.log('[AgentTaskManager] Cleared finished tasks');
+  }
+
+  /**
+   * Gets a specific task by ID.
+   *
+   * @param taskId The task ID to get.
+   * @returns The task or undefined if not found.
+   */
+  getTask(taskId: string): AgentTask | undefined {
+    const task = this.tasks.get(taskId);
+    return task ? { ...task } : undefined;
+  }
+
+  /**
+   * Checks if there are any running tasks.
+   *
+   * @returns True if there are running tasks.
+   */
+  hasRunningTasks(): boolean {
+    return Array.from(this.tasks.values()).some(
+      (task) => task.status === 'pending' || task.status === 'running',
+    );
+  }
+}
+
+// Singleton instance for the task manager
+let taskManagerInstance: AgentTaskManager | null = null;
+
+/**
+ * Gets or creates the singleton AgentTaskManager instance.
+ *
+ * @param config The configuration (required on first call).
+ * @returns The AgentTaskManager instance.
+ */
+export function getTaskManager(config?: Config): AgentTaskManager {
+  if (!taskManagerInstance) {
+    if (!config) {
+      throw new Error('Config is required to initialize AgentTaskManager');
+    }
+    taskManagerInstance = new AgentTaskManager(config);
+  }
+  return taskManagerInstance;
+}
+
+/**
+ * Resets the singleton instance (primarily for testing).
+ */
+export function resetTaskManager(): void {
+  taskManagerInstance = null;
+}

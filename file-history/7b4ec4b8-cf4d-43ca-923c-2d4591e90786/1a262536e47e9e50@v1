@@ -1,0 +1,357 @@
+"""
+Physique Router - Photo upload and body analysis endpoints
+
+Endpoints:
+- POST /physique/upload - Upload physique photos (front, side, back)
+- GET /physique/my-photos - Get user's stored physique photos
+- POST /physique/analyze - Trigger body analysis via Claude Vision
+- GET /physique/my-analysis - Get stored analysis results
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import boto3
+from botocore.exceptions import ClientError
+
+from app.database import get_db
+from app.models.user import User
+from app.models.physique import PhysiqueAnalysis
+from app.services.auth import get_current_user
+from app.config import get_settings
+
+
+router = APIRouter(prefix="/physique", tags=["physique"])
+settings = get_settings()
+
+# Allowed image types
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+# ============================================
+# SCHEMAS
+# ============================================
+
+class PhysiquePhotoUrls(BaseModel):
+    """Response with physique photo URLs"""
+    front_photo_url: Optional[str] = None
+    side_photo_url: Optional[str] = None
+    back_photo_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class PhysiqueAnalysisResponse(BaseModel):
+    """Response with full physique analysis"""
+    front_photo_url: Optional[str] = None
+    side_photo_url: Optional[str] = None
+    back_photo_url: Optional[str] = None
+    estimated_body_fat: Optional[float] = None
+    muscle_level: Optional[str] = None
+    analysis_confidence: Optional[float] = None
+    analysis_notes: Optional[str] = None
+    analyzed_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class AnalyzePhysiqueRequest(BaseModel):
+    """Request to trigger body analysis"""
+    gender: str = Field(..., pattern="^(male|female)$")
+
+
+class AnalyzePhysiqueResponse(BaseModel):
+    """Response from body analysis"""
+    estimated_body_fat: float
+    muscle_level: str
+    confidence: float
+    notes: Optional[str] = None
+
+
+# ============================================
+# S3 HELPERS
+# ============================================
+
+def get_s3_client():
+    """Get configured S3 client"""
+    return boto3.client(
+        's3',
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=settings.s3_region,
+    )
+
+
+async def upload_to_s3(
+    file: UploadFile,
+    user_id: str,
+    angle: str,  # front, side, back
+) -> str:
+    """
+    Upload image to S3 and return public URL.
+
+    Args:
+        file: The uploaded file
+        user_id: User's UUID
+        angle: Photo angle (front, side, back)
+
+    Returns:
+        Public URL to the uploaded image
+    """
+    s3_client = get_s3_client()
+
+    # Generate unique filename
+    ext = file.filename.split('.')[-1] if file.filename else 'jpg'
+    key = f"physique/{user_id}/{angle}_{uuid.uuid4()}.{ext}"
+
+    # Read file content
+    content = await file.read()
+
+    # Upload to S3
+    try:
+        s3_client.put_object(
+            Bucket=settings.s3_bucket,
+            Key=key,
+            Body=content,
+            ContentType=file.content_type or 'image/jpeg',
+        )
+    except ClientError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload to S3: {str(e)}"
+        )
+
+    # Return public URL
+    return f"https://{settings.s3_bucket}.s3.{settings.s3_region}.amazonaws.com/{key}"
+
+
+def validate_image_file(file: UploadFile) -> None:
+    """Validate uploaded image file"""
+    if not file.content_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File content type not provided"
+        )
+
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid file type: {file.content_type}. Allowed: {', '.join(ALLOWED_CONTENT_TYPES)}"
+        )
+
+
+# ============================================
+# ENDPOINTS
+# ============================================
+
+@router.post("/upload", response_model=PhysiquePhotoUrls)
+async def upload_physique_photos(
+    front: Optional[UploadFile] = File(None),
+    side: Optional[UploadFile] = File(None),
+    back: Optional[UploadFile] = File(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload physique photos (front, side, and/or back).
+
+    At least one photo must be provided.
+    Photos are stored in S3 and URLs are saved to database.
+    Subsequent uploads overwrite previous photos.
+    """
+    # Validate at least one file provided
+    if not any([front, side, back]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one photo (front, side, or back) is required"
+        )
+
+    # Validate file types
+    for file, name in [(front, "front"), (side, "side"), (back, "back")]:
+        if file:
+            validate_image_file(file)
+
+    # Get or create physique analysis record
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        physique = PhysiqueAnalysis(
+            id=uuid.uuid4(),
+            user_id=current_user.id,
+        )
+        db.add(physique)
+
+    user_id_str = str(current_user.id)
+
+    # Upload each provided photo
+    if front:
+        physique.front_photo_url = await upload_to_s3(front, user_id_str, "front")
+    if side:
+        physique.side_photo_url = await upload_to_s3(side, user_id_str, "side")
+    if back:
+        physique.back_photo_url = await upload_to_s3(back, user_id_str, "back")
+
+    physique.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(physique)
+
+    return PhysiquePhotoUrls(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        created_at=physique.created_at,
+        updated_at=physique.updated_at,
+    )
+
+
+@router.get("/my-photos", response_model=Optional[PhysiquePhotoUrls])
+async def get_my_photos(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get the current user's stored physique photos.
+
+    Returns null if no photos uploaded yet.
+    """
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        return None
+
+    return PhysiquePhotoUrls(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        created_at=physique.created_at,
+        updated_at=physique.updated_at,
+    )
+
+
+@router.post("/analyze", response_model=AnalyzePhysiqueResponse)
+async def analyze_physique(
+    request: AnalyzePhysiqueRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Analyze physique photos using Claude Vision.
+
+    Requires at least a front photo to be uploaded first.
+    Returns estimated body fat percentage and muscle level.
+    """
+    # Get user's physique record
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No photos found. Please upload physique photos first."
+        )
+
+    if not physique.front_photo_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Front photo is required for analysis. Please upload a front photo."
+        )
+
+    # Import body analysis service (lazy load to avoid circular imports)
+    from app.services.body_analysis import analyze_physique as analyze_body
+
+    # Run analysis
+    analysis_result = await analyze_body(
+        front_url=physique.front_photo_url,
+        side_url=physique.side_photo_url,
+        back_url=physique.back_photo_url,
+        gender=request.gender,
+    )
+
+    # Store results
+    physique.estimated_body_fat = analysis_result.estimated_body_fat
+    physique.muscle_level = analysis_result.muscle_level
+    physique.analysis_confidence = analysis_result.confidence
+    physique.analysis_notes = analysis_result.notes
+    physique.analyzed_at = datetime.utcnow()
+    physique.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(physique)
+
+    return AnalyzePhysiqueResponse(
+        estimated_body_fat=analysis_result.estimated_body_fat,
+        muscle_level=analysis_result.muscle_level,
+        confidence=analysis_result.confidence,
+        notes=analysis_result.notes,
+    )
+
+
+@router.get("/my-analysis", response_model=Optional[PhysiqueAnalysisResponse])
+async def get_my_analysis(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get the current user's stored physique analysis.
+
+    Returns null if no analysis exists yet.
+    """
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        return None
+
+    return PhysiqueAnalysisResponse(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        estimated_body_fat=physique.estimated_body_fat,
+        muscle_level=physique.muscle_level,
+        analysis_confidence=physique.analysis_confidence,
+        analysis_notes=physique.analysis_notes,
+        analyzed_at=physique.analyzed_at,
+        created_at=physique.created_at,
+        updated_at=physique.updated_at,
+    )
+
+
+@router.delete("/my-photos")
+async def delete_my_photos(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete all physique photos and analysis for the current user.
+    """
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No physique data found"
+        )
+
+    await db.delete(physique)
+    await db.commit()
+
+    return {"message": "Physique data deleted successfully"}

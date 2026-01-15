@@ -1,0 +1,241 @@
+/**
+ * Usage Tracking Service
+ *
+ * Tracks user credit balances and usage for billing.
+ * Uses PostgreSQL for persistence.
+ */
+
+const { Pool } = require('pg');
+
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Hours per tier
+const TIER_HOURS = {
+  starter: 15,
+  pro: 50,
+  team: 150,
+  cancelled: 0
+};
+
+/**
+ * Initialize database tables
+ */
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        stripe_customer_id VARCHAR(255) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        tier VARCHAR(50) DEFAULT 'starter',
+        hours_remaining DECIMAL(10,4) DEFAULT 15,
+        hours_total DECIMAL(10,4) DEFAULT 15,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS usage_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        stripe_customer_id VARCHAR(255),
+        audio_duration_seconds DECIMAL(10,2),
+        hours_used DECIMAL(10,6),
+        endpoint VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_stripe_customer_id ON users(stripe_customer_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_log_user_id ON usage_log(user_id)
+    `);
+
+    console.log('[UsageTracking] Database initialized');
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get or create a user by Stripe customer ID
+ */
+async function getOrCreateUser(stripeCustomerId, email = null) {
+  const client = await pool.connect();
+  try {
+    // Try to find existing user
+    let result = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length > 0) {
+      return result.rows[0];
+    }
+
+    // Create new user with starter tier
+    result = await client.query(
+      `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total)
+       VALUES ($1, $2, 'starter', $3, $3)
+       RETURNING *`,
+      [stripeCustomerId, email, TIER_HOURS.starter]
+    );
+
+    return result.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get user's current credit balance
+ */
+async function getBalance(stripeCustomerId) {
+  const user = await getOrCreateUser(stripeCustomerId);
+  return {
+    hoursRemaining: parseFloat(user.hours_remaining),
+    hoursTotal: parseFloat(user.hours_total),
+    tier: user.tier,
+    percentUsed: ((user.hours_total - user.hours_remaining) / user.hours_total * 100).toFixed(1)
+  };
+}
+
+/**
+ * Check if user has enough credits for estimated duration
+ */
+async function hasCredits(stripeCustomerId, estimatedSeconds = 0) {
+  const balance = await getBalance(stripeCustomerId);
+  const estimatedHours = estimatedSeconds / 3600;
+  return balance.hoursRemaining >= estimatedHours;
+}
+
+/**
+ * Deduct usage from user's balance
+ */
+async function deductUsage(stripeCustomerId, audioDurationSeconds, endpoint = 'unknown') {
+  const hoursUsed = audioDurationSeconds / 3600;
+
+  const client = await pool.connect();
+  try {
+    // Get user
+    const userResult = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (userResult.rows.length === 0) {
+      throw new Error('User not found');
+    }
+
+    const user = userResult.rows[0];
+
+    // Update balance
+    await client.query(
+      `UPDATE users
+       SET hours_remaining = GREATEST(0, hours_remaining - $1),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_customer_id = $2`,
+      [hoursUsed, stripeCustomerId]
+    );
+
+    // Log usage
+    await client.query(
+      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [user.id, stripeCustomerId, audioDurationSeconds, hoursUsed, endpoint]
+    );
+
+    // Return updated balance
+    return await getBalance(stripeCustomerId);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Reset user's hours for new billing period
+ */
+async function resetHours(stripeCustomerId, tier) {
+  const hours = TIER_HOURS[tier] || TIER_HOURS.starter;
+
+  await pool.query(
+    `UPDATE users
+     SET hours_remaining = $1, hours_total = $1, tier = $2, updated_at = CURRENT_TIMESTAMP
+     WHERE stripe_customer_id = $3`,
+    [hours, tier, stripeCustomerId]
+  );
+
+  return await getBalance(stripeCustomerId);
+}
+
+/**
+ * Update user's tier (from Stripe webhook)
+ */
+async function updateTier(stripeCustomerId, tier, email = null) {
+  const hours = TIER_HOURS[tier] || TIER_HOURS.starter;
+
+  const client = await pool.connect();
+  try {
+    // Check if user exists
+    const result = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length === 0) {
+      // Create new user with this tier
+      await client.query(
+        `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total)
+         VALUES ($1, $2, $3, $4, $4)`,
+        [stripeCustomerId, email, tier, hours]
+      );
+    } else {
+      // Update existing user
+      await client.query(
+        `UPDATE users
+         SET tier = $1, hours_remaining = $2, hours_total = $2, updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_customer_id = $3`,
+        [tier, hours, stripeCustomerId]
+      );
+    }
+
+    return await getBalance(stripeCustomerId);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get usage history for a user
+ */
+async function getUsageHistory(stripeCustomerId, limit = 50) {
+  const result = await pool.query(
+    `SELECT * FROM usage_log
+     WHERE stripe_customer_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [stripeCustomerId, limit]
+  );
+  return result.rows;
+}
+
+module.exports = {
+  initDatabase,
+  getOrCreateUser,
+  getBalance,
+  hasCredits,
+  deductUsage,
+  resetHours,
+  updateTier,
+  getUsageHistory,
+  TIER_HOURS
+};

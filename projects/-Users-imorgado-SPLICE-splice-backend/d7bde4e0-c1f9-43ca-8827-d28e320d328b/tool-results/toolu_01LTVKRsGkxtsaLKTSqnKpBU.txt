@@ -1,0 +1,572 @@
+     1→/**
+     2→ * SPLICE Chapter Detection Service
+     3→ *
+     4→ * Analyzes transcripts to identify natural chapter/topic boundaries.
+     5→ * Uses GPT-4o-mini for intelligent topic segmentation.
+     6→ *
+     7→ * Features:
+     8→ * - Automatic chapter boundary detection
+     9→ * - YouTube timestamp format generation
+    10→ * - Timeline marker data for Premiere Pro
+    11→ * - Configurable chapter count and minimum length
+    12→ */
+    13→
+    14→const OpenAI = require('openai');
+    15→
+    16→// Lazy-load OpenAI client to avoid errors when API key is not set
+    17→let openai = null;
+    18→function getOpenAI() {
+    19→  if (!openai) {
+    20→    openai = new OpenAI();
+    21→  }
+    22→  return openai;
+    23→}
+    24→
+    25→/**
+    26→ * Detect chapters in a transcript using AI
+    27→ * @param {Object} transcript - Transcript with text and/or segments
+    28→ * @param {Object} settings - Detection settings
+    29→ * @returns {Promise<Object>} Detected chapters, timestamps, and markers
+    30→ */
+    31→async function detectChapters(transcript, settings = {}) {
+    32→  const {
+    33→    maxChapters = 10,
+    34→    minChapterLength = 60, // seconds
+    35→    language = 'en',
+    36→    titleStyle = 'standard' // 'standard', 'youtube', 'shorts'
+    37→  } = settings;
+    38→
+    39→  // Get full text from transcript
+    40→  const text = extractText(transcript);
+    41→
+    42→  if (!text || text.length < 100) {
+    43→    console.log('[SPLICE Chapters] Transcript too short for chapter detection');
+    44→    return {
+    45→      chapters: [],
+    46→      youtubeTimestamps: '',
+    47→      markers: [],
+    48→      metadata: {
+    49→        chapterCount: 0,
+    50→        reason: 'transcript_too_short'
+    51→      }
+    52→    };
+    53→  }
+    54→
+    55→  // Get duration
+    56→  const duration = transcript.duration ||
+    57→    (transcript.segments?.length > 0 ? transcript.segments[transcript.segments.length - 1].end : 0);
+    58→
+    59→  if (duration < minChapterLength * 2) {
+    60→    console.log('[SPLICE Chapters] Content too short for multiple chapters');
+    61→    return {
+    62→      chapters: [{
+    63→        startTime: 0,
+    64→        title: 'Full Video',
+    65→        description: 'Video content'
+    66→      }],
+    67→      youtubeTimestamps: '0:00 Full Video',
+    68→      markers: [{
+    69→        time: 0,
+    70→        name: 'Full Video',
+    71→        comment: 'Video content'
+    72→      }],
+    73→      metadata: {
+    74→        chapterCount: 1,
+    75→        reason: 'single_chapter'
+    76→      }
+    77→    };
+    78→  }
+    79→
+    80→  console.log(`[SPLICE Chapters] Analyzing transcript (${text.length} chars, ${Math.floor(duration)}s)`);
+    81→
+    82→  try {
+    83→    const prompt = buildChapterPrompt(text, maxChapters, minChapterLength, duration, titleStyle);
+    84→
+    85→    const response = await getOpenAI().chat.completions.create({
+    86→      model: 'gpt-4o-mini',
+    87→      messages: [
+    88→        {
+    89→          role: 'system',
+    90→          content: `You are a video chapter detection expert. Analyze transcripts to identify natural topic changes and chapter boundaries. Return structured JSON with accurate timestamps.`
+    91→        },
+    92→        {
+    93→          role: 'user',
+    94→          content: prompt
+    95→        }
+    96→      ],
+    97→      temperature: 0.3,
+    98→      max_tokens: 1000,
+    99→      response_format: { type: 'json_object' }
+   100→    });
+   101→
+   102→    const result = JSON.parse(response.choices[0].message.content);
+   103→    const chapters = result.chapters || result || [];
+   104→
+   105→    // Validate and clean chapters
+   106→    const validChapters = validateChapters(chapters, duration, minChapterLength);
+   107→
+   108→    // Generate YouTube timestamps
+   109→    const youtubeTimestamps = formatYouTubeTimestamps(validChapters);
+   110→
+   111→    // Generate marker data
+   112→    const markers = validChapters.map(ch => ({
+   113→      time: ch.startTime,
+   114→      name: ch.title,
+   115→      comment: ch.description || '',
+   116→      keywords: ch.keywords || []
+   117→    }));
+   118→
+   119→    console.log(`[SPLICE Chapters] Detected ${validChapters.length} chapters`);
+   120→
+   121→    return {
+   122→      chapters: validChapters,
+   123→      youtubeTimestamps,
+   124→      markers,
+   125→      metadata: {
+   126→        chapterCount: validChapters.length,
+   127→        duration,
+   128→        model: 'gpt-4o-mini',
+   129→        titleStyle
+   130→      }
+   131→    };
+   132→
+   133→  } catch (err) {
+   134→    console.error('[SPLICE Chapters] Detection error:', err);
+   135→    throw new Error(`Chapter detection failed: ${err.message}`);
+   136→  }
+   137→}
+   138→
+   139→/**
+   140→ * Extract plain text from transcript
+   141→ * @param {Object} transcript - Transcript object
+   142→ * @returns {string} Plain text
+   143→ */
+   144→function extractText(transcript) {
+   145→  if (typeof transcript === 'string') {
+   146→    return transcript;
+   147→  }
+   148→
+   149→  if (transcript.text) {
+   150→    return transcript.text;
+   151→  }
+   152→
+   153→  if (transcript.segments) {
+   154→    return transcript.segments
+   155→      .map(s => s.text || s.content || '')
+   156→      .join(' ')
+   157→      .trim();
+   158→  }
+   159→
+   160→  if (transcript.words) {
+   161→    return transcript.words
+   162→      .map(w => w.word || w.text || '')
+   163→      .join(' ')
+   164→      .trim();
+   165→  }
+   166→
+   167→  return '';
+   168→}
+   169→
+   170→/**
+   171→ * Build the prompt for chapter detection
+   172→ * @param {string} text - Transcript text
+   173→ * @param {number} maxChapters - Maximum chapters
+   174→ * @param {number} minLength - Minimum chapter length
+   175→ * @param {number} duration - Total duration
+   176→ * @param {string} titleStyle - Title style: 'standard', 'youtube', 'shorts'
+   177→ * @returns {string} Formatted prompt
+   178→ */
+   179→function buildChapterPrompt(text, maxChapters, minLength, duration, titleStyle = 'standard') {
+   180→  // Truncate text if too long (keep first 15000 chars)
+   181→  const truncatedText = text.length > 15000 ? text.substring(0, 15000) + '...' : text;
+   182→
+   183→  // Get title style rules based on format
+   184→  let titleRules = '';
+   185→  switch (titleStyle) {
+   186→    case 'youtube':
+   187→      titleRules = `TITLE STYLE (YouTube Long-Form):
+   188→- Create engaging, SEO-optimized titles (5-8 words max)
+   189→- Use keywords that viewers might search for
+   190→- Make titles compelling and clickable
+   191→- Include relevant topic keywords
+   192→- Avoid clickbait but be interesting
+   193→- Example: "Setting Up Your Development Environment"`;
+   194→      break;
+   195→    case 'shorts':
+   196→      titleRules = `TITLE STYLE (YouTube Shorts/TikTok):
+   197→- Create punchy, hook-style titles (3-5 words max)
+   198→- Use action words and emotional triggers
+   199→- Make it scroll-stopping and urgent
+   200→- Keep it ultra-concise for mobile
+   201→- Example: "This Changes Everything" or "Wait For It..."`;
+   202→      break;
+   203→    default:
+   204→      titleRules = `TITLE STYLE:
+   205→- Create short, descriptive titles (3-5 words max)
+   206→- Focus on the main topic of each section
+   207→- Be clear and informative`;
+   208→  }
+   209→
+   210→  return `Analyze this transcript and identify natural chapter breaks.
+   211→
+   212→RULES:
+   213→- Maximum ${maxChapters} chapters
+   214→- Minimum ${minLength} seconds between chapters
+   215→- First chapter MUST start at 0 seconds
+   216→- Total video duration is ${Math.floor(duration)} seconds
+   217→- Identify topic/subject changes
+   218→
+   219→${titleRules}
+   220→
+   221→TRANSCRIPT:
+   222→${truncatedText}
+   223→
+   224→Return JSON in this exact format:
+   225→{
+   226→  "chapters": [
+   227→    {
+   228→      "startTime": 0,
+   229→      "title": "Introduction",
+   230→      "description": "Brief description of this chapter",
+   231→      "keywords": ["keyword1", "keyword2"]
+   232→    },
+   233→    {
+   234→      "startTime": 120,
+   235→      "title": "Main Topic",
+   236→      "description": "Description of what happens",
+   237→      "keywords": ["topic", "subject"]
+   238→    }
+   239→  ]
+   240→}
+   241→
+   242→IMPORTANT:
+   243→- startTime values must be in SECONDS as numbers, not strings.
+   244→- Include 2-3 relevant keywords for each chapter for SEO.`;
+   245→}
+   246→
+   247→/**
+   248→ * Validate and clean detected chapters
+   249→ * @param {Array} chapters - Raw chapters from AI
+   250→ * @param {number} duration - Total duration
+   251→ * @param {number} minLength - Minimum chapter length
+   252→ * @returns {Array} Validated chapters
+   253→ */
+   254→function validateChapters(chapters, duration, minLength) {
+   255→  if (!Array.isArray(chapters)) {
+   256→    return [{
+   257→      startTime: 0,
+   258→      title: 'Video',
+   259→      description: 'Full video content'
+   260→    }];
+   261→  }
+   262→
+   263→  const validChapters = [];
+   264→  let lastTime = -minLength;
+   265→
+   266→  // Sort by start time
+   267→  const sorted = [...chapters].sort((a, b) => {
+   268→    const aTime = parseFloat(a.startTime) || 0;
+   269→    const bTime = parseFloat(b.startTime) || 0;
+   270→    return aTime - bTime;
+   271→  });
+   272→
+   273→  for (const chapter of sorted) {
+   274→    const startTime = parseFloat(chapter.startTime) || 0;
+   275→
+   276→    // Skip if too close to last chapter
+   277→    if (startTime - lastTime < minLength && validChapters.length > 0) {
+   278→      continue;
+   279→    }
+   280→
+   281→    // Skip if past duration
+   282→    if (startTime >= duration) {
+   283→      continue;
+   284→    }
+   285→
+   286→    // Ensure title exists
+   287→    const title = (chapter.title || 'Chapter ' + (validChapters.length + 1)).substring(0, 50);
+   288→    const description = (chapter.description || '').substring(0, 200);
+   289→
+   290→    // Preserve keywords if provided by AI
+   291→    const keywords = Array.isArray(chapter.keywords) ? chapter.keywords.slice(0, 5) : [];
+   292→
+   293→    validChapters.push({
+   294→      startTime: parseFloat(startTime.toFixed(2)),
+   295→      title,
+   296→      description,
+   297→      keywords
+   298→    });
+   299→
+   300→    lastTime = startTime;
+   301→  }
+   302→
+   303→  // Ensure first chapter starts at 0
+   304→  if (validChapters.length > 0 && validChapters[0].startTime > 0) {
+   305→    validChapters.unshift({
+   306→      startTime: 0,
+   307→      title: 'Introduction',
+   308→      description: 'Video introduction'
+   309→    });
+   310→  }
+   311→
+   312→  // Ensure at least one chapter
+   313→  if (validChapters.length === 0) {
+   314→    validChapters.push({
+   315→      startTime: 0,
+   316→      title: 'Video',
+   317→      description: 'Full video content'
+   318→    });
+   319→  }
+   320→
+   321→  return validChapters;
+   322→}
+   323→
+   324→/**
+   325→ * Format chapters as YouTube timestamps
+   326→ * @param {Array} chapters - Array of chapter objects
+   327→ * @returns {string} YouTube-formatted timestamp string
+   328→ */
+   329→function formatYouTubeTimestamps(chapters) {
+   330→  return chapters.map(ch => {
+   331→    const totalSeconds = Math.floor(ch.startTime);
+   332→    const hours = Math.floor(totalSeconds / 3600);
+   333→    const minutes = Math.floor((totalSeconds % 3600) / 60);
+   334→    const seconds = totalSeconds % 60;
+   335→
+   336→    let time;
+   337→    if (hours > 0) {
+   338→      time = `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+   339→    } else {
+   340→      time = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+   341→    }
+   342→
+   343→    return `${time} ${ch.title}`;
+   344→  }).join('\n');
+   345→}
+   346→
+   347→/**
+   348→ * Detect chapters from segments (fallback without AI)
+   349→ * Uses silence gaps and segment boundaries
+   350→ * @param {Object} transcript - Transcript with segments
+   351→ * @param {Object} settings - Detection settings
+   352→ * @returns {Object} Detected chapters
+   353→ */
+   354→function detectChaptersFallback(transcript, settings = {}) {
+   355→  const {
+   356→    minChapterLength = 120,
+   357→    gapThreshold = 3 // seconds of silence to consider chapter break
+   358→  } = settings;
+   359→
+   360→  const segments = transcript.segments || [];
+   361→  if (segments.length === 0) {
+   362→    return {
+   363→      chapters: [{ startTime: 0, title: 'Video', description: '' }],
+   364→      youtubeTimestamps: '0:00 Video',
+   365→      markers: [{ time: 0, name: 'Video', comment: '' }],
+   366→      metadata: { chapterCount: 1, method: 'fallback' }
+   367→    };
+   368→  }
+   369→
+   370→  const chapters = [{ startTime: 0, title: 'Chapter 1', description: '' }];
+   371→  let chapterNum = 2;
+   372→  let lastEnd = 0;
+   373→  let lastChapterTime = 0;
+   374→
+   375→  for (const segment of segments) {
+   376→    const gap = segment.start - lastEnd;
+   377→
+   378→    // Large gap indicates potential chapter break
+   379→    if (gap >= gapThreshold && segment.start - lastChapterTime >= minChapterLength) {
+   380→      chapters.push({
+   381→        startTime: parseFloat(segment.start.toFixed(2)),
+   382→        title: `Chapter ${chapterNum}`,
+   383→        description: ''
+   384→      });
+   385→      chapterNum++;
+   386→      lastChapterTime = segment.start;
+   387→    }
+   388→
+   389→    lastEnd = segment.end;
+   390→  }
+   391→
+   392→  return {
+   393→    chapters,
+   394→    youtubeTimestamps: formatYouTubeTimestamps(chapters),
+   395→    markers: chapters.map(ch => ({
+   396→      time: ch.startTime,
+   397→      name: ch.title,
+   398→      comment: ch.description
+   399→    })),
+   400→    metadata: {
+   401→      chapterCount: chapters.length,
+   402→      method: 'fallback'
+   403→    }
+   404→  };
+   405→}
+   406→
+   407→/**
+   408→ * Generate chapter divider data for timeline insertion
+   409→ * Creates divider clips with text, colors, and animation data
+   410→ * @param {Array} chapters - Array of chapter objects
+   411→ * @param {Object} settings - Divider settings
+   412→ * @returns {Object} Divider data for builder insertion
+   413→ */
+   414→function generateChapterDividers(chapters, settings = {}) {
+   415→  const {
+   416→    duration = 3, // seconds per divider
+   417→    style = 'gradient', // 'gradient', 'solid', 'minimal'
+   418→    colorScheme = 'blue', // 'blue', 'purple', 'green', 'orange', 'custom'
+   419→    fadeIn = 0.5,
+   420→    fadeOut = 0.5,
+   421→    fontSize = 72,
+   422→    fontFamily = 'Arial',
+   423→    position = 'center', // 'center', 'lower-third', 'top'
+   424→    includeChapterNumber = true,
+   425→    customColors = null
+   426→  } = settings;
+   427→
+   428→  // Color schemes for gradients
+   429→  const colorSchemes = {
+   430→    blue: { start: '#1e3a8a', end: '#3b82f6', text: '#ffffff' },
+   431→    purple: { start: '#581c87', end: '#a855f7', text: '#ffffff' },
+   432→    green: { start: '#14532d', end: '#22c55e', text: '#ffffff' },
+   433→    orange: { start: '#7c2d12', end: '#f97316', text: '#ffffff' },
+   434→    red: { start: '#7f1d1d', end: '#ef4444', text: '#ffffff' },
+   435→    custom: customColors || { start: '#000000', end: '#333333', text: '#ffffff' }
+   436→  };
+   437→
+   438→  const colors = colorSchemes[colorScheme] || colorSchemes.blue;
+   439→
+   440→  // Position presets (as percentages)
+   441→  const positions = {
+   442→    'center': { x: 50, y: 50 },
+   443→    'lower-third': { x: 50, y: 80 },
+   444→    'top': { x: 50, y: 20 }
+   445→  };
+   446→
+   447→  const pos = positions[position] || positions.center;
+   448→
+   449→  const dividers = chapters.map((chapter, index) => {
+   450→    const chapterNum = index + 1;
+   451→    const displayTitle = includeChapterNumber
+   452→      ? `Chapter ${chapterNum}: ${chapter.title}`
+   453→      : chapter.title;
+   454→
+   455→    return {
+   456→      // Timing
+   457→      insertTime: chapter.startTime,
+   458→      duration: duration,
+   459→      fadeIn: fadeIn,
+   460→      fadeOut: fadeOut,
+   461→
+   462→      // Content
+   463→      chapterNumber: chapterNum,
+   464→      title: chapter.title,
+   465→      displayTitle: displayTitle,
+   466→      description: chapter.description || '',
+   467→      keywords: chapter.keywords || [],
+   468→
+   469→      // Styling
+   470→      style: style,
+   471→      colors: {
+   472→        background: colors.start,
+   473→        backgroundEnd: colors.end,
+   474→        text: colors.text
+   475→      },
+   476→
+   477→      // Text properties
+   478→      font: {
+   479→        family: fontFamily,
+   480→        size: fontSize,
+   481→        weight: 'bold'
+   482→      },
+   483→
+   484→      // Position (percentages)
+   485→      position: {
+   486→        x: pos.x,
+   487→        y: pos.y
+   488→      },
+   489→
+   490→      // Animation
+   491→      animation: {
+   492→        type: 'fade',
+   493→        easeIn: 'ease-out',
+   494→        easeOut: 'ease-in'
+   495→      },
+   496→
+   497→      // Marker for Premiere Pro
+   498→      markerData: {
+   499→        time: chapter.startTime,
+   500→        name: `SPLICE: ${displayTitle}`,
+   501→        comment: `Chapter divider - ${chapter.description || 'No description'}`,
+   502→        colorIndex: 5 // Cerulean
+   503→      }
+   504→    };
+   505→  });
+   506→
+   507→  return {
+   508→    dividers,
+   509→    settings: {
+   510→      duration,
+   511→      style,
+   512→      colorScheme,
+   513→      position,
+   514→      fadeIn,
+   515→      fadeOut
+   516→    },
+   517→    metadata: {
+   518→      count: dividers.length,
+   519→      totalDuration: dividers.length * duration
+   520→    }
+   521→  };
+   522→}
+   523→
+   524→/**
+   525→ * Get available divider styles and color schemes
+   526→ * @returns {Object} Available options
+   527→ */
+   528→function getDividerPresets() {
+   529→  return {
+   530→    styles: [
+   531→      { id: 'gradient', name: 'Gradient', description: 'Smooth color gradient background' },
+   532→      { id: 'solid', name: 'Solid', description: 'Single color background' },
+   533→      { id: 'minimal', name: 'Minimal', description: 'Text only with subtle shadow' }
+   534→    ],
+   535→    colorSchemes: [
+   536→      { id: 'blue', name: 'Blue', colors: { start: '#1e3a8a', end: '#3b82f6' } },
+   537→      { id: 'purple', name: 'Purple', colors: { start: '#581c87', end: '#a855f7' } },
+   538→      { id: 'green', name: 'Green', colors: { start: '#14532d', end: '#22c55e' } },
+   539→      { id: 'orange', name: 'Orange', colors: { start: '#7c2d12', end: '#f97316' } },
+   540→      { id: 'red', name: 'Red', colors: { start: '#7f1d1d', end: '#ef4444' } }
+   541→    ],
+   542→    positions: [
+   543→      { id: 'center', name: 'Center', y: 50 },
+   544→      { id: 'lower-third', name: 'Lower Third', y: 80 },
+   545→      { id: 'top', name: 'Top', y: 20 }
+   546→    ],
+   547→    defaults: {
+   548→      duration: 3,
+   549→      fadeIn: 0.5,
+   550→      fadeOut: 0.5,
+   551→      fontSize: 72,
+   552→      style: 'gradient',
+   553→      colorScheme: 'blue',
+   554→      position: 'center'
+   555→    }
+   556→  };
+   557→}
+   558→
+   559→module.exports = {
+   560→  detectChapters,
+   561→  detectChaptersFallback,
+   562→  formatYouTubeTimestamps,
+   563→  extractText,
+   564→  validateChapters,
+   565→  generateChapterDividers,
+   566→  getDividerPresets
+   567→};
+   568→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

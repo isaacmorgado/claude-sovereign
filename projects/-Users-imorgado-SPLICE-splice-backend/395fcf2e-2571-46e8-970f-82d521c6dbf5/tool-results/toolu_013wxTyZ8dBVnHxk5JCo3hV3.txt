@@ -1,0 +1,557 @@
+     1→/**
+     2→ * Settings Management
+     3→ *
+     4→ * Persists user preferences to localStorage
+     5→ * v3.5: Added Persistent Token support for media folder access
+     6→ */
+     7→
+     8→const uxpFs = require('uxp').storage.localFileSystem;
+     9→
+    10→const DEFAULT_SETTINGS = {
+    11→  sensitivity: 50,
+    12→  audioSource: 'original',
+    13→  autoMarkBest: true,
+    14→  enableTakesDetection: true,
+    15→  rememberOptions: false,
+    16→  optionsExpanded: false,
+    17→  customerId: null,          // Stripe customer ID for billing
+    18→  mediaFolderToken: null,    // Persistent token for media folder access
+    19→  mediaFolderPath: null,     // Path to the media folder (for display)
+    20→  activePreset: 'custom'     // Currently active preset
+    21→};
+    22→
+    23→// =============================================================================
+    24→// PRESET PROFILES
+    25→// =============================================================================
+    26→
+    27→/**
+    28→ * Detection presets for different content types.
+    29→ * Each preset defines optimal settings for a specific use case.
+    30→ */
+    31→const PRESETS = {
+    32→  // Custom - user-defined settings (default)
+    33→  custom: {
+    34→    name: 'Custom',
+    35→    description: 'Your custom settings',
+    36→    icon: 'settings',
+    37→    settings: null // Uses current user settings
+    38→  },
+    39→
+    40→  // Podcast - longer pauses are natural, be conservative
+    41→  podcast: {
+    42→    name: 'Podcast',
+    43→    description: 'Longer natural pauses, conversational flow',
+    44→    icon: 'mic',
+    45→    settings: {
+    46→      sensitivity: 35,           // Lower sensitivity (fewer cuts)
+    47→      threshold: -35,            // Higher threshold (only deep silence)
+    48→      minSilenceLength: 0.8,     // Longer minimum silence
+    49→      paddingStart: 0.15,        // More padding for natural transitions
+    50→      paddingEnd: 0.15,
+    51→      mergeDistance: 0.3,        // Merge nearby silences
+    52→      autoMarkBest: false,       // Don't auto-mark (manual review)
+    53→      enableTakesDetection: true
+    54→    }
+    55→  },
+    56→
+    57→  // Interview - balanced, respects speaker pauses
+    58→  interview: {
+    59→    name: 'Interview',
+    60→    description: 'Balanced cuts, preserves Q&A rhythm',
+    61→    icon: 'people',
+    62→    settings: {
+    63→      sensitivity: 50,           // Medium sensitivity
+    64→      threshold: -32,            // Moderate threshold
+    65→      minSilenceLength: 0.5,     // Standard minimum silence
+    66→      paddingStart: 0.12,        // Moderate padding
+    67→      paddingEnd: 0.08,
+    68→      mergeDistance: 0.2,
+    69→      autoMarkBest: true,
+    70→      enableTakesDetection: true
+    71→    }
+    72→  },
+    73→
+    74→  // Reaction video - fast pacing, quick cuts
+    75→  reaction: {
+    76→    name: 'Reaction',
+    77→    description: 'Fast-paced, tight cuts for energy',
+    78→    icon: 'bolt',
+    79→    settings: {
+    80→      sensitivity: 70,           // Higher sensitivity (more cuts)
+    81→      threshold: -28,            // Lower threshold (catches more silence)
+    82→      minSilenceLength: 0.3,     // Short minimum silence
+    83→      paddingStart: 0.05,        // Minimal padding for snappy edits
+    84→      paddingEnd: 0.03,
+    85→      mergeDistance: 0.15,
+    86→      autoMarkBest: true,
+    87→      enableTakesDetection: false // Usually single-take content
+    88→    }
+    89→  },
+    90→
+    91→  // Tutorial/Educational - preserve thinking pauses
+    92→  tutorial: {
+    93→    name: 'Tutorial',
+    94→    description: 'Preserves teaching pace, minimal cuts',
+    95→    icon: 'school',
+    96→    settings: {
+    97→      sensitivity: 30,           // Low sensitivity
+    98→      threshold: -38,            // Only deep silence
+    99→      minSilenceLength: 1.0,     // Long minimum (preserve demo pauses)
+   100→      paddingStart: 0.2,         // Extra padding for clarity
+   101→      paddingEnd: 0.15,
+   102→      mergeDistance: 0.4,
+   103→      autoMarkBest: false,
+   104→      enableTakesDetection: true
+   105→    }
+   106→  },
+   107→
+   108→  // Vlog/YouTube - punchy edits, engagement-focused
+   109→  vlog: {
+   110→    name: 'Vlog',
+   111→    description: 'Punchy edits for YouTube engagement',
+   112→    icon: 'videocam',
+   113→    settings: {
+   114→      sensitivity: 65,           // Higher sensitivity
+   115→      threshold: -30,            // Moderate-low threshold
+   116→      minSilenceLength: 0.35,    // Short silences
+   117→      paddingStart: 0.08,        // Quick transitions
+   118→      paddingEnd: 0.05,
+   119→      mergeDistance: 0.2,
+   120→      autoMarkBest: true,
+   121→      enableTakesDetection: true
+   122→    }
+   123→  }
+   124→};
+   125→
+   126→/**
+   127→ * Get all available presets
+   128→ * @returns {Object} All preset definitions
+   129→ */
+   130→function getPresets() {
+   131→  return { ...PRESETS };
+   132→}
+   133→
+   134→/**
+   135→ * Get a specific preset by name
+   136→ * @param {string} presetName - Name of the preset
+   137→ * @returns {Object|null} Preset definition or null if not found
+   138→ */
+   139→function getPreset(presetName) {
+   140→  return PRESETS[presetName] || null;
+   141→}
+   142→
+   143→/**
+   144→ * Get preset names as array (for UI)
+   145→ * @returns {Array<string>} Array of preset names
+   146→ */
+   147→function getPresetNames() {
+   148→  return Object.keys(PRESETS);
+   149→}
+   150→
+   151→/**
+   152→ * Apply a preset to current settings
+   153→ * @param {string} presetName - Name of the preset to apply
+   154→ * @returns {Object} The applied settings
+   155→ */
+   156→function applyPreset(presetName) {
+   157→  const preset = PRESETS[presetName];
+   158→
+   159→  if (!preset) {
+   160→    console.warn(`[SPLICE] Unknown preset: ${presetName}`);
+   161→    return getSettings();
+   162→  }
+   163→
+   164→  // Custom preset uses current settings
+   165→  if (presetName === 'custom' || !preset.settings) {
+   166→    saveSettings({ activePreset: 'custom' });
+   167→    return getSettings();
+   168→  }
+   169→
+   170→  // Apply preset settings
+   171→  const newSettings = {
+   172→    ...preset.settings,
+   173→    activePreset: presetName
+   174→  };
+   175→
+   176→  saveSettings(newSettings);
+   177→  console.log(`[SPLICE] Applied preset: ${preset.name}`);
+   178→
+   179→  return getSettings();
+   180→}
+   181→
+   182→/**
+   183→ * Get the currently active preset
+   184→ * @returns {string} Active preset name
+   185→ */
+   186→function getActivePreset() {
+   187→  const settings = getSettings();
+   188→  return settings.activePreset || 'custom';
+   189→}
+   190→
+   191→/**
+   192→ * Check if current settings match a preset
+   193→ * @param {string} presetName - Preset to compare against
+   194→ * @returns {boolean} True if settings match the preset
+   195→ */
+   196→function settingsMatchPreset(presetName) {
+   197→  const preset = PRESETS[presetName];
+   198→  if (!preset || !preset.settings) return presetName === 'custom';
+   199→
+   200→  const current = getSettings();
+   201→
+   202→  // Compare relevant settings
+   203→  return Object.keys(preset.settings).every(key => {
+   204→    if (key === 'activePreset') return true;
+   205→    return current[key] === preset.settings[key];
+   206→  });
+   207→}
+   208→
+   209→let currentSettings = { ...DEFAULT_SETTINGS };
+   210→
+   211→/**
+   212→ * Load settings from localStorage
+   213→ */
+   214→function loadSettings() {
+   215→  try {
+   216→    const saved = localStorage.getItem('spliceSettings');
+   217→    if (saved) {
+   218→      currentSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+   219→    }
+   220→  } catch (e) {
+   221→    console.warn('[SPLICE] Could not load settings:', e);
+   222→    currentSettings = { ...DEFAULT_SETTINGS };
+   223→  }
+   224→  return currentSettings;
+   225→}
+   226→
+   227→/**
+   228→ * Save settings to localStorage
+   229→ */
+   230→function saveSettings(settings) {
+   231→  try {
+   232→    currentSettings = { ...currentSettings, ...settings };
+   233→    localStorage.setItem('spliceSettings', JSON.stringify(currentSettings));
+   234→  } catch (e) {
+   235→    console.warn('[SPLICE] Could not save settings:', e);
+   236→  }
+   237→}
+   238→
+   239→/**
+   240→ * Get current settings
+   241→ */
+   242→function getSettings() {
+   243→  return { ...currentSettings };
+   244→}
+   245→
+   246→/**
+   247→ * Reset settings to defaults
+   248→ */
+   249→function resetSettings() {
+   250→  currentSettings = { ...DEFAULT_SETTINGS };
+   251→  try {
+   252→    localStorage.removeItem('spliceSettings');
+   253→  } catch (e) {
+   254→    console.warn('[SPLICE] Could not clear settings:', e);
+   255→  }
+   256→}
+   257→
+   258→/**
+   259→ * Initialize settings UI components
+   260→ */
+   261→function initSettingsUI() {
+   262→  const settings = loadSettings();
+   263→
+   264→  // Apply saved sensitivity to slider
+   265→  const sensitivitySlider = document.getElementById('sensitivitySlider');
+   266→  if (sensitivitySlider) {
+   267→    sensitivitySlider.value = settings.sensitivity;
+   268→  }
+   269→
+   270→  // Apply saved audio source
+   271→  const sourceOriginal = document.getElementById('sourceOriginal');
+   272→  const sourceIsolated = document.getElementById('sourceIsolated');
+   273→  if (sourceOriginal && sourceIsolated) {
+   274→    sourceOriginal.checked = settings.audioSource === 'original' || settings.audioSource === 'both';
+   275→    sourceIsolated.checked = settings.audioSource === 'isolated' || settings.audioSource === 'both';
+   276→  }
+   277→
+   278→  // Apply auto-mark best setting
+   279→  const autoMarkBest = document.getElementById('autoMarkBest');
+   280→  if (autoMarkBest) {
+   281→    autoMarkBest.checked = settings.autoMarkBest;
+   282→  }
+   283→
+   284→  // Apply takes detection setting
+   285→  const enableTakesDetection = document.getElementById('enableTakesDetection');
+   286→  if (enableTakesDetection) {
+   287→    enableTakesDetection.checked = settings.enableTakesDetection;
+   288→  }
+   289→
+   290→  // Apply remember options setting
+   291→  const rememberOptions = document.getElementById('rememberOptions');
+   292→  if (rememberOptions) {
+   293→    rememberOptions.checked = settings.rememberOptions;
+   294→  }
+   295→
+   296→  // Restore expanded state if remember is enabled
+   297→  if (settings.rememberOptions && settings.optionsExpanded) {
+   298→    toggleOptionsPanel(true);
+   299→  }
+   300→}
+   301→
+   302→/**
+   303→ * Toggle options panel visibility (unified panel)
+   304→ */
+   305→function toggleOptionsPanel(forceState) {
+   306→  const toggle = document.getElementById('optionsToggle');
+   307→  const panel = document.getElementById('optionsPanel');
+   308→
+   309→  if (!toggle || !panel) return;
+   310→
+   311→  const shouldExpand = forceState !== undefined ? forceState : panel.classList.contains('collapsed');
+   312→
+   313→  if (shouldExpand) {
+   314→    panel.classList.remove('collapsed');
+   315→    toggle.classList.add('expanded');
+   316→  } else {
+   317→    panel.classList.add('collapsed');
+   318→    toggle.classList.remove('expanded');
+   319→  }
+   320→
+   321→  // Save state if remember is enabled
+   322→  const settings = getSettings();
+   323→  if (settings.rememberOptions) {
+   324→    saveSettings({ optionsExpanded: shouldExpand });
+   325→  }
+   326→}
+   327→
+   328→/**
+   329→ * Initialize settings modal
+   330→ */
+   331→function initSettingsModal() {
+   332→  const settingsBtn = document.getElementById('settingsBtn');
+   333→  const modal = document.getElementById('settingsModal');
+   334→  const closeBtn = document.getElementById('closeSettingsBtn');
+   335→  const defaultSensitivity = document.getElementById('defaultSensitivity');
+   336→  const rememberOptions = document.getElementById('rememberOptions');
+   337→
+   338→  if (settingsBtn && modal) {
+   339→    settingsBtn.addEventListener('click', () => {
+   340→      modal.classList.remove('hidden');
+   341→      // Sync modal values with current settings
+   342→      const settings = getSettings();
+   343→      if (defaultSensitivity) defaultSensitivity.value = settings.sensitivity;
+   344→      if (rememberOptions) rememberOptions.checked = settings.rememberOptions;
+   345→    });
+   346→  }
+   347→
+   348→  if (closeBtn && modal) {
+   349→    closeBtn.addEventListener('click', () => {
+   350→      modal.classList.add('hidden');
+   351→    });
+   352→  }
+   353→
+   354→  // Close on backdrop click
+   355→  if (modal) {
+   356→    modal.addEventListener('click', (e) => {
+   357→      if (e.target === modal) {
+   358→        modal.classList.add('hidden');
+   359→      }
+   360→    });
+   361→  }
+   362→
+   363→  // Save default sensitivity when changed
+   364→  if (defaultSensitivity) {
+   365→    defaultSensitivity.addEventListener('change', () => {
+   366→      saveSettings({ sensitivity: parseInt(defaultSensitivity.value) });
+   367→      // Also update the main slider
+   368→      const mainSlider = document.getElementById('sensitivitySlider');
+   369→      if (mainSlider) mainSlider.value = defaultSensitivity.value;
+   370→    });
+   371→  }
+   372→
+   373→  // Save remember options when changed
+   374→  if (rememberOptions) {
+   375→    rememberOptions.addEventListener('change', () => {
+   376→      saveSettings({ rememberOptions: rememberOptions.checked });
+   377→    });
+   378→  }
+   379→}
+   380→
+   381→/**
+   382→ * Initialize options toggle (unified panel)
+   383→ */
+   384→function initOptionsToggles() {
+   385→  const toggle = document.getElementById('optionsToggle');
+   386→
+   387→  if (toggle) {
+   388→    toggle.addEventListener('click', () => toggleOptionsPanel());
+   389→  }
+   390→}
+   391→
+   392→/**
+   393→ * Initialize help button
+   394→ */
+   395→function initHelpButton() {
+   396→  const helpBtn = document.getElementById('helpBtn');
+   397→  if (helpBtn) {
+   398→    helpBtn.addEventListener('click', () => {
+   399→      setStatus('Silence: removes quiet gaps | Takes: detects repeated content');
+   400→    });
+   401→  }
+   402→}
+   403→
+   404→// =============================================================================
+   405→// PERSISTENT TOKEN MANAGEMENT (v3.5)
+   406→// =============================================================================
+   407→
+   408→/**
+   409→ * Media folder entry (cached after selection)
+   410→ * @type {Object|null}
+   411→ */
+   412→let mediaFolderEntry = null;
+   413→
+   414→/**
+   415→ * Prompt user to select a media folder and create a persistent token.
+   416→ * This allows silent file access without repeated permission prompts.
+   417→ *
+   418→ * @returns {Promise<{success: boolean, path?: string, error?: string}>}
+   419→ */
+   420→async function setupMediaFolder() {
+   421→  try {
+   422→    // Open folder picker dialog
+   423→    const folder = await uxpFs.getFolder();
+   424→
+   425→    if (!folder) {
+   426→      return { success: false, error: 'No folder selected' };
+   427→    }
+   428→
+   429→    // Create a persistent token for this folder
+   430→    const token = await uxpFs.createPersistentToken(folder);
+   431→
+   432→    if (!token) {
+   433→      return { success: false, error: 'Failed to create persistent token' };
+   434→    }
+   435→
+   436→    // Get the folder path for display
+   437→    const folderPath = folder.nativePath || folder.name;
+   438→
+   439→    // Save to settings
+   440→    saveSettings({
+   441→      mediaFolderToken: token,
+   442→      mediaFolderPath: folderPath
+   443→    });
+   444→
+   445→    // Cache the folder entry
+   446→    mediaFolderEntry = folder;
+   447→
+   448→    console.log(`[SPLICE] Media folder set: ${folderPath}`);
+   449→
+   450→    return {
+   451→      success: true,
+   452→      path: folderPath,
+   453→      token
+   454→    };
+   455→  } catch (err) {
+   456→    console.error('[SPLICE] Error setting up media folder:', err);
+   457→    return { success: false, error: err.message };
+   458→  }
+   459→}
+   460→
+   461→/**
+   462→ * Get the media folder entry using the stored persistent token.
+   463→ * Falls back to prompting if token is invalid.
+   464→ *
+   465→ * @returns {Promise<Object|null>} The folder entry or null
+   466→ */
+   467→async function getMediaFolder() {
+   468→  // Return cached entry if available
+   469→  if (mediaFolderEntry) {
+   470→    return mediaFolderEntry;
+   471→  }
+   472→
+   473→  const settings = getSettings();
+   474→
+   475→  // Try to restore from persistent token
+   476→  if (settings.mediaFolderToken) {
+   477→    try {
+   478→      const folder = await uxpFs.getEntryForPersistentToken(settings.mediaFolderToken);
+   479→      if (folder) {
+   480→        mediaFolderEntry = folder;
+   481→        console.log(`[SPLICE] Restored media folder from token: ${settings.mediaFolderPath}`);
+   482→        return folder;
+   483→      }
+   484→    } catch (err) {
+   485→      console.warn('[SPLICE] Could not restore media folder from token:', err.message);
+   486→      // Clear invalid token
+   487→      saveSettings({ mediaFolderToken: null, mediaFolderPath: null });
+   488→    }
+   489→  }
+   490→
+   491→  return null;
+   492→}
+   493→
+   494→/**
+   495→ * Check if a media folder is configured
+   496→ * @returns {boolean}
+   497→ */
+   498→function hasMediaFolder() {
+   499→  const settings = getSettings();
+   500→  return !!settings.mediaFolderToken;
+   501→}
+   502→
+   503→/**
+   504→ * Get the configured media folder path (for display)
+   505→ * @returns {string|null}
+   506→ */
+   507→function getMediaFolderPath() {
+   508→  const settings = getSettings();
+   509→  return settings.mediaFolderPath;
+   510→}
+   511→
+   512→/**
+   513→ * Clear the media folder configuration
+   514→ */
+   515→function clearMediaFolder() {
+   516→  mediaFolderEntry = null;
+   517→  saveSettings({
+   518→    mediaFolderToken: null,
+   519→    mediaFolderPath: null
+   520→  });
+   521→  console.log('[SPLICE] Media folder cleared');
+   522→}
+   523→
+   524→/**
+   525→ * Read a file from the media folder
+   526→ * @param {string} filename - Name of the file to read
+   527→ * @returns {Promise<ArrayBuffer|null>} File contents or null
+   528→ */
+   529→async function readMediaFile(filename) {
+   530→  const folder = await getMediaFolder();
+   531→  if (!folder) {
+   532→    console.warn('[SPLICE] No media folder configured');
+   533→    return null;
+   534→  }
+   535→
+   536→  try {
+   537→    const file = await folder.getEntry(filename);
+   538→    if (!file) {
+   539→      console.warn(`[SPLICE] File not found in media folder: ${filename}`);
+   540→      return null;
+   541→    }
+   542→
+   543→    const contents = await file.read({ format: uxpFs.formats.binary });
+   544→    return contents;
+   545→  } catch (err) {
+   546→    console.error(`[SPLICE] Error reading file ${filename}:`, err);
+   547→    return null;
+   548→  }
+   549→}
+   550→
+   551→// Load settings on script load
+   552→loadSettings();
+   553→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

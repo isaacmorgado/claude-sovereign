@@ -1,0 +1,490 @@
+/**
+ * Song Identification Service
+ * Identifies songs from YouTube URLs using ACRCloud fingerprinting
+ */
+
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
+const FormData = require('form-data');
+
+const execAsync = promisify(exec);
+
+// ACRCloud configuration
+const ACRCLOUD_HOST = process.env.ACRCLOUD_HOST || 'identify-us-west-2.acrcloud.com';
+const ACRCLOUD_ACCESS_KEY = process.env.ACRCLOUD_ACCESS_KEY;
+const ACRCLOUD_ACCESS_SECRET = process.env.ACRCLOUD_ACCESS_SECRET;
+
+// Temp directory for audio files
+const TEMP_DIR = process.env.TEMP_DIR || '/tmp/splice-music';
+
+// YouTube URL patterns
+// Matches: youtube.com/watch?v=, youtu.be/, youtube.com/embed/
+const YOUTUBE_PATTERNS = [
+  /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+  /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+  /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+  /^[a-zA-Z0-9_-]{11}$/
+];
+
+/**
+ * Validate YouTube URL and extract video ID
+ * @param {string} url - YouTube URL
+ * @returns {{valid: boolean, videoId: string|null, error: string|null}}
+ */
+function validateYouTubeUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return { valid: false, videoId: null, error: 'URL is required' };
+  }
+
+  for (const pattern of YOUTUBE_PATTERNS) {
+    const match = url.match(pattern);
+    if (match) {
+      return { valid: true, videoId: match[1] || match[0], error: null };
+    }
+  }
+
+  return { valid: false, videoId: null, error: 'Invalid YouTube URL format' };
+}
+
+/**
+ * Ensure temp directory exists
+ */
+async function ensureTempDir() {
+  try {
+    await fs.mkdir(TEMP_DIR, { recursive: true });
+  } catch (error) {
+    if (error.code !== 'EEXIST') {
+      throw error;
+    }
+  }
+}
+
+/**
+ * Extract 15-second audio fingerprint from YouTube URL using yt-dlp
+ * @param {string} youtubeUrl - YouTube URL
+ * @returns {Promise<string>} Path to extracted audio file
+ */
+async function extractAudioFingerprint(youtubeUrl) {
+  // Validate URL
+  const validation = validateYouTubeUrl(youtubeUrl);
+  if (!validation.valid) {
+    throw new Error(validation.error);
+  }
+
+  await ensureTempDir();
+
+  const outputFile = path.join(TEMP_DIR, `fingerprint_${Date.now()}_${validation.videoId}.wav`);
+
+  try {
+    // Use yt-dlp to download first 30 seconds of audio
+    // Then trim to 15 seconds for fingerprinting
+    const ytdlpCommand = [
+      'yt-dlp',
+      '--no-warnings',
+      '--quiet',
+      '--extract-audio',
+      '--audio-format', 'wav',
+      '--audio-quality', '0',
+      '--output', outputFile.replace('.wav', '.%(ext)s'),
+      '--postprocessor-args', '"-t 30"', // Limit to 30 seconds during download
+      '--', // Prevent URL from being interpreted as option
+      youtubeUrl
+    ].join(' ');
+
+    await execAsync(ytdlpCommand, { timeout: 60000 });
+
+    // Check if file was created (yt-dlp may change extension)
+    const files = await fs.readdir(TEMP_DIR);
+    const matchingFile = files.find(f =>
+      f.includes(validation.videoId) && f.startsWith('fingerprint_')
+    );
+
+    if (!matchingFile) {
+      throw new Error('Audio extraction failed - no output file created');
+    }
+
+    const extractedPath = path.join(TEMP_DIR, matchingFile);
+
+    // Trim to 15 seconds using FFmpeg
+    const trimmedFile = outputFile.replace('.wav', '_trimmed.wav');
+    await execAsync(`ffmpeg -y -i "${extractedPath}" -t 15 -ar 44100 -ac 1 "${trimmedFile}"`, {
+      timeout: 30000
+    });
+
+    // Clean up original (keep trimmed)
+    try {
+      await fs.unlink(extractedPath);
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+
+    return trimmedFile;
+
+  } catch (error) {
+    // Clean up on error
+    try {
+      await cleanupTempFiles(validation.videoId);
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+
+    if (error.message.includes('Video unavailable')) {
+      throw new Error('YouTube video is unavailable or private');
+    }
+    if (error.message.includes('not found')) {
+      throw new Error('yt-dlp is not installed. Run: brew install yt-dlp');
+    }
+
+    throw new Error(`Audio extraction failed: ${error.message}`);
+  }
+}
+
+/**
+ * Clean up temporary files for a video
+ * @param {string} videoId - YouTube video ID
+ */
+async function cleanupTempFiles(videoId) {
+  try {
+    const files = await fs.readdir(TEMP_DIR);
+    for (const file of files) {
+      if (file.includes(videoId)) {
+        await fs.unlink(path.join(TEMP_DIR, file));
+      }
+    }
+  } catch (error) {
+    console.warn('Cleanup warning:', error.message);
+  }
+}
+
+/**
+ * Generate ACRCloud signature
+ * @param {string} stringToSign - String to sign
+ * @returns {string} Base64-encoded signature
+ */
+function generateSignature(stringToSign) {
+  return crypto
+    .createHmac('sha1', ACRCLOUD_ACCESS_SECRET)
+    .update(stringToSign, 'utf-8')
+    .digest('base64');
+}
+
+/**
+ * Identify song using ACRCloud
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<Object>} Identification result
+ */
+async function identifySong(audioPath) {
+  // Validate configuration
+  if (!ACRCLOUD_ACCESS_KEY || !ACRCLOUD_ACCESS_SECRET) {
+    throw new Error('ACRCloud credentials not configured. Set ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET');
+  }
+
+  // Read audio file
+  const audioBuffer = await fs.readFile(audioPath);
+  const fileSize = audioBuffer.length;
+
+  // Generate request parameters
+  const timestamp = Math.floor(Date.now() / 1000);
+  const stringToSign = [
+    'POST',
+    '/v1/identify',
+    ACRCLOUD_ACCESS_KEY,
+    'audio',
+    '1',
+    timestamp
+  ].join('\n');
+
+  const signature = generateSignature(stringToSign);
+
+  // Create form data
+  const form = new FormData();
+  form.append('sample', audioBuffer, {
+    filename: 'sample.wav',
+    contentType: 'audio/wav'
+  });
+  form.append('sample_bytes', fileSize.toString());
+  form.append('access_key', ACRCLOUD_ACCESS_KEY);
+  form.append('data_type', 'audio');
+  form.append('signature_version', '1');
+  form.append('signature', signature);
+  form.append('timestamp', timestamp.toString());
+
+  // Make request to ACRCloud
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: ACRCLOUD_HOST,
+      path: '/v1/identify',
+      method: 'POST',
+      headers: form.getHeaders()
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          resolve(parseACRCloudResponse(result));
+        } catch (error) {
+          reject(new Error(`Failed to parse ACRCloud response: ${error.message}`));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(new Error(`ACRCloud request failed: ${error.message}`));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('ACRCloud request timeout'));
+    });
+
+    req.setTimeout(30000);
+    form.pipe(req);
+  });
+}
+
+/**
+ * Parse ACRCloud API response
+ * @param {Object} response - ACRCloud response
+ * @returns {Object} Parsed identification result
+ */
+function parseACRCloudResponse(response) {
+  // Check status
+  if (response.status?.code === 0) {
+    // Success - song identified
+    const music = response.metadata?.music?.[0];
+
+    if (!music) {
+      return {
+        identified: false,
+        confidence: 0,
+        error: 'No music data in response'
+      };
+    }
+
+    // Extract metadata
+    return {
+      identified: true,
+      title: music.title || 'Unknown Title',
+      artist: music.artists?.[0]?.name || 'Unknown Artist',
+      album: music.album?.name || null,
+      releaseDate: music.release_date || null,
+      genres: music.genres?.map(g => g.name) || [],
+      bpm: extractBPM(music),
+      key: extractKey(music),
+      mood: extractMood(music),
+      confidence: music.score || 0,
+      acrid: music.acrid || null,
+      duration: music.duration_ms ? music.duration_ms / 1000 : null,
+      external: {
+        spotify: music.external_metadata?.spotify?.track?.id || null,
+        youtube: music.external_metadata?.youtube?.vid || null,
+        deezer: music.external_metadata?.deezer?.track?.id || null
+      }
+    };
+
+  } else if (response.status?.code === 1001) {
+    // No match found
+    return {
+      identified: false,
+      confidence: 0,
+      error: 'No matching song found'
+    };
+
+  } else {
+    // Error
+    return {
+      identified: false,
+      confidence: 0,
+      error: response.status?.msg || 'Unknown ACRCloud error'
+    };
+  }
+}
+
+/**
+ * Extract BPM from ACRCloud metadata
+ * @param {Object} music - Music metadata
+ * @returns {number|null} BPM or null
+ */
+function extractBPM(music) {
+  // ACRCloud may include BPM in different fields
+  if (music.bpm) return Math.round(music.bpm);
+  if (music.tempo) return Math.round(music.tempo);
+
+  // Check external metadata
+  const spotify = music.external_metadata?.spotify?.track;
+  if (spotify?.tempo) return Math.round(spotify.tempo);
+
+  return null;
+}
+
+/**
+ * Extract musical key from ACRCloud metadata
+ * @param {Object} music - Music metadata
+ * @returns {string|null} Key (e.g., "C Major") or null
+ */
+function extractKey(music) {
+  // ACRCloud may include key in different formats
+  if (music.key) return normalizeKey(music.key);
+
+  // Check external metadata (Spotify audio features)
+  const spotify = music.external_metadata?.spotify?.track;
+  if (spotify?.key !== undefined && spotify?.mode !== undefined) {
+    return spotifyKeyToString(spotify.key, spotify.mode);
+  }
+
+  return null;
+}
+
+/**
+ * Convert Spotify key/mode to string
+ * @param {number} key - Spotify key (0-11)
+ * @param {number} mode - Spotify mode (0=minor, 1=major)
+ * @returns {string} Key string
+ */
+function spotifyKeyToString(key, mode) {
+  const keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const modeName = mode === 1 ? 'Major' : 'Minor';
+  return `${keys[key]} ${modeName}`;
+}
+
+/**
+ * Normalize key string
+ * @param {string} key - Raw key string
+ * @returns {string} Normalized key
+ */
+function normalizeKey(key) {
+  if (typeof key !== 'string') return null;
+
+  // Clean up and standardize
+  return key
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/maj(or)?/i, 'Major')
+    .replace(/min(or)?/i, 'Minor');
+}
+
+/**
+ * Extract mood from ACRCloud metadata
+ * @param {Object} music - Music metadata
+ * @returns {string|null} Mood or null
+ */
+function extractMood(music) {
+  // Check for mood tags
+  if (music.moods?.length > 0) {
+    return music.moods[0].name || music.moods[0];
+  }
+
+  // Check genres for mood hints
+  const genres = music.genres?.map(g => g.name?.toLowerCase() || g.toLowerCase()) || [];
+
+  if (genres.some(g => /happy|upbeat|energetic|dance/.test(g))) {
+    return 'Energetic';
+  }
+  if (genres.some(g => /sad|melancholy|slow/.test(g))) {
+    return 'Melancholic';
+  }
+  if (genres.some(g => /chill|relax|ambient/.test(g))) {
+    return 'Relaxed';
+  }
+  if (genres.some(g => /rock|metal|punk/.test(g))) {
+    return 'Intense';
+  }
+
+  return null;
+}
+
+/**
+ * Full identification flow: URL → Audio extraction → Identification
+ * @param {string} youtubeUrl - YouTube URL
+ * @returns {Promise<Object>} Identification result
+ */
+async function identifyFromYouTube(youtubeUrl) {
+  let audioPath = null;
+
+  try {
+    // Step 1: Extract audio fingerprint
+    audioPath = await extractAudioFingerprint(youtubeUrl);
+
+    // Step 2: Identify song
+    const result = await identifySong(audioPath);
+
+    // Add source URL to result
+    result.sourceUrl = youtubeUrl;
+    result.sourceType = 'youtube';
+
+    return result;
+
+  } finally {
+    // Cleanup temp file
+    if (audioPath) {
+      try {
+        await fs.unlink(audioPath);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
+
+/**
+ * Check if yt-dlp and ffmpeg are available
+ * @returns {Promise<{ytdlp: boolean, ffmpeg: boolean}>}
+ */
+async function checkDependencies() {
+  const checks = {
+    ytdlp: false,
+    ffmpeg: false
+  };
+
+  try {
+    await execAsync('yt-dlp --version');
+    checks.ytdlp = true;
+  } catch (e) {
+    // Not installed
+  }
+
+  try {
+    await execAsync('ffmpeg -version');
+    checks.ffmpeg = true;
+  } catch (e) {
+    // Not installed
+  }
+
+  return checks;
+}
+
+/**
+ * Check ACRCloud credentials
+ * @returns {boolean} True if credentials are configured
+ */
+function hasACRCloudCredentials() {
+  return !!(ACRCLOUD_ACCESS_KEY && ACRCLOUD_ACCESS_SECRET);
+}
+
+module.exports = {
+  validateYouTubeUrl,
+  extractAudioFingerprint,
+  identifySong,
+  identifyFromYouTube,
+  cleanupTempFiles,
+  checkDependencies,
+  hasACRCloudCredentials,
+  parseACRCloudResponse,
+  extractBPM,
+  extractKey,
+  extractMood,
+  spotifyKeyToString,
+  normalizeKey,
+  TEMP_DIR
+};

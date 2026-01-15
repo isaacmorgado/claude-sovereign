@@ -1,0 +1,1284 @@
+// Cutting Panel - Silence-based auto-cutting from transcription results
+import { LitElement, html, css } from 'lit'
+import { customElement, property, state } from 'lit/decorators.js'
+import { logger } from '@/utils/logger'
+import {
+  detectCutPoints,
+  getSilenceStats,
+  type CutPoint,
+  type SilenceDetectionConfig,
+  type TranscriptionSegment,
+} from '@/utils/cutting/silence-detector'
+import {
+  applySilenceCutsToSelection,
+  applyTakeGroupColors,
+  getSelectedClips,
+  extractAudioFromClips,
+  getSelectedClipsDuration,
+  type ApplyCutsResult,
+  type TakeGroupInput,
+  type AudioExtractionProgress,
+} from '@/utils/api/premiere'
+import { backendClient, type TakeGroup, type TakeDetectionResult } from '@/utils/api/backend-client'
+
+type CuttingState = 'idle' | 'analyzing' | 'ready' | 'preview' | 'applying' | 'complete' | 'error'
+type AudioSource = 'original' | 'isolated'
+type ExtractionState = 'idle' | 'extracting' | 'uploading' | 'transcribing' | 'complete' | 'error'
+
+// Color labels for take count display
+const TAKE_COUNT_COLOR_NAMES: Record<number, { name: string; hex: string }> = {
+  1: { name: 'Green', hex: '#4CAF50' },
+  2: { name: 'Yellow', hex: '#FFC107' },
+  3: { name: 'Orange', hex: '#FF9800' },
+  4: { name: 'Magenta', hex: '#E91E63' },
+}
+
+@customElement('cutting-panel')
+export class CuttingPanel extends LitElement {
+  static styles = css`
+    :host {
+      display: block;
+    }
+
+    .section {
+      margin-bottom: var(--space-lg);
+    }
+
+    .section-title {
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+      color: var(--text-secondary);
+      margin-bottom: var(--space-sm);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .config-card {
+      background: var(--bg-layer-1);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+      margin-bottom: var(--space-sm);
+    }
+
+    .config-row {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-xs);
+      margin-bottom: var(--space-md);
+    }
+
+    .config-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .config-label {
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+    }
+
+    .config-description {
+      font-size: var(--font-size-xs);
+      color: var(--text-secondary);
+    }
+
+    .slider-container {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    .slider {
+      flex: 1;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--bg-layer-2);
+      -webkit-appearance: none;
+      appearance: none;
+    }
+
+    .slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--color-accent);
+      cursor: pointer;
+    }
+
+    .slider-value {
+      min-width: 50px;
+      text-align: right;
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+    }
+
+    .stats-card {
+      background: var(--bg-layer-1);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: var(--space-sm);
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: var(--space-sm);
+      background: var(--bg-layer-2);
+      border-radius: var(--radius-sm);
+    }
+
+    .stat-value {
+      font-size: var(--font-size-lg);
+      font-weight: var(--font-weight-bold);
+      color: var(--color-accent);
+    }
+
+    .stat-label {
+      font-size: var(--font-size-xs);
+      color: var(--text-secondary);
+    }
+
+    .cut-points-list {
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: var(--space-sm);
+    }
+
+    .cut-point-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: var(--space-xs) var(--space-sm);
+      background: var(--bg-layer-2);
+      border-radius: var(--radius-sm);
+      margin-bottom: var(--space-xs);
+      font-size: var(--font-size-sm);
+    }
+
+    .cut-point-time {
+      font-weight: var(--font-weight-medium);
+    }
+
+    .cut-point-duration {
+      color: var(--text-secondary);
+      font-size: var(--font-size-xs);
+    }
+
+    .action-buttons {
+      display: flex;
+      gap: var(--space-sm);
+      margin-top: var(--space-md);
+    }
+
+    .btn {
+      flex: 1;
+      padding: var(--space-sm) var(--space-md);
+      border: none;
+      border-radius: var(--radius-sm);
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: var(--color-accent);
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      filter: brightness(1.1);
+    }
+
+    .btn-secondary {
+      background: var(--bg-layer-2);
+      color: var(--text-primary);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--bg-layer-1);
+    }
+
+    .status-message {
+      text-align: center;
+      padding: var(--space-md);
+      font-size: var(--font-size-sm);
+      color: var(--text-secondary);
+    }
+
+    .status-message.success {
+      color: var(--color-accent);
+    }
+
+    .status-message.error {
+      color: var(--color-negative);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: var(--space-xl);
+      color: var(--text-secondary);
+    }
+
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: var(--space-sm);
+    }
+
+    /* Audio options styles */
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      margin-bottom: var(--space-sm);
+    }
+
+    .checkbox-row input[type='checkbox'] {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--color-accent);
+    }
+
+    .select-container {
+      margin-top: var(--space-sm);
+    }
+
+    .select-container select {
+      width: 100%;
+      padding: var(--space-sm);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      background: var(--bg-layer-2);
+      color: var(--text-primary);
+      font-size: var(--font-size-sm);
+    }
+
+    /* Take groups styles */
+    .take-groups-list {
+      max-height: 250px;
+      overflow-y: auto;
+    }
+
+    .take-group-card {
+      background: var(--bg-layer-2);
+      border-radius: var(--radius-sm);
+      margin-bottom: var(--space-sm);
+      overflow: hidden;
+    }
+
+    .take-group-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      padding: var(--space-sm);
+      cursor: pointer;
+    }
+
+    .take-group-header:hover {
+      background: var(--bg-layer-1);
+    }
+
+    .color-swatch {
+      width: 16px;
+      height: 16px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+
+    .take-group-label {
+      flex: 1;
+      font-weight: var(--font-weight-medium);
+      font-size: var(--font-size-sm);
+    }
+
+    .take-count-badge {
+      font-size: var(--font-size-xs);
+      padding: 2px 6px;
+      border-radius: 10px;
+      background: var(--bg-layer-1);
+    }
+
+    .take-group-takes {
+      padding: 0 var(--space-sm) var(--space-sm);
+      border-top: 1px solid var(--border-color);
+    }
+
+    .take-item {
+      display: flex;
+      justify-content: space-between;
+      font-size: var(--font-size-xs);
+      padding: var(--space-xs) 0;
+      color: var(--text-secondary);
+    }
+
+    .detecting-indicator {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-sm);
+      padding: var(--space-md);
+      color: var(--text-secondary);
+    }
+
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border-color);
+      border-top-color: var(--color-accent);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* Preview modal styles */
+    .preview-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .preview-modal {
+      background: var(--bg-layer-0);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      max-width: 450px;
+      width: 90%;
+      max-height: 80vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .preview-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      margin-bottom: var(--space-md);
+    }
+
+    .preview-icon {
+      font-size: 24px;
+    }
+
+    .preview-title {
+      font-size: var(--font-size-lg);
+      font-weight: var(--font-weight-bold);
+    }
+
+    .preview-warning {
+      background: rgba(255, 152, 0, 0.15);
+      border: 1px solid rgba(255, 152, 0, 0.3);
+      border-radius: var(--radius-sm);
+      padding: var(--space-sm) var(--space-md);
+      margin-bottom: var(--space-md);
+      font-size: var(--font-size-sm);
+      color: #ffb74d;
+    }
+
+    .preview-summary {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: var(--space-sm);
+      margin-bottom: var(--space-md);
+    }
+
+    .preview-stat {
+      text-align: center;
+      padding: var(--space-sm);
+      background: var(--bg-layer-1);
+      border-radius: var(--radius-sm);
+    }
+
+    .preview-stat-value {
+      font-size: var(--font-size-lg);
+      font-weight: var(--font-weight-bold);
+      color: var(--color-accent);
+    }
+
+    .preview-stat-label {
+      font-size: var(--font-size-xs);
+      color: var(--text-secondary);
+    }
+
+    .preview-cuts-list {
+      flex: 1;
+      overflow-y: auto;
+      max-height: 200px;
+      margin-bottom: var(--space-md);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+    }
+
+    .preview-cut-item {
+      display: flex;
+      justify-content: space-between;
+      padding: var(--space-xs) var(--space-sm);
+      font-size: var(--font-size-sm);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .preview-cut-item:last-child {
+      border-bottom: none;
+    }
+
+    .preview-cut-time {
+      color: var(--text-primary);
+    }
+
+    .preview-cut-duration {
+      color: var(--color-negative);
+      font-weight: var(--font-weight-medium);
+    }
+
+    .preview-actions {
+      display: flex;
+      gap: var(--space-sm);
+    }
+
+    .btn-danger {
+      background: var(--color-negative);
+      color: white;
+    }
+
+    .btn-danger:hover:not(:disabled) {
+      filter: brightness(1.1);
+    }
+
+    /* Progress bar for extraction */
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: var(--bg-layer-2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--color-accent);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+  `
+
+  @property({ type: Object })
+  transcriptionResult: { segments: TranscriptionSegment[] } | null = null
+
+  @state()
+  private cuttingState: CuttingState = 'idle'
+
+  @state()
+  private minSilenceDuration = 0.5
+
+  @state()
+  private cutPosition: 'start' | 'middle' | 'end' = 'middle'
+
+  @state()
+  private detectedCutPoints: CutPoint[] = []
+
+  @state()
+  private cutResults: ApplyCutsResult[] = []
+
+  @state()
+  private errorMessage = ''
+
+  @state()
+  private selectedClipsCount = 0
+
+  // Audio options
+  @state()
+  private isolateAudio = false
+
+  @state()
+  private timelineAudioSource: AudioSource = 'original'
+
+  // Take detection
+  @state()
+  private takeDetectionResult: TakeDetectionResult | null = null
+
+  @state()
+  private isDetectingTakes = false
+
+  @state()
+  private expandedGroups: Set<string> = new Set()
+
+  // Audio extraction state
+  @state()
+  private extractionState: ExtractionState = 'idle'
+
+  @state()
+  private extractionProgress: AudioExtractionProgress | null = null
+
+  @state()
+  private clipsDuration = 0
+
+  connectedCallback() {
+    super.connectedCallback()
+    this.checkSelectedClips()
+  }
+
+  private async checkSelectedClips() {
+    const clips = await getSelectedClips()
+    this.selectedClipsCount = clips.length
+    this.clipsDuration = await getSelectedClipsDuration()
+  }
+
+  private get config(): SilenceDetectionConfig {
+    return {
+      minSilenceDuration: this.minSilenceDuration,
+      maxSilenceDuration: 10,
+      cutPosition: this.cutPosition,
+    }
+  }
+
+  private handleAnalyze() {
+    if (!this.transcriptionResult?.segments) {
+      this.errorMessage = 'No transcription data available'
+      this.cuttingState = 'error'
+      return
+    }
+
+    this.cuttingState = 'analyzing'
+    this.errorMessage = ''
+
+    try {
+      this.detectedCutPoints = detectCutPoints(this.transcriptionResult.segments, this.config)
+      this.cuttingState = 'ready'
+
+      logger.info('Cut points detected', {
+        count: this.detectedCutPoints.length,
+        config: this.config,
+      })
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Analysis failed'
+      this.cuttingState = 'error'
+      logger.error('Failed to detect cut points', error)
+    }
+  }
+
+  private async handleShowPreview() {
+    if (this.detectedCutPoints.length === 0) {
+      this.errorMessage = 'No cut points to preview'
+      return
+    }
+
+    await this.checkSelectedClips()
+    if (this.selectedClipsCount === 0) {
+      this.errorMessage = 'Please select clips in the timeline first'
+      this.cuttingState = 'error'
+      return
+    }
+
+    this.cuttingState = 'preview'
+    this.errorMessage = ''
+    logger.info('Showing cut preview', { cutCount: this.detectedCutPoints.length })
+  }
+
+  private handleCancelPreview() {
+    this.cuttingState = 'ready'
+    logger.info('Cut preview cancelled')
+  }
+
+  private async handleConfirmCuts() {
+    this.cuttingState = 'applying'
+    this.errorMessage = ''
+
+    try {
+      const cutTimes = this.detectedCutPoints.map((cp) => cp.time)
+      this.cutResults = await applySilenceCutsToSelection(cutTimes)
+
+      const totalApplied = this.cutResults.reduce((sum, r) => sum + r.cutsApplied, 0)
+      const totalFailed = this.cutResults.reduce((sum, r) => sum + r.cutsFailed, 0)
+
+      if (totalFailed === 0 && totalApplied > 0) {
+        this.cuttingState = 'complete'
+        logger.info('Cuts applied successfully', { totalApplied })
+      } else if (totalApplied === 0) {
+        this.errorMessage = 'No cuts were applied'
+        this.cuttingState = 'error'
+      } else {
+        this.errorMessage = `${totalApplied} cuts applied, ${totalFailed} failed`
+        this.cuttingState = 'complete'
+      }
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Failed to apply cuts'
+      this.cuttingState = 'error'
+      logger.error('Failed to apply cuts', error)
+    }
+  }
+
+  private handleReset() {
+    this.cuttingState = 'idle'
+    this.detectedCutPoints = []
+    this.cutResults = []
+    this.errorMessage = ''
+    this.takeDetectionResult = null
+    this.expandedGroups = new Set()
+    this.extractionState = 'idle'
+    this.extractionProgress = null
+    this.transcriptionResult = null
+  }
+
+  // Audio options handlers
+  private handleIsolateAudioChange(e: Event) {
+    const target = e.target as HTMLInputElement
+    this.isolateAudio = target.checked
+  }
+
+  private handleAudioSourceChange(e: Event) {
+    const target = e.target as HTMLSelectElement
+    this.timelineAudioSource = target.value as AudioSource
+  }
+
+  // Take detection handlers
+  private async handleDetectTakes() {
+    if (!this.transcriptionResult?.segments) {
+      this.errorMessage = 'No transcription data for take detection'
+      return
+    }
+
+    this.isDetectingTakes = true
+    this.errorMessage = ''
+
+    try {
+      const result = await backendClient.submitTakeDetection(this.transcriptionResult.segments)
+      this.takeDetectionResult = result
+
+      logger.info('Take detection completed', {
+        groupCount: result.groups.length,
+        totalTakes: result.totalTakes,
+        model: result.metadata.model,
+      })
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Take detection failed'
+      logger.error('Take detection failed', error)
+    } finally {
+      this.isDetectingTakes = false
+    }
+  }
+
+  private async handleApplyTakeLabels() {
+    if (!this.takeDetectionResult?.groups.length) {
+      this.errorMessage = 'No take groups to apply'
+      return
+    }
+
+    await this.checkSelectedClips()
+    if (this.selectedClipsCount === 0) {
+      this.errorMessage = 'Please select clips in the timeline first'
+      return
+    }
+
+    try {
+      const takeGroups: TakeGroupInput[] = this.takeDetectionResult.groups.map((g) => ({
+        id: g.id,
+        label: g.label,
+        takes: g.takes,
+        colorIndex: g.colorIndex,
+      }))
+
+      const result = await applyTakeGroupColors(takeGroups)
+
+      if (result.clipsLabeled > 0) {
+        logger.info('Take labels applied', {
+          clipsLabeled: result.clipsLabeled,
+          clipsFailed: result.clipsFailed,
+        })
+      }
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Failed to apply labels'
+      logger.error('Failed to apply take labels', error)
+    }
+  }
+
+  private toggleGroupExpanded(groupId: string) {
+    const newExpanded = new Set(this.expandedGroups)
+    if (newExpanded.has(groupId)) {
+      newExpanded.delete(groupId)
+    } else {
+      newExpanded.add(groupId)
+    }
+    this.expandedGroups = newExpanded
+  }
+
+  // Audio extraction and processing
+  private async handleExtractAudio() {
+    await this.checkSelectedClips()
+    if (this.selectedClipsCount === 0) {
+      this.errorMessage = 'Please select clips in the timeline first'
+      this.extractionState = 'error'
+      return
+    }
+
+    // Check usage limits before proceeding
+    const durationMinutes = this.clipsDuration / 60
+    const canSubmit = await backendClient.canSubmitAudioJob(durationMinutes)
+    if (!canSubmit.allowed) {
+      this.errorMessage = canSubmit.reason ?? 'Usage limit reached'
+      this.extractionState = 'error'
+      return
+    }
+
+    this.extractionState = 'extracting'
+    this.errorMessage = ''
+    this.extractionProgress = null
+
+    try {
+      // Step 1: Extract audio from selected clips
+      const extractResult = await extractAudioFromClips(
+        { format: 'wav', sampleRate: 48000 },
+        (progress) => {
+          this.extractionProgress = progress
+        }
+      )
+
+      if (!extractResult.success || !extractResult.combinedFile) {
+        this.errorMessage = extractResult.error ?? 'Failed to extract audio'
+        this.extractionState = 'error'
+        return
+      }
+
+      // Step 2: Upload to S3
+      this.extractionState = 'uploading'
+      this.extractionProgress = {
+        phase: 'processing',
+        clipIndex: 0,
+        totalClips: this.selectedClipsCount,
+        progress: 0,
+        message: 'Uploading audio...',
+      }
+
+      const uploadResult = await backendClient.uploadFileWithProgress(
+        extractResult.combinedFile,
+        (progress) => {
+          this.extractionProgress = {
+            phase: 'processing',
+            clipIndex: 0,
+            totalClips: this.selectedClipsCount,
+            progress: progress / 100,
+            message: `Uploading: ${Math.round(progress)}%`,
+          }
+        }
+      )
+
+      // Step 3: Submit for transcription
+      this.extractionState = 'transcribing'
+      this.extractionProgress = {
+        phase: 'processing',
+        clipIndex: 0,
+        totalClips: this.selectedClipsCount,
+        progress: 0,
+        message: 'Submitting for transcription...',
+      }
+
+      // If isolate audio is enabled, submit for vocal isolation first
+      if (this.isolateAudio) {
+        const isolationJob = await backendClient.submitVocalIsolation(
+          uploadResult.publicUrl,
+          durationMinutes
+        )
+
+        // Poll for isolation completion
+        const isolationResult = await backendClient.pollJobUntilComplete(isolationJob.id, (job) => {
+          this.extractionProgress = {
+            phase: 'processing',
+            clipIndex: 0,
+            totalClips: this.selectedClipsCount,
+            progress: (job.progress ?? 0) / 100,
+            message: `Isolating vocals: ${job.progress ?? 0}%`,
+          }
+        })
+
+        // Cast to VocalIsolationResult type
+        const isolationData = isolationResult.resultData as {
+          vocalsUrl: string
+          instrumentalUrl: string
+        } | null
+
+        if (isolationResult.status === 'completed' && isolationData?.vocalsUrl) {
+          // Use isolated audio for transcription
+          const transcriptionJob = await backendClient.submitTranscription(
+            isolationData.vocalsUrl,
+            durationMinutes
+          )
+
+          await this.pollTranscriptionJob(transcriptionJob.id)
+        } else {
+          this.errorMessage = 'Vocal isolation failed'
+          this.extractionState = 'error'
+          return
+        }
+      } else {
+        // Direct transcription without isolation
+        const transcriptionJob = await backendClient.submitTranscription(
+          uploadResult.publicUrl,
+          durationMinutes
+        )
+
+        await this.pollTranscriptionJob(transcriptionJob.id)
+      }
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Processing failed'
+      this.extractionState = 'error'
+      logger.error('Audio extraction/processing failed', error)
+    }
+  }
+
+  private async pollTranscriptionJob(jobId: string) {
+    try {
+      const result = await backendClient.pollJobUntilComplete(jobId, (job) => {
+        this.extractionProgress = {
+          phase: 'processing',
+          clipIndex: 0,
+          totalClips: this.selectedClipsCount,
+          progress: (job.progress ?? 0) / 100,
+          message: `Transcribing: ${job.progress ?? 0}%`,
+        }
+      })
+
+      // Cast to TranscriptionResult type
+      const transcriptionData = result.resultData as {
+        text: string
+        segments: TranscriptionSegment[]
+        language: string
+        confidence: number
+      } | null
+
+      if (result.status === 'completed' && transcriptionData?.segments) {
+        // Set transcription result which triggers the cutting UI
+        this.transcriptionResult = { segments: transcriptionData.segments }
+        this.extractionState = 'complete'
+        this.extractionProgress = {
+          phase: 'complete',
+          clipIndex: this.selectedClipsCount,
+          totalClips: this.selectedClipsCount,
+          progress: 1,
+          message: 'Transcription complete!',
+        }
+
+        logger.info('Transcription complete', {
+          segmentCount: transcriptionData.segments.length,
+        })
+      } else {
+        this.errorMessage = 'Transcription failed'
+        this.extractionState = 'error'
+      }
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : 'Transcription polling failed'
+      this.extractionState = 'error'
+      logger.error('Transcription polling failed', error)
+    }
+  }
+
+  private getColorForTakeCount(count: number): { name: string; hex: string } {
+    if (count >= 4) return TAKE_COUNT_COLOR_NAMES[4]
+    return TAKE_COUNT_COLOR_NAMES[count] ?? TAKE_COUNT_COLOR_NAMES[1]
+  }
+
+  private handleSliderChange(e: Event) {
+    const target = e.target as HTMLInputElement
+    this.minSilenceDuration = parseFloat(target.value)
+
+    // Re-analyze if we already have cut points
+    if (this.detectedCutPoints.length > 0 && this.transcriptionResult) {
+      this.handleAnalyze()
+    }
+  }
+
+  private formatTime(seconds: number): string {
+    const mins = Math.floor(seconds / 60)
+    const secs = (seconds % 60).toFixed(1)
+    return `${mins}:${secs.padStart(4, '0')}`
+  }
+
+  private getTotalSilenceToRemove(): number {
+    return this.detectedCutPoints.reduce((total, cp) => {
+      return total + (cp.silenceGap?.duration ?? 0)
+    }, 0)
+  }
+
+  private renderPreviewModal() {
+    if (this.cuttingState !== 'preview') return null
+
+    const totalSilence = this.getTotalSilenceToRemove()
+
+    return html`
+      <div class="preview-overlay" @click=${this.handleCancelPreview}>
+        <div class="preview-modal" @click=${(e: Event) => e.stopPropagation()}>
+          <div class="preview-header">
+            <span class="preview-icon">&#9986;</span>
+            <span class="preview-title">Preview Cuts</span>
+          </div>
+
+          <div class="preview-warning">
+            <strong>Warning:</strong> This action will permanently modify your timeline. Consider
+            duplicating your sequence before proceeding.
+          </div>
+
+          <div class="preview-summary">
+            <div class="preview-stat">
+              <div class="preview-stat-value">${this.detectedCutPoints.length}</div>
+              <div class="preview-stat-label">Cuts</div>
+            </div>
+            <div class="preview-stat">
+              <div class="preview-stat-value">${totalSilence.toFixed(1)}s</div>
+              <div class="preview-stat-label">Removed</div>
+            </div>
+            <div class="preview-stat">
+              <div class="preview-stat-value">${this.selectedClipsCount}</div>
+              <div class="preview-stat-label">Clips</div>
+            </div>
+          </div>
+
+          <div class="preview-cuts-list">
+            ${this.detectedCutPoints.map(
+              (cp, i) => html`
+                <div class="preview-cut-item">
+                  <span class="preview-cut-time">#${i + 1} @ ${this.formatTime(cp.time)}</span>
+                  ${cp.silenceGap
+                    ? html`
+                        <span class="preview-cut-duration">
+                          -${cp.silenceGap.duration.toFixed(2)}s
+                        </span>
+                      `
+                    : null}
+                </div>
+              `
+            )}
+          </div>
+
+          <div class="preview-actions">
+            <button class="btn btn-secondary" @click=${this.handleCancelPreview}>Cancel</button>
+            <button class="btn btn-danger" @click=${this.handleConfirmCuts}>Apply Cuts</button>
+          </div>
+        </div>
+      </div>
+    `
+  }
+
+  private renderEmptyState() {
+    const isProcessing =
+      this.extractionState === 'extracting' ||
+      this.extractionState === 'uploading' ||
+      this.extractionState === 'transcribing'
+
+    return html`
+      <div class="empty-state">
+        ${isProcessing
+          ? html`
+              <div
+                class="spinner"
+                style="width: 32px; height: 32px; margin: 0 auto var(--space-md);"
+              ></div>
+              <p>${this.extractionProgress?.message ?? 'Processing...'}</p>
+              ${this.extractionProgress
+                ? html`
+                    <div class="progress-bar" style="margin-top: var(--space-sm);">
+                      <div
+                        class="progress-fill"
+                        style="width: ${Math.round(this.extractionProgress.progress * 100)}%"
+                      ></div>
+                    </div>
+                  `
+                : null}
+            `
+          : html`
+              <div class="empty-state-icon">&#9986;</div>
+              <p>
+                ${this.selectedClipsCount > 0
+                  ? `${this.selectedClipsCount} clips selected`
+                  : 'No clips selected'}
+              </p>
+              <p class="config-description">
+                ${this.selectedClipsCount > 0
+                  ? `Duration: ${this.formatTime(this.clipsDuration)}`
+                  : 'Select clips in the timeline to extract and transcribe audio'}
+              </p>
+              ${this.renderAudioOptions()}
+              <div class="action-buttons" style="margin-top: var(--space-md);">
+                <button
+                  class="btn btn-primary"
+                  ?disabled=${this.selectedClipsCount === 0}
+                  @click=${this.handleExtractAudio}
+                >
+                  Extract & Transcribe
+                </button>
+                <button class="btn btn-secondary" @click=${this.checkSelectedClips}>Refresh</button>
+              </div>
+            `}
+        ${this.errorMessage
+          ? html`<div class="status-message error" style="margin-top: var(--space-md);">
+              ${this.errorMessage}
+            </div>`
+          : null}
+      </div>
+    `
+  }
+
+  private renderAudioOptions() {
+    return html`
+      <div class="section">
+        <div class="section-title">Audio Options</div>
+        <div class="config-card">
+          <div class="checkbox-row">
+            <input
+              type="checkbox"
+              id="isolate-audio"
+              .checked=${this.isolateAudio}
+              @change=${this.handleIsolateAudioChange}
+            />
+            <label for="isolate-audio" class="config-label">Isolate Audio</label>
+          </div>
+          <span class="config-description">
+            Run vocal isolation for cleaner transcription and optional isolated output
+          </span>
+
+          <div class="select-container">
+            <label class="config-label">Timeline Audio Source</label>
+            <select .value=${this.timelineAudioSource} @change=${this.handleAudioSourceChange}>
+              <option value="original">Original Audio</option>
+              <option value="isolated" ?disabled=${!this.isolateAudio}>Isolated Vocals</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    `
+  }
+
+  private renderConfig() {
+    return html`
+      <div class="section">
+        <div class="section-title">Silence Detection Settings</div>
+        <div class="config-card">
+          <div class="config-row">
+            <span class="config-label">Minimum Silence Duration</span>
+            <span class="config-description"> Only detect gaps longer than this threshold </span>
+            <div class="slider-container">
+              <input
+                type="range"
+                class="slider"
+                min="0.1"
+                max="3"
+                step="0.1"
+                .value=${String(this.minSilenceDuration)}
+                @input=${this.handleSliderChange}
+              />
+              <span class="slider-value">${this.minSilenceDuration.toFixed(1)}s</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `
+  }
+
+  private renderTakeGroups() {
+    return html`
+      <div class="section">
+        <div class="section-title">Take Detection</div>
+        <div class="config-card">
+          ${this.isDetectingTakes
+            ? html`
+                <div class="detecting-indicator">
+                  <div class="spinner"></div>
+                  <span>Analyzing transcript for repeated takes...</span>
+                </div>
+              `
+            : this.takeDetectionResult?.groups.length
+              ? html`
+                  <div class="take-groups-list">
+                    ${this.takeDetectionResult.groups.map((group) => this.renderTakeGroup(group))}
+                  </div>
+                  <div class="action-buttons" style="margin-top: var(--space-sm)">
+                    <button class="btn btn-primary" @click=${this.handleApplyTakeLabels}>
+                      Apply Colors & Labels
+                    </button>
+                  </div>
+                `
+              : html`
+                  <div class="config-row">
+                    <span class="config-description">
+                      Detect repeated takes (similar statements) in the transcript and color-code
+                      them on the timeline.
+                    </span>
+                    <button
+                      class="btn btn-secondary"
+                      style="margin-top: var(--space-sm)"
+                      @click=${this.handleDetectTakes}
+                    >
+                      Detect Takes
+                    </button>
+                  </div>
+                `}
+        </div>
+      </div>
+    `
+  }
+
+  private renderTakeGroup(group: TakeGroup) {
+    const isExpanded = this.expandedGroups.has(group.id)
+    const color = this.getColorForTakeCount(group.takes.length)
+
+    return html`
+      <div class="take-group-card">
+        <div class="take-group-header" @click=${() => this.toggleGroupExpanded(group.id)}>
+          <div class="color-swatch" style="background: ${color.hex}"></div>
+          <span class="take-group-label">${group.label}</span>
+          <span class="take-count-badge">${group.takes.length} takes</span>
+        </div>
+        ${isExpanded
+          ? html`
+              <div class="take-group-takes">
+                ${group.takes.map(
+                  (take) => html`
+                    <div class="take-item">
+                      <span>Take ${take.takeNumber}</span>
+                      <span
+                        >${this.formatTime(take.startTime)} - ${this.formatTime(take.endTime)}</span
+                      >
+                    </div>
+                  `
+                )}
+              </div>
+            `
+          : null}
+      </div>
+    `
+  }
+
+  private renderStats() {
+    if (!this.transcriptionResult?.segments) return null
+
+    const gaps = this.detectedCutPoints
+      .map((cp) => cp.silenceGap)
+      .filter((g): g is NonNullable<typeof g> => g !== undefined)
+
+    const stats = getSilenceStats(gaps)
+
+    return html`
+      <div class="section">
+        <div class="section-title">Detected Cut Points</div>
+        <div class="stats-card">
+          <div class="stats-grid">
+            <div class="stat-item">
+              <div class="stat-value">${stats.count}</div>
+              <div class="stat-label">Cut Points</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-value">${stats.totalDuration.toFixed(1)}s</div>
+              <div class="stat-label">Total Silence</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-value">${stats.averageDuration.toFixed(2)}s</div>
+              <div class="stat-label">Avg Gap</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-value">${this.selectedClipsCount}</div>
+              <div class="stat-label">Selected Clips</div>
+            </div>
+          </div>
+
+          ${this.detectedCutPoints.length > 0
+            ? html`
+                <div class="cut-points-list">
+                  ${this.detectedCutPoints.map(
+                    (cp, i) => html`
+                      <div class="cut-point-item">
+                        <span class="cut-point-time">#${i + 1} @ ${this.formatTime(cp.time)}</span>
+                        ${cp.silenceGap
+                          ? html`
+                              <span class="cut-point-duration">
+                                ${cp.silenceGap.duration.toFixed(2)}s gap
+                              </span>
+                            `
+                          : null}
+                      </div>
+                    `
+                  )}
+                </div>
+              `
+            : null}
+        </div>
+      </div>
+    `
+  }
+
+  private renderActions() {
+    const canPreview = this.cuttingState === 'ready' && this.detectedCutPoints.length > 0
+    const isProcessing =
+      this.cuttingState === 'analyzing' ||
+      this.cuttingState === 'applying' ||
+      this.cuttingState === 'preview'
+
+    return html`
+      <div class="action-buttons">
+        <button class="btn btn-secondary" ?disabled=${isProcessing} @click=${this.handleAnalyze}>
+          ${this.cuttingState === 'analyzing' ? 'Analyzing...' : 'Detect Cuts'}
+        </button>
+        <button
+          class="btn btn-primary"
+          ?disabled=${!canPreview || isProcessing}
+          @click=${this.handleShowPreview}
+        >
+          Preview Cuts
+        </button>
+      </div>
+
+      ${this.cuttingState === 'complete'
+        ? html`
+            <div class="status-message success">
+              Cuts applied successfully!
+              <button
+                class="btn btn-secondary"
+                style="margin-top: var(--space-sm)"
+                @click=${this.handleReset}
+              >
+                Reset
+              </button>
+            </div>
+          `
+        : null}
+      ${this.errorMessage
+        ? html`<div class="status-message error">${this.errorMessage}</div>`
+        : null}
+    `
+  }
+
+  render() {
+    if (!this.transcriptionResult?.segments) {
+      return this.renderEmptyState()
+    }
+
+    return html`
+      ${this.renderAudioOptions()} ${this.renderConfig()} ${this.renderTakeGroups()}
+      ${this.renderStats()} ${this.renderActions()} ${this.renderPreviewModal()}
+    `
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'cutting-panel': CuttingPanel
+  }
+}

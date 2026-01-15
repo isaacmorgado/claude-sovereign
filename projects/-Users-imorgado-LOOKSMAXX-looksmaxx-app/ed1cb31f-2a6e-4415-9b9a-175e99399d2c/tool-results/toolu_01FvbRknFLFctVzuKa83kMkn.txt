@@ -1,0 +1,2591 @@
+     1→/**
+     2→ * Insights Engine
+     3→ *
+     4→ * Processes insight definitions from insights.json and classifies them
+     5→ * as strengths or areas of improvement based on user's metric scores.
+     6→ *
+     7→ * Logic:
+     8→ * - For each insight definition, calculate average score of affected metrics
+     9→ * - Weakness: if avg score < threshold → classify with severity label
+    10→ * - Strength: if avg score > threshold → classify with grade label
+    11→ *
+    12→ * Z-Score Based Severity Logic (NEW):
+    13→ * - Ideal (Green): User is inside the ideal range
+    14→ * - Good (Blue): Within 1 Standard Deviation of the mean (|z| < 1)
+    15→ * - Moderate (Yellow): Between 1 and 2 Standard Deviations (1 ≤ |z| < 2)
+    16→ * - Severe (Red): More than 2 Standard Deviations away (|z| ≥ 2)
+    17→ *
+    18→ * Severity Labels (Weaknesses):
+    19→ *   0-3 = "Severe"
+    20→ *   3-5 = "Moderate"
+    21→ *   5-7 = "Minor"
+    22→ *
+    23→ * Grade Labels (Strengths):
+    24→ *   8-9   = "Good"
+    25→ *   9-9.5 = "Excellent"
+    26→ *   9.5-10 = "Ideal"
+    27→ */
+    28→
+    29→import { Strength, Flaw } from '@/types/results';
+    30→import { FaceIQScoreResult, FACEIQ_METRICS, isValueAcceptable } from '@/lib/faceiq-scoring';
+    31→
+    32→// ============================================
+    33→// MASTER SCORING DATABASE (Z-Score Based)
+    34→// ============================================
+    35→
+    36→export type SeverityLevel = 'ideal' | 'good' | 'moderate' | 'severe';
+    37→export type Gender = 'male' | 'female';
+    38→export type Ethnicity = 'white' | 'black' | 'east_asian' | 'south_asian' | 'hispanic' | 'middle_eastern' | 'native_american' | 'pacific_islander';
+    39→
+    40→export interface MasterMetricConfig {
+    41→  ideal: [number, number];  // [min, max] ideal range
+    42→  mean: number;             // Population mean
+    43→  std_dev: number;          // Standard deviation
+    44→  flaws?: {
+    45→    low?: string[];         // Flaws when value is too low
+    46→    high?: string[];        // Flaws when value is too high
+    47→  };
+    48→}
+    49→
+    50→// Base/Default standards (White Male baseline)
+    51→export const MASTER_SCORING_DB: Record<string, MasterMetricConfig> = {
+    52→  // MIDFACE & PROPORTIONS
+    53→  "midface_ratio": {
+    54→    ideal: [0.97, 1.00],
+    55→    mean: 1.0,
+    56→    std_dev: 0.115,
+    57→    flaws: { low: ["Long midface", "Long upper jaw"] }
+    58→  },
+    59→  "faceWidthToHeight": {
+    60→    ideal: [1.30, 1.45],
+    61→    mean: 1.38,
+    62→    std_dev: 0.08,
+    63→    flaws: {
+    64→      low: ["Overly long face", "Narrow face"],
+    65→      high: ["Wide face", "Short face"]
+    66→    }
+    67→  },
+    68→  "totalFacialWidthToHeight": {
+    69→    ideal: [1.25, 1.40],
+    70→    mean: 1.33,
+    71→    std_dev: 0.075,
+    72→    flaws: {
+    73→      low: ["Long face shape"],
+    74→      high: ["Wide face shape"]
+    75→    }
+    76→  },
+    77→  "upperThirdProportion": {
+    78→    ideal: [0.30, 0.36],
+    79→    mean: 0.33,
+    80→    std_dev: 0.03,
+    81→    flaws: {
+    82→      low: ["Short forehead"],
+    83→      high: ["Long forehead"]
+    84→    }
+    85→  },
+    86→  "middleThirdProportion": {
+    87→    ideal: [0.30, 0.36],
+    88→    mean: 0.33,
+    89→    std_dev: 0.03,
+    90→    flaws: {
+    91→      low: ["Short midface"],
+    92→      high: ["Long midface"]
+    93→    }
+    94→  },
+    95→  "lowerThirdProportion": {
+    96→    ideal: [0.30, 0.36],
+    97→    mean: 0.33,
+    98→    std_dev: 0.03,
+    99→    flaws: {
+   100→      low: ["Short lower face"],
+   101→      high: ["Long lower face"]
+   102→    }
+   103→  },
+   104→
+   105→  // EYE SPACING & IPD
+   106→  "eye_separation_ratio": {
+   107→    ideal: [0.45, 0.47],
+   108→    mean: 0.46,
+   109→    std_dev: 0.03,
+   110→    flaws: {
+   111→      low: ["Close-set eyes"],
+   112→      high: ["Wide-set eyes"]
+   113→    }
+   114→  },
+   115→  "interpupillaryRatio": {
+   116→    ideal: [0.44, 0.48],
+   117→    mean: 0.46,
+   118→    std_dev: 0.025,
+   119→    flaws: {
+   120→      low: ["Close-set eyes"],
+   121→      high: ["Wide-set eyes"]
+   122→    }
+   123→  },
+   124→  "oneEyeApartTest": {
+   125→    ideal: [0.95, 1.05],
+   126→    mean: 1.0,
+   127→    std_dev: 0.08,
+   128→    flaws: {
+   129→      low: ["Close-set eyes"],
+   130→      high: ["Wide-set eyes"]
+   131→    }
+   132→  },
+   133→  "intercanthalWidth": {
+   134→    ideal: [30, 35],
+   135→    mean: 32.5,
+   136→    std_dev: 2.5,
+   137→    flaws: {
+   138→      low: ["Narrow eye spacing"],
+   139→      high: ["Wide eye spacing"]
+   140→    }
+   141→  },
+   142→
+   143→  // EYE SHAPE & FEATURES
+   144→  "lateralCanthalTilt": {
+   145→    ideal: [6, 8],
+   146→    mean: 5.0,
+   147→    std_dev: 3.5,
+   148→    flaws: {
+   149→      low: ["Negative canthal tilt", "Downturned eyes"],
+   150→      high: ["Excessively upturned eyes"]
+   151→    }
+   152→  },
+   153→  "eyeAspectRatio": {
+   154→    ideal: [0.30, 0.35],
+   155→    mean: 0.32,
+   156→    std_dev: 0.04,
+   157→    flaws: {
+   158→      low: ["Narrow eyes"],
+   159→      high: ["Round eyes"]
+   160→    }
+   161→  },
+   162→  "palpebralFissureLength": {
+   163→    ideal: [28, 32],
+   164→    mean: 30.0,
+   165→    std_dev: 2.5,
+   166→    flaws: {
+   167→      low: ["Small eyes"],
+   168→      high: ["Large eyes"]
+   169→    }
+   170→  },
+   171→  "eyeWidth": {
+   172→    ideal: [28, 32],
+   173→    mean: 30.0,
+   174→    std_dev: 2.0,
+   175→    flaws: {
+   176→      low: ["Narrow eyes"],
+   177→      high: ["Wide eyes"]
+   178→    }
+   179→  },
+   180→  "upperEyelidExposure": {
+   181→    ideal: [0.5, 1.2],
+   182→    mean: 0.85,
+   183→    std_dev: 0.35,
+   184→    flaws: {
+   185→      low: ["Hooded eyes"],
+   186→      high: ["Excessive upper lid exposure"]
+   187→    }
+   188→  },
+   189→  "tearTroughDepth": {
+   190→    ideal: [0.0, 0.3],
+   191→    mean: 0.15,
+   192→    std_dev: 0.15,
+   193→    flaws: {
+   194→      high: ["Dark circles / Tear troughs", "Under-eye hollowness"]
+   195→    }
+   196→  },
+   197→
+   198→  // JAW ANGLES & STRUCTURE
+   199→  "gonial_angle": {
+   200→    ideal: [115, 125],
+   201→    mean: 118.0,
+   202→    std_dev: 6.5,
+   203→    flaws: {
+   204→      high: ["Weak/soft jaw structure", "Rounded jaw"]
+   205→    }
+   206→  },
+   207→  "mandibularPlaneAngle": {
+   208→    ideal: [20, 28],
+   209→    mean: 24.0,
+   210→    std_dev: 4.0,
+   211→    flaws: {
+   212→      low: ["Flat mandibular plane"],
+   213→      high: ["Steep mandibular plane", "Hyper-divergent jaw"]
+   214→    }
+   215→  },
+   216→  "jawFrontalAngle": {
+   217→    ideal: [125, 135],
+   218→    mean: 130.0,
+   219→    std_dev: 5.0,
+   220→    flaws: {
+   221→      low: ["Steep jaw"],
+   222→      high: ["Flat jaw angle"]
+   223→    }
+   224→  },
+   225→  "jawSlope": {
+   226→    ideal: [25, 35],
+   227→    mean: 30.0,
+   228→    std_dev: 5.0,
+   229→    flaws: {
+   230→      low: ["Flat jawline"],
+   231→      high: ["Steep jawline"]
+   232→    }
+   233→  },
+   234→
+   235→  // JAW WIDTH
+   236→  "jawWidthRatio": {
+   237→    ideal: [0.85, 0.95],
+   238→    mean: 0.90,
+   239→    std_dev: 0.05,
+   240→    flaws: {
+   241→      low: ["Narrow jaw"],
+   242→      high: ["Wide jaw"]
+   243→    }
+   244→  },
+   245→  "bigonialWidth": {
+   246→    ideal: [110, 125],
+   247→    mean: 117.5,
+   248→    std_dev: 7.5,
+   249→    flaws: {
+   250→      low: ["Narrow jaw width"],
+   251→      high: ["Excessively wide jaw"]
+   252→    }
+   253→  },
+   254→
+   255→  // CHEEKBONES
+   256→  "cheekbone_height": {
+   257→    ideal: [83.0, 100.0],
+   258→    mean: 85.0,
+   259→    std_dev: 5.0,
+   260→    flaws: {
+   261→      low: ["Low-set cheekbones", "Flat midface"]
+   262→    }
+   263→  },
+   264→  "cheekboneWidth": {
+   265→    ideal: [130, 145],
+   266→    mean: 137.5,
+   267→    std_dev: 7.5,
+   268→    flaws: {
+   269→      low: ["Narrow cheekbones"],
+   270→      high: ["Wide cheekbones"]
+   271→    }
+   272→  },
+   273→
+   274→  // CHIN
+   275→  "chinPhiltrumRatio": {
+   276→    ideal: [1.8, 2.2],
+   277→    mean: 2.0,
+   278→    std_dev: 0.2,
+   279→    flaws: {
+   280→      low: ["Recessed chin", "Short chin"],
+   281→      high: ["Long chin", "Projected chin"]
+   282→    }
+   283→  },
+   284→  "chinHeight": {
+   285→    ideal: [35, 45],
+   286→    mean: 40.0,
+   287→    std_dev: 5.0,
+   288→    flaws: {
+   289→      low: ["Short chin"],
+   290→      high: ["Long chin"]
+   291→    }
+   292→  },
+   293→  "chinWidth": {
+   294→    ideal: [35, 45],
+   295→    mean: 40.0,
+   296→    std_dev: 5.0,
+   297→    flaws: {
+   298→      low: ["Pointed/Narrow chin"],
+   299→      high: ["Wide chin"]
+   300→    }
+   301→  },
+   302→
+   303→  // NOSE ANGLES
+   304→  "nasalTipAngle": {
+   305→    ideal: [95, 115],
+   306→    mean: 105.0,
+   307→    std_dev: 10.0,
+   308→    flaws: {
+   309→      low: ["Droopy nasal tip"],
+   310→      high: ["Upturned nasal tip"]
+   311→    }
+   312→  },
+   313→  "nasolabialAngle": {
+   314→    ideal: [95, 110],
+   315→    mean: 102.5,
+   316→    std_dev: 7.5,
+   317→    flaws: {
+   318→      low: ["Droopy nasal tip"],
+   319→      high: ["Upturned nose"]
+   320→    }
+   321→  },
+   322→  "nasofrontalAngle": {
+   323→    ideal: [115, 135],
+   324→    mean: 125.0,
+   325→    std_dev: 10.0,
+   326→    flaws: {
+   327→      low: ["Deep nasal root"],
+   328→      high: ["Flat nasal root"]
+   329→    }
+   330→  },
+   331→  "nasofacialAngle": {
+   332→    ideal: [30, 40],
+   333→    mean: 35.0,
+   334→    std_dev: 5.0,
+   335→    flaws: {
+   336→      low: ["Flat nose profile"],
+   337→      high: ["Overprojected nose"]
+   338→    }
+   339→  },
+   340→  "nasomentaAngle": {
+   341→    ideal: [120, 135],
+   342→    mean: 127.5,
+   343→    std_dev: 7.5,
+   344→    flaws: {
+   345→      low: ["Convex profile"],
+   346→      high: ["Concave profile"]
+   347→    }
+   348→  },
+   349→
+   350→  // NOSE WIDTH & PROPORTIONS
+   351→  "nasalIndex": {
+   352→    ideal: [65, 75],
+   353→    mean: 70.0,
+   354→    std_dev: 5.0,
+   355→    flaws: {
+   356→      low: ["Narrow nose"],
+   357→      high: ["Wide nose", "Bulbous nose"]
+   358→    }
+   359→  },
+   360→  "noseWidth": {
+   361→    ideal: [35, 42],
+   362→    mean: 38.5,
+   363→    std_dev: 3.5,
+   364→    flaws: {
+   365→      low: ["Narrow nose"],
+   366→      high: ["Wide nasal base"]
+   367→    }
+   368→  },
+   369→  "noseBridgeWidth": {
+   370→    ideal: [12, 18],
+   371→    mean: 15.0,
+   372→    std_dev: 3.0,
+   373→    flaws: {
+   374→      low: ["Narrow nose bridge"],
+   375→      high: ["Wide nose bridge"]
+   376→    }
+   377→  },
+   378→  "nasalProjection": {
+   379→    ideal: [16, 22],
+   380→    mean: 19.0,
+   381→    std_dev: 3.0,
+   382→    flaws: {
+   383→      low: ["Underprojected nose"],
+   384→      high: ["Overprojected nose"]
+   385→    }
+   386→  },
+   387→  "noseLengthRatio": {
+   388→    ideal: [0.45, 0.55],
+   389→    mean: 0.50,
+   390→    std_dev: 0.05,
+   391→    flaws: {
+   392→      low: ["Short nose"],
+   393→      high: ["Long nose"]
+   394→    }
+   395→  },
+   396→
+   397→  // LIPS & PHILTRUM
+   398→  "lipRatio": {
+   399→    ideal: [1.4, 1.6],
+   400→    mean: 1.5,
+   401→    std_dev: 0.15,
+   402→    flaws: {
+   403→      low: ["Thin upper lip"],
+   404→      high: ["Thick upper lip"]
+   405→    }
+   406→  },
+   407→  "philtrumLength": {
+   408→    ideal: [11, 15],
+   409→    mean: 13.0,
+   410→    std_dev: 2.0,
+   411→    flaws: {
+   412→      low: ["Short philtrum"],
+   413→      high: ["Long philtrum"]
+   414→    }
+   415→  },
+   416→  "upperLipHeight": {
+   417→    ideal: [18, 24],
+   418→    mean: 21.0,
+   419→    std_dev: 3.0,
+   420→    flaws: {
+   421→      low: ["Thin upper lip"],
+   422→      high: ["Thick upper lip"]
+   423→    }
+   424→  },
+   425→  "lipChinDistance": {
+   426→    ideal: [40, 50],
+   427→    mean: 45.0,
+   428→    std_dev: 5.0,
+   429→    flaws: {
+   430→      low: ["Short lower third"],
+   431→      high: ["Long lower third"]
+   432→    }
+   433→  },
+   434→  "upperLipProjection": {
+   435→    ideal: [-2, 2],
+   436→    mean: 0.0,
+   437→    std_dev: 2.0,
+   438→    flaws: {
+   439→      low: ["Recessed upper lip"],
+   440→      high: ["Protruding upper lip"]
+   441→    }
+   442→  },
+   443→  "lowerLipProjection": {
+   444→    ideal: [-1, 3],
+   445→    mean: 1.0,
+   446→    std_dev: 2.0,
+   447→    flaws: {
+   448→      low: ["Recessed lower lip"],
+   449→      high: ["Protruding lower lip"]
+   450→    }
+   451→  },
+   452→  "cupidsBowDepth": {
+   453→    ideal: [3, 6],
+   454→    mean: 4.5,
+   455→    std_dev: 1.5,
+   456→    flaws: {
+   457→      low: ["Flat cupid's bow"],
+   458→      high: ["Pronounced cupid's bow"]
+   459→    }
+   460→  },
+   461→
+   462→  // EYEBROWS
+   463→  "eyebrowHeight": {
+   464→    ideal: [8, 14],
+   465→    mean: 11.0,
+   466→    std_dev: 3.0,
+   467→    flaws: {
+   468→      low: ["Low-set eyebrows"],
+   469→      high: ["High eyebrows"]
+   470→    }
+   471→  },
+   472→  "browLengthRatio": {
+   473→    ideal: [0.50, 0.60],
+   474→    mean: 0.55,
+   475→    std_dev: 0.05,
+   476→    flaws: {
+   477→      low: ["Short eyebrows"],
+   478→      high: ["Long eyebrows"]
+   479→    }
+   480→  },
+   481→  "browLengthToFaceWidth": {
+   482→    ideal: [0.30, 0.38],
+   483→    mean: 0.34,
+   484→    std_dev: 0.04,
+   485→    flaws: {
+   486→      low: ["Short eyebrows"],
+   487→      high: ["Long eyebrows"]
+   488→    }
+   489→  },
+   490→  "browridgeInclinationAngle": {
+   491→    ideal: [10, 20],
+   492→    mean: 15.0,
+   493→    std_dev: 5.0,
+   494→    flaws: {
+   495→      low: ["Flat brow ridge"],
+   496→      high: ["Prominent brow ridge"]
+   497→    }
+   498→  },
+   499→  "eyebrowThickness": {
+   500→    ideal: [1.5, 3.0],
+   501→    mean: 2.25,
+   502→    std_dev: 0.75,
+   503→    flaws: {
+   504→      low: ["Sparse/Weak eyebrows"],
+   505→      high: ["Overly thick eyebrows"]
+   506→    }
+   507→  },
+   508→
+   509→  // FOREHEAD
+   510→  "foreheadHeight": {
+   511→    ideal: [55, 70],
+   512→    mean: 62.5,
+   513→    std_dev: 7.5,
+   514→    flaws: {
+   515→      low: ["Short forehead"],
+   516→      high: ["Tall forehead"]
+   517→    }
+   518→  },
+   519→  "bitemporalWidth": {
+   520→    ideal: [120, 135],
+   521→    mean: 127.5,
+   522→    std_dev: 7.5,
+   523→    flaws: {
+   524→      low: ["Narrow forehead"],
+   525→      high: ["Wide forehead"]
+   526→    }
+   527→  },
+   528→
+   529→  // PROFILE & DEPTH
+   530→  "facialDepthToHeight": {
+   531→    ideal: [0.75, 0.85],
+   532→    mean: 0.80,
+   533→    std_dev: 0.05,
+   534→    flaws: {
+   535→      low: ["Flat facial profile"],
+   536→      high: ["Overprojected profile"]
+   537→    }
+   538→  },
+   539→  "anteriorFacialDepth": {
+   540→    ideal: [115, 130],
+   541→    mean: 122.5,
+   542→    std_dev: 7.5,
+   543→    flaws: {
+   544→      low: ["Shallow face depth"],
+   545→      high: ["Deep face projection"]
+   546→    }
+   547→  },
+   548→  "totalProfileAngle": {
+   549→    ideal: [165, 175],
+   550→    mean: 170.0,
+   551→    std_dev: 5.0,
+   552→    flaws: {
+   553→      low: ["Convex profile"],
+   554→      high: ["Concave profile"]
+   555→    }
+   556→  },
+   557→
+   558→  // ASYMMETRY
+   559→  "facialAsymmetryIndex": {
+   560→    ideal: [0, 3],
+   561→    mean: 2.0,
+   562→    std_dev: 1.5,
+   563→    flaws: {
+   564→      high: ["Facial asymmetry"]
+   565→    }
+   566→  },
+   567→  "eyeAsymmetry": {
+   568→    ideal: [0, 2],
+   569→    mean: 1.0,
+   570→    std_dev: 1.0,
+   571→    flaws: {
+   572→      high: ["Eye asymmetry"]
+   573→    }
+   574→  },
+   575→  "jawAsymmetry": {
+   576→    ideal: [0, 3],
+   577→    mean: 1.5,
+   578→    std_dev: 1.5,
+   579→    flaws: {
+   580→      high: ["Jaw asymmetry"]
+   581→    }
+   582→  },
+   583→
+   584→  // OTHER
+   585→  "recessionFrankfort": {
+   586→    ideal: [-2, 2],
+   587→    mean: 0.0,
+   588→    std_dev: 2.0,
+   589→    flaws: {
+   590→      low: ["Maxillary recession"],
+   591→      high: ["Maxillary protrusion"]
+   592→    }
+   593→  },
+   594→  "neckWidth": {
+   595→    ideal: [110, 130],
+   596→    mean: 120.0,
+   597→    std_dev: 10.0,
+   598→    flaws: {
+   599→      low: ["Narrow neck"],
+   600→      high: ["Wide neck"]
+   601→    }
+   602→  },
+   603→  "neckToJawRatio": {
+   604→    ideal: [0.90, 1.10],
+   605→    mean: 1.0,
+   606→    std_dev: 0.10,
+   607→    flaws: {
+   608→      low: ["Narrow neck"],
+   609→      high: ["Thick neck"]
+   610→    }
+   611→  }
+   612→};
+   613→
+   614→// ============================================
+   615→// ETHNICITY-SPECIFIC OVERRIDES
+   616→// ============================================
+   617→
+   618→/**
+   619→ * Ethnicity and gender-specific metric standards
+   620→ * These override the base MASTER_SCORING_DB values for specific populations
+   621→ */
+   622→export const ETHNICITY_OVERRIDES: Record<string, Record<string, Partial<MasterMetricConfig>>> = {
+   623→  // ========================================
+   624→  // MALE WHITE STANDARDS (Neoclassical Baseline)
+   625→  // ========================================
+   626→  "male_white": {
+   627→    // NOSE WIDTH - Strict 1:1 ratio (Eye Width = Nose Width)
+   628→    "noseWidth": {
+   629→      ideal: [35, 42],  // Corresponds to alar_base_ratio [0.98, 1.05]
+   630→      mean: 38.5,
+   631→      std_dev: 3.5,
+   632→      flaws: {
+   633→        high: ["Wide nasal base"]
+   634→      }
+   635→    },
+   636→
+   637→    // MIDFACE - Prefers compact midface (Hunter look)
+   638→    "midface_ratio": {
+   639→      ideal: [0.95, 1.02],
+   640→      mean: 0.985,
+   641→      std_dev: 0.035,
+   642→      flaws: {
+   643→        low: ["Long midface"]
+   644→      }
+   645→    },
+   646→
+   647→    // JAW - Square/Robust jaw preference
+   648→    "gonial_angle": {
+   649→      ideal: [115.0, 125.0],
+   650→      mean: 120.0,
+   651→      std_dev: 5.0,
+   652→      flaws: {
+   653→        high: ["Weak/Soft jaw structure"]
+   654→      }
+   655→    },
+   656→
+   657→    // FACE WIDTH - Standard Mesoprosopic range
+   658→    "faceWidthToHeight": {
+   659→      ideal: [1.90, 2.05],
+   660→      mean: 1.975,
+   661→      std_dev: 0.075,
+   662→      flaws: {
+   663→        low: ["Narrow face"],
+   664→        high: ["Short/Wide face"]
+   665→      }
+   666→    },
+   667→
+   668→    // EYE TILT - Neutral to slightly positive
+   669→    "lateralCanthalTilt": {
+   670→      ideal: [4.0, 8.0],
+   671→      mean: 6.0,
+   672→      std_dev: 2.0,
+   673→      flaws: {
+   674→        low: ["Negative canthal tilt"]
+   675→      }
+   676→    },
+   677→
+   678→    // LOWER FACE BALANCE
+   679→    "chinPhiltrumRatio": {
+   680→      ideal: [2.10, 2.30],
+   681→      mean: 2.20,
+   682→      std_dev: 0.10,
+   683→      flaws: {
+   684→        low: ["Long philtrum / Short chin"]
+   685→      }
+   686→    }
+   687→  },
+   688→
+   689→  // ========================================
+   690→  // MALE BLACK / AFRICAN STANDARDS
+   691→  // ========================================
+   692→  "male_black": {
+   693→    // NOSE WIDTH - Significantly wider tolerance
+   694→    "noseWidth": {
+   695→      ideal: [40, 50],  // Wider range (corresponds to alar_base_ratio [1.12, 1.25])
+   696→      mean: 45.0,
+   697→      std_dev: 5.0,
+   698→      flaws: {
+   699→        high: ["Wide nasal base"]
+   700→      }
+   701→    },
+   702→    "nasalIndex": {
+   703→      ideal: [80, 95],  // Wider nasal index
+   704→      mean: 87.5,
+   705→      std_dev: 7.5,
+   706→      flaws: {
+   707→        high: ["Wide nose"]
+   708→      }
+   709→    },
+   710→
+   711→    // LIPS - Prefers fuller lips
+   712→    "lipRatio": {
+   713→      ideal: [1.2, 1.5],
+   714→      mean: 1.35,
+   715→      std_dev: 0.15,
+   716→      flaws: {
+   717→        low: ["Thin lips"]
+   718→      }
+   719→    },
+   720→
+   721→    // PHILTRUM - Shorter visible philtrum is ideal
+   722→    "philtrumLength": {
+   723→      ideal: [11.0, 14.0],
+   724→      mean: 12.5,
+   725→      std_dev: 1.5,
+   726→      flaws: {
+   727→        high: ["Long philtrum"]
+   728→      }
+   729→    },
+   730→
+   731→    // CHIN - Adjusts for natural forward mouth projection (Prognathism)
+   732→    "chinPhiltrumRatio": {
+   733→      ideal: [1.80, 2.10],  // Lower range to account for prognathism
+   734→      mean: 1.95,
+   735→      std_dev: 0.15,
+   736→      flaws: {
+   737→        low: ["Recessed chin"]
+   738→      }
+   739→    }
+   740→  },
+   741→
+   742→  // ========================================
+   743→  // MALE EAST ASIAN STANDARDS
+   744→  // ========================================
+   745→  "male_east_asian": {
+   746→    // EYE SPACING - Shifted WIDER for East Asian males
+   747→    "eye_separation_ratio": {
+   748→      ideal: [0.48, 0.53],  // Shifted wider (0.46 is "close-set" here)
+   749→      mean: 0.505,
+   750→      std_dev: 0.025,
+   751→      flaws: {
+   752→        low: ["Close-set eyes"],
+   753→        high: ["Wide-set eyes"]
+   754→      }
+   755→    },
+   756→    "interpupillaryRatio": {
+   757→      ideal: [0.48, 0.53],
+   758→      mean: 0.505,
+   759→      std_dev: 0.025,
+   760→      flaws: {
+   761→        low: ["Close-set eyes"],
+   762→        high: ["Wide-set eyes"]
+   763→      }
+   764→    },
+   765→
+   766→    // EYE SHAPE - Prefers narrower/longer eyes (Hunter Eyes)
+   767→    "eyeAspectRatio": {
+   768→      ideal: [0.25, 0.29],  // Lower ratio = more elongated
+   769→      mean: 0.27,
+   770→      std_dev: 0.02,
+   771→      flaws: {
+   772→        low: ["Overly narrow eyes"],
+   773→        high: ["Overly round eye shape"]
+   774→      }
+   775→    },
+   776→    "palpebralFissureLength": {
+   777→      ideal: [29, 33],
+   778→      mean: 31.0,
+   779→      std_dev: 2.0,
+   780→      flaws: {
+   781→        low: ["Small eyes"],
+   782→        high: ["Large eyes"]
+   783→      }
+   784→    },
+   785→
+   786→    // NOSE - Asian noses typically allowed to be wider
+   787→    "nasalIndex": {
+   788→      ideal: [75, 85],
+   789→      mean: 80.0,
+   790→      std_dev: 5.0,
+   791→      flaws: {
+   792→        high: ["Wide nose"]
+   793→      }
+   794→    },
+   795→    "noseWidth": {
+   796→      ideal: [38, 45],
+   797→      mean: 41.5,
+   798→      std_dev: 3.5,
+   799→      flaws: {
+   800→        low: ["Narrow nose"],
+   801→        high: ["Very wide nasal base"]
+   802→      }
+   803→    },
+   804→    "noseBridgeWidth": {
+   805→      ideal: [14, 20],
+   806→      mean: 17.0,
+   807→      std_dev: 3.0,
+   808→      flaws: {
+   809→        low: ["Narrow nose bridge"],
+   810→        high: ["Wide nose bridge"]
+   811→      }
+   812→    },
+   813→
+   814→    // CHEEKS - Rewards slightly fuller cheeks (Youth/K-Pop aesthetic)
+   815→    "cheekbone_height": {
+   816→      ideal: [80.0, 95.0],
+   817→      mean: 87.5,
+   818→      std_dev: 7.5,
+   819→      flaws: {
+   820→        low: ["Gaunt/Hollow face"]
+   821→      }
+   822→    },
+   823→
+   824→    // JAW - Slightly softer angles acceptable
+   825→    "gonial_angle": {
+   826→      ideal: [118, 128],
+   827→      mean: 123.0,
+   828→      std_dev: 5.0,
+   829→      flaws: {
+   830→        high: ["Weak/soft jaw structure"]
+   831→      }
+   832→    },
+   833→    "mandibularPlaneAngle": {
+   834→      ideal: [20, 30],
+   835→      mean: 25.0,
+   836→      std_dev: 5.0,
+   837→      flaws: {
+   838→        low: ["Flat mandibular plane"],
+   839→        high: ["Steep mandibular plane"]
+   840→      }
+   841→    },
+   842→
+   843→    // FACIAL PROPORTIONS - Wider faces more common
+   844→    "faceWidthToHeight": {
+   845→      ideal: [1.35, 1.50],
+   846→      mean: 1.425,
+   847→      std_dev: 0.075,
+   848→      flaws: {
+   849→        low: ["Long face"],
+   850→        high: ["Very wide face"]
+   851→      }
+   852→    },
+   853→    "totalFacialWidthToHeight": {
+   854→      ideal: [1.30, 1.45],
+   855→      mean: 1.375,
+   856→      std_dev: 0.075,
+   857→      flaws: {
+   858→        low: ["Long face shape"],
+   859→        high: ["Wide face shape"]
+   860→      }
+   861→    }
+   862→  },
+   863→
+   864→  // ========================================
+   865→  // MALE SOUTH ASIAN STANDARDS
+   866→  // ========================================
+   867→  "male_south_asian": {
+   868→    // NOSE WIDTH - Slightly wider tolerance than White
+   869→    "noseWidth": {
+   870→      ideal: [36, 43],  // alar_base_ratio [1.00, 1.08]
+   871→      mean: 39.5,
+   872→      std_dev: 3.5,
+   873→      flaws: {
+   874→        high: ["Wide nasal base"]
+   875→      }
+   876→    },
+   877→
+   878→    // TEAR TROUGH - VERY STRICT. High penalty for dark circles
+   879→    "tearTroughDepth": {
+   880→      ideal: [0.0, 0.5],
+   881→      mean: 0.25,
+   882→      std_dev: 0.25,
+   883→      flaws: {
+   884→        high: ["Dark circles / Tear troughs"]
+   885→      }
+   886→    },
+   887→
+   888→    // UPPER EYELID - Often prefers visible lid platform
+   889→    "upperEyelidExposure": {
+   890→      ideal: [0.5, 2.0],
+   891→      mean: 1.25,
+   892→      std_dev: 0.75,
+   893→      flaws: {
+   894→        low: ["Hooded eyes"]
+   895→      }
+   896→    },
+   897→
+   898→    // CHEEKS - Penalizes "Gaunt" looks heavily
+   899→    "cheekbone_height": {
+   900→      ideal: [83.0, 95.0],
+   901→      mean: 89.0,
+   902→      std_dev: 6.0,
+   903→      flaws: {
+   904→        low: ["Volume loss / Gauntness"]
+   905→      }
+   906→    }
+   907→  },
+   908→
+   909→  // ========================================
+   910→  // MALE HISPANIC STANDARDS ("The Bridge Model")
+   911→  // ========================================
+   912→  "male_hispanic": {
+   913→    // FACE WIDTH - Rewards broader, more robust face shapes (Mestizo)
+   914→    "faceWidthToHeight": {
+   915→      ideal: [1.95, 2.10],
+   916→      mean: 2.025,
+   917→      std_dev: 0.075,
+   918→      flaws: {
+   919→        low: ["Long/Narrow face"]
+   920→      }
+   921→    },
+   922→
+   923→    // NOSE WIDTH - Bridge tolerance (Wider than White, narrower than Black)
+   924→    "noseWidth": {
+   925→      ideal: [36, 44],  // alar_base_ratio [1.00, 1.12]
+   926→      mean: 40.0,
+   927→      std_dev: 4.0,
+   928→      flaws: {
+   929→        high: ["Wide nasal base"]
+   930→      }
+   931→    },
+   932→
+   933→    // EYE TILT - Strong preference for positive tilt
+   934→    "lateralCanthalTilt": {
+   935→      ideal: [6.0, 12.0],
+   936→      mean: 9.0,
+   937→      std_dev: 3.0,
+   938→      flaws: {
+   939→        low: ["Negative/Neutral canthal tilt"]
+   940→      }
+   941→    }
+   942→  },
+   943→
+   944→  // ========================================
+   945→  // MALE MIDDLE EASTERN STANDARDS
+   946→  // ========================================
+   947→  "male_middle_eastern": {
+   948→    // EYEBROW THICKNESS - Prefers significantly thicker/darker brows
+   949→    "eyebrowThickness": {
+   950→      ideal: [2.0, 4.0],
+   951→      mean: 3.0,
+   952→      std_dev: 1.0,
+   953→      flaws: {
+   954→        low: ["Sparse/Weak eyebrows"],
+   955→        high: ["Unibrow"]
+   956→      }
+   957→    },
+   958→
+   959→    // NASOLABIAL ANGLE - Penalizes droopy tip (<90) or hooked noses
+   960→    "nasolabialAngle": {
+   961→      ideal: [90.0, 100.0],
+   962→      mean: 95.0,
+   963→      std_dev: 5.0,
+   964→      flaws: {
+   965→        low: ["Droopy nose tip / Hooked nose"]
+   966→      }
+   967→    },
+   968→
+   969→    // EYE TILT - Strong preference for Almond/Hunter eye shape
+   970→    "lateralCanthalTilt": {
+   971→      ideal: [4.0, 10.0],
+   972→      mean: 7.0,
+   973→      std_dev: 3.0,
+   974→      flaws: {
+   975→        low: ["Downturned eyes"]
+   976→      }
+   977→    },
+   978→
+   979→    // MIDFACE - Similar to White model (Compact is better)
+   980→    "midface_ratio": {
+   981→      ideal: [0.95, 1.02],
+   982→      mean: 0.985,
+   983→      std_dev: 0.035,
+   984→      flaws: {
+   985→        low: ["Long midface"]
+   986→      }
+   987→    }
+   988→  },
+   989→
+   990→  // ========================================
+   991→  // MALE PACIFIC ISLANDER STANDARDS ("The Warrior Skull")
+   992→  // ========================================
+   993→  "male_pacific_islander": {
+   994→    // FACE WIDTH - The Highest Width Standard (Very broad)
+   995→    "faceWidthToHeight": {
+   996→      ideal: [2.10, 2.30],
+   997→      mean: 2.20,
+   998→      std_dev: 0.10,
+   999→      flaws: {
+  1000→        low: ["Narrow/Long face"]
+  1001→      }
+  1002→    },
+  1003→
+  1004→    // NOSE WIDTH - Wide tolerance
+  1005→    "noseWidth": {
+  1006→      ideal: [38, 48],  // alar_base_ratio [1.05, 1.20]
+  1007→      mean: 43.0,
+  1008→      std_dev: 5.0,
+  1009→      flaws: {
+  1010→        high: ["Wide nasal base"]
+  1011→      }
+  1012→    },
+  1013→
+  1014→    // CHEEKS - Rewards high mass/robustness
+  1015→    "cheekbone_height": {
+  1016→      ideal: [85.0, 100.0],
+  1017→      mean: 92.5,
+  1018→      std_dev: 7.5,
+  1019→      flaws: {
+  1020→        low: ["Gaunt/Weak face structure"]
+  1021→      }
+  1022→    },
+  1023→
+  1024→    // CHIN WIDTH - Prefers a very broad, square chin
+  1025→    "chinWidth": {
+  1026→      ideal: [40.0, 50.0],
+  1027→      mean: 45.0,
+  1028→      std_dev: 5.0,
+  1029→      flaws: {
+  1030→        low: ["Pointed/Narrow chin"]
+  1031→      }
+  1032→    }
+  1033→  },
+  1034→
+  1035→  // ========================================
+  1036→  // FEMALE ETHNICITIES (The "Missing Link")
+  1037→  // ========================================
+  1038→
+  1039→  "female_white": {
+  1040→    // NOSE WIDTH - Strict Rule of Fifths for feminine harmony
+  1041→    "alar_base_ratio": {
+  1042→      ideal: [0.98, 1.05],
+  1043→      mean: 1.015,
+  1044→      std_dev: 0.035,
+  1045→      flaws: {
+  1046→        high: ["Wide nasal base"]
+  1047→      }
+  1048→    },
+  1049→
+  1050→    // FACE WIDTH - Prefers oval/narrow feminine proportions
+  1051→    "fwhr": {
+  1052→      ideal: [1.45, 1.53],
+  1053→      mean: 1.49,
+  1054→      std_dev: 0.04,
+  1055→      flaws: {
+  1056→        low: ["Long/Narrow face"],
+  1057→        high: ["Wide face"]
+  1058→      }
+  1059→    },
+  1060→
+  1061→    // JAW - Soft, tapered feminine jawline
+  1062→    "gonial_angle": {
+  1063→      ideal: [122.0, 130.0],
+  1064→      mean: 126.0,
+  1065→      std_dev: 4.0,
+  1066→      flaws: {
+  1067→        low: ["Sharp/Masculine jaw angle"],
+  1068→        high: ["Weak/Overly soft jawline"]
+  1069→      }
+  1070→    },
+  1071→
+  1072→    // EYE TILT - Neutral to positive preferred
+  1073→    "canthal_tilt": {
+  1074→      ideal: [4.0, 9.0],
+  1075→      mean: 6.5,
+  1076→      std_dev: 2.5,
+  1077→      flaws: {
+  1078→        low: ["Negative/Downturned eyes"]
+  1079→      }
+  1080→    },
+  1081→
+  1082→    // CHIN-PHILTRUM - Golden Ratio balance
+  1083→    "chin_philtrum_ratio": {
+  1084→      ideal: [2.0, 2.2],
+  1085→      mean: 2.1,
+  1086→      std_dev: 0.1,
+  1087→      flaws: {
+  1088→        low: ["Recessed chin"],
+  1089→        high: ["Protruding chin"]
+  1090→      }
+  1091→    }
+  1092→  },
+  1093→
+  1094→  "female_black": {
+  1095→    // LIPS - High volume preference (fuller lips)
+  1096→    "lipRatio": {
+  1097→      ideal: [1.3, 1.6],
+  1098→      mean: 1.45,
+  1099→      std_dev: 0.15,
+  1100→      flaws: {
+  1101→        low: ["Thin lips"]
+  1102→      }
+  1103→    },
+  1104→
+  1105→    // NOSE WIDTH - Wider tolerance for ethnic variation
+  1106→    "alar_base_ratio": {
+  1107→      ideal: [1.05, 1.15],
+  1108→      mean: 1.10,
+  1109→      std_dev: 0.05,
+  1110→      flaws: {
+  1111→        high: ["Very wide nasal base"]
+  1112→      }
+  1113→    },
+  1114→
+  1115→    // CHIN - Allows forward projection (natural prognathism)
+  1116→    "chin_projection": {
+  1117→      ideal: [0.0, 5.0],
+  1118→      mean: 2.5,
+  1119→      std_dev: 2.5,
+  1120→      flaws: {
+  1121→        high: ["Excessive chin projection"]
+  1122→      }
+  1123→    },
+  1124→
+  1125→    // JAW - Soft feminine jawline
+  1126→    "gonial_angle": {
+  1127→      ideal: [120.0, 130.0],
+  1128→      mean: 125.0,
+  1129→      std_dev: 5.0,
+  1130→      flaws: {
+  1131→        low: ["Sharp jaw angle"],
+  1132→        high: ["Weak jawline"]
+  1133→      }
+  1134→    }
+  1135→  },
+  1136→
+  1137→  "female_east_asian": {
+  1138→    // EYE SPACING - Wide-set neotenous preference
+  1139→    "eye_separation_ratio": {
+  1140→      ideal: [46.3, 47.5],
+  1141→      mean: 46.9,
+  1142→      std_dev: 0.6,
+  1143→      flaws: {
+  1144→        low: ["Close-set eyes"],
+  1145→        high: ["Very wide-set eyes"]
+  1146→      }
+  1147→    },
+  1148→
+  1149→    // JAW - Tapered V-shape feminine ideal
+  1150→    "gonial_angle": {
+  1151→      ideal: [120.0, 126.0],
+  1152→      mean: 123.0,
+  1153→      std_dev: 3.0,
+  1154→      flaws: {
+  1155→        low: ["Sharp V-line jaw"],
+  1156→        high: ["Weak/Square jawline"]
+  1157→      }
+  1158→    },
+  1159→
+  1160→    // EYEBROWS - Higher set brows (youthful feminine)
+  1161→    "eyebrow_height": {
+  1162→      ideal: [0.85, 1.30],
+  1163→      mean: 1.075,
+  1164→      std_dev: 0.225,
+  1165→      flaws: {
+  1166→        low: ["Low-set/Heavy brows"],
+  1167→        high: ["Very high-arched brows"]
+  1168→      }
+  1169→    },
+  1170→
+  1171→    // LOWER FACE - Compact lower third (neotenous)
+  1172→    "lower_third_ratio": {
+  1173→      ideal: [29.6, 32.7],
+  1174→      mean: 31.15,
+  1175→      std_dev: 1.55,
+  1176→      flaws: {
+  1177→        low: ["Very short lower face"],
+  1178→        high: ["Long lower face"]
+  1179→      }
+  1180→    }
+  1181→  },
+  1182→
+  1183→  "female_south_asian": {
+  1184→    // TEAR TROUGHS - Very strict on dark circles
+  1185→    "tear_trough_depth": {
+  1186→      ideal: [0.0, 0.5],
+  1187→      mean: 0.25,
+  1188→      std_dev: 0.25,
+  1189→      flaws: {
+  1190→        high: ["Dark circles / Deep tear troughs"]
+  1191→      }
+  1192→    },
+  1193→
+  1194→    // CHEEKS - Rewards midface volume (youthful fullness)
+  1195→    "cheek_fullness": {
+  1196→      ideal: [1.0, 2.0],
+  1197→      mean: 1.5,
+  1198→      std_dev: 0.5,
+  1199→      flaws: {
+  1200→        low: ["Gaunt/Hollow cheeks"]
+  1201→      }
+  1202→    },
+  1203→
+  1204→    // SKIN - High penalty for uneven skin tone
+  1205→    "skin_uniformity": {
+  1206→      ideal: [0.92, 1.0],
+  1207→      mean: 0.96,
+  1208→      std_dev: 0.04,
+  1209→      flaws: {
+  1210→        low: ["Uneven skin tone / Pigmentation"]
+  1211→      }
+  1212→    },
+  1213→
+  1214→    // NOSE WIDTH - Intermediate tolerance
+  1215→    "alar_base_ratio": {
+  1216→      ideal: [1.00, 1.08],
+  1217→      mean: 1.04,
+  1218→      std_dev: 0.04,
+  1219→      flaws: {
+  1220→        high: ["Wide nasal base"]
+  1221→      }
+  1222→    }
+  1223→  },
+  1224→
+  1225→  "female_hispanic": {
+  1226→    // FACE WIDTH - Broader Mestiza tolerance
+  1227→    "fwhr": {
+  1228→      ideal: [1.50, 1.62],
+  1229→      mean: 1.56,
+  1230→      std_dev: 0.06,
+  1231→      flaws: {
+  1232→        low: ["Long/Narrow face"],
+  1233→        high: ["Very wide face"]
+  1234→      }
+  1235→    },
+  1236→
+  1237→    // EYE TILT - Strong almond eye preference
+  1238→    "canthal_tilt": {
+  1239→      ideal: [6.0, 12.0],
+  1240→      mean: 9.0,
+  1241→      std_dev: 3.0,
+  1242→      flaws: {
+  1243→        low: ["Neutral/Downturned eyes"]
+  1244→      }
+  1245→    },
+  1246→
+  1247→    // NOSE WIDTH - Intermediate width tolerance
+  1248→    "alar_base_ratio": {
+  1249→      ideal: [1.00, 1.10],
+  1250→      mean: 1.05,
+  1251→      std_dev: 0.05,
+  1252→      flaws: {
+  1253→        high: ["Wide nasal base"]
+  1254→      }
+  1255→    },
+  1256→
+  1257→    // LIPS - Voluptuous preference
+  1258→    "lipRatio": {
+  1259→      ideal: [1.1, 1.35],
+  1260→      mean: 1.225,
+  1261→      std_dev: 0.125,
+  1262→      flaws: {
+  1263→        low: ["Thin lips"]
+  1264→      }
+  1265→    }
+  1266→  },
+  1267→
+  1268→  "female_middle_eastern": {
+  1269→    // EYEBROWS - Dense/Thick brows preference
+  1270→    "eyebrow_thickness": {
+  1271→      ideal: [1.5, 3.0],
+  1272→      mean: 2.25,
+  1273→      std_dev: 0.75,
+  1274→      flaws: {
+  1275→        low: ["Sparse/Thin eyebrows"],
+  1276→        high: ["Unibrow"]
+  1277→      }
+  1278→    },
+  1279→
+  1280→    // NOSE - Refined/Upturned tip
+  1281→    "nasolabial_angle": {
+  1282→      ideal: [95.0, 105.0],
+  1283→      mean: 100.0,
+  1284→      std_dev: 5.0,
+  1285→      flaws: {
+  1286→        low: ["Droopy nose tip"],
+  1287→        high: ["Overly upturned nose"]
+  1288→      }
+  1289→    },
+  1290→
+  1291→    // EYE TILT - Foxy/Hunter feminine eye shape
+  1292→    "canthal_tilt": {
+  1293→      ideal: [5.0, 10.0],
+  1294→      mean: 7.5,
+  1295→      std_dev: 2.5,
+  1296→      flaws: {
+  1297→        low: ["Downturned eyes"]
+  1298→      }
+  1299→    },
+  1300→
+  1301→    // EYELID - Low exposure preferred
+  1302→    "upper_eyelid_exposure": {
+  1303→      ideal: [0.5, 1.5],
+  1304→      mean: 1.0,
+  1305→      std_dev: 0.5,
+  1306→      flaws: {
+  1307→        low: ["Hooded eyes"],
+  1308→        high: ["Excessive eyelid exposure"]
+  1309→      }
+  1310→    }
+  1311→  },
+  1312→
+  1313→  "female_native_american": {
+  1314→    // FACE WIDTH - Wide/High cheekbone structure
+  1315→    "fwhr": {
+  1316→      ideal: [1.52, 1.65],
+  1317→      mean: 1.585,
+  1318→      std_dev: 0.065,
+  1319→      flaws: {
+  1320→        low: ["Narrow face"],
+  1321→        high: ["Very wide face"]
+  1322→      }
+  1323→    },
+  1324→
+  1325→    // CHEEKBONES - High definition/prominence
+  1326→    "cheekbone_prominence": {
+  1327→      ideal: [1.5, 2.5],
+  1328→      mean: 2.0,
+  1329→      std_dev: 0.5,
+  1330→      flaws: {
+  1331→        low: ["Flat cheekbones"],
+  1332→        high: ["Overly prominent cheekbones"]
+  1333→      }
+  1334→    },
+  1335→
+  1336→    // JAW - Stronger jaw tolerance
+  1337→    "gonial_angle": {
+  1338→      ideal: [115.0, 125.0],
+  1339→      mean: 120.0,
+  1340→      std_dev: 5.0,
+  1341→      flaws: {
+  1342→        low: ["Very sharp jaw"],
+  1343→        high: ["Weak jawline"]
+  1344→      }
+  1345→    },
+  1346→
+  1347→    // EYE TILT - Positive tilt preference
+  1348→    "canthal_tilt": {
+  1349→      ideal: [5.0, 11.0],
+  1350→      mean: 8.0,
+  1351→      std_dev: 3.0,
+  1352→      flaws: {
+  1353→        low: ["Downturned eyes"]
+  1354→      }
+  1355→    }
+  1356→  },
+  1357→
+  1358→  "female_pacific_islander": {
+  1359→    // FACE WIDTH - Widest/Robust facial structure
+  1360→    "fwhr": {
+  1361→      ideal: [1.55, 1.70],
+  1362→      mean: 1.625,
+  1363→      std_dev: 0.075,
+  1364→      flaws: {
+  1365→        low: ["Narrow face"],
+  1366→        high: ["Very wide face"]
+  1367→      }
+  1368→    },
+  1369→
+  1370→    // CHEEKS - High volume/softness preference
+  1371→    "cheek_fullness": {
+  1372→      ideal: [1.2, 2.5],
+  1373→      mean: 1.85,
+  1374→      std_dev: 0.65,
+  1375→      flaws: {
+  1376→        low: ["Gaunt/Hollow cheeks"]
+  1377→      }
+  1378→    },
+  1379→
+  1380→    // NOSE WIDTH - Wide nose tolerance
+  1381→    "alar_base_ratio": {
+  1382→      ideal: [1.05, 1.15],
+  1383→      mean: 1.10,
+  1384→      std_dev: 0.05,
+  1385→      flaws: {
+  1386→        high: ["Very wide nasal base"]
+  1387→      }
+  1388→    },
+  1389→
+  1390→    // LIPS - Full lips preference
+  1391→    "lipRatio": {
+  1392→      ideal: [1.25, 1.50],
+  1393→      mean: 1.375,
+  1394→      std_dev: 0.125,
+  1395→      flaws: {
+  1396→        low: ["Thin lips"]
+  1397→      }
+  1398→    }
+  1399→  }
+  1400→};
+  1401→
+  1402→/**
+  1403→ * Get the appropriate metric configuration for a given gender and ethnicity
+  1404→ * Falls back to base config if no override exists
+  1405→ */
+  1406→export function getMetricConfig(
+  1407→  metricId: string,
+  1408→  gender: Gender = 'male',
+  1409→  ethnicity: Ethnicity = 'white'
+  1410→): MasterMetricConfig | undefined {
+  1411→  const key = `${gender}_${ethnicity}`;
+  1412→  const override = ETHNICITY_OVERRIDES[key]?.[metricId];
+  1413→  const baseConfig = MASTER_SCORING_DB[metricId];
+  1414→
+  1415→  if (!baseConfig) return undefined;
+  1416→
+  1417→  // Merge override with base config
+  1418→  if (override) {
+  1419→    return {
+  1420→      ...baseConfig,
+  1421→      ...override,
+  1422→      flaws: {
+  1423→        ...baseConfig.flaws,
+  1424→        ...override.flaws
+  1425→      }
+  1426→    } as MasterMetricConfig;
+  1427→  }
+  1428→
+  1429→  return baseConfig;
+  1430→}
+  1431→
+  1432→// ============================================
+  1433→// Z-SCORE SEVERITY FUNCTIONS
+  1434→// ============================================
+  1435→
+  1436→/**
+  1437→ * Calculate Z-score for a given value
+  1438→ * Z = (value - mean) / std_dev
+  1439→ */
+  1440→export function calculateZScore(value: number, mean: number, stdDev: number): number {
+  1441→  if (stdDev === 0) return 0;
+  1442→  return Math.abs((value - mean) / stdDev);
+  1443→}
+  1444→
+  1445→/**
+  1446→ * Determine severity level based on Z-score and ideal range
+  1447→ * - Ideal: Value is within ideal range
+  1448→ * - Good: |z| < 1 (within 1 standard deviation)
+  1449→ * - Moderate: 1 ≤ |z| < 2 (between 1-2 standard deviations)
+  1450→ * - Severe: |z| ≥ 2 (more than 2 standard deviations away)
+  1451→ */
+  1452→export function getSeverityFromZScore(
+  1453→  value: number,
+  1454→  config: MasterMetricConfig
+  1455→): { severity: SeverityLevel; zScore: number; isInIdeal: boolean } {
+  1456→  const { ideal, mean, std_dev } = config;
+  1457→  const isInIdeal = value >= ideal[0] && value <= ideal[1];
+  1458→  const zScore = calculateZScore(value, mean, std_dev);
+  1459→
+  1460→  let severity: SeverityLevel;
+  1461→  if (isInIdeal) {
+  1462→    severity = 'ideal';
+  1463→  } else if (zScore < 1) {
+  1464→    severity = 'good';
+  1465→  } else if (zScore < 2) {
+  1466→    severity = 'moderate';
+  1467→  } else {
+  1468→    severity = 'severe';
+  1469→  }
+  1470→
+  1471→  return { severity, zScore, isInIdeal };
+  1472→}
+  1473→
+  1474→/**
+  1475→ * Get severity for a metric value with ethnicity/gender awareness
+  1476→ */
+  1477→export function getSeverityForMetric(
+  1478→  metricId: string,
+  1479→  value: number,
+  1480→  gender: Gender = 'male',
+  1481→  ethnicity: Ethnicity = 'white'
+  1482→): { severity: SeverityLevel; zScore: number; isInIdeal: boolean; config: MasterMetricConfig } | null {
+  1483→  const config = getMetricConfig(metricId, gender, ethnicity);
+  1484→  if (!config) return null;
+  1485→
+  1486→  const result = getSeverityFromZScore(value, config);
+  1487→  return { ...result, config };
+  1488→}
+  1489→
+  1490→/**
+  1491→ * Get badge color for severity level
+  1492→ */
+  1493→export function getSeverityColor(severity: SeverityLevel): string {
+  1494→  switch (severity) {
+  1495→    case 'ideal': return 'green';
+  1496→    case 'good': return 'blue';
+  1497→    case 'moderate': return 'yellow';
+  1498→    case 'severe': return 'red';
+  1499→    default: return 'gray';
+  1500→  }
+  1501→}
+  1502→
+  1503→/**
+  1504→ * Get severity label for display
+  1505→ */
+  1506→export function getSeverityLabel(severity: SeverityLevel): string {
+  1507→  switch (severity) {
+  1508→    case 'ideal': return 'Ideal';
+  1509→    case 'good': return 'Good';
+  1510→    case 'moderate': return 'Moderate';
+  1511→    case 'severe': return 'Severe';
+  1512→    default: return 'Unknown';
+  1513→  }
+  1514→}
+  1515→
+  1516→// ============================================
+  1517→// INSIGHT DEFINITION TYPES
+  1518→// ============================================
+  1519→
+  1520→export interface InsightSeverityLogic {
+  1521→  metrics: string[];  // Display names of metrics (e.g., "Face Width to Height Ratio")
+  1522→  threshold: number;  // Score threshold for classification
+  1523→}
+  1524→
+  1525→export interface WeaknessSeverityLabels {
+  1526→  minor: string;
+  1527→  moderate: string;
+  1528→  severe: string;
+  1529→}
+  1530→
+  1531→export interface StrengthGradeLabels {
+  1532→  good: string;
+  1533→  excellent: string;
+  1534→  ideal: string;
+  1535→}
+  1536→
+  1537→export interface InsightContent {
+  1538→  description: string;
+  1539→  severity_labels?: WeaknessSeverityLabels;  // For weaknesses
+  1540→  grade_labels?: StrengthGradeLabels;        // For strengths
+  1541→}
+  1542→
+  1543→export interface InsightDefinition {
+  1544→  id: string;
+  1545→  title: string;
+  1546→  type: 'weakness' | 'strength';
+  1547→  severity_logic: InsightSeverityLogic;
+  1548→  content: InsightContent;
+  1549→}
+  1550→
+  1551→// ============================================
+  1552→// CLASSIFICATION RESULT TYPES
+  1553→// ============================================
+  1554→
+  1555→export type WeaknessSeverity = 'severe' | 'moderate' | 'minor';
+  1556→export type StrengthGrade = 'ideal' | 'excellent' | 'good';
+  1557→
+  1558→export interface ClassifiedWeakness {
+  1559→  insightId: string;
+  1560→  title: string;
+  1561→  description: string;
+  1562→  severity: WeaknessSeverity;
+  1563→  severityLabel: string;  // Custom label from definition (e.g., "Extremely Long")
+  1564→  avgScore: number;
+  1565→  matchedMetrics: MatchedMetric[];
+  1566→}
+  1567→
+  1568→export interface ClassifiedStrength {
+  1569→  insightId: string;
+  1570→  title: string;
+  1571→  description: string;
+  1572→  grade: StrengthGrade;
+  1573→  gradeLabel: string;  // Custom label from definition (e.g., "Ideal")
+  1574→  avgScore: number;
+  1575→  matchedMetrics: MatchedMetric[];
+  1576→}
+  1577→
+  1578→export interface MatchedMetric {
+  1579→  metricId: string;
+  1580→  metricName: string;
+  1581→  score: number;
+  1582→  value: number;
+  1583→  idealMin: number;
+  1584→  idealMax: number;
+  1585→  unit: string;
+  1586→  category: string;
+  1587→}
+  1588→
+  1589→export interface InsightClassificationResult {
+  1590→  strengths: ClassifiedStrength[];
+  1591→  weaknesses: ClassifiedWeakness[];
+  1592→}
+  1593→
+  1594→// ============================================
+  1595→// INSIGHTS DATABASE
+  1596→// ============================================
+  1597→
+  1598→export const INSIGHTS_DEFINITIONS: InsightDefinition[] = [
+  1599→  {
+  1600→    id: "long_midface",
+  1601→    title: "Long Midface",
+  1602→    type: "weakness",
+  1603→    severity_logic: {
+  1604→      metrics: ["Face Width to Height Ratio", "Midface Ratio", "Ipsilateral Alar Angle"],
+  1605→      threshold: 6.0
+  1606→    },
+  1607→    content: {
+  1608→      description: "The middle of the face is elongated, creating an unbalanced vertical proportion.",
+  1609→      severity_labels: { minor: "Slightly Long", moderate: "Long", severe: "Extremely Long" }
+  1610→    }
+  1611→  },
+  1612→  {
+  1613→    id: "short_midface",
+  1614→    title: "Short Midface",
+  1615→    type: "strength",
+  1616→    severity_logic: {
+  1617→      metrics: ["Face Width to Height Ratio", "Midface Ratio"],
+  1618→      threshold: 8.0
+  1619→    },
+  1620→    content: {
+  1621→      description: "The midface has ideal vertical proportions, contributing to facial harmony.",
+  1622→      grade_labels: { good: "Proportionate", excellent: "Well-Balanced", ideal: "Ideal" }
+  1623→    }
+  1624→  },
+  1625→  {
+  1626→    id: "weak_jaw",
+  1627→    title: "Weak/Soft Jaw Structure",
+  1628→    type: "weakness",
+  1629→    severity_logic: {
+  1630→      metrics: ["Gonial Angle", "Mandibular Plane Angle", "Chin to Philtrum Ratio", "Jaw Slope"],
+  1631→      threshold: 5.0
+  1632→    },
+  1633→    content: {
+  1634→      description: "The jaw has a softer, rounder shape, often less angular and robust than the ideal.",
+  1635→      severity_labels: { minor: "Soft", moderate: "Recessed", severe: "Weak" }
+  1636→    }
+  1637→  },
+  1638→  {
+  1639→    id: "strong_jaw",
+  1640→    title: "Strong Jaw Definition",
+  1641→    type: "strength",
+  1642→    severity_logic: {
+  1643→      metrics: ["Gonial Angle", "Mandibular Plane Angle", "Jaw Width Ratio", "Bigonial Width"],
+  1644→      threshold: 8.0
+  1645→    },
+  1646→    content: {
+  1647→      description: "The jaw displays strong definition with well-defined angles and proportionate width.",
+  1648→      grade_labels: { good: "Defined", excellent: "Strong", ideal: "Ideal Angular" }
+  1649→    }
+  1650→  },
+  1651→  {
+  1652→    id: "refined_nasal_tip",
+  1653→    title: "Refined Nasal Tip",
+  1654→    type: "strength",
+  1655→    severity_logic: {
+  1656→      metrics: ["Nasal Tip Angle", "Nose Tip Position", "Frankfort-tip Angle"],
+  1657→      threshold: 8.5
+  1658→    },
+  1659→    content: {
+  1660→      description: "This contributes to a harmonious nasal profile due to the nasal tip being well-defined and proportionate.",
+  1661→      grade_labels: { good: "Good", excellent: "Excellent", ideal: "Ideal" }
+  1662→    }
+  1663→  },
+  1664→  {
+  1665→    id: "bulbous_nose",
+  1666→    title: "Bulbous Nasal Tip",
+  1667→    type: "weakness",
+  1668→    severity_logic: {
+  1669→      metrics: ["Nasal Index", "Nose Width", "Nasal Tip Angle"],
+  1670→      threshold: 5.5
+  1671→    },
+  1672→    content: {
+  1673→      description: "The nasal tip appears rounded and less defined, affecting nasal aesthetics.",
+  1674→      severity_labels: { minor: "Slightly Rounded", moderate: "Rounded", severe: "Bulbous" }
+  1675→    }
+  1676→  },
+  1677→  {
+  1678→    id: "ideal_upper_lip",
+  1679→    title: "Well-Positioned Upper Lip",
+  1680→    type: "strength",
+  1681→    severity_logic: {
+  1682→      metrics: ["Upper Lip E-Line Position", "Upper Lip S-Line Position", "Nasolabial Angle"],
+  1683→      threshold: 9.0
+  1684→    },
+  1685→    content: {
+  1686→      description: "This contributes to a harmonious mouth region due to the upper lip sitting neither too far forward nor too far back.",
+  1687→      grade_labels: { good: "Good", excellent: "Excellent", ideal: "Ideal" }
+  1688→    }
+  1689→  },
+  1690→  {
+  1691→    id: "negative_canthal_tilt",
+  1692→    title: "Negative Canthal Tilt",
+  1693→    type: "weakness",
+  1694→    severity_logic: {
+  1695→      metrics: ["Lateral Canthal Tilt", "Eye Aspect Ratio"],
+  1696→      threshold: 5.0
+  1697→    },
+  1698→    content: {
+  1699→      description: "The outer corners of the eyes sit lower than the inner corners, creating a downturned appearance.",
+  1700→      severity_labels: { minor: "Slight Downturn", moderate: "Noticeable", severe: "Pronounced" }
+  1701→    }
+  1702→  },
+  1703→  {
+  1704→    id: "positive_canthal_tilt",
+  1705→    title: "Positive Canthal Tilt",
+  1706→    type: "strength",
+  1707→    severity_logic: {
+  1708→      metrics: ["Lateral Canthal Tilt", "Eye Aspect Ratio"],
+  1709→      threshold: 8.0
+  1710→    },
+  1711→    content: {
+  1712→      description: "The outer corners of the eyes are elevated, creating an attractive upswept eye shape.",
+  1713→      grade_labels: { good: "Slight Upturn", excellent: "Well-Tilted", ideal: "Hunter Eyes" }
+  1714→    }
+  1715→  },
+  1716→  {
+  1717→    id: "balanced_facial_thirds",
+  1718→    title: "Balanced Facial Thirds",
+  1719→    type: "strength",
+  1720→    severity_logic: {
+  1721→      metrics: ["Upper Third Proportion", "Middle Third Proportion", "Lower Third Proportion"],
+  1722→      threshold: 8.5
+  1723→    },
+  1724→    content: {
+  1725→      description: "The face displays well-balanced vertical proportions across all three facial thirds.",
+  1726→      grade_labels: { good: "Balanced", excellent: "Harmonious", ideal: "Perfectly Proportioned" }
+  1727→    }
+  1728→  },
+  1729→  {
+  1730→    id: "imbalanced_thirds",
+  1731→    title: "Facial Third Imbalance",
+  1732→    type: "weakness",
+  1733→    severity_logic: {
+  1734→      metrics: ["Upper Third Proportion", "Middle Third Proportion", "Lower Third Proportion"],
+  1735→      threshold: 5.5
+  1736→    },
+  1737→    content: {
+  1738→      description: "The vertical face proportions show imbalance between the three facial thirds.",
+  1739→      severity_labels: { minor: "Slight Imbalance", moderate: "Noticeable Disproportion", severe: "Significant Imbalance" }
+  1740→    }
+  1741→  },
+  1742→  {
+  1743→    id: "high_cheekbones",
+  1744→    title: "High Cheekbones",
+  1745→    type: "strength",
+  1746→    severity_logic: {
+  1747→      metrics: ["Cheekbone Height", "Cheekbone Width", "Midface Ratio"],
+  1748→      threshold: 8.5
+  1749→    },
+  1750→    content: {
+  1751→      description: "Well-positioned cheekbones that create attractive facial contours and catch light beautifully.",
+  1752→      grade_labels: { good: "Visible", excellent: "Prominent", ideal: "Model-Tier" }
+  1753→    }
+  1754→  },
+  1755→  {
+  1756→    id: "flat_midface",
+  1757→    title: "Flat Midface",
+  1758→    type: "weakness",
+  1759→    severity_logic: {
+  1760→      metrics: ["Cheekbone Height", "Midface Ratio", "Total Facial Width to Height"],
+  1761→      threshold: 5.0
+  1762→    },
+  1763→    content: {
+  1764→      description: "The midface lacks forward projection, resulting in flatter facial contours.",
+  1765→      severity_labels: { minor: "Slightly Flat", moderate: "Underprojected", severe: "Recessed" }
+  1766→    }
+  1767→  },
+  1768→  {
+  1769→    id: "ideal_lip_ratio",
+  1770→    title: "Ideal Lip Proportions",
+  1771→    type: "strength",
+  1772→    severity_logic: {
+  1773→      metrics: ["Lip Ratio", "Philtrum Length", "Lip Chin Distance"],
+  1774→      threshold: 8.5
+  1775→    },
+  1776→    content: {
+  1777→      description: "The lips demonstrate excellent proportions with balanced upper-to-lower lip ratio.",
+  1778→      grade_labels: { good: "Balanced", excellent: "Well-Proportioned", ideal: "Perfect Ratio" }
+  1779→    }
+  1780→  },
+  1781→  {
+  1782→    id: "thin_lips",
+  1783→    title: "Thin Lip Profile",
+  1784→    type: "weakness",
+  1785→    severity_logic: {
+  1786→      metrics: ["Lip Ratio", "Upper Lip Projection", "Lower Lip Projection"],
+  1787→      threshold: 5.0
+  1788→    },
+  1789→    content: {
+  1790→      description: "The lips appear thinner than ideal proportions, affecting lower face harmony.",
+  1791→      severity_labels: { minor: "Slightly Thin", moderate: "Thin", severe: "Very Thin" }
+  1792→    }
+  1793→  },
+  1794→  {
+  1795→    id: "ideal_ipd",
+  1796→    title: "Ideal Eye Spacing",
+  1797→    type: "strength",
+  1798→    severity_logic: {
+  1799→      metrics: ["Interpupillary Ratio", "Eye Separation Ratio", "One Eye Apart Test"],
+  1800→      threshold: 8.5
+  1801→    },
+  1802→    content: {
+  1803→      description: "The eyes are ideally spaced, creating facial balance and attractiveness.",
+  1804→      grade_labels: { good: "Good Spacing", excellent: "Ideal Distance", ideal: "Perfect IPD" }
+  1805→    }
+  1806→  },
+  1807→  {
+  1808→    id: "wide_set_eyes",
+  1809→    title: "Wide-Set Eyes",
+  1810→    type: "weakness",
+  1811→    severity_logic: {
+  1812→      metrics: ["Interpupillary Ratio", "Eye Separation Ratio", "One Eye Apart Test"],
+  1813→      threshold: 5.5
+  1814→    },
+  1815→    content: {
+  1816→      description: "The eyes are spaced wider apart than the aesthetic ideal.",
+  1817→      severity_labels: { minor: "Slightly Wide", moderate: "Noticeably Wide", severe: "Very Wide" }
+  1818→    }
+  1819→  },
+  1820→  {
+  1821→    id: "close_set_eyes",
+  1822→    title: "Close-Set Eyes",
+  1823→    type: "weakness",
+  1824→    severity_logic: {
+  1825→      metrics: ["Interpupillary Ratio", "Eye Separation Ratio", "Intercanthal Width"],
+  1826→      threshold: 5.5
+  1827→    },
+  1828→    content: {
+  1829→      description: "The eyes are positioned closer together than the aesthetic ideal.",
+  1830→      severity_labels: { minor: "Slightly Close", moderate: "Noticeably Close", severe: "Very Close" }
+  1831→    }
+  1832→  },
+  1833→  {
+  1834→    id: "ideal_nose_projection",
+  1835→    title: "Ideal Nasal Projection",
+  1836→    type: "strength",
+  1837→    severity_logic: {
+  1838→      metrics: ["Nasofrontal Angle", "Nasofacial Angle", "Nasomenta Angle"],
+  1839→      threshold: 8.5
+  1840→    },
+  1841→    content: {
+  1842→      description: "The nose has ideal forward projection relative to the face, creating profile harmony.",
+  1843→      grade_labels: { good: "Good", excellent: "Well-Projected", ideal: "Perfect Projection" }
+  1844→    }
+  1845→  },
+  1846→  {
+  1847→    id: "recessed_chin",
+  1848→    title: "Recessed Chin",
+  1849→    type: "weakness",
+  1850→    severity_logic: {
+  1851→      metrics: ["Chin to Philtrum Ratio", "Chin Height", "Facial Depth to Height"],
+  1852→      threshold: 5.0
+  1853→    },
+  1854→    content: {
+  1855→      description: "The chin sits behind the ideal position, affecting profile balance.",
+  1856→      severity_labels: { minor: "Slightly Recessed", moderate: "Recessed", severe: "Severely Recessed" }
+  1857→    }
+  1858→  },
+  1859→  {
+  1860→    id: "ideal_chin_projection",
+  1861→    title: "Ideal Chin Projection",
+  1862→    type: "strength",
+  1863→    severity_logic: {
+  1864→      metrics: ["Chin to Philtrum Ratio", "Chin Height", "Anterior Facial Depth"],
+  1865→      threshold: 8.5
+  1866→    },
+  1867→    content: {
+  1868→      description: "The chin demonstrates ideal projection and proportions relative to the face.",
+  1869→      grade_labels: { good: "Good", excellent: "Well-Projected", ideal: "Perfect" }
+  1870→    }
+  1871→  },
+  1872→  {
+  1873→    id: "long_philtrum",
+  1874→    title: "Long Philtrum",
+  1875→    type: "weakness",
+  1876→    severity_logic: {
+  1877→      metrics: ["Philtrum Length", "Lip Chin Distance", "Upper Lip Height"],
+  1878→      threshold: 5.5
+  1879→    },
+  1880→    content: {
+  1881→      description: "The distance between nose and upper lip is longer than ideal.",
+  1882→      severity_labels: { minor: "Slightly Long", moderate: "Long", severe: "Very Long" }
+  1883→    }
+  1884→  },
+  1885→  {
+  1886→    id: "short_philtrum",
+  1887→    title: "Short Philtrum",
+  1888→    type: "strength",
+  1889→    severity_logic: {
+  1890→      metrics: ["Philtrum Length", "Upper Lip Height"],
+  1891→      threshold: 8.0
+  1892→    },
+  1893→    content: {
+  1894→      description: "The philtrum has ideal or shorter length, considered youthful and attractive.",
+  1895→      grade_labels: { good: "Good Length", excellent: "Short", ideal: "Ideal" }
+  1896→    }
+  1897→  },
+  1898→  {
+  1899→    id: "wide_nose",
+  1900→    title: "Wide Nasal Base",
+  1901→    type: "weakness",
+  1902→    severity_logic: {
+  1903→      metrics: ["Nasal Index", "Intercanthal Nasal Ratio", "Nose Bridge Width"],
+  1904→      threshold: 5.0
+  1905→    },
+  1906→    content: {
+  1907→      description: "The base of the nose is wider than the aesthetic ideal for facial harmony.",
+  1908→      severity_labels: { minor: "Slightly Wide", moderate: "Wide", severe: "Very Wide" }
+  1909→    }
+  1910→  },
+  1911→  {
+  1912→    id: "ideal_brow_position",
+  1913→    title: "Ideal Brow Position",
+  1914→    type: "strength",
+  1915→    severity_logic: {
+  1916→      metrics: ["Eyebrow Height", "Brow Length Ratio"],
+  1917→      threshold: 8.0
+  1918→    },
+  1919→    content: {
+  1920→      description: "The eyebrows are ideally positioned relative to the eyes and facial structure.",
+  1921→      grade_labels: { good: "Good Position", excellent: "Well-Arched", ideal: "Perfect Frame" }
+  1922→    }
+  1923→  },
+  1924→  {
+  1925→    id: "narrow_jaw",
+  1926→    title: "Narrow Jaw",
+  1927→    type: "weakness",
+  1928→    severity_logic: {
+  1929→      metrics: ["Jaw Width Ratio", "Bigonial Width", "Jaw Frontal Angle"],
+  1930→      threshold: 5.0
+  1931→    },
+  1932→    content: {
+  1933→      description: "The jaw is narrower than ideal, affecting lower face width and definition.",
+  1934→      severity_labels: { minor: "Slightly Narrow", moderate: "Narrow", severe: "Very Narrow" }
+  1935→    }
+  1936→  },
+  1937→  {
+  1938→    id: "steep_mandibular_plane",
+  1939→    title: "Steep Mandibular Plane",
+  1940→    type: "weakness",
+  1941→    severity_logic: {
+  1942→      metrics: ["Mandibular Plane Angle", "Gonial Angle", "Lower Third Proportion"],
+  1943→      threshold: 5.0
+  1944→    },
+  1945→    content: {
+  1946→      description: "The mandibular plane angle is steeper than ideal, often indicating vertical growth pattern.",
+  1947→      severity_labels: { minor: "Slightly Steep", moderate: "Steep", severe: "Very Steep" }
+  1948→    }
+  1949→  },
+  1950→  // ============================================
+  1951→  // SCRAPED FROM FACEIQ (element.html / element1.html)
+  1952→  // ============================================
+  1953→  // --- WEAKNESSES ---
+  1954→  {
+  1955→    id: "steep_jaw",
+  1956→    title: "Steep Jaw",
+  1957→    type: "weakness",
+  1958→    severity_logic: {
+  1959→      metrics: ["Mandibular Plane Angle", "Gonial Angle", "Jaw Frontal Angle"],
+  1960→      threshold: 6.0
+  1961→    },
+  1962→    content: {
+  1963→      description: "The jaw angles sharply downward, creating a narrow or pointed chin effect.",
+  1964→      severity_labels: { minor: "Slightly Steep", moderate: "Steep", severe: "Very Steep" }
+  1965→    }
+  1966→  },
+  1967→  {
+  1968→    id: "maxillary_recession",
+  1969→    title: "Maxillary Recession",
+  1970→    type: "weakness",
+  1971→    severity_logic: {
+  1972→      metrics: ["Nasofacial Angle", "Nasomental Angle", "Facial Depth to Height Ratio"],
+  1973→      threshold: 6.0
+  1974→    },
+  1975→    content: {
+  1976→      description: "The upper jaw is less forward than ideal, reducing midface projection and facial harmony.",
+  1977→      severity_labels: { minor: "Slight Recession", moderate: "Noticeable Recession", severe: "Severe Recession" }
+  1978→    }
+  1979→  },
+  1980→  {
+  1981→    id: "mandibular_recession",
+  1982→    title: "Mandibular Recession",
+  1983→    type: "weakness",
+  1984→    severity_logic: {
+  1985→      metrics: ["Recession Relative to Frankfort Plane", "Chin to Philtrum Ratio"],
+  1986→      threshold: 6.0
+  1987→    },
+  1988→    content: {
+  1989→      description: "The lower jaw is set back, creating a less prominent chin and an unbalanced profile.",
+  1990→      severity_labels: { minor: "Slight Recession", moderate: "Noticeable Recession", severe: "Severe Recession" }
+  1991→    }
+  1992→  },
+  1993→  {
+  1994→    id: "underprojected_chin",
+  1995→    title: "Underprojected Chin",
+  1996→    type: "weakness",
+  1997→    severity_logic: {
+  1998→      metrics: ["Recession Relative to Frankfort Plane", "Chin to Philtrum Ratio", "Chin Height"],
+  1999→      threshold: 6.0
+  2000→    },
+  2001→    content: {
+  2002→      description: "The chin lacks forward projection, creating a weak lower face appearance.",
+  2003→      severity_labels: { minor: "Slightly Weak", moderate: "Underprojected", severe: "Severely Underprojected" }
+  2004→    }
+  2005→  },
+  2006→  {
+  2007→    id: "overly_long_face",
+  2008→    title: "Overly Long Face Shape",
+  2009→    type: "weakness",
+  2010→    severity_logic: {
+  2011→      metrics: ["Total Facial Width to Height Ratio", "Face Width to Height Ratio"],
+  2012→      threshold: 6.0
+  2013→    },
+  2014→    content: {
+  2015→      description: "The face is excessively tall and narrow, creating an elongated appearance.",
+  2016→      severity_labels: { minor: "Slightly Long", moderate: "Long", severe: "Very Long" }
+  2017→    }
+  2018→  },
+  2019→  {
+  2020→    id: "hyper_divergent_jaw",
+  2021→    title: "Hyper-Divergent Jaw Growth",
+  2022→    type: "weakness",
+  2023→    severity_logic: {
+  2024→      metrics: ["Mandibular Plane Angle", "Gonial Angle", "Lower Third Proportion"],
+  2025→      threshold: 5.5
+  2026→    },
+  2027→    content: {
+  2028→      description: "The jaw grows with an overly steep angle, resulting in a long or narrow lower face. This can indicate malocclusion.",
+  2029→      severity_labels: { minor: "Mildly Divergent", moderate: "Divergent", severe: "Hyper-Divergent" }
+  2030→    }
+  2031→  },
+  2032→  {
+  2033→    id: "weak_brow_ridge",
+  2034→    title: "Soft/Weak Brow Ridge",
+  2035→    type: "weakness",
+  2036→    severity_logic: {
+  2037→      metrics: ["Browridge Inclination Angle", "Eyebrow Height"],
+  2038→      threshold: 5.5
+  2039→    },
+  2040→    content: {
+  2041→      description: "The forehead has a softer, less prominent ridge than the ideal, reducing masculine definition.",
+  2042→      severity_labels: { minor: "Slightly Soft", moderate: "Soft", severe: "Very Weak" }
+  2043→    }
+  2044→  },
+  2045→  {
+  2046→    id: "droopy_nasal_tip",
+  2047→    title: "Droopy Nasal Tip",
+  2048→    type: "weakness",
+  2049→    severity_logic: {
+  2050→      metrics: ["Nasolabial Angle", "Nasal Tip Angle", "Nasofacial Angle"],
+  2051→      threshold: 5.5
+  2052→    },
+  2053→    content: {
+  2054→      description: "The nasal tip points downward more than ideal, creating a drooping appearance.",
+  2055→      severity_labels: { minor: "Slightly Droopy", moderate: "Droopy", severe: "Very Droopy" }
+  2056→    }
+  2057→  },
+  2058→  {
+  2059→    id: "overprojected_nose",
+  2060→    title: "Overprojected Nose",
+  2061→    type: "weakness",
+  2062→    severity_logic: {
+  2063→      metrics: ["Nasal Projection", "Nasofacial Angle", "Nose Length Ratio"],
+  2064→      threshold: 5.5
+  2065→    },
+  2066→    content: {
+  2067→      description: "The nose projects too far forward relative to the face, creating imbalance.",
+  2068→      severity_labels: { minor: "Slightly Projected", moderate: "Overprojected", severe: "Very Overprojected" }
+  2069→    }
+  2070→  },
+  2071→  {
+  2072→    id: "small_eyes",
+  2073→    title: "Small Eyes",
+  2074→    type: "weakness",
+  2075→    severity_logic: {
+  2076→      metrics: ["Eye Aspect Ratio", "Palpebral Fissure Length", "Eye Width"],
+  2077→      threshold: 5.5
+  2078→    },
+  2079→    content: {
+  2080→      description: "The eyes appear smaller than the aesthetic ideal relative to the face.",
+  2081→      severity_labels: { minor: "Slightly Small", moderate: "Small", severe: "Very Small" }
+  2082→    }
+  2083→  },
+  2084→  {
+  2085→    id: "low_set_eyebrows",
+  2086→    title: "Low-Set Eyebrows",
+  2087→    type: "weakness",
+  2088→    severity_logic: {
+  2089→      metrics: ["Eyebrow Height", "Brow to Hairline Distance"],
+  2090→      threshold: 5.5
+  2091→    },
+  2092→    content: {
+  2093→      description: "The eyebrows sit lower than ideal, reducing the visible upper eyelid space.",
+  2094→      severity_labels: { minor: "Slightly Low", moderate: "Low", severe: "Very Low" }
+  2095→    }
+  2096→  },
+  2097→  {
+  2098→    id: "asymmetrical_face",
+  2099→    title: "Facial Asymmetry",
+  2100→    type: "weakness",
+  2101→    severity_logic: {
+  2102→      metrics: ["Facial Asymmetry Index", "Eye Asymmetry", "Jaw Asymmetry"],
+  2103→      threshold: 5.5
+  2104→    },
+  2105→    content: {
+  2106→      description: "The left and right sides of the face show noticeable differences in proportion or position.",
+  2107→      severity_labels: { minor: "Slight Asymmetry", moderate: "Noticeable Asymmetry", severe: "Significant Asymmetry" }
+  2108→    }
+  2109→  },
+  2110→  // --- STRENGTHS ---
+  2111→  {
+  2112→    id: "good_jaw_width",
+  2113→    title: "Good Jaw Width",
+  2114→    type: "strength",
+  2115→    severity_logic: {
+  2116→      metrics: ["Bigonial Width", "Jaw Width Ratio", "Jaw Frontal Angle"],
+  2117→      threshold: 8.5
+  2118→    },
+  2119→    content: {
+  2120→      description: "This contributes to a pleasant jaw contour due to the jaw being neither too wide nor too narrow.",
+  2121→      grade_labels: { good: "Good Width", excellent: "Well-Proportioned", ideal: "Ideal Width" }
+  2122→    }
+  2123→  },
+  2124→  {
+  2125→    id: "good_forehead_slope",
+  2126→    title: "Good Forehead Slope",
+  2127→    type: "strength",
+  2128→    severity_logic: {
+  2129→      metrics: ["Browridge Inclination Angle", "Forehead Height"],
+  2130→      threshold: 8.5
+  2131→    },
+  2132→    content: {
+  2133→      description: "This contributes to a pleasant forehead contour by indicating that the forehead is neither too steep nor too flat.",
+  2134→      grade_labels: { good: "Good Slope", excellent: "Well-Angled", ideal: "Ideal Slope" }
+  2135→    }
+  2136→  },
+  2137→  {
+  2138→    id: "good_cupids_bow",
+  2139→    title: "Good Cupid's Bow Depth",
+  2140→    type: "strength",
+  2141→    severity_logic: {
+  2142→      metrics: ["Cupids Bow Depth", "Upper Lip Height"],
+  2143→      threshold: 8.5
+  2144→    },
+  2145→    content: {
+  2146→      description: "This contributes to a harmonious lip region due to the cupid's bow having ideal definition and depth.",
+  2147→      grade_labels: { good: "Defined", excellent: "Well-Defined", ideal: "Perfectly Defined" }
+  2148→    }
+  2149→  },
+  2150→  {
+  2151→    id: "good_eyebrow_length",
+  2152→    title: "Good Eyebrow Length",
+  2153→    type: "strength",
+  2154→    severity_logic: {
+  2155→      metrics: ["Brow Length to Face Width Ratio", "Brow Length Ratio"],
+  2156→      threshold: 8.5
+  2157→    },
+  2158→    content: {
+  2159→      description: "This contributes to a harmonious eye region due to the eyebrows having ideal horizontal length relative to face width.",
+  2160→      grade_labels: { good: "Good Length", excellent: "Well-Proportioned", ideal: "Ideal Length" }
+  2161→    }
+  2162→  },
+  2163→  {
+  2164→    id: "good_neck_width",
+  2165→    title: "Good Neck Width",
+  2166→    type: "strength",
+  2167→    severity_logic: {
+  2168→      metrics: ["Neck Width", "Neck to Jaw Ratio"],
+  2169→      threshold: 8.5
+  2170→    },
+  2171→    content: {
+  2172→      description: "This contributes to a harmonious lower face due to the neck being neither too wide nor too thin.",
+  2173→      grade_labels: { good: "Good Width", excellent: "Well-Proportioned", ideal: "Ideal Width" }
+  2174→    }
+  2175→  },
+  2176→  {
+  2177→    id: "ideal_nasolabial_angle",
+  2178→    title: "Ideal Nasolabial Angle",
+  2179→    type: "strength",
+  2180→    severity_logic: {
+  2181→      metrics: ["Nasolabial Angle", "Nasal Tip Angle"],
+  2182→      threshold: 8.5
+  2183→    },
+  2184→    content: {
+  2185→      description: "The angle between nose and upper lip is in the ideal range, creating profile harmony.",
+  2186→      grade_labels: { good: "Good Angle", excellent: "Well-Angled", ideal: "Perfect Angle" }
+  2187→    }
+  2188→  },
+  2189→  {
+  2190→    id: "ideal_facial_depth",
+  2191→    title: "Ideal Facial Depth",
+  2192→    type: "strength",
+  2193→    severity_logic: {
+  2194→      metrics: ["Facial Depth to Height Ratio", "Anterior Facial Depth"],
+  2195→      threshold: 8.5
+  2196→    },
+  2197→    content: {
+  2198→      description: "The face has ideal forward projection creating attractive three-dimensional contours.",
+  2199→      grade_labels: { good: "Good Depth", excellent: "Well-Projected", ideal: "Ideal Projection" }
+  2200→    }
+  2201→  },
+  2202→  {
+  2203→    id: "ideal_eye_shape",
+  2204→    title: "Ideal Eye Shape",
+  2205→    type: "strength",
+  2206→    severity_logic: {
+  2207→      metrics: ["Eye Aspect Ratio", "Lateral Canthal Tilt", "Palpebral Fissure Length"],
+  2208→      threshold: 8.5
+  2209→    },
+  2210→    content: {
+  2211→      description: "The eyes have an attractive almond shape with ideal proportions and tilt.",
+  2212→      grade_labels: { good: "Attractive", excellent: "Well-Shaped", ideal: "Hunter Eyes" }
+  2213→    }
+  2214→  },
+  2215→  {
+  2216→    id: "harmonious_profile",
+  2217→    title: "Harmonious Profile",
+  2218→    type: "strength",
+  2219→    severity_logic: {
+  2220→      metrics: ["Nasofacial Angle", "Nasomental Angle", "Total Profile Angle"],
+  2221→      threshold: 8.5
+  2222→    },
+  2223→    content: {
+  2224→      description: "The facial profile shows excellent balance between nose, lips, and chin positions.",
+  2225→      grade_labels: { good: "Balanced", excellent: "Harmonious", ideal: "Perfect Profile" }
+  2226→    }
+  2227→  },
+  2228→  {
+  2229→    id: "good_facial_symmetry",
+  2230→    title: "Good Facial Symmetry",
+  2231→    type: "strength",
+  2232→    severity_logic: {
+  2233→      metrics: ["Facial Asymmetry Index", "Eye Asymmetry", "Jaw Asymmetry"],
+  2234→      threshold: 8.5
+  2235→    },
+  2236→    content: {
+  2237→      description: "The face displays excellent bilateral symmetry, a key component of attractiveness.",
+  2238→      grade_labels: { good: "Symmetric", excellent: "Very Symmetric", ideal: "Near-Perfect Symmetry" }
+  2239→    }
+  2240→  }
+  2241→];
+  2242→
+  2243→// ============================================
+  2244→// METRIC NAME MAPPING
+  2245→// ============================================
+  2246→
+  2247→// Map display names to metric IDs for lookup
+  2248→const METRIC_NAME_TO_ID: Record<string, string> = {
+  2249→  // Face Shape/Proportions
+  2250→  "Face Width to Height Ratio": "faceWidthToHeight",
+  2251→  "Total Facial Width to Height": "totalFacialWidthToHeight",
+  2252→  "Total Facial Width to Height Ratio": "totalFacialWidthToHeight",
+  2253→  "Midface Ratio": "midfaceRatio",
+  2254→  "Upper Third Proportion": "upperThirdProportion",
+  2255→  "Middle Third Proportion": "middleThirdProportion",
+  2256→  "Lower Third Proportion": "lowerThirdProportion",
+  2257→  "Cheekbone Height": "cheekboneHeight",
+  2258→  "Cheekbone Width": "cheekboneWidth",
+  2259→  "Bitemporal Width": "bitemporalWidth",
+  2260→  "Forehead Height": "foreheadHeight",
+  2261→  "Facial Asymmetry Index": "facialAsymmetryIndex",
+  2262→
+  2263→  // Jaw
+  2264→  "Gonial Angle": "gonialAngle",
+  2265→  "Mandibular Plane Angle": "mandibularPlaneAngle",
+  2266→  "Jaw Width Ratio": "jawWidthRatio",
+  2267→  "Bigonial Width": "bigonialWidth",
+  2268→  "Jaw Frontal Angle": "jawFrontalAngle",
+  2269→  "Jaw Slope": "jawSlope",
+  2270→  "Jaw Asymmetry": "jawAsymmetry",
+  2271→
+  2272→  // Chin
+  2273→  "Chin to Philtrum Ratio": "chinPhiltrumRatio",
+  2274→  "Chin Height": "chinHeight",
+  2275→  "Facial Depth to Height": "facialDepthToHeight",
+  2276→  "Facial Depth to Height Ratio": "facialDepthToHeight",
+  2277→  "Anterior Facial Depth": "anteriorFacialDepth",
+  2278→  "Recession Relative to Frankfort Plane": "recessionFrankfort",
+  2279→
+  2280→  // Eyes
+  2281→  "Lateral Canthal Tilt": "lateralCanthalTilt",
+  2282→  "Eye Aspect Ratio": "eyeAspectRatio",
+  2283→  "Eye Separation Ratio": "eyeSeparationRatio",
+  2284→  "Interpupillary Ratio": "interpupillaryRatio",
+  2285→  "One Eye Apart Test": "oneEyeApartTest",
+  2286→  "Intercanthal Width": "intercanthalWidth",
+  2287→  "Eyebrow Height": "eyebrowHeight",
+  2288→  "Brow Length Ratio": "browLengthRatio",
+  2289→  "Brow Length to Face Width Ratio": "browLengthToFaceWidth",
+  2290→  "Palpebral Fissure Length": "palpebralFissureLength",
+  2291→  "Eye Width": "eyeWidth",
+  2292→  "Eye Asymmetry": "eyeAsymmetry",
+  2293→  "Brow to Hairline Distance": "browToHairlineDistance",
+  2294→
+  2295→  // Brow
+  2296→  "Browridge Inclination Angle": "browridgeInclinationAngle",
+  2297→
+  2298→  // Nose
+  2299→  "Nasal Index": "nasalIndex",
+  2300→  "Nasal Tip Angle": "nasalTipAngle",
+  2301→  "Nose Tip Position": "noseTipPosition",
+  2302→  "Frankfort-tip Angle": "frankfortTipAngle",
+  2303→  "Nasofrontal Angle": "nasofrontalAngle",
+  2304→  "Nasofacial Angle": "nasofacialAngle",
+  2305→  "Nasomenta Angle": "nasomentaAngle",
+  2306→  "Nasomental Angle": "nasomentaAngle",
+  2307→  "Intercanthal Nasal Ratio": "intercanthalNasalRatio",
+  2308→  "Nose Bridge Width": "noseBridgeWidth",
+  2309→  "Nose Width": "noseWidth",
+  2310→  "Nasal Projection": "nasalProjection",
+  2311→  "Nose Length Ratio": "noseLengthRatio",
+  2312→  "Ipsilateral Alar Angle": "ipsilateralAlarAngle",
+  2313→
+  2314→  // Lips
+  2315→  "Lip Ratio": "lipRatio",
+  2316→  "Philtrum Length": "philtrumLength",
+  2317→  "Upper Lip Projection": "upperLipProjection",
+  2318→  "Lower Lip Projection": "lowerLipProjection",
+  2319→  "Lip Chin Distance": "lipChinDistance",
+  2320→  "Upper Lip Height": "upperLipHeight",
+  2321→  "Upper Lip E-Line Position": "upperLipELine",
+  2322→  "Upper Lip S-Line Position": "upperLipSLine",
+  2323→  "Nasolabial Angle": "nasolabialAngle",
+  2324→  "Cupids Bow Depth": "cupidsBowDepth",
+  2325→
+  2326→  // Neck
+  2327→  "Neck Width": "neckWidth",
+  2328→  "Neck to Jaw Ratio": "neckToJawRatio",
+  2329→
+  2330→  // Profile
+  2331→  "Total Profile Angle": "totalProfileAngle",
+  2332→};
+  2333→
+  2334→// ============================================
+  2335→// CLASSIFICATION FUNCTIONS
+  2336→// ============================================
+  2337→
+  2338→/**
+  2339→ * Get weakness severity based on average score
+  2340→ * 0-3 = "Severe", 3-5 = "Moderate", 5-7 = "Minor"
+  2341→ */
+  2342→function getWeaknessSeverity(avgScore: number): WeaknessSeverity {
+  2343→  if (avgScore <= 3) return 'severe';
+  2344→  if (avgScore <= 5) return 'moderate';
+  2345→  return 'minor';
+  2346→}
+  2347→
+  2348→/**
+  2349→ * Get strength grade based on average score
+  2350→ * 8-9 = "Good", 9-9.5 = "Excellent", 9.5-10 = "Ideal"
+  2351→ */
+  2352→function getStrengthGrade(avgScore: number): StrengthGrade {
+  2353→  if (avgScore >= 9.5) return 'ideal';
+  2354→  if (avgScore >= 9) return 'excellent';
+  2355→  return 'good';
+  2356→}
+  2357→
+  2358→/**
+  2359→ * Find metric by display name from measurements array
+  2360→ */
+  2361→function findMetricByName(
+  2362→  metricName: string,
+  2363→  measurements: FaceIQScoreResult[]
+  2364→): FaceIQScoreResult | undefined {
+  2365→  // First try direct ID mapping
+  2366→  const metricId = METRIC_NAME_TO_ID[metricName];
+  2367→  if (metricId) {
+  2368→    return measurements.find(m => m.metricId === metricId);
+  2369→  }
+  2370→
+  2371→  // Fallback: try fuzzy matching on name
+  2372→  const normalizedName = metricName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  2373→  return measurements.find(m => {
+  2374→    const normalizedMetricName = m.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+  2375→    return normalizedMetricName.includes(normalizedName) ||
+  2376→           normalizedName.includes(normalizedMetricName);
+  2377→  });
+  2378→}
+  2379→
+  2380→/**
+  2381→ * Check if a metric should be considered a "false positive" weakness.
+  2382→ * This handles directional/dimorphic metrics where low scores don't mean weakness.
+  2383→ *
+  2384→ * Example: Canthal Tilt of 3° gets a low score (not in 6-8° ideal range)
+  2385→ * but is still a POSITIVE trait, not a weakness.
+  2386→ */
+  2387→function isFalsePositiveWeakness(metric: MatchedMetric): boolean {
+  2388→  const config = FACEIQ_METRICS[metric.metricId];
+  2389→  if (!config) return false;
+  2390→
+  2391→  // Check if the value is actually acceptable based on polarity
+  2392→  const { acceptable } = isValueAcceptable(metric.value, config);
+  2393→  return acceptable;
+  2394→}
+  2395→
+  2396→/**
+  2397→ * Process all insight definitions against user's measurements
+  2398→ */
+  2399→export function classifyInsights(
+  2400→  measurements: FaceIQScoreResult[],
+  2401→  insightDefinitions: InsightDefinition[] = INSIGHTS_DEFINITIONS
+  2402→): InsightClassificationResult {
+  2403→  const strengths: ClassifiedStrength[] = [];
+  2404→  const weaknesses: ClassifiedWeakness[] = [];
+  2405→
+  2406→  for (const insight of insightDefinitions) {
+  2407→    const { metrics, threshold } = insight.severity_logic;
+  2408→
+  2409→    // Find matching measurements for this insight
+  2410→    const matchedMetrics: MatchedMetric[] = [];
+  2411→    for (const metricName of metrics) {
+  2412→      const measurement = findMetricByName(metricName, measurements);
+  2413→      if (measurement) {
+  2414→        matchedMetrics.push({
+  2415→          metricId: measurement.metricId,
+  2416→          metricName: measurement.name,
+  2417→          score: measurement.score,
+  2418→          value: measurement.value,
+  2419→          idealMin: measurement.idealMin,
+  2420→          idealMax: measurement.idealMax,
+  2421→          unit: measurement.unit,
+  2422→          category: measurement.category,
+  2423→        });
+  2424→      }
+  2425→    }
+  2426→
+  2427→    // Skip if no metrics matched (need at least 1)
+  2428→    if (matchedMetrics.length === 0) continue;
+  2429→
+  2430→    // Calculate average score
+  2431→    const avgScore = matchedMetrics.reduce((sum, m) => sum + m.score, 0) / matchedMetrics.length;
+  2432→
+  2433→    // Classify based on type and threshold
+  2434→    if (insight.type === 'weakness') {
+  2435→      // Weakness: avg < threshold → add to areas of improvement
+  2436→      if (avgScore < threshold) {
+  2437→        // ========== FALSE POSITIVE CHECK ==========
+  2438→        // Before adding to weaknesses, check if ANY of the matched metrics
+  2439→        // are actually in an "acceptable" zone based on their polarity.
+  2440→        // If so, this is a false positive and should be skipped or reclassified.
+  2441→        const falsePositiveMetrics = matchedMetrics.filter(isFalsePositiveWeakness);
+  2442→
+  2443→        // If ALL matched metrics are false positives, skip this weakness entirely
+  2444→        if (falsePositiveMetrics.length === matchedMetrics.length) {
+  2445→          // This is a false positive weakness - the values are actually acceptable
+  2446→          // Consider adding to strengths if scores are decent
+  2447→          if (avgScore >= 6) {
+  2448→            strengths.push({
+  2449→              insightId: `${insight.id}_acceptable`,
+  2450→              title: insight.title.replace('Negative', 'Neutral').replace('Weak', 'Moderate'),
+  2451→              description: `While not in the peak ideal range, the measured values are within acceptable limits.`,
+  2452→              grade: 'good',
+  2453→              gradeLabel: 'Acceptable',
+  2454→              avgScore,
+  2455→              matchedMetrics,
+  2456→            });
+  2457→          }
+  2458→          continue; // Skip adding as weakness
+  2459→        }
+  2460→
+  2461→        // If SOME metrics are false positives, filter them out
+  2462→        const trueWeaknessMetrics = matchedMetrics.filter(m => !isFalsePositiveWeakness(m));
+  2463→        if (trueWeaknessMetrics.length === 0) continue;
+  2464→
+  2465→        // Recalculate average with only true weakness metrics
+  2466→        const trueAvgScore = trueWeaknessMetrics.reduce((sum, m) => sum + m.score, 0) / trueWeaknessMetrics.length;
+  2467→
+  2468→        // Only add as weakness if true average is still below threshold
+  2469→        if (trueAvgScore < threshold) {
+  2470→          const severity = getWeaknessSeverity(trueAvgScore);
+  2471→          const labels = insight.content.severity_labels;
+  2472→          const severityLabel = labels?.[severity] || severity;
+  2473→
+  2474→          weaknesses.push({
+  2475→            insightId: insight.id,
+  2476→            title: insight.title,
+  2477→            description: insight.content.description,
+  2478→            severity,
+  2479→            severityLabel,
+  2480→            avgScore: trueAvgScore,
+  2481→            matchedMetrics: trueWeaknessMetrics,
+  2482→          });
+  2483→        }
+  2484→      }
+  2485→    } else {
+  2486→      // Strength: avg > threshold → add to key strengths
+  2487→      if (avgScore > threshold) {
+  2488→        const grade = getStrengthGrade(avgScore);
+  2489→        const labels = insight.content.grade_labels;
+  2490→        const gradeLabel = labels?.[grade] || grade;
+  2491→
+  2492→        strengths.push({
+  2493→          insightId: insight.id,
+  2494→          title: insight.title,
+  2495→          description: insight.content.description,
+  2496→          grade,
+  2497→          gradeLabel,
+  2498→          avgScore,
+  2499→          matchedMetrics,
+  2500→        });
+  2501→      }
+  2502→    }
+  2503→  }
+  2504→
+  2505→  // Sort by score (weaknesses by lowest score first, strengths by highest first)
+  2506→  weaknesses.sort((a, b) => a.avgScore - b.avgScore);
+  2507→  strengths.sort((a, b) => b.avgScore - a.avgScore);
+  2508→
+  2509→  return { strengths, weaknesses };
+  2510→}
+  2511→
+  2512→/**
+  2513→ * Convert ClassifiedStrength to Strength type for UI compatibility
+  2514→ */
+  2515→export function convertToStrength(classified: ClassifiedStrength): Strength {
+  2516→  return {
+  2517→    id: `insight_strength_${classified.insightId}`,
+  2518→    strengthName: `${classified.title} (${classified.gradeLabel})`,
+  2519→    summary: classified.description,
+  2520→    avgScore: classified.avgScore,
+  2521→    qualityLevel: classified.grade === 'ideal' ? 'ideal' :
+  2522→                  classified.grade === 'excellent' ? 'excellent' : 'good',
+  2523→    categoryName: classified.matchedMetrics[0]?.category || 'General',
+  2524→    responsibleRatios: classified.matchedMetrics.map(m => ({
+  2525→      ratioName: m.metricName,
+  2526→      ratioId: m.metricId,
+  2527→      score: m.score,
+  2528→      value: m.value,
+  2529→      idealMin: m.idealMin,
+  2530→      idealMax: m.idealMax,
+  2531→      unit: m.unit,
+  2532→      category: m.category,
+  2533→    })),
+  2534→  };
+  2535→}
+  2536→
+  2537→/**
+  2538→ * Convert ClassifiedWeakness to Flaw type for UI compatibility
+  2539→ */
+  2540→export function convertToFlaw(classified: ClassifiedWeakness, index: number, rollingLost: number): Flaw {
+  2541→  const impact = (10 - classified.avgScore) * 0.5;
+  2542→  const newRollingLost = rollingLost + impact;
+  2543→
+  2544→  return {
+  2545→    id: `insight_flaw_${classified.insightId}`,
+  2546→    flawName: `${classified.title} (${classified.severityLabel})`,
+  2547→    summary: classified.description,
+  2548→    harmonyPercentageLost: impact,
+  2549→    standardizedImpact: impact / 10,
+  2550→    categoryName: classified.matchedMetrics[0]?.category || 'General',
+  2551→    responsibleRatios: classified.matchedMetrics.map(m => ({
+  2552→      ratioName: m.metricName,
+  2553→      ratioId: m.metricId,
+  2554→      score: m.score,
+  2555→      value: m.value,
+  2556→      idealMin: m.idealMin,
+  2557→      idealMax: m.idealMax,
+  2558→      unit: m.unit,
+  2559→      category: m.category,
+  2560→    })),
+  2561→    rollingPointsDeducted: newRollingLost,
+  2562→    rollingHarmonyPercentageLost: newRollingLost,
+  2563→    rollingStandardizedImpact: newRollingLost / 10,
+  2564→  };
+  2565→}
+  2566→
+  2567→/**
+  2568→ * Main function: Generate strengths and flaws from measurements using insights
+  2569→ */
+  2570→export function generateInsightBasedResults(
+  2571→  measurements: FaceIQScoreResult[]
+  2572→): { strengths: Strength[]; flaws: Flaw[] } {
+  2573→  const { strengths: classifiedStrengths, weaknesses: classifiedWeaknesses } = classifyInsights(measurements);
+  2574→
+  2575→  // Convert to UI-compatible types
+  2576→  const strengths = classifiedStrengths.map((s) => convertToStrength(s));
+  2577→
+  2578→  let rollingLost = 0;
+  2579→  const flaws = classifiedWeaknesses.map((w, i) => {
+  2580→    const flaw = convertToFlaw(w, i, rollingLost);
+  2581→    rollingLost = flaw.rollingPointsDeducted || 0;
+  2582→    return flaw;
+  2583→  });
+  2584→
+  2585→  return { strengths, flaws };
+  2586→}
+  2587→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

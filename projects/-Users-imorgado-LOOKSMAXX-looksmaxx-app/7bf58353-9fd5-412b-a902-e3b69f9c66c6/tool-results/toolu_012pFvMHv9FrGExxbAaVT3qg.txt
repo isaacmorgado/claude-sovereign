@@ -1,0 +1,546 @@
+     1→"""
+     2→Admin router - Moderation endpoints for managing reports, posts, comments, and users
+     3→
+     4→All endpoints require admin role (UserRole.ADMIN).
+     5→"""
+     6→
+     7→from fastapi import APIRouter, Depends, HTTPException, Query, status
+     8→from sqlalchemy.ext.asyncio import AsyncSession
+     9→from sqlalchemy import select, func, and_, case
+    10→from sqlalchemy.orm import selectinload
+    11→from uuid import UUID
+    12→from typing import Optional, List
+    13→from datetime import datetime, timezone, timedelta
+    14→
+    15→from app.database import get_db
+    16→from app.models.user import User, UserRole
+    17→from app.models.forum import (
+    18→    ForumPost, ForumComment, ForumReport,
+    19→    TargetType, ReportStatus, ReportReason
+    20→)
+    21→from app.services.auth import get_current_user
+    22→from app.schemas.forum import (
+    23→    ReportDetailResponse, ReportListResponse, ResolveReportRequest,
+    24→    ModerationStatsResponse, BanUserRequest, BanUserResponse,
+    25→    ReportStatusEnum, ActionTaken, TargetType as SchemaTargetType, ReportReason as SchemaReportReason
+    26→)
+    27→
+    28→router = APIRouter(prefix="/admin", tags=["admin"])
+    29→
+    30→
+    31→def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    32→    """Dependency that requires admin role"""
+    33→    if current_user.role != UserRole.ADMIN:
+    34→        raise HTTPException(
+    35→            status_code=status.HTTP_403_FORBIDDEN,
+    36→            detail="Admin access required"
+    37→        )
+    38→    return current_user
+    39→
+    40→
+    41→# === MODERATION STATS ===
+    42→
+    43→@router.get("/moderation/stats", response_model=ModerationStatsResponse)
+    44→async def get_moderation_stats(
+    45→    current_user: User = Depends(require_admin),
+    46→    db: AsyncSession = Depends(get_db),
+    47→):
+    48→    """Get moderation dashboard statistics."""
+    49→    now = datetime.now(timezone.utc)
+    50→    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    51→    week_start = today_start - timedelta(days=now.weekday())
+    52→
+    53→    # Get pending count
+    54→    pending_result = await db.execute(
+    55→        select(func.count(ForumReport.id)).where(ForumReport.status == ReportStatus.PENDING)
+    56→    )
+    57→    pending_reports = pending_result.scalar() or 0
+    58→
+    59→    # Get resolved today
+    60→    resolved_today_result = await db.execute(
+    61→        select(func.count(ForumReport.id)).where(
+    62→            and_(
+    63→                ForumReport.status.in_([ReportStatus.RESOLVED, ReportStatus.DISMISSED]),
+    64→                ForumReport.reviewed_at >= today_start
+    65→            )
+    66→        )
+    67→    )
+    68→    resolved_today = resolved_today_result.scalar() or 0
+    69→
+    70→    # Get resolved this week
+    71→    resolved_week_result = await db.execute(
+    72→        select(func.count(ForumReport.id)).where(
+    73→            and_(
+    74→                ForumReport.status.in_([ReportStatus.RESOLVED, ReportStatus.DISMISSED]),
+    75→                ForumReport.reviewed_at >= week_start
+    76→            )
+    77→        )
+    78→    )
+    79→    resolved_this_week = resolved_week_result.scalar() or 0
+    80→
+    81→    # Get total count
+    82→    total_result = await db.execute(select(func.count(ForumReport.id)))
+    83→    total_reports = total_result.scalar() or 0
+    84→
+    85→    # Get counts by reason
+    86→    reason_query = (
+    87→        select(ForumReport.reason, func.count(ForumReport.id))
+    88→        .group_by(ForumReport.reason)
+    89→    )
+    90→    reason_result = await db.execute(reason_query)
+    91→    reports_by_reason = {}
+    92→    for row in reason_result:
+    93→        reason_val = row[0].value if hasattr(row[0], 'value') else str(row[0])
+    94→        reports_by_reason[reason_val] = row[1]
+    95→
+    96→    # Get counts by status
+    97→    status_query = (
+    98→        select(ForumReport.status, func.count(ForumReport.id))
+    99→        .group_by(ForumReport.status)
+   100→    )
+   101→    status_result = await db.execute(status_query)
+   102→    reports_by_status = {}
+   103→    for row in status_result:
+   104→        status_val = row[0].value if hasattr(row[0], 'value') else str(row[0])
+   105→        reports_by_status[status_val] = row[1]
+   106→
+   107→    return ModerationStatsResponse(
+   108→        pending_reports=pending_reports,
+   109→        resolved_today=resolved_today,
+   110→        resolved_this_week=resolved_this_week,
+   111→        total_reports=total_reports,
+   112→        reports_by_reason=reports_by_reason,
+   113→        reports_by_status=reports_by_status,
+   114→    )
+   115→
+   116→
+   117→# === REPORTS ===
+   118→
+   119→@router.get("/reports", response_model=ReportListResponse)
+   120→async def list_reports(
+   121→    status_filter: Optional[ReportStatusEnum] = Query(None, alias="status"),
+   122→    reason_filter: Optional[SchemaReportReason] = Query(None, alias="reason"),
+   123→    target_type_filter: Optional[SchemaTargetType] = Query(None, alias="target_type"),
+   124→    limit: int = Query(20, ge=1, le=100),
+   125→    offset: int = Query(0, ge=0),
+   126→    current_user: User = Depends(require_admin),
+   127→    db: AsyncSession = Depends(get_db),
+   128→):
+   129→    """List all reports with filtering and pagination."""
+   130→    # Base query with reporter relationship
+   131→    query = (
+   132→        select(ForumReport)
+   133→        .options(selectinload(ForumReport.reporter))
+   134→        .order_by(
+   135→            # Pending first, then by date
+   136→            case(
+   137→                (ForumReport.status == ReportStatus.PENDING, 0),
+   138→                else_=1
+   139→            ),
+   140→            ForumReport.created_at.desc()
+   141→        )
+   142→    )
+   143→
+   144→    # Apply filters
+   145→    filters = []
+   146→    if status_filter:
+   147→        filters.append(ForumReport.status == ReportStatus(status_filter.value))
+   148→    if reason_filter:
+   149→        filters.append(ForumReport.reason == ReportReason(reason_filter.value))
+   150→    if target_type_filter:
+   151→        filters.append(ForumReport.target_type == TargetType(target_type_filter.value))
+   152→
+   153→    if filters:
+   154→        query = query.where(and_(*filters))
+   155→
+   156→    # Get total count
+   157→    count_query = select(func.count(ForumReport.id))
+   158→    if filters:
+   159→        count_query = count_query.where(and_(*filters))
+   160→    total_result = await db.execute(count_query)
+   161→    total_count = total_result.scalar() or 0
+   162→
+   163→    # Paginate
+   164→    query = query.offset(offset).limit(limit)
+   165→    result = await db.execute(query)
+   166→    reports = result.scalars().all()
+   167→
+   168→    # Fetch content for each report
+   169→    report_responses = []
+   170→    for report in reports:
+   171→        content_preview = None
+   172→        content_author_id = None
+   173→        content_author_username = None
+   174→
+   175→        if report.target_type == TargetType.POST:
+   176→            post_result = await db.execute(
+   177→                select(ForumPost)
+   178→                .options(selectinload(ForumPost.author))
+   179→                .where(ForumPost.id == report.target_id)
+   180→            )
+   181→            post = post_result.scalar_one_or_none()
+   182→            if post:
+   183→                content_preview = post.content[:200] + "..." if len(post.content) > 200 else post.content
+   184→                content_author_id = post.author_id
+   185→                content_author_username = post.author.username
+   186→        else:
+   187→            comment_result = await db.execute(
+   188→                select(ForumComment)
+   189→                .options(selectinload(ForumComment.author))
+   190→                .where(ForumComment.id == report.target_id)
+   191→            )
+   192→            comment = comment_result.scalar_one_or_none()
+   193→            if comment:
+   194→                content_preview = comment.content[:200] + "..." if len(comment.content) > 200 else comment.content
+   195→                content_author_id = comment.author_id
+   196→                content_author_username = comment.author.username
+   197→
+   198→        report_responses.append(ReportDetailResponse(
+   199→            id=report.id,
+   200→            target_type=SchemaTargetType(report.target_type.value),
+   201→            target_id=report.target_id,
+   202→            reason=SchemaReportReason(report.reason.value),
+   203→            details=report.details,
+   204→            status=report.status.value,
+   205→            reporter_id=report.reporter_id,
+   206→            reporter_username=report.reporter.username,
+   207→            reviewed_by=report.reviewed_by,
+   208→            reviewed_at=report.reviewed_at,
+   209→            resolution_notes=getattr(report, 'resolution_notes', None),
+   210→            action_taken=getattr(report, 'action_taken', None),
+   211→            created_at=report.created_at,
+   212→            content_preview=content_preview,
+   213→            content_author_id=content_author_id,
+   214→            content_author_username=content_author_username,
+   215→        ))
+   216→
+   217→    return ReportListResponse(
+   218→        reports=report_responses,
+   219→        total_count=total_count,
+   220→        has_more=offset + limit < total_count,
+   221→    )
+   222→
+   223→
+   224→@router.get("/reports/{report_id}", response_model=ReportDetailResponse)
+   225→async def get_report(
+   226→    report_id: UUID,
+   227→    current_user: User = Depends(require_admin),
+   228→    db: AsyncSession = Depends(get_db),
+   229→):
+   230→    """Get a single report with full details."""
+   231→    result = await db.execute(
+   232→        select(ForumReport)
+   233→        .options(selectinload(ForumReport.reporter))
+   234→        .where(ForumReport.id == report_id)
+   235→    )
+   236→    report = result.scalar_one_or_none()
+   237→
+   238→    if not report:
+   239→        raise HTTPException(status_code=404, detail="Report not found")
+   240→
+   241→    # Fetch content
+   242→    content_preview = None
+   243→    content_author_id = None
+   244→    content_author_username = None
+   245→
+   246→    if report.target_type == TargetType.POST:
+   247→        post_result = await db.execute(
+   248→            select(ForumPost)
+   249→            .options(selectinload(ForumPost.author))
+   250→            .where(ForumPost.id == report.target_id)
+   251→        )
+   252→        post = post_result.scalar_one_or_none()
+   253→        if post:
+   254→            content_preview = post.content
+   255→            content_author_id = post.author_id
+   256→            content_author_username = post.author.username
+   257→    else:
+   258→        comment_result = await db.execute(
+   259→            select(ForumComment)
+   260→            .options(selectinload(ForumComment.author))
+   261→            .where(ForumComment.id == report.target_id)
+   262→        )
+   263→        comment = comment_result.scalar_one_or_none()
+   264→        if comment:
+   265→            content_preview = comment.content
+   266→            content_author_id = comment.author_id
+   267→            content_author_username = comment.author.username
+   268→
+   269→    return ReportDetailResponse(
+   270→        id=report.id,
+   271→        target_type=SchemaTargetType(report.target_type.value),
+   272→        target_id=report.target_id,
+   273→        reason=SchemaReportReason(report.reason.value),
+   274→        details=report.details,
+   275→        status=report.status.value,
+   276→        reporter_id=report.reporter_id,
+   277→        reporter_username=report.reporter.username,
+   278→        reviewed_by=report.reviewed_by,
+   279→        reviewed_at=report.reviewed_at,
+   280→        resolution_notes=getattr(report, 'resolution_notes', None),
+   281→        action_taken=getattr(report, 'action_taken', None),
+   282→        created_at=report.created_at,
+   283→        content_preview=content_preview,
+   284→        content_author_id=content_author_id,
+   285→        content_author_username=content_author_username,
+   286→    )
+   287→
+   288→
+   289→@router.put("/reports/{report_id}/resolve")
+   290→async def resolve_report(
+   291→    report_id: UUID,
+   292→    data: ResolveReportRequest,
+   293→    current_user: User = Depends(require_admin),
+   294→    db: AsyncSession = Depends(get_db),
+   295→):
+   296→    """Resolve a report with status, notes, and action taken."""
+   297→    result = await db.execute(
+   298→        select(ForumReport).where(ForumReport.id == report_id)
+   299→    )
+   300→    report = result.scalar_one_or_none()
+   301→
+   302→    if not report:
+   303→        raise HTTPException(status_code=404, detail="Report not found")
+   304→
+   305→    # Update report
+   306→    report.status = ReportStatus(data.status.value)
+   307→    report.reviewed_by = current_user.id
+   308→    report.reviewed_at = datetime.now(timezone.utc)
+   309→
+   310→    # Set resolution notes and action taken if the model supports them
+   311→    if hasattr(report, 'resolution_notes'):
+   312→        report.resolution_notes = data.resolution_notes
+   313→    if hasattr(report, 'action_taken') and data.action_taken:
+   314→        report.action_taken = data.action_taken.value
+   315→
+   316→    await db.commit()
+   317→
+   318→    return {
+   319→        "success": True,
+   320→        "report_id": str(report_id),
+   321→        "status": data.status.value,
+   322→        "action_taken": data.action_taken.value if data.action_taken else None,
+   323→    }
+   324→
+   325→
+   326→# === CONTENT MODERATION ===
+   327→
+   328→@router.put("/posts/{post_id}/remove")
+   329→async def remove_post(
+   330→    post_id: UUID,
+   331→    current_user: User = Depends(require_admin),
+   332→    db: AsyncSession = Depends(get_db),
+   333→):
+   334→    """Remove (soft delete) a post."""
+   335→    result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+   336→    post = result.scalar_one_or_none()
+   337→
+   338→    if not post:
+   339→        raise HTTPException(status_code=404, detail="Post not found")
+   340→
+   341→    if post.is_deleted:
+   342→        raise HTTPException(status_code=400, detail="Post is already deleted")
+   343→
+   344→    post.is_deleted = True
+   345→    post.deleted_at = datetime.now(timezone.utc)
+   346→    post.deleted_by = current_user.id
+   347→
+   348→    await db.commit()
+   349→
+   350→    return {"success": True, "post_id": str(post_id), "message": "Post removed"}
+   351→
+   352→
+   353→@router.put("/posts/{post_id}/restore")
+   354→async def restore_post(
+   355→    post_id: UUID,
+   356→    current_user: User = Depends(require_admin),
+   357→    db: AsyncSession = Depends(get_db),
+   358→):
+   359→    """Restore a previously removed post."""
+   360→    result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+   361→    post = result.scalar_one_or_none()
+   362→
+   363→    if not post:
+   364→        raise HTTPException(status_code=404, detail="Post not found")
+   365→
+   366→    if not post.is_deleted:
+   367→        raise HTTPException(status_code=400, detail="Post is not deleted")
+   368→
+   369→    post.is_deleted = False
+   370→    post.deleted_at = None
+   371→    post.deleted_by = None
+   372→
+   373→    await db.commit()
+   374→
+   375→    return {"success": True, "post_id": str(post_id), "message": "Post restored"}
+   376→
+   377→
+   378→@router.put("/comments/{comment_id}/remove")
+   379→async def remove_comment(
+   380→    comment_id: UUID,
+   381→    current_user: User = Depends(require_admin),
+   382→    db: AsyncSession = Depends(get_db),
+   383→):
+   384→    """Remove (soft delete) a comment."""
+   385→    result = await db.execute(select(ForumComment).where(ForumComment.id == comment_id))
+   386→    comment = result.scalar_one_or_none()
+   387→
+   388→    if not comment:
+   389→        raise HTTPException(status_code=404, detail="Comment not found")
+   390→
+   391→    if comment.is_deleted:
+   392→        raise HTTPException(status_code=400, detail="Comment is already deleted")
+   393→
+   394→    comment.is_deleted = True
+   395→    comment.deleted_at = datetime.now(timezone.utc)
+   396→    comment.deleted_by = current_user.id
+   397→
+   398→    # Decrement comment count on parent post
+   399→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == comment.post_id))
+   400→    post = post_result.scalar_one_or_none()
+   401→    if post and post.comment_count > 0:
+   402→        post.comment_count -= 1
+   403→
+   404→    await db.commit()
+   405→
+   406→    return {"success": True, "comment_id": str(comment_id), "message": "Comment removed"}
+   407→
+   408→
+   409→@router.put("/comments/{comment_id}/restore")
+   410→async def restore_comment(
+   411→    comment_id: UUID,
+   412→    current_user: User = Depends(require_admin),
+   413→    db: AsyncSession = Depends(get_db),
+   414→):
+   415→    """Restore a previously removed comment."""
+   416→    result = await db.execute(select(ForumComment).where(ForumComment.id == comment_id))
+   417→    comment = result.scalar_one_or_none()
+   418→
+   419→    if not comment:
+   420→        raise HTTPException(status_code=404, detail="Comment not found")
+   421→
+   422→    if not comment.is_deleted:
+   423→        raise HTTPException(status_code=400, detail="Comment is not deleted")
+   424→
+   425→    comment.is_deleted = False
+   426→    comment.deleted_at = None
+   427→    comment.deleted_by = None
+   428→
+   429→    # Increment comment count on parent post
+   430→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == comment.post_id))
+   431→    post = post_result.scalar_one_or_none()
+   432→    if post:
+   433→        post.comment_count += 1
+   434→
+   435→    await db.commit()
+   436→
+   437→    return {"success": True, "comment_id": str(comment_id), "message": "Comment restored"}
+   438→
+   439→
+   440→# === USER MANAGEMENT ===
+   441→
+   442→@router.put("/users/{user_id}/ban", response_model=BanUserResponse)
+   443→async def ban_user(
+   444→    user_id: UUID,
+   445→    data: BanUserRequest,
+   446→    current_user: User = Depends(require_admin),
+   447→    db: AsyncSession = Depends(get_db),
+   448→):
+   449→    """Ban a user from the platform."""
+   450→    if user_id == current_user.id:
+   451→        raise HTTPException(status_code=400, detail="You cannot ban yourself")
+   452→
+   453→    result = await db.execute(select(User).where(User.id == user_id))
+   454→    user = result.scalar_one_or_none()
+   455→
+   456→    if not user:
+   457→        raise HTTPException(status_code=404, detail="User not found")
+   458→
+   459→    if user.role == UserRole.ADMIN:
+   460→        raise HTTPException(status_code=400, detail="Cannot ban an admin user")
+   461→
+   462→    if user.is_banned:
+   463→        raise HTTPException(status_code=400, detail="User is already banned")
+   464→
+   465→    user.is_banned = True
+   466→    await db.commit()
+   467→
+   468→    return BanUserResponse(
+   469→        user_id=user.id,
+   470→        username=user.username,
+   471→        is_banned=True,
+   472→        message=f"User {user.username} has been banned"
+   473→    )
+   474→
+   475→
+   476→@router.put("/users/{user_id}/unban", response_model=BanUserResponse)
+   477→async def unban_user(
+   478→    user_id: UUID,
+   479→    current_user: User = Depends(require_admin),
+   480→    db: AsyncSession = Depends(get_db),
+   481→):
+   482→    """Unban a previously banned user."""
+   483→    result = await db.execute(select(User).where(User.id == user_id))
+   484→    user = result.scalar_one_or_none()
+   485→
+   486→    if not user:
+   487→        raise HTTPException(status_code=404, detail="User not found")
+   488→
+   489→    if not user.is_banned:
+   490→        raise HTTPException(status_code=400, detail="User is not banned")
+   491→
+   492→    user.is_banned = False
+   493→    await db.commit()
+   494→
+   495→    return BanUserResponse(
+   496→        user_id=user.id,
+   497→        username=user.username,
+   498→        is_banned=False,
+   499→        message=f"User {user.username} has been unbanned"
+   500→    )
+   501→
+   502→
+   503→@router.get("/users/banned")
+   504→async def list_banned_users(
+   505→    limit: int = Query(50, ge=1, le=100),
+   506→    offset: int = Query(0, ge=0),
+   507→    current_user: User = Depends(require_admin),
+   508→    db: AsyncSession = Depends(get_db),
+   509→):
+   510→    """List all banned users."""
+   511→    query = (
+   512→        select(User)
+   513→        .where(User.is_banned == True)
+   514→        .order_by(User.updated_at.desc())
+   515→        .offset(offset)
+   516→        .limit(limit)
+   517→    )
+   518→    result = await db.execute(query)
+   519→    users = result.scalars().all()
+   520→
+   521→    # Get total count
+   522→    count_result = await db.execute(
+   523→        select(func.count(User.id)).where(User.is_banned == True)
+   524→    )
+   525→    total_count = count_result.scalar() or 0
+   526→
+   527→    return {
+   528→        "users": [
+   529→            {
+   530→                "id": str(u.id),
+   531→                "username": u.username,
+   532→                "email": u.email,
+   533→                "is_banned": u.is_banned,
+   534→                "created_at": u.created_at.isoformat() if u.created_at else None,
+   535→                "updated_at": u.updated_at.isoformat() if u.updated_at else None,
+   536→            }
+   537→            for u in users
+   538→        ],
+   539→        "total_count": total_count,
+   540→        "has_more": offset + limit < total_count,
+   541→    }
+   542→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

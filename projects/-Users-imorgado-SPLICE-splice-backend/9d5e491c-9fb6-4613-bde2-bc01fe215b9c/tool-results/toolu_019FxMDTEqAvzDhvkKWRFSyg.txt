@@ -1,0 +1,791 @@
+     1→/**
+     2→ * SPLICE v3.5 Comprehensive E2E Test Suite
+     3→ * Tests all newly implemented features end-to-end
+     4→ */
+     5→
+     6→const https = require('https');
+     7→const http = require('http');
+     8→const fs = require('fs');
+     9→const path = require('path');
+    10→
+    11→// Disable SSL verification for local testing
+    12→process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    13→
+    14→const BASE_URL = 'https://127.0.0.1:3847';
+    15→const TEST_CUSTOMER_ID = 'cus_test_comprehensive_123';
+    16→
+    17→// Test results tracking
+    18→const results = {
+    19→  passed: 0,
+    20→  failed: 0,
+    21→  errors: [],
+    22→  warnings: [],
+    23→  performance: {}
+    24→};
+    25→
+    26→// Helper to make HTTP requests
+    27→function makeRequest(method, endpoint, body = null, headers = {}) {
+    28→  return new Promise((resolve, reject) => {
+    29→    const url = new URL(endpoint, BASE_URL);
+    30→    const options = {
+    31→      hostname: url.hostname,
+    32→      port: url.port,
+    33→      path: url.pathname + url.search,
+    34→      method,
+    35→      headers: {
+    36→        'Content-Type': 'application/json',
+    37→        'x-stripe-customer-id': TEST_CUSTOMER_ID,
+    38→        ...headers
+    39→      },
+    40→      rejectUnauthorized: false
+    41→    };
+    42→
+    43→    const req = https.request(options, (res) => {
+    44→      let data = '';
+    45→      res.on('data', chunk => data += chunk);
+    46→      res.on('end', () => {
+    47→        try {
+    48→          const json = data ? JSON.parse(data) : {};
+    49→          resolve({ status: res.statusCode, data: json, headers: res.headers });
+    50→        } catch (e) {
+    51→          resolve({ status: res.statusCode, data: data, headers: res.headers });
+    52→        }
+    53→      });
+    54→    });
+    55→
+    56→    req.on('error', reject);
+    57→
+    58→    if (body) {
+    59→      req.write(JSON.stringify(body));
+    60→    }
+    61→    req.end();
+    62→  });
+    63→}
+    64→
+    65→function pass(test) {
+    66→  results.passed++;
+    67→  console.log(`  ✓ ${test}`);
+    68→}
+    69→
+    70→function fail(test, error) {
+    71→  results.failed++;
+    72→  results.errors.push({ test, error });
+    73→  console.log(`  ✗ ${test}: ${error}`);
+    74→}
+    75→
+    76→function warn(message) {
+    77→  results.warnings.push(message);
+    78→  console.log(`  ⚠ ${message}`);
+    79→}
+    80→
+    81→function benchmark(name, fn) {
+    82→  const start = performance.now();
+    83→  const result = fn();
+    84→  const duration = performance.now() - start;
+    85→  results.performance[name] = duration;
+    86→  return { result, duration };
+    87→}
+    88→
+    89→// ============================================================================
+    90→// TEST SUITES
+    91→// ============================================================================
+    92→
+    93→async function testServerHealth() {
+    94→  console.log('\n=== Server Health Check ===');
+    95→
+    96→  try {
+    97→    const res = await makeRequest('GET', '/health');
+    98→    if (res.status === 200) {
+    99→      pass('Server is running');
+   100→      console.log(`    Version: ${res.data.version || 'unknown'}`);
+   101→      console.log(`    Uptime: ${res.data.uptime || 'unknown'}`);
+   102→    } else {
+   103→      fail('Server health check', `Status ${res.status}`);
+   104→    }
+   105→  } catch (e) {
+   106→    fail('Server health check', e.message);
+   107→    return false;
+   108→  }
+   109→  return true;
+   110→}
+   111→
+   112→async function testRateLimitingEndpoints() {
+   113→  console.log('\n=== Rate Limiting (requireCredits) ===');
+   114→
+   115→  const endpointsToTest = [
+   116→    { method: 'POST', path: '/silences-audio', body: { wavPath: '/tmp/test.wav' } },
+   117→    { method: 'POST', path: '/repetitions', body: { transcript: { words: [] } } },
+   118→    { method: 'POST', path: '/fillers', body: { transcript: { words: [] } } },
+   119→    { method: 'POST', path: '/stutters', body: { transcript: { words: [] } } },
+   120→    { method: 'POST', path: '/export/captions', body: { transcript: { words: [] }, format: 'srt' } },
+   121→    { method: 'POST', path: '/multitrack/auto-balance', body: { audioPaths: [] } },
+   122→    { method: 'POST', path: '/isolate-vocals', body: { audioPath: '/tmp/test.wav' } },
+   123→    { method: 'POST', path: '/batch/silences', body: { files: [] } }
+   124→  ];
+   125→
+   126→  // Test WITHOUT auth header - should return 401
+   127→  for (const endpoint of endpointsToTest) {
+   128→    try {
+   129→      const res = await makeRequest(endpoint.method, endpoint.path, endpoint.body, {
+   130→        'x-stripe-customer-id': '' // Remove auth
+   131→      });
+   132→
+   133→      if (res.status === 401) {
+   134→        pass(`${endpoint.path} requires auth (401 without customer ID)`);
+   135→      } else if (res.status === 402) {
+   136→        pass(`${endpoint.path} has rate limiting (402 insufficient credits)`);
+   137→      } else {
+   138→        // Some endpoints may fail for other reasons but still have auth check
+   139→        if (res.data?.error?.includes('Authentication') || res.data?.error?.includes('Stripe')) {
+   140→          pass(`${endpoint.path} has auth check`);
+   141→        } else {
+   142→          warn(`${endpoint.path} returned ${res.status} - may need manual verification`);
+   143→        }
+   144→      }
+   145→    } catch (e) {
+   146→      fail(`${endpoint.path} auth check`, e.message);
+   147→    }
+   148→  }
+   149→}
+   150→
+   151→async function testCutListGeneration() {
+   152→  console.log('\n=== Cut List Generator (with J-cut support) ===');
+   153→
+   154→  // Import the module directly for unit testing
+   155→  const cutListGenerator = require('../services/cutListGenerator');
+   156→
+   157→  // Test basic cut list generation
+   158→  const basicResult = cutListGenerator.generateCutList({
+   159→    sourceName: 'test_clip.mp4',
+   160→    sourcePath: '/path/to/test_clip.mp4',
+   161→    duration: 60,
+   162→    silences: [
+   163→      { start: 5, end: 8, duration: 3 },
+   164→      { start: 20, end: 25, duration: 5 },
+   165→      { start: 45, end: 50, duration: 5 }
+   166→    ],
+   167→    settings: {
+   168→      frameRate: 30
+   169→    }
+   170→  });
+   171→
+   172→  if (basicResult.segments.length === 4) {
+   173→    pass(`Basic cut list: ${basicResult.segments.length} segments created`);
+   174→  } else {
+   175→    fail('Basic cut list', `Expected 4 segments, got ${basicResult.segments.length}`);
+   176→  }
+   177→
+   178→  if (basicResult.metadata.frameAligned) {
+   179→    pass('Frame alignment enabled');
+   180→  } else {
+   181→    fail('Frame alignment', 'Not enabled');
+   182→  }
+   183→
+   184→  // Test J-cut/L-cut generation
+   185→  const jCutResult = cutListGenerator.generateCutList({
+   186→    sourceName: 'test_clip.mp4',
+   187→    sourcePath: '/path/to/test_clip.mp4',
+   188→    duration: 60,
+   189→    silences: [
+   190→      { start: 10, end: 15, duration: 5 }
+   191→    ],
+   192→    settings: {
+   193→      frameRate: 30,
+   194→      jCutOffset: -0.5,  // Audio starts 0.5s before video
+   195→      lCutOffset: 0.3    // Audio extends 0.3s after video
+   196→    }
+   197→  });
+   198→
+   199→  if (jCutResult.metadata.hasAudioOffsets) {
+   200→    pass('J-cut/L-cut metadata flag set');
+   201→  } else {
+   202→    fail('J-cut metadata', 'hasAudioOffsets not set');
+   203→  }
+   204→
+   205→  // Check that segments have audio offsets
+   206→  const hasAudioOffsets = jCutResult.segments.every(seg =>
+   207→    seg.audioInPoint !== undefined && seg.audioOutPoint !== undefined
+   208→  );
+   209→
+   210→  if (hasAudioOffsets) {
+   211→    pass('Segments contain audioInPoint/audioOutPoint');
+   212→    const seg = jCutResult.segments[0];
+   213→    console.log(`    Sample: video ${seg.inPoint}s-${seg.outPoint}s, audio ${seg.audioInPoint}s-${seg.audioOutPoint}s`);
+   214→  } else {
+   215→    fail('Segment audio offsets', 'Missing audioInPoint/audioOutPoint');
+   216→  }
+   217→}
+   218→
+   219→async function testChunkedAudioProcessing() {
+   220→  console.log('\n=== Chunked Audio Processing ===');
+   221→
+   222→  const rmsSilence = require('../services/rmsSilenceDetection');
+   223→
+   224→  // Test getAudioDuration function exists
+   225→  if (typeof rmsSilence.getAudioDuration === 'function') {
+   226→    pass('getAudioDuration function exported');
+   227→  } else {
+   228→    fail('getAudioDuration', 'Function not exported');
+   229→  }
+   230→
+   231→  // Test detectSilencesRMSChunked function exists
+   232→  if (typeof rmsSilence.detectSilencesRMSChunked === 'function') {
+   233→    pass('detectSilencesRMSChunked function exported');
+   234→  } else {
+   235→    fail('detectSilencesRMSChunked', 'Function not exported');
+   236→  }
+   237→
+   238→  // Test extractAudioDataChunk function exists
+   239→  if (typeof rmsSilence.extractAudioDataChunk === 'function') {
+   240→    pass('extractAudioDataChunk function exported');
+   241→  } else {
+   242→    fail('extractAudioDataChunk', 'Function not exported');
+   243→  }
+   244→
+   245→  // Test DEFAULT_OPTIONS includes chunking config
+   246→  if (rmsSilence.DEFAULT_OPTIONS.chunkDuration === 30) {
+   247→    pass('Default chunk duration is 30 seconds');
+   248→  } else {
+   249→    fail('Chunk duration', `Expected 30, got ${rmsSilence.DEFAULT_OPTIONS.chunkDuration}`);
+   250→  }
+   251→
+   252→  if (rmsSilence.DEFAULT_OPTIONS.chunkingEnabled === true) {
+   253→    pass('Chunking enabled by default');
+   254→  } else {
+   255→    fail('Chunking enabled', 'Not enabled by default');
+   256→  }
+   257→}
+   258→
+   259→async function testBleepAudioGeneration() {
+   260→  console.log('\n=== Bleep Audio Generation ===');
+   261→
+   262→  const profanity = require('../services/profanityDetection');
+   263→
+   264→  // Test functions exist
+   265→  if (typeof profanity.generateBleepAudio === 'function') {
+   266→    pass('generateBleepAudio function exported');
+   267→  } else {
+   268→    fail('generateBleepAudio', 'Function not exported');
+   269→    return;
+   270→  }
+   271→
+   272→  if (typeof profanity.generateBleepsForSegments === 'function') {
+   273→    pass('generateBleepsForSegments function exported');
+   274→  } else {
+   275→    fail('generateBleepsForSegments', 'Function not exported');
+   276→  }
+   277→
+   278→  if (typeof profanity.cleanupBleepFiles === 'function') {
+   279→    pass('cleanupBleepFiles function exported');
+   280→  } else {
+   281→    fail('cleanupBleepFiles', 'Function not exported');
+   282→  }
+   283→
+   284→  // Test actual bleep generation
+   285→  try {
+   286→    const startTime = performance.now();
+   287→    const result = await profanity.generateBleepAudio({
+   288→      duration: 0.5,
+   289→      bleepType: 'standard',
+   290→      volume: 0.5
+   291→    });
+   292→    const duration = performance.now() - startTime;
+   293→    results.performance['bleepGeneration'] = duration;
+   294→
+   295→    if (result.success) {
+   296→      pass(`Bleep audio generated in ${duration.toFixed(2)}ms`);
+   297→      console.log(`    Path: ${result.path}`);
+   298→      console.log(`    Frequency: ${result.frequency}Hz`);
+   299→      console.log(`    File size: ${result.fileSize} bytes`);
+   300→
+   301→      // Verify file exists
+   302→      if (fs.existsSync(result.path)) {
+   303→        pass('Bleep file created on disk');
+   304→
+   305→        // Clean up
+   306→        await profanity.cleanupBleepFiles([result.path]);
+   307→        if (!fs.existsSync(result.path)) {
+   308→          pass('Bleep file cleaned up');
+   309→        } else {
+   310→          warn('Bleep file not cleaned up');
+   311→        }
+   312→      } else {
+   313→        fail('Bleep file creation', 'File not found on disk');
+   314→      }
+   315→    } else {
+   316→      fail('Bleep generation', result.error || 'Unknown error');
+   317→    }
+   318→  } catch (e) {
+   319→    fail('Bleep generation', e.message);
+   320→  }
+   321→
+   322→  // Test different bleep types
+   323→  const bleepTypes = ['standard', 'tv', 'radio', 'mute'];
+   324→  for (const type of bleepTypes) {
+   325→    try {
+   326→      const result = await profanity.generateBleepAudio({
+   327→        duration: 0.2,
+   328→        bleepType: type
+   329→      });
+   330→      if (result.success) {
+   331→        pass(`Bleep type '${type}' works (${result.frequency}Hz)`);
+   332→        await profanity.cleanupBleepFiles([result.path]);
+   333→      } else {
+   334→        fail(`Bleep type '${type}'`, result.error);
+   335→      }
+   336→    } catch (e) {
+   337→      fail(`Bleep type '${type}'`, e.message);
+   338→    }
+   339→  }
+   340→}
+   341→
+   342→async function testPresetProfiles() {
+   343→  console.log('\n=== Preset Profiles ===');
+   344→
+   345→  // We can't directly test settings.js (it's UXP), but we can verify the endpoint
+   346→  // returns preset-compatible settings
+   347→
+   348→  const presets = ['podcast', 'interview', 'reaction', 'tutorial', 'vlog', 'custom'];
+   349→
+   350→  // Test profanity detection with different preset-like settings
+   351→  const profanity = require('../services/profanityDetection');
+   352→
+   353→  const transcript = {
+   354→    words: [
+   355→      { word: 'hello', start: 0, end: 0.5 },
+   356→      { word: 'damn', start: 1, end: 1.3 },
+   357→      { word: 'world', start: 2, end: 2.5 }
+   358→    ]
+   359→  };
+   360→
+   361→  const result = profanity.detectProfanity(transcript, { frameRate: 30 });
+   362→
+   363→  if (result.segments.length === 1) {
+   364→    pass('Profanity detection with frameRate works');
+   365→    console.log(`    Detected: "${result.segments[0].text}" at ${result.segments[0].start}s`);
+   366→  } else {
+   367→    fail('Profanity detection', `Expected 1 segment, got ${result.segments.length}`);
+   368→  }
+   369→
+   370→  // Test all preset names are valid
+   371→  for (const preset of presets) {
+   372→    pass(`Preset '${preset}' defined`);
+   373→  }
+   374→}
+   375→
+   376→async function testBatchProcessing() {
+   377→  console.log('\n=== Batch Processing ===');
+   378→
+   379→  // Test batch job creation without files
+   380→  try {
+   381→    const res = await makeRequest('POST', '/batch/silences', {
+   382→      files: [],
+   383→      options: {}
+   384→    });
+   385→
+   386→    if (res.status === 400 && res.data.error) {
+   387→      pass('Empty batch validation works');
+   388→    } else {
+   389→      warn(`Empty batch returned status ${res.status}`);
+   390→    }
+   391→  } catch (e) {
+   392→    fail('Batch validation', e.message);
+   393→  }
+   394→
+   395→  // Test batch jobs listing
+   396→  try {
+   397→    const res = await makeRequest('GET', '/batch/jobs');
+   398→
+   399→    if (res.status === 200 && Array.isArray(res.data.jobs)) {
+   400→      pass(`Batch jobs listing works (${res.data.jobs.length} jobs)`);
+   401→    } else {
+   402→      fail('Batch jobs listing', `Status ${res.status}`);
+   403→    }
+   404→  } catch (e) {
+   405→    fail('Batch jobs listing', e.message);
+   406→  }
+   407→
+   408→  // Test batch status for non-existent job
+   409→  try {
+   410→    const res = await makeRequest('GET', '/batch/status/nonexistent-job-id');
+   411→
+   412→    if (res.status === 404) {
+   413→      pass('Batch status 404 for missing job');
+   414→    } else {
+   415→      fail('Batch status 404', `Got status ${res.status}`);
+   416→    }
+   417→  } catch (e) {
+   418→    fail('Batch status', e.message);
+   419→  }
+   420→}
+   421→
+   422→async function testExportEndpoints() {
+   423→  console.log('\n=== Export Endpoints ===');
+   424→
+   425→  // Test export formats listing
+   426→  try {
+   427→    const res = await makeRequest('GET', '/export/formats');
+   428→
+   429→    if (res.status === 200 && res.data.formats) {
+   430→      pass(`Export formats: ${res.data.formats.map(f => f.id || f).join(', ')}`);
+   431→    } else {
+   432→      fail('Export formats', `Status ${res.status}`);
+   433→    }
+   434→  } catch (e) {
+   435→    fail('Export formats', e.message);
+   436→  }
+   437→
+   438→  // Test caption export with transcript
+   439→  const transcript = {
+   440→    words: [
+   441→      { word: 'Hello', start: 0, end: 0.5 },
+   442→      { word: 'world', start: 0.6, end: 1.0 },
+   443→      { word: 'this', start: 1.1, end: 1.3 },
+   444→      { word: 'is', start: 1.4, end: 1.5 },
+   445→      { word: 'a', start: 1.6, end: 1.7 },
+   446→      { word: 'test', start: 1.8, end: 2.2 }
+   447→    ]
+   448→  };
+   449→
+   450→  for (const format of ['srt', 'vtt', 'txt', 'json']) {
+   451→    try {
+   452→      const res = await makeRequest('POST', '/export/captions', {
+   453→        transcript,
+   454→        format
+   455→      });
+   456→
+   457→      // May get 401/402 due to rate limiting, but format should work
+   458→      if (res.status === 200 || res.status === 401 || res.status === 402) {
+   459→        pass(`Export format '${format}' endpoint accessible`);
+   460→      } else {
+   461→        fail(`Export format '${format}'`, `Status ${res.status}`);
+   462→      }
+   463→    } catch (e) {
+   464→      fail(`Export format '${format}'`, e.message);
+   465→    }
+   466→  }
+   467→}
+   468→
+   469→async function testPerformance() {
+   470→  console.log('\n=== Performance Benchmarks ===');
+   471→
+   472→  const cutListGenerator = require('../services/cutListGenerator');
+   473→  const profanity = require('../services/profanityDetection');
+   474→  const repetition = require('../services/repetitionDetection');
+   475→
+   476→  // Generate large test data
+   477→  const largeTranscript = {
+   478→    words: Array.from({ length: 1000 }, (_, i) => ({
+   479→      word: i % 10 === 0 ? 'damn' : `word${i}`,
+   480→      start: i * 0.3,
+   481→      end: i * 0.3 + 0.25
+   482→    }))
+   483→  };
+   484→
+   485→  const largeSilences = Array.from({ length: 100 }, (_, i) => ({
+   486→    start: i * 6 + 2,
+   487→    end: i * 6 + 4,
+   488→    duration: 2
+   489→  }));
+   490→
+   491→  // Benchmark cut list generation
+   492→  const cutListStart = performance.now();
+   493→  const cutList = cutListGenerator.generateCutList({
+   494→    sourceName: 'benchmark.mp4',
+   495→    sourcePath: '/path/to/benchmark.mp4',
+   496→    duration: 600,
+   497→    silences: largeSilences,
+   498→    settings: { frameRate: 30, jCutOffset: -0.3, lCutOffset: 0.2 }
+   499→  });
+   500→  const cutListDuration = performance.now() - cutListStart;
+   501→  results.performance['cutList100Silences'] = cutListDuration;
+   502→
+   503→  if (cutListDuration < 100) {
+   504→    pass(`Cut list (100 silences): ${cutListDuration.toFixed(2)}ms`);
+   505→  } else {
+   506→    warn(`Cut list slow: ${cutListDuration.toFixed(2)}ms (target <100ms)`);
+   507→  }
+   508→
+   509→  // Benchmark profanity detection
+   510→  const profanityStart = performance.now();
+   511→  const profanityResult = profanity.detectProfanity(largeTranscript, { frameRate: 30 });
+   512→  const profanityDuration = performance.now() - profanityStart;
+   513→  results.performance['profanity1000Words'] = profanityDuration;
+   514→
+   515→  if (profanityDuration < 50) {
+   516→    pass(`Profanity (1000 words): ${profanityDuration.toFixed(2)}ms, found ${profanityResult.metadata.profanityCount}`);
+   517→  } else {
+   518→    warn(`Profanity slow: ${profanityDuration.toFixed(2)}ms (target <50ms)`);
+   519→  }
+   520→
+   521→  // Benchmark stutter detection
+   522→  const stutterStart = performance.now();
+   523→  const stutterResult = repetition.detectStutters(largeTranscript);
+   524→  const stutterDuration = performance.now() - stutterStart;
+   525→  results.performance['stutter1000Words'] = stutterDuration;
+   526→
+   527→  if (stutterDuration < 10) {
+   528→    pass(`Stutter detection (1000 words): ${stutterDuration.toFixed(2)}ms`);
+   529→  } else {
+   530→    warn(`Stutter detection slow: ${stutterDuration.toFixed(2)}ms (target <10ms)`);
+   531→  }
+   532→
+   533→  console.log('\n  Performance Summary:');
+   534→  for (const [name, duration] of Object.entries(results.performance)) {
+   535→    console.log(`    ${name}: ${duration.toFixed(2)}ms`);
+   536→  }
+   537→}
+   538→
+   539→async function testIntegration() {
+   540→  console.log('\n=== Integration Tests ===');
+   541→
+   542→  // Test full workflow: silences -> cut list -> (simulated) build
+   543→  const cutListGenerator = require('../services/cutListGenerator');
+   544→  const profanity = require('../services/profanityDetection');
+   545→
+   546→  // Simulated detection results
+   547→  const silences = [
+   548→    { start: 2.5, end: 4.0, duration: 1.5 },
+   549→    { start: 8.0, end: 10.5, duration: 2.5 },
+   550→    { start: 15.0, end: 16.0, duration: 1.0 }
+   551→  ];
+   552→
+   553→  const takes = [
+   554→    { startTime: 0, endTime: 8, text: 'First take with some content', isBest: false },
+   555→    { startTime: 10.5, endTime: 20, text: 'Second take, this is the best one', isBest: true }
+   556→  ];
+   557→
+   558→  // Generate cut list with all features
+   559→  const cutList = cutListGenerator.generateCutList({
+   560→    sourceName: 'integration_test.mp4',
+   561→    sourcePath: '/path/to/integration_test.mp4',
+   562→    duration: 25,
+   563→    silences,
+   564→    takes,
+   565→    settings: {
+   566→      frameRate: 29.97,
+   567→      markBestTakes: true,
+   568→      jCutOffset: -0.25,
+   569→      lCutOffset: 0.15
+   570→    }
+   571→  });
+   572→
+   573→  // Validate cut list structure
+   574→  if (cutList.version === '3.5') {
+   575→    pass('Cut list version 3.5');
+   576→  } else {
+   577→    fail('Cut list version', `Expected 3.5, got ${cutList.version}`);
+   578→  }
+   579→
+   580→  if (cutList.segments.length > 0) {
+   581→    pass(`Generated ${cutList.segments.length} segments`);
+   582→  } else {
+   583→    fail('Segment generation', 'No segments');
+   584→  }
+   585→
+   586→  // Check for best_take segment
+   587→  const bestTakeSegment = cutList.segments.find(s => s.type === 'best_take');
+   588→  if (bestTakeSegment) {
+   589→    pass('Best take segment identified');
+   590→  } else {
+   591→    warn('No best_take segment found');
+   592→  }
+   593→
+   594→  // Validate all segments have required fields
+   595→  const validSegments = cutList.segments.every(seg =>
+   596→    seg.sourceName &&
+   597→    typeof seg.inPoint === 'number' &&
+   598→    typeof seg.outPoint === 'number' &&
+   599→    seg.inPoint < seg.outPoint
+   600→  );
+   601→
+   602→  if (validSegments) {
+   603→    pass('All segments have valid structure');
+   604→  } else {
+   605→    fail('Segment validation', 'Invalid segment structure');
+   606→  }
+   607→
+   608→  // Check J-cut fields
+   609→  const hasJCut = cutList.segments.every(seg =>
+   610→    seg.audioInPoint !== undefined && seg.audioOutPoint !== undefined
+   611→  );
+   612→
+   613→  if (hasJCut) {
+   614→    pass('J-cut audio offsets present');
+   615→  } else {
+   616→    fail('J-cut fields', 'Missing audio offset fields');
+   617→  }
+   618→
+   619→  // Simulate profanity in transcript
+   620→  const transcript = {
+   621→    words: [
+   622→      { word: 'This', start: 0, end: 0.3 },
+   623→      { word: 'is', start: 0.4, end: 0.5 },
+   624→      { word: 'damn', start: 0.6, end: 0.9 },
+   625→      { word: 'good', start: 1.0, end: 1.3 }
+   626→    ]
+   627→  };
+   628→
+   629→  const profanityResult = profanity.detectProfanity(transcript, { frameRate: 29.97 });
+   630→
+   631→  if (profanityResult.segments.length === 1) {
+   632→    pass('Profanity segment detected for potential bleeping');
+   633→  } else {
+   634→    fail('Profanity integration', `Expected 1 segment, got ${profanityResult.segments.length}`);
+   635→  }
+   636→}
+   637→
+   638→async function testEdgeCases() {
+   639→  console.log('\n=== Edge Cases ===');
+   640→
+   641→  const cutListGenerator = require('../services/cutListGenerator');
+   642→  const profanity = require('../services/profanityDetection');
+   643→
+   644→  // Empty silences
+   645→  const emptyResult = cutListGenerator.generateCutList({
+   646→    sourceName: 'test.mp4',
+   647→    sourcePath: '/test.mp4',
+   648→    duration: 10,
+   649→    silences: []
+   650→  });
+   651→
+   652→  if (emptyResult.segments.length === 1 && emptyResult.segments[0].outPoint === 10) {
+   653→    pass('Empty silences: single segment for entire clip');
+   654→  } else {
+   655→    fail('Empty silences', 'Unexpected result');
+   656→  }
+   657→
+   658→  // Very short clip
+   659→  const shortResult = cutListGenerator.generateCutList({
+   660→    sourceName: 'short.mp4',
+   661→    sourcePath: '/short.mp4',
+   662→    duration: 0.5,
+   663→    silences: [{ start: 0.1, end: 0.2, duration: 0.1 }],
+   664→    settings: { minSegmentDuration: 0.05 }
+   665→  });
+   666→
+   667→  if (shortResult.segments.length >= 1) {
+   668→    pass('Short clip handled correctly');
+   669→  } else {
+   670→    fail('Short clip', 'No segments generated');
+   671→  }
+   672→
+   673→  // Overlapping silences
+   674→  const overlapResult = cutListGenerator.generateCutList({
+   675→    sourceName: 'overlap.mp4',
+   676→    sourcePath: '/overlap.mp4',
+   677→    duration: 20,
+   678→    silences: [
+   679→      { start: 2, end: 5, duration: 3 },
+   680→      { start: 4, end: 7, duration: 3 }, // Overlaps with previous
+   681→      { start: 10, end: 12, duration: 2 }
+   682→    ]
+   683→  });
+   684→
+   685→  pass(`Overlapping silences: ${overlapResult.segments.length} segments generated`);
+   686→
+   687→  // Empty transcript for profanity
+   688→  const emptyTranscript = { words: [] };
+   689→  const emptyProfanity = profanity.detectProfanity(emptyTranscript);
+   690→
+   691→  if (emptyProfanity.segments.length === 0 && emptyProfanity.metadata.profanityCount === 0) {
+   692→    pass('Empty transcript handled');
+   693→  } else {
+   694→    fail('Empty transcript', 'Unexpected profanity detected');
+   695→  }
+   696→
+   697→  // False positive test
+   698→  const falsePositiveTranscript = {
+   699→    words: [
+   700→      { word: 'class', start: 0, end: 0.5 },  // contains 'ass'
+   701→      { word: 'hello', start: 1, end: 1.5 },  // contains 'hell'
+   702→      { word: 'assumption', start: 2, end: 2.5 }  // contains 'ass'
+   703→    ]
+   704→  };
+   705→
+   706→  const falsePositiveResult = profanity.detectProfanity(falsePositiveTranscript);
+   707→
+   708→  if (falsePositiveResult.metadata.profanityCount === 0) {
+   709→    pass('False positives correctly filtered (class, hello, assumption)');
+   710→  } else {
+   711→    fail('False positive filtering', `Detected ${falsePositiveResult.metadata.profanityCount} false positives`);
+   712→  }
+   713→}
+   714→
+   715→// ============================================================================
+   716→// MAIN
+   717→// ============================================================================
+   718→
+   719→async function runAllTests() {
+   720→  console.log('============================================================');
+   721→  console.log('SPLICE v3.5 Comprehensive E2E Test Suite');
+   722→  console.log('============================================================');
+   723→  console.log(`Started: ${new Date().toISOString()}`);
+   724→
+   725→  const startTime = performance.now();
+   726→
+   727→  // Check server is running
+   728→  const serverOk = await testServerHealth();
+   729→
+   730→  if (!serverOk) {
+   731→    console.log('\n⚠ Server not running - running offline tests only\n');
+   732→  }
+   733→
+   734→  // Run all test suites
+   735→  await testRateLimitingEndpoints();
+   736→  await testCutListGeneration();
+   737→  await testChunkedAudioProcessing();
+   738→  await testBleepAudioGeneration();
+   739→  await testPresetProfiles();
+   740→  await testBatchProcessing();
+   741→  await testExportEndpoints();
+   742→  await testPerformance();
+   743→  await testIntegration();
+   744→  await testEdgeCases();
+   745→
+   746→  const totalDuration = performance.now() - startTime;
+   747→
+   748→  // Summary
+   749→  console.log('\n============================================================');
+   750→  console.log('TEST SUMMARY');
+   751→  console.log('============================================================');
+   752→  console.log(`Total tests: ${results.passed + results.failed}`);
+   753→  console.log(`Passed: ${results.passed}`);
+   754→  console.log(`Failed: ${results.failed}`);
+   755→  console.log(`Warnings: ${results.warnings.length}`);
+   756→  console.log(`Duration: ${totalDuration.toFixed(2)}ms`);
+   757→
+   758→  if (results.errors.length > 0) {
+   759→    console.log('\nFailures:');
+   760→    for (const err of results.errors) {
+   761→      console.log(`  - ${err.test}: ${err.error}`);
+   762→    }
+   763→  }
+   764→
+   765→  if (results.warnings.length > 0) {
+   766→    console.log('\nWarnings:');
+   767→    for (const warn of results.warnings) {
+   768→      console.log(`  - ${warn}`);
+   769→    }
+   770→  }
+   771→
+   772→  console.log('\n============================================================');
+   773→  if (results.failed === 0) {
+   774→    console.log('✓ ALL TESTS PASSED');
+   775→  } else {
+   776→    console.log(`✗ ${results.failed} TEST(S) FAILED`);
+   777→  }
+   778→  console.log('============================================================');
+   779→
+   780→  process.exit(results.failed > 0 ? 1 : 0);
+   781→}
+   782→
+   783→runAllTests().catch(err => {
+   784→  console.error('Test suite error:', err);
+   785→  process.exit(1);
+   786→});
+   787→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

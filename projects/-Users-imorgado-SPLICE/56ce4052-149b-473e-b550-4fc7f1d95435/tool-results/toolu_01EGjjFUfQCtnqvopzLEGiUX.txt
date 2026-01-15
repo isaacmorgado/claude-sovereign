@@ -1,0 +1,172 @@
+     1→/**
+     2→ * Export Routes
+     3→ *
+     4→ * Caption export endpoints (SRT, VTT, TXT, JSON)
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const { transcribeWithWords } = require('../services/transcription');
+     9→const {
+    10→  toSRT,
+    11→  toVTT,
+    12→  toPlainText,
+    13→  toJSON,
+    14→  exportToFile,
+    15→  getSupportedFormats
+    16→} = require('../services/captionExporter');
+    17→const { validateAudioPath, validatePath } = require('../services/securityUtils');
+    18→
+    19→/**
+    20→ * Create export routes
+    21→ * @param {Object} options - Route configuration options
+    22→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    23→ * @param {Object} options.staticCache - Static response cache
+    24→ * @returns {express.Router}
+    25→ */
+    26→function createExportRoutes(options = {}) {
+    27→  const router = express.Router();
+    28→  const { requireCredits } = options.middleware || {};
+    29→  const { staticCache, sendCachedResponse } = options;
+    30→
+    31→  /**
+    32→   * POST /captions - Export transcript to caption format (SRT, VTT, etc.)
+    33→   *
+    34→   * Converts a transcript to the specified caption format.
+    35→   * Can optionally save to file.
+    36→   *
+    37→   * Options:
+    38→   * - wavPath: Path to audio file (to transcribe first)
+    39→   * - transcript: Pre-existing transcript with word-level timing
+    40→   * - format: Export format (srt, vtt, txt, json) - default: srt
+    41→   * - outputPath: Optional file path to save to
+    42→   * - maxWordsPerCaption: Max words per caption (default: 8)
+    43→   * - maxDuration: Max duration per caption in seconds (default: 5)
+    44→   */
+    45→  router.post('/captions', requireCredits({ endpoint: 'export-captions' }), async (req, res) => {
+    46→    const {
+    47→      wavPath,
+    48→      transcript: providedTranscript,
+    49→      format = 'srt',
+    50→      outputPath = null,
+    51→      maxWordsPerCaption = 8,
+    52→      maxDuration = 5
+    53→    } = req.body;
+    54→
+    55→    if (!wavPath && !providedTranscript) {
+    56→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+    57→    }
+    58→
+    59→    // SECURITY: Validate wavPath to prevent path traversal attacks
+    60→    let validatedWavPath = null;
+    61→    if (wavPath) {
+    62→      const wavValidation = await validateAudioPath(wavPath);
+    63→      if (!wavValidation.valid) {
+    64→        return res.status(400).json({ error: `Invalid audio path: ${wavValidation.error}` });
+    65→      }
+    66→      validatedWavPath = wavValidation.path;
+    67→    }
+    68→
+    69→    // SECURITY: Validate outputPath to prevent path traversal attacks
+    70→    if (outputPath) {
+    71→      const outputValidation = await validatePath(outputPath, {
+    72→        mustExist: false,
+    73→        allowedExtensions: ['.srt', '.vtt', '.txt', '.json']
+    74→      });
+    75→      if (!outputValidation.valid) {
+    76→        return res.status(400).json({ error: `Invalid output path: ${outputValidation.error}` });
+    77→      }
+    78→    }
+    79→
+    80→    console.log(`[SPLICE] Caption export: ${validatedWavPath || 'provided transcript'} -> ${format}`);
+    81→
+    82→    try {
+    83→      // Get or create transcript with word-level timestamps
+    84→      let transcript = providedTranscript;
+    85→      if (!transcript && validatedWavPath) {
+    86→        transcript = await transcribeWithWords(validatedWavPath);
+    87→      }
+    88→
+    89→      const exportOptions = { maxWordsPerCaption, maxDuration };
+    90→
+    91→      // Generate caption content based on format
+    92→      let content;
+    93→      let mimeType;
+    94→
+    95→      switch (format.toLowerCase()) {
+    96→        case 'srt':
+    97→          content = toSRT(transcript, exportOptions);
+    98→          mimeType = 'application/x-subrip';
+    99→          break;
+   100→        case 'vtt':
+   101→        case 'webvtt':
+   102→          content = toVTT(transcript, exportOptions);
+   103→          mimeType = 'text/vtt';
+   104→          break;
+   105→        case 'txt':
+   106→        case 'text':
+   107→          content = toPlainText(transcript, { ...exportOptions, includeTimestamps: true });
+   108→          mimeType = 'text/plain';
+   109→          break;
+   110→        case 'json':
+   111→          content = toJSON(transcript);
+   112→          mimeType = 'application/json';
+   113→          break;
+   114→        default:
+   115→          return res.status(400).json({
+   116→            error: `Unsupported format: ${format}`,
+   117→            supportedFormats: getSupportedFormats()
+   118→          });
+   119→      }
+   120→
+   121→      // Save to file if outputPath provided
+   122→      let savedPath = null;
+   123→      if (outputPath) {
+   124→        const result = await exportToFile(transcript, outputPath, format, exportOptions);
+   125→        savedPath = result.path;
+   126→        console.log(`[SPLICE] Saved captions to: ${savedPath}`);
+   127→      }
+   128→
+   129→      // Deduct usage based on audio duration
+   130→      const audioDuration = transcript.duration || 0;
+   131→      let balance = null;
+   132→      if (audioDuration > 0 && req.deductUsage) {
+   133→        balance = await req.deductUsage(audioDuration);
+   134→      }
+   135→
+   136→      res.json({
+   137→        success: true,
+   138→        format,
+   139→        content,
+   140→        mimeType,
+   141→        savedPath,
+   142→        wordCount: transcript.words?.length || 0,
+   143→        duration: transcript.duration || 0,
+   144→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   145→      });
+   146→    } catch (err) {
+   147→      console.error('[SPLICE] Caption export error:', err);
+   148→      res.status(500).json({ error: err.message });
+   149→    }
+   150→  });
+   151→
+   152→  /**
+   153→   * GET /formats - Get supported export formats
+   154→   * PERF-FIX: Uses cached response with ETag for conditional GET
+   155→   */
+   156→  router.get('/formats', (req, res) => {
+   157→    if (sendCachedResponse && staticCache?.exportFormats) {
+   158→      return sendCachedResponse(req, res, 'exportFormats');
+   159→    }
+   160→    const formats = getSupportedFormats();
+   161→    res.json({ success: true, formats });
+   162→  });
+   163→
+   164→  return router;
+   165→}
+   166→
+   167→module.exports = createExportRoutes;
+   168→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

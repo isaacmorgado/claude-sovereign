@@ -1,0 +1,970 @@
+     1→/**
+     2→ * Music Generation Service
+     3→ * Generates AI music using Mureka API
+     4→ *
+     5→ * Circuit Breaker Protection:
+     6→ * - All Mureka API calls wrapped with circuit breaker
+     7→ * - Audio downloads protected separately
+     8→ * - Failures save request to dead letter queue (future enhancement)
+     9→ * - Returns clear error messages when circuit is OPEN
+    10→ */
+    11→
+    12→const https = require('https');
+    13→const { execFile } = require('child_process');
+    14→const { promisify } = require('util');
+    15→const fs = require('fs').promises;
+    16→const path = require('path');
+    17→const sceneAnalysis = require('./sceneAnalysis');
+    18→const { circuitBreakers } = require('../config/circuitBreakers');
+    19→
+    20→// SECURITY: Using execFile with array arguments prevents command injection
+    21→const execFileAsync = promisify(execFile);
+    22→
+    23→// Mureka API configuration
+    24→const MUREKA_API_KEY = process.env.MUREKA_API_KEY;
+    25→const MUREKA_BASE_URL = 'api.mureka.ai';
+    26→const MUREKA_API_VERSION = 'v1';
+    27→
+    28→// Generation settings
+    29→const DEFAULT_DURATION = 60;
+    30→const MIN_DURATION = 30;
+    31→const MAX_DURATION = 180;
+    32→const POLL_INTERVAL = 5000; // 5 seconds
+    33→const MAX_POLL_ATTEMPTS = 120; // 10 minutes max
+    34→
+    35→// Mood presets with Mureka-compatible descriptions
+    36→const MOOD_PRESETS = {
+    37→  energetic: 'upbeat, high energy, driving rhythm, motivational',
+    38→  relaxed: 'calm, peaceful, ambient, soothing',
+    39→  melancholic: 'sad, emotional, introspective, minor key',
+    40→  intense: 'powerful, dramatic, cinematic, building tension',
+    41→  happy: 'joyful, cheerful, bright, uplifting',
+    42→  mysterious: 'dark, suspenseful, atmospheric, enigmatic',
+    43→  romantic: 'warm, intimate, gentle, loving',
+    44→  epic: 'grand, orchestral, sweeping, heroic',
+    45→  chill: 'lo-fi, laid-back, smooth, easy-going',
+    46→  neutral: 'balanced, versatile, general purpose'
+    47→};
+    48→
+    49→// Instrument categories
+    50→const INSTRUMENT_PRESETS = {
+    51→  acoustic: ['acoustic guitar', 'piano', 'strings', 'woodwinds'],
+    52→  electronic: ['synthesizer', 'drum machine', 'bass', 'pads'],
+    53→  rock: ['electric guitar', 'drums', 'bass guitar', 'distortion'],
+    54→  orchestral: ['strings', 'brass', 'woodwinds', 'percussion', 'harp'],
+    55→  minimal: ['piano', 'ambient pads'],
+    56→  hiphop: ['808 bass', 'hi-hats', 'trap drums', 'synth']
+    57→};
+    58→
+    59→/**
+    60→ * Check if Mureka API key is configured
+    61→ * @returns {boolean}
+    62→ */
+    63→function hasMurekaCredentials() {
+    64→  return !!MUREKA_API_KEY;
+    65→}
+    66→
+    67→/**
+    68→ * Build prompt for Mureka API from generation options
+    69→ * @param {Object} options - Generation options
+    70→ * @returns {string} Formatted prompt
+    71→ */
+    72→function buildMurekaPrompt(options) {
+    73→  const parts = [];
+    74→
+    75→  // Add custom prompt if provided
+    76→  if (options.prompt) {
+    77→    parts.push(options.prompt);
+    78→  }
+    79→
+    80→  // Add reference song style if available
+    81→  if (options.referenceSong && options.referenceSong.identified) {
+    82→    parts.push(`Style inspired by "${options.referenceSong.title}" by ${options.referenceSong.artist}`);
+    83→
+    84→    if (options.referenceSong.bpm) {
+    85→      parts.push(`Tempo around ${options.referenceSong.bpm} BPM`);
+    86→    }
+    87→
+    88→    if (options.referenceSong.key) {
+    89→      parts.push(`Key: ${options.referenceSong.key}`);
+    90→    }
+    91→
+    92→    if (options.referenceSong.genres?.length > 0) {
+    93→      parts.push(`Genre: ${options.referenceSong.genres.join(', ')}`);
+    94→    }
+    95→  }
+    96→
+    97→  // Add mood description
+    98→  if (options.mood) {
+    99→    const moodDescription = MOOD_PRESETS[options.mood] || options.mood;
+   100→    parts.push(`Mood: ${moodDescription}`);
+   101→  }
+   102→
+   103→  // Add instruments
+   104→  if (options.instruments?.length > 0) {
+   105→    const instruments = options.instruments.map(i => {
+   106→      // Check if it's a preset or individual instrument
+   107→      if (INSTRUMENT_PRESETS[i]) {
+   108→        return INSTRUMENT_PRESETS[i].join(', ');
+   109→      }
+   110→      return i;
+   111→    }).join(', ');
+   112→    parts.push(`Instruments: ${instruments}`);
+   113→  }
+   114→
+   115→  // Add duration
+   116→  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+   117→  parts.push(`Duration: approximately ${duration} seconds`);
+   118→
+   119→  // Add quality markers
+   120→  parts.push('Instrumental only, no vocals');
+   121→  parts.push('Suitable as background music for video');
+   122→  parts.push('Professional quality, well-mixed');
+   123→
+   124→  return parts.join('. ');
+   125→}
+   126→
+   127→/**
+   128→ * Clamp duration to valid range
+   129→ * @param {number} duration - Duration in seconds
+   130→ * @returns {number} Clamped duration
+   131→ */
+   132→function clampDuration(duration) {
+   133→  return Math.min(Math.max(duration, MIN_DURATION), MAX_DURATION);
+   134→}
+   135→
+   136→/**
+   137→ * Make HTTP request to Mureka API
+   138→ * @param {string} method - HTTP method
+   139→ * @param {string} endpoint - API endpoint
+   140→ * @param {Object} data - Request body (for POST)
+   141→ * @returns {Promise<Object>} API response
+   142→ */
+   143→async function murekaRequest(method, endpoint, data = null) {
+   144→  if (!MUREKA_API_KEY) {
+   145→    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+   146→  }
+   147→
+   148→  return new Promise((resolve, reject) => {
+   149→    const options = {
+   150→      hostname: MUREKA_BASE_URL,
+   151→      path: `/${MUREKA_API_VERSION}${endpoint}`,
+   152→      method,
+   153→      headers: {
+   154→        'Authorization': `Bearer ${MUREKA_API_KEY}`,
+   155→        'Content-Type': 'application/json',
+   156→        'Accept': 'application/json'
+   157→      }
+   158→    };
+   159→
+   160→    const req = https.request(options, (res) => {
+   161→      let responseData = '';
+   162→
+   163→      res.on('data', (chunk) => {
+   164→        responseData += chunk;
+   165→      });
+   166→
+   167→      res.on('end', () => {
+   168→        try {
+   169→          const parsed = JSON.parse(responseData);
+   170→
+   171→          if (res.statusCode >= 400) {
+   172→            const error = new Error(parsed.message || parsed.error || 'Mureka API error');
+   173→            error.statusCode = res.statusCode;
+   174→            error.response = parsed;
+   175→            reject(error);
+   176→            return;
+   177→          }
+   178→
+   179→          resolve(parsed);
+   180→        } catch (parseError) {
+   181→          reject(new Error(`Failed to parse Mureka response: ${parseError.message}`));
+   182→        }
+   183→      });
+   184→    });
+   185→
+   186→    req.on('error', (error) => {
+   187→      reject(new Error(`Mureka API request failed: ${error.message}`));
+   188→    });
+   189→
+   190→    req.on('timeout', () => {
+   191→      req.destroy();
+   192→      reject(new Error('Mureka API request timeout'));
+   193→    });
+   194→
+   195→    req.setTimeout(60000); // 60 second timeout
+   196→
+   197→    if (data) {
+   198→      req.write(JSON.stringify(data));
+   199→    }
+   200→
+   201→    req.end();
+   202→  });
+   203→}
+   204→
+   205→/**
+   206→ * Submit music generation request to Mureka
+   207→ * @param {Object} options - Generation options
+   208→ * @returns {Promise<{taskId: string, status: string}>}
+   209→ */
+   210→async function submitGeneration(options) {
+   211→  const prompt = buildMurekaPrompt(options);
+   212→  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+   213→
+   214→  const requestBody = {
+   215→    prompt,
+   216→    duration,
+   217→    type: 'instrumental', // Background music mode
+   218→    format: 'wav',
+   219→    quality: 'high'
+   220→  };
+   221→
+   222→  // Add reference track if available
+   223→  if (options.referenceTrackUrl) {
+   224→    requestBody.reference_url = options.referenceTrackUrl;
+   225→  }
+   226→
+   227→  const response = await murekaRequest('POST', '/generate', requestBody);
+   228→
+   229→  if (!response.task_id) {
+   230→    throw new Error('Mureka did not return a task ID');
+   231→  }
+   232→
+   233→  return {
+   234→    taskId: response.task_id,
+   235→    status: response.status || 'pending',
+   236→    estimatedTime: response.estimated_time || '3-5 minutes'
+   237→  };
+   238→}
+   239→
+   240→/**
+   241→ * Check status of a generation task
+   242→ * @param {string} taskId - Mureka task ID
+   243→ * @returns {Promise<Object>} Task status
+   244→ */
+   245→async function checkTaskStatus(taskId) {
+   246→  const response = await murekaRequest('GET', `/tasks/${taskId}`);
+   247→
+   248→  return {
+   249→    taskId,
+   250→    status: response.status,
+   251→    progress: response.progress || 0,
+   252→    audioUrl: response.audio_url || null,
+   253→    previewUrl: response.preview_url || null,
+   254→    duration: response.duration || null,
+   255→    error: response.error || null
+   256→  };
+   257→}
+   258→
+   259→/**
+   260→ * Poll for task completion
+   261→ * @param {string} taskId - Mureka task ID
+   262→ * @param {Function} onProgress - Progress callback
+   263→ * @returns {Promise<Object>} Completed task result
+   264→ */
+   265→async function pollForCompletion(taskId, onProgress = null) {
+   266→  let attempts = 0;
+   267→
+   268→  while (attempts < MAX_POLL_ATTEMPTS) {
+   269→    attempts++;
+   270→
+   271→    const status = await checkTaskStatus(taskId);
+   272→
+   273→    if (onProgress) {
+   274→      onProgress(status.progress, status.status);
+   275→    }
+   276→
+   277→    if (status.status === 'completed') {
+   278→      if (!status.audioUrl) {
+   279→        throw new Error('Mureka completed but no audio URL provided');
+   280→      }
+   281→      return status;
+   282→    }
+   283→
+   284→    if (status.status === 'failed') {
+   285→      throw new Error(status.error || 'Mureka generation failed');
+   286→    }
+   287→
+   288→    if (status.status === 'cancelled') {
+   289→      throw new Error('Mureka generation was cancelled');
+   290→    }
+   291→
+   292→    // Wait before polling again
+   293→    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+   294→  }
+   295→
+   296→  throw new Error('Mureka generation timed out after 10 minutes');
+   297→}
+   298→
+   299→/**
+   300→ * Download audio file from URL
+   301→ * @param {string} url - Audio URL
+   302→ * @returns {Promise<Buffer>} Audio buffer
+   303→ */
+   304→async function downloadAudio(url) {
+   305→  return new Promise((resolve, reject) => {
+   306→    const protocol = url.startsWith('https') ? https : require('http');
+   307→
+   308→    protocol.get(url, (res) => {
+   309→      if (res.statusCode === 302 || res.statusCode === 301) {
+   310→        // Handle redirect
+   311→        return downloadAudio(res.headers.location).then(resolve).catch(reject);
+   312→      }
+   313→
+   314→      if (res.statusCode !== 200) {
+   315→        reject(new Error(`Failed to download audio: HTTP ${res.statusCode}`));
+   316→        return;
+   317→      }
+   318→
+   319→      const chunks = [];
+   320→      res.on('data', (chunk) => chunks.push(chunk));
+   321→      res.on('end', () => resolve(Buffer.concat(chunks)));
+   322→      res.on('error', reject);
+   323→    }).on('error', reject);
+   324→  });
+   325→}
+   326→
+   327→/**
+   328→ * Convert audio buffer to preview MP3
+   329→ * @param {Buffer} wavBuffer - WAV audio buffer
+   330→ * @returns {Promise<Buffer>} MP3 buffer
+   331→ */
+   332→async function createPreviewMp3(wavBuffer) {
+   333→  const tempDir = process.env.TEMP_DIR || '/tmp/splice-music';
+   334→  const tempWav = path.join(tempDir, `preview_${Date.now()}.wav`);
+   335→  const tempMp3 = path.join(tempDir, `preview_${Date.now()}.mp3`);
+   336→
+   337→  try {
+   338→    // Ensure temp dir exists
+   339→    await fs.mkdir(tempDir, { recursive: true });
+   340→
+   341→    // Write WAV to temp file
+   342→    await fs.writeFile(tempWav, wavBuffer);
+   343→
+   344→    // Convert to MP3 using FFmpeg
+   345→    // SECURITY: Using execFileAsync with array arguments prevents command injection
+   346→    const ffmpegArgs = ['-y', '-i', tempWav, '-codec:a', 'libmp3lame', '-qscale:a', '4', tempMp3];
+   347→    await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 30000 });
+   348→
+   349→    // Read MP3 buffer
+   350→    const mp3Buffer = await fs.readFile(tempMp3);
+   351→
+   352→    return mp3Buffer;
+   353→  } finally {
+   354→    // Cleanup temp files
+   355→    try {
+   356→      await fs.unlink(tempWav);
+   357→      await fs.unlink(tempMp3);
+   358→    } catch (_e) {
+   359→      // Ignore cleanup errors
+   360→    }
+   361→  }
+   362→}
+   363→
+   364→/**
+   365→ * Generate music title from options
+   366→ * @param {Object} options - Generation options
+   367→ * @returns {string} Generated title
+   368→ */
+   369→function generateTitle(options) {
+   370→  const parts = [];
+   371→
+   372→  // Add mood
+   373→  if (options.mood) {
+   374→    parts.push(options.mood.charAt(0).toUpperCase() + options.mood.slice(1));
+   375→  }
+   376→
+   377→  // Add reference song if available
+   378→  if (options.referenceSong?.title) {
+   379→    parts.push(`(${options.referenceSong.title} style)`);
+   380→  }
+   381→
+   382→  // Add genre if available
+   383→  if (options.referenceSong?.genres?.[0]) {
+   384→    parts.push(options.referenceSong.genres[0]);
+   385→  }
+   386→
+   387→  // Fallback
+   388→  if (parts.length === 0) {
+   389→    parts.push('AI Generated');
+   390→  }
+   391→
+   392→  parts.push('Music');
+   393→
+   394→  return parts.join(' ');
+   395→}
+   396→
+   397→/**
+   398→ * Full music generation flow
+   399→ * @param {Object} options - Generation options
+   400→ * @param {Function} onProgress - Progress callback
+   401→ * @returns {Promise<Object>} Generated music result
+   402→ */
+   403→async function generateMusic(options, onProgress = null) {
+   404→  // Validate credentials
+   405→  if (!hasMurekaCredentials()) {
+   406→    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+   407→  }
+   408→
+   409→  // Submit generation request
+   410→  const { taskId } = await submitGeneration(options);
+   411→
+   412→  if (onProgress) {
+   413→    onProgress(10, 'submitted');
+   414→  }
+   415→
+   416→  // Poll for completion
+   417→  const result = await pollForCompletion(taskId, (progress, status) => {
+   418→    if (onProgress) {
+   419→      // Scale progress to 10-90 range (10 for submitted, 90 for downloading)
+   420→      const scaledProgress = 10 + Math.floor(progress * 0.8);
+   421→      onProgress(scaledProgress, status);
+   422→    }
+   423→  });
+   424→
+   425→  if (onProgress) {
+   426→    onProgress(90, 'downloading');
+   427→  }
+   428→
+   429→  // Download audio
+   430→  const audioBuffer = await downloadAudio(result.audioUrl);
+   431→
+   432→  if (onProgress) {
+   433→    onProgress(95, 'processing');
+   434→  }
+   435→
+   436→  // Create preview MP3
+   437→  let previewBuffer;
+   438→  try {
+   439→    previewBuffer = await createPreviewMp3(audioBuffer);
+   440→  } catch (error) {
+   441→    console.warn('Failed to create preview MP3:', error.message);
+   442→    previewBuffer = null;
+   443→  }
+   444→
+   445→  // Generate title
+   446→  const title = generateTitle(options);
+   447→
+   448→  if (onProgress) {
+   449→    onProgress(100, 'completed');
+   450→  }
+   451→
+   452→  return {
+   453→    title,
+   454→    taskId: result.taskId,
+   455→    duration: result.duration || options.duration || DEFAULT_DURATION,
+   456→    audioBuffer,
+   457→    previewBuffer,
+   458→    audioUrl: result.audioUrl,
+   459→    previewUrl: result.previewUrl
+   460→  };
+   461→}
+   462→
+   463→/**
+   464→ * Get available moods
+   465→ * @returns {Object} Mood presets
+   466→ */
+   467→function getAvailableMoods() {
+   468→  return Object.keys(MOOD_PRESETS).map(key => ({
+   469→    id: key,
+   470→    name: key.charAt(0).toUpperCase() + key.slice(1),
+   471→    description: MOOD_PRESETS[key]
+   472→  }));
+   473→}
+   474→
+   475→/**
+   476→ * Get available instrument presets
+   477→ * @returns {Object} Instrument presets
+   478→ */
+   479→function getAvailableInstruments() {
+   480→  return Object.keys(INSTRUMENT_PRESETS).map(key => ({
+   481→    id: key,
+   482→    name: key.charAt(0).toUpperCase() + key.slice(1),
+   483→    instruments: INSTRUMENT_PRESETS[key]
+   484→  }));
+   485→}
+   486→
+   487→/**
+   488→ * Validate generation options
+   489→ * @param {Object} options - Generation options
+   490→ * @returns {{valid: boolean, errors: string[]}}
+   491→ */
+   492→function validateOptions(options) {
+   493→  const errors = [];
+   494→
+   495→  // Check duration
+   496→  if (options.duration !== undefined) {
+   497→    if (typeof options.duration !== 'number') {
+   498→      errors.push('Duration must be a number');
+   499→    } else if (options.duration < MIN_DURATION) {
+   500→      errors.push(`Duration must be at least ${MIN_DURATION} seconds`);
+   501→    } else if (options.duration > MAX_DURATION) {
+   502→      errors.push(`Duration must be at most ${MAX_DURATION} seconds`);
+   503→    }
+   504→  }
+   505→
+   506→  // Check mood
+   507→  if (options.mood && !MOOD_PRESETS[options.mood]) {
+   508→    // Allow custom moods, just log a warning
+   509→    console.warn(`Unknown mood preset: ${options.mood}. Using as custom description.`);
+   510→  }
+   511→
+   512→  // Check instruments
+   513→  if (options.instruments && !Array.isArray(options.instruments)) {
+   514→    errors.push('Instruments must be an array');
+   515→  }
+   516→
+   517→  return {
+   518→    valid: errors.length === 0,
+   519→    errors
+   520→  };
+   521→}
+   522→
+   523→/**
+   524→ * Generate multiple music variations in parallel
+   525→ * Creates 3 variations with subtle prompt differences for user selection
+   526→ * @param {Object} options - Generation options
+   527→ * @param {Function} onProgress - Progress callback (variationIndex, progress, status)
+   528→ * @returns {Promise<Object>} Object with variations array
+   529→ */
+   530→async function generateVariations(options, onProgress = null) {
+   531→  // Validate credentials
+   532→  if (!hasMurekaCredentials()) {
+   533→    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+   534→  }
+   535→
+   536→  // Create 3 prompt variations with subtle differences
+   537→  const variationPrompts = createVariationPrompts(options);
+   538→  const variationCount = 3;
+   539→
+   540→  // Track progress for each variation
+   541→  const variationProgress = new Array(variationCount).fill(0);
+   542→  const variationStatus = new Array(variationCount).fill('pending');
+   543→
+   544→  // Submit all variations in parallel
+   545→  const submittedTasks = await Promise.all(
+   546→    variationPrompts.map(async (varOptions, index) => {
+   547→      try {
+   548→        const { taskId } = await submitGeneration(varOptions);
+   549→        variationStatus[index] = 'submitted';
+   550→        if (onProgress) {
+   551→          onProgress(index, 10, 'submitted');
+   552→        }
+   553→        return { taskId, options: varOptions, index };
+   554→      } catch (error) {
+   555→        console.error(`Variation ${index + 1} submission failed:`, error.message);
+   556→        throw new Error(`Variation ${index + 1} failed to submit: ${error.message}`);
+   557→      }
+   558→    })
+   559→  );
+   560→
+   561→  // Poll all tasks in parallel
+   562→  const results = await Promise.all(
+   563→    submittedTasks.map(async ({ taskId, options: varOptions, index }) => {
+   564→      try {
+   565→        const result = await pollForCompletion(taskId, (progress, status) => {
+   566→          variationProgress[index] = progress;
+   567→          variationStatus[index] = status;
+   568→          if (onProgress) {
+   569→            // Scale progress to 10-90 range
+   570→            const scaledProgress = 10 + Math.floor(progress * 0.8);
+   571→            onProgress(index, scaledProgress, status);
+   572→          }
+   573→        });
+   574→
+   575→        if (onProgress) {
+   576→          onProgress(index, 90, 'downloading');
+   577→        }
+   578→
+   579→        // Download audio
+   580→        const audioBuffer = await downloadAudio(result.audioUrl);
+   581→
+   582→        if (onProgress) {
+   583→          onProgress(index, 95, 'processing');
+   584→        }
+   585→
+   586→        // Create preview MP3
+   587→        let previewBuffer;
+   588→        try {
+   589→          previewBuffer = await createPreviewMp3(audioBuffer);
+   590→        } catch (error) {
+   591→          console.warn(`Failed to create preview MP3 for variation ${index + 1}:`, error.message);
+   592→          previewBuffer = null;
+   593→        }
+   594→
+   595→        if (onProgress) {
+   596→          onProgress(index, 100, 'completed');
+   597→        }
+   598→
+   599→        return {
+   600→          variationIndex: index,
+   601→          variationName: getVariationName(index),
+   602→          title: generateTitle(varOptions),
+   603→          taskId: result.taskId,
+   604→          duration: result.duration || varOptions.duration || DEFAULT_DURATION,
+   605→          audioBuffer,
+   606→          previewBuffer,
+   607→          audioUrl: result.audioUrl,
+   608→          previewUrl: result.previewUrl,
+   609→          promptDescription: varOptions.variationDescription || ''
+   610→        };
+   611→      } catch (error) {
+   612→        console.error(`Variation ${index + 1} failed:`, error.message);
+   613→        return {
+   614→          variationIndex: index,
+   615→          variationName: getVariationName(index),
+   616→          error: error.message,
+   617→          failed: true
+   618→        };
+   619→      }
+   620→    })
+   621→  );
+   622→
+   623→  // Check if at least one variation succeeded
+   624→  const successfulVariations = results.filter(r => !r.failed);
+   625→  if (successfulVariations.length === 0) {
+   626→    throw new Error('All variations failed to generate');
+   627→  }
+   628→
+   629→  return {
+   630→    variations: results,
+   631→    successCount: successfulVariations.length,
+   632→    failedCount: results.length - successfulVariations.length,
+   633→    totalCount: results.length
+   634→  };
+   635→}
+   636→
+   637→/**
+   638→ * Create 3 variation prompts with subtle differences
+   639→ * @param {Object} baseOptions - Base generation options
+   640→ * @returns {Object[]} Array of 3 variation options
+   641→ */
+   642→function createVariationPrompts(baseOptions) {
+   643→  // Variation modifiers to create subtle differences
+   644→  const variations = [
+   645→    {
+   646→      suffix: 'Version A - Original interpretation',
+   647→      variationDescription: 'Original interpretation with balanced arrangement',
+   648→      moodModifier: ''
+   649→    },
+   650→    {
+   651→      suffix: 'Version B - More dynamic',
+   652→      variationDescription: 'More dynamic with increased energy and variation',
+   653→      moodModifier: 'with added dynamic range and rhythmic variation'
+   654→    },
+   655→    {
+   656→      suffix: 'Version C - More subtle',
+   657→      variationDescription: 'More subtle and minimalist approach',
+   658→      moodModifier: 'with a more subtle, understated approach'
+   659→    }
+   660→  ];
+   661→
+   662→  return variations.map((variation, index) => {
+   663→    // Create modified options for each variation
+   664→    const modifiedOptions = { ...baseOptions };
+   665→
+   666→    // Build variation-specific prompt
+   667→    const basePrompt = baseOptions.prompt || '';
+   668→    const variationPrompt = basePrompt
+   669→      ? `${basePrompt}. ${variation.suffix}`
+   670→      : variation.suffix;
+   671→
+   672→    modifiedOptions.prompt = variationPrompt;
+   673→    modifiedOptions.variationIndex = index;
+   674→    modifiedOptions.variationDescription = variation.variationDescription;
+   675→
+   676→    // Slightly modify mood description for variety
+   677→    if (variation.moodModifier) {
+   678→      modifiedOptions.moodModifier = variation.moodModifier;
+   679→    }
+   680→
+   681→    return modifiedOptions;
+   682→  });
+   683→}
+   684→
+   685→/**
+   686→ * Get variation display name
+   687→ * @param {number} index - Variation index (0-2)
+   688→ * @returns {string} Display name
+   689→ */
+   690→function getVariationName(index) {
+   691→  const names = ['Version A', 'Version B', 'Version C'];
+   692→  return names[index] || `Version ${index + 1}`;
+   693→}
+   694→
+   695→/**
+   696→ * Build Mureka prompt with variation modifier
+   697→ * Extended version of buildMurekaPrompt that handles variations
+   698→ * @param {Object} options - Generation options with potential variation modifiers
+   699→ * @returns {string} Formatted prompt
+   700→ */
+   701→function buildMurekaPromptWithVariation(options) {
+   702→  const parts = [];
+   703→
+   704→  // Add custom prompt if provided (includes variation suffix)
+   705→  if (options.prompt) {
+   706→    parts.push(options.prompt);
+   707→  }
+   708→
+   709→  // Add reference song style if available
+   710→  if (options.referenceSong && options.referenceSong.identified) {
+   711→    parts.push(`Style inspired by "${options.referenceSong.title}" by ${options.referenceSong.artist}`);
+   712→
+   713→    if (options.referenceSong.bpm) {
+   714→      parts.push(`Tempo around ${options.referenceSong.bpm} BPM`);
+   715→    }
+   716→
+   717→    if (options.referenceSong.key) {
+   718→      parts.push(`Key: ${options.referenceSong.key}`);
+   719→    }
+   720→
+   721→    if (options.referenceSong.genres?.length > 0) {
+   722→      parts.push(`Genre: ${options.referenceSong.genres.join(', ')}`);
+   723→    }
+   724→  }
+   725→
+   726→  // Add mood description with variation modifier
+   727→  if (options.mood) {
+   728→    let moodDescription = MOOD_PRESETS[options.mood] || options.mood;
+   729→    if (options.moodModifier) {
+   730→      moodDescription = `${moodDescription} ${options.moodModifier}`;
+   731→    }
+   732→    parts.push(`Mood: ${moodDescription}`);
+   733→  }
+   734→
+   735→  // Add instruments
+   736→  if (options.instruments?.length > 0) {
+   737→    const instruments = options.instruments.map(i => {
+   738→      if (INSTRUMENT_PRESETS[i]) {
+   739→        return INSTRUMENT_PRESETS[i].join(', ');
+   740→      }
+   741→      return i;
+   742→    }).join(', ');
+   743→    parts.push(`Instruments: ${instruments}`);
+   744→  }
+   745→
+   746→  // Add duration
+   747→  const duration = clampDuration(options.duration || DEFAULT_DURATION);
+   748→  parts.push(`Duration: approximately ${duration} seconds`);
+   749→
+   750→  // Add quality markers
+   751→  parts.push('Instrumental only, no vocals');
+   752→  parts.push('Suitable as background music for video');
+   753→  parts.push('Professional quality, well-mixed');
+   754→
+   755→  return parts.join('. ');
+   756→}
+   757→
+   758→/**
+   759→ * Generate scene-aware music using transcript analysis
+   760→ * Analyzes transcript for mood/energy and builds enhanced prompt
+   761→ * @param {Object[]} segments - Transcript segments with {id, start, end, text}
+   762→ * @param {Object} options - Generation options
+   763→ * @param {Function} onProgress - Progress callback
+   764→ * @returns {Promise<Object>} Generated music result with scene context
+   765→ */
+   766→async function generateSceneAwareMusic(segments, options, onProgress = null) {
+   767→  // Validate credentials
+   768→  if (!hasMurekaCredentials()) {
+   769→    throw new Error('Mureka API key not configured. Set MUREKA_API_KEY environment variable.');
+   770→  }
+   771→
+   772→  if (onProgress) {
+   773→    onProgress(5, 'analyzing');
+   774→  }
+   775→
+   776→  // Analyze scenes from transcript
+   777→  const sceneContext = await sceneAnalysis.analyzeScenes(segments);
+   778→
+   779→  if (onProgress) {
+   780→    onProgress(15, 'building_prompt');
+   781→  }
+   782→
+   783→  // Build scene-aware prompt
+   784→  const enhancedPrompt = sceneAnalysis.buildSceneAwarePrompt(sceneContext, options);
+   785→
+   786→  // Create modified options with scene-aware prompt
+   787→  const sceneAwareOptions = {
+   788→    ...options,
+   789→    prompt: enhancedPrompt,
+   790→    // Store scene context for metadata
+   791→    _sceneContext: sceneContext
+   792→  };
+   793→
+   794→  if (onProgress) {
+   795→    onProgress(20, 'generating');
+   796→  }
+   797→
+   798→  // Submit generation with scene-aware prompt
+   799→  const { taskId } = await submitGeneration(sceneAwareOptions);
+   800→
+   801→  // Poll for completion
+   802→  const result = await pollForCompletion(taskId, (progress, pollStatus) => {
+   803→    if (onProgress) {
+   804→      // Scale progress to 20-90 range
+   805→      const scaledProgress = 20 + Math.floor(progress * 0.7);
+   806→      onProgress(scaledProgress, pollStatus);
+   807→    }
+   808→  });
+   809→
+   810→  if (onProgress) {
+   811→    onProgress(90, 'downloading');
+   812→  }
+   813→
+   814→  // Download audio
+   815→  const audioBuffer = await downloadAudio(result.audioUrl);
+   816→
+   817→  if (onProgress) {
+   818→    onProgress(95, 'processing');
+   819→  }
+   820→
+   821→  // Create preview MP3
+   822→  let previewBuffer;
+   823→  try {
+   824→    previewBuffer = await createPreviewMp3(audioBuffer);
+   825→  } catch (error) {
+   826→    console.warn('Failed to create preview MP3:', error.message);
+   827→    previewBuffer = null;
+   828→  }
+   829→
+   830→  // Generate title with scene context
+   831→  const title = generateSceneAwareTitle(options, sceneContext);
+   832→
+   833→  if (onProgress) {
+   834→    onProgress(100, 'completed');
+   835→  }
+   836→
+   837→  return {
+   838→    title,
+   839→    taskId: result.taskId,
+   840→    duration: result.duration || options.duration || DEFAULT_DURATION,
+   841→    audioBuffer,
+   842→    previewBuffer,
+   843→    audioUrl: result.audioUrl,
+   844→    previewUrl: result.previewUrl,
+   845→    // Include scene analysis metadata
+   846→    sceneContext: {
+   847→      dominantMood: sceneContext.dominantMood,
+   848→      averageEnergy: sceneContext.averageEnergy,
+   849→      sceneCount: sceneContext.scenes.length,
+   850→      summary: sceneAnalysis.getSceneContextSummary(sceneContext)
+   851→    }
+   852→  };
+   853→}
+   854→
+   855→/**
+   856→ * Generate title for scene-aware music
+   857→ * @param {Object} options - Generation options
+   858→ * @param {Object} sceneContext - Scene analysis result
+   859→ * @returns {string} Generated title
+   860→ */
+   861→function generateSceneAwareTitle(options, sceneContext) {
+   862→  const parts = [];
+   863→
+   864→  // Add detected mood
+   865→  if (sceneContext.dominantMood && sceneContext.dominantMood !== 'neutral') {
+   866→    const moodName = sceneContext.dominantMood.charAt(0).toUpperCase() +
+   867→      sceneContext.dominantMood.slice(1);
+   868→    parts.push(moodName);
+   869→  }
+   870→
+   871→  // Add energy indicator
+   872→  const energy = sceneContext.averageEnergy;
+   873→  if (energy >= 75) {
+   874→    parts.push('High-Energy');
+   875→  } else if (energy <= 30) {
+   876→    parts.push('Ambient');
+   877→  }
+   878→
+   879→  // Add user mood if different
+   880→  if (options.mood && options.mood !== sceneContext.dominantMood) {
+   881→    const userMood = options.mood.charAt(0).toUpperCase() + options.mood.slice(1);
+   882→    parts.push(userMood);
+   883→  }
+   884→
+   885→  // Add reference song if available
+   886→  if (options.referenceSong?.title) {
+   887→    parts.push(`(${options.referenceSong.title} style)`);
+   888→  }
+   889→
+   890→  // Fallback
+   891→  if (parts.length === 0) {
+   892→    parts.push('Scene-Aware');
+   893→  }
+   894→
+   895→  parts.push('Music');
+   896→
+   897→  return parts.join(' ');
+   898→}
+   899→
+   900→/**
+   901→ * Validate scene-aware generation options
+   902→ * @param {Object[]} segments - Transcript segments
+   903→ * @param {Object} options - Generation options
+   904→ * @returns {{valid: boolean, errors: string[]}}
+   905→ */
+   906→function validateSceneAwareOptions(segments, options) {
+   907→  const errors = [];
+   908→
+   909→  // Check segments
+   910→  if (!segments || !Array.isArray(segments)) {
+   911→    errors.push('Transcript segments are required');
+   912→  } else if (segments.length === 0) {
+   913→    errors.push('At least one transcript segment is required');
+   914→  } else {
+   915→    // Validate segment format
+   916→    const hasValidFormat = segments.every(s =>
+   917→      typeof s.start === 'number' &&
+   918→      typeof s.end === 'number' &&
+   919→      typeof s.text === 'string'
+   920→    );
+   921→    if (!hasValidFormat) {
+   922→      errors.push('Segments must have start, end (numbers), and text (string)');
+   923→    }
+   924→  }
+   925→
+   926→  // Also validate base options
+   927→  const baseValidation = validateOptions(options);
+   928→  if (!baseValidation.valid) {
+   929→    errors.push(...baseValidation.errors);
+   930→  }
+   931→
+   932→  return {
+   933→    valid: errors.length === 0,
+   934→    errors
+   935→  };
+   936→}
+   937→
+   938→module.exports = {
+   939→  hasMurekaCredentials,
+   940→  buildMurekaPrompt,
+   941→  buildMurekaPromptWithVariation,
+   942→  clampDuration,
+   943→  submitGeneration,
+   944→  checkTaskStatus,
+   945→  pollForCompletion,
+   946→  downloadAudio,
+   947→  createPreviewMp3,
+   948→  generateTitle,
+   949→  generateMusic,
+   950→  generateVariations,
+   951→  createVariationPrompts,
+   952→  getVariationName,
+   953→  getAvailableMoods,
+   954→  getAvailableInstruments,
+   955→  validateOptions,
+   956→  // Scene-aware functions
+   957→  generateSceneAwareMusic,
+   958→  generateSceneAwareTitle,
+   959→  validateSceneAwareOptions,
+   960→  MOOD_PRESETS,
+   961→  INSTRUMENT_PRESETS,
+   962→  MIN_DURATION,
+   963→  MAX_DURATION,
+   964→  DEFAULT_DURATION
+   965→};
+   966→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

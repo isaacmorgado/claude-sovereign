@@ -1,0 +1,379 @@
+"""
+Leaderboard router - Submit scores and retrieve rankings
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text, func
+from uuid import UUID
+from typing import List, Optional
+from pydantic import BaseModel, Field
+from datetime import datetime
+from decimal import Decimal
+
+from app.database import get_db
+from app.models.user import User
+from app.models.leaderboard import LeaderboardScore, generate_anonymous_name
+from app.services.auth import get_current_user
+
+router = APIRouter(prefix="/leaderboard", tags=["leaderboard"])
+
+
+# === SCHEMAS ===
+
+class ScoreSubmit(BaseModel):
+    score: float = Field(..., ge=0, le=10, description="Harmony score 0-10")
+    analysis_id: Optional[str] = None
+    gender: str = Field(..., pattern="^(male|female)$")
+    ethnicity: Optional[str] = None
+    face_photo_url: Optional[str] = None
+    top_strengths: Optional[List[str]] = Field(None, max_length=3)
+    top_improvements: Optional[List[str]] = Field(None, max_length=3)
+
+
+class UserRankResponse(BaseModel):
+    user_id: str
+    score: float
+    global_rank: int
+    gender_rank: int
+    percentile: float
+    total_users: int
+    gender_total: int
+    anonymous_name: str
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LeaderboardEntry(BaseModel):
+    user_id: str
+    rank: int
+    score: float
+    anonymous_name: str
+    gender: str
+    face_photo_url: Optional[str] = None
+    is_current_user: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class UserProfile(BaseModel):
+    user_id: str
+    rank: int
+    score: float
+    anonymous_name: str
+    gender: str
+    face_photo_url: Optional[str] = None
+    top_strengths: List[str] = []
+    top_improvements: List[str] = []
+
+    class Config:
+        from_attributes = True
+
+
+class LeaderboardResponse(BaseModel):
+    entries: List[LeaderboardEntry]
+    total_count: int
+    user_rank: Optional[UserRankResponse] = None
+
+
+# === ENDPOINTS ===
+
+@router.post("/score", response_model=UserRankResponse)
+async def submit_score(
+    data: ScoreSubmit,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Submit or update user's score for leaderboard.
+    Upserts: creates new entry or updates existing.
+    """
+    # Check if user already has a score
+    result = await db.execute(
+        select(LeaderboardScore).where(LeaderboardScore.user_id == current_user.id)
+    )
+    existing = result.scalar_one_or_none()
+
+    if existing:
+        # Update existing score
+        existing.score = Decimal(str(data.score))
+        existing.analysis_id = UUID(data.analysis_id) if data.analysis_id else None
+        existing.gender = data.gender
+        existing.ethnicity = data.ethnicity
+        existing.face_photo_url = data.face_photo_url
+        existing.top_strengths = data.top_strengths[:3] if data.top_strengths else None
+        existing.top_improvements = data.top_improvements[:3] if data.top_improvements else None
+        existing.anonymous_name = current_user.username  # Sync username
+        existing.updated_at = datetime.utcnow()
+    else:
+        # Create new entry
+        entry = LeaderboardScore(
+            user_id=current_user.id,
+            analysis_id=UUID(data.analysis_id) if data.analysis_id else None,
+            score=Decimal(str(data.score)),
+            gender=data.gender,
+            ethnicity=data.ethnicity,
+            anonymous_name=current_user.username,  # Use username
+            face_photo_url=data.face_photo_url,
+            top_strengths=data.top_strengths[:3] if data.top_strengths else None,
+            top_improvements=data.top_improvements[:3] if data.top_improvements else None,
+        )
+        db.add(entry)
+
+    await db.commit()
+
+    # Get updated rank
+    rank = await get_user_rank_internal(current_user.id, db)
+    if not rank:
+        raise HTTPException(status_code=500, detail="Failed to calculate rank")
+    return rank
+
+
+@router.get("/rank", response_model=UserRankResponse)
+async def get_my_rank(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current user's rank and statistics."""
+    rank = await get_user_rank_internal(current_user.id, db)
+    if not rank:
+        raise HTTPException(status_code=404, detail="No score submitted yet")
+    return rank
+
+
+@router.get("/user/{user_id}", response_model=UserProfile)
+async def get_user_profile(
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a user's profile with strengths and improvements."""
+    try:
+        uid = UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+
+    # Get user's leaderboard entry
+    result = await db.execute(
+        select(LeaderboardScore).where(LeaderboardScore.user_id == uid)
+    )
+    entry = result.scalar_one_or_none()
+
+    if not entry:
+        raise HTTPException(status_code=404, detail="User not found on leaderboard")
+
+    # Get rank
+    rank_query = text("""
+        SELECT COUNT(*) + 1 as rank
+        FROM leaderboard_scores
+        WHERE score > :score
+    """)
+    rank_result = await db.execute(rank_query, {"score": float(entry.score)})
+    rank = rank_result.scalar() or 1
+
+    return UserProfile(
+        user_id=str(entry.user_id),
+        rank=rank,
+        score=float(entry.score),
+        anonymous_name=entry.anonymous_name,
+        gender=entry.gender,
+        face_photo_url=entry.face_photo_url,
+        top_strengths=entry.top_strengths or [],
+        top_improvements=entry.top_improvements or [],
+    )
+
+
+@router.get("", response_model=LeaderboardResponse)
+async def get_leaderboard(
+    gender: Optional[str] = Query(None, pattern="^(male|female)$"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get leaderboard entries.
+    Optionally filter by gender.
+    Returns top scores with ranks.
+    """
+    import traceback
+    try:
+        print(f"[LEADERBOARD] GET request from user {current_user.id}", flush=True)
+
+        # Build the base query with window functions
+        if gender:
+            query = text("""
+                WITH ranked AS (
+                    SELECT
+                        user_id,
+                        score,
+                        anonymous_name,
+                        gender,
+                        face_photo_url,
+                        DENSE_RANK() OVER (ORDER BY score DESC) as rank
+                    FROM leaderboard_scores
+                    WHERE gender = :gender
+                )
+                SELECT *, (SELECT COUNT(*) FROM leaderboard_scores WHERE gender = :gender) as total_count
+                FROM ranked
+                ORDER BY rank
+                LIMIT :limit OFFSET :offset
+            """)
+            params = {"gender": gender, "limit": limit, "offset": offset}
+        else:
+            query = text("""
+                WITH ranked AS (
+                    SELECT
+                        user_id,
+                        score,
+                        anonymous_name,
+                        gender,
+                        face_photo_url,
+                        DENSE_RANK() OVER (ORDER BY score DESC) as rank
+                    FROM leaderboard_scores
+                )
+                SELECT *, (SELECT COUNT(*) FROM leaderboard_scores) as total_count
+                FROM ranked
+                ORDER BY rank
+                LIMIT :limit OFFSET :offset
+            """)
+            params = {"limit": limit, "offset": offset}
+
+        print(f"[LEADERBOARD] Executing query...", flush=True)
+        result = await db.execute(query, params)
+        rows = result.fetchall()
+        print(f"[LEADERBOARD] Got {len(rows)} rows", flush=True)
+
+        entries = []
+        total_count = 0
+        for row in rows:
+            total_count = row.total_count
+            entries.append(LeaderboardEntry(
+                user_id=str(row.user_id),
+                rank=row.rank,
+                score=float(row.score),
+                anonymous_name=row.anonymous_name,
+                gender=row.gender,
+                face_photo_url=row.face_photo_url,
+                is_current_user=str(row.user_id) == str(current_user.id),
+            ))
+
+        print(f"[LEADERBOARD] Getting user rank...", flush=True)
+        # Get current user's rank
+        user_rank = await get_user_rank_internal(current_user.id, db)
+        print(f"[LEADERBOARD] User rank: {user_rank}", flush=True)
+
+        return LeaderboardResponse(
+            entries=entries,
+            total_count=total_count,
+            user_rank=user_rank,
+        )
+    except Exception as e:
+        print(f"[LEADERBOARD] ERROR: {e}\n{traceback.format_exc()}", flush=True)
+        raise
+
+
+@router.get("/around-me", response_model=LeaderboardResponse)
+async def get_leaderboard_around_me(
+    range_size: int = Query(5, ge=1, le=20),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get leaderboard entries around the current user's rank.
+    Shows `range_size` users above and below.
+    """
+    user_rank = await get_user_rank_internal(current_user.id, db)
+    if not user_rank:
+        raise HTTPException(status_code=404, detail="No score submitted yet")
+
+    min_rank = max(1, user_rank.global_rank - range_size)
+    max_rank = user_rank.global_rank + range_size
+
+    query = text("""
+        WITH ranked AS (
+            SELECT
+                user_id,
+                score,
+                anonymous_name,
+                gender,
+                face_photo_url,
+                DENSE_RANK() OVER (ORDER BY score DESC) as rank
+            FROM leaderboard_scores
+        )
+        SELECT *, (SELECT COUNT(*) FROM leaderboard_scores) as total_count
+        FROM ranked
+        WHERE rank BETWEEN :min_rank AND :max_rank
+        ORDER BY rank
+    """)
+
+    result = await db.execute(query, {"min_rank": min_rank, "max_rank": max_rank})
+    rows = result.fetchall()
+
+    entries = [
+        LeaderboardEntry(
+            user_id=str(row.user_id),
+            rank=row.rank,
+            score=float(row.score),
+            anonymous_name=row.anonymous_name,
+            gender=row.gender,
+            face_photo_url=row.face_photo_url,
+            is_current_user=str(row.user_id) == str(current_user.id),
+        )
+        for row in rows
+    ]
+
+    total_count = rows[0].total_count if rows else 0
+
+    return LeaderboardResponse(
+        entries=entries,
+        total_count=total_count,
+        user_rank=user_rank,
+    )
+
+
+# === INTERNAL HELPERS ===
+
+async def get_user_rank_internal(user_id: UUID, db: AsyncSession) -> Optional[UserRankResponse]:
+    """Internal function to get user rank calculated from base table."""
+    query = text("""
+        WITH ranked AS (
+            SELECT
+                user_id,
+                score,
+                gender,
+                anonymous_name,
+                updated_at,
+                DENSE_RANK() OVER (ORDER BY score DESC) as global_rank,
+                DENSE_RANK() OVER (PARTITION BY gender ORDER BY score DESC) as gender_rank,
+                PERCENT_RANK() OVER (ORDER BY score DESC) * 100 as percentile
+            FROM leaderboard_scores
+        )
+        SELECT
+            r.*,
+            (SELECT COUNT(*) FROM leaderboard_scores) as total_users,
+            (SELECT COUNT(*) FROM leaderboard_scores WHERE gender = r.gender) as gender_total
+        FROM ranked r
+        WHERE r.user_id = :user_id
+    """)
+
+    result = await db.execute(query, {"user_id": str(user_id)})
+    row = result.fetchone()
+
+    if not row:
+        return None
+
+    return UserRankResponse(
+        user_id=str(row.user_id),
+        score=float(row.score),
+        global_rank=row.global_rank,
+        gender_rank=row.gender_rank,
+        percentile=round(100 - float(row.percentile), 1),  # Invert: top X%
+        total_users=row.total_users,
+        gender_total=row.gender_total,
+        anonymous_name=row.anonymous_name,
+        updated_at=row.updated_at,
+    )

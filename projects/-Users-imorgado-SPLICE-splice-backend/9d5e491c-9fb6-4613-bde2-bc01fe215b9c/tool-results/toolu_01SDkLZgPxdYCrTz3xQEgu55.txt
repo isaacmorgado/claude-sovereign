@@ -1,0 +1,528 @@
+     1→     1→/**
+     2→     2→ * Phase 1 E2E Tests: Critical Concurrency Fixes
+     3→     3→ *
+     4→     4→ * Tests:
+     5→     5→ * - 1.1 Atomic Credit Reservation
+     6→     6→ * - 1.2 License Key Delivery
+     7→     7→ * - 1.3 License Activation Row Locking
+     8→     8→ */
+     9→     9→
+    10→    10→const assert = require('assert');
+    11→    11→
+    12→    12→// Mock database for testing (in-memory)
+    13→    13→let mockUsers = {};
+    14→    14→let mockLicenseKeys = {};
+    15→    15→let mockWebhookEvents = {};
+    16→    16→let mockStripeMetadata = {};
+    17→    17→
+    18→    18→// Simulated delay for async operations
+    19→    19→const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    20→    20→
+    21→    21→// ============================================================================
+    22→    22→// Mock Services (simulating the actual services)
+    23→    23→// ============================================================================
+    24→    24→
+    25→    25→/**
+    26→    26→ * Mock UsageTracking Service
+    27→    27→ */
+    28→    28→const mockUsageTracking = {
+    29→    29→  async reserveCredits(customerId, estimatedSeconds, endpoint) {
+    30→    30→    const estimatedHours = estimatedSeconds / 3600;
+    31→    31→
+    32→    32→    // Simulate database lock with atomic operation
+    33→    33→    return new Promise(async (resolve) => {
+    34→    34→      // Simulate lock acquisition time
+    35→    35→      await delay(Math.random() * 10);
+    36→    36→
+    37→    37→      if (!mockUsers[customerId]) {
+    38→    38→        mockUsers[customerId] = { hoursRemaining: 15, tier: 'starter' };
+    39→    39→      }
+    40→    40→
+    41→    41→      const user = mockUsers[customerId];
+    42→    42→
+    43→    43→      if (user.hoursRemaining < estimatedHours) {
+    44→    44→        resolve({
+    45→    45→          success: false,
+    46→    46→          error: 'Insufficient credits',
+    47→    47→          hoursRemaining: user.hoursRemaining
+    48→    48→        });
+    49→    49→        return;
+    50→    50→      }
+    51→    51→
+    52→    52→      // Atomic deduction
+    53→    53→      user.hoursRemaining -= estimatedHours;
+    54→    54→
+    55→    55→      resolve({
+    56→    56→        success: true,
+    57→    57→        reservationId: `res_${Date.now()}`,
+    58→    58→        hoursReserved: estimatedHours,
+    59→    59→        hoursRemaining: user.hoursRemaining
+    60→    60→      });
+    61→    61→    });
+    62→    62→  },
+    63→    63→
+    64→    64→  async confirmReservation(customerId, actualSeconds, reservedSeconds, endpoint) {
+    65→    65→    const actualHours = actualSeconds / 3600;
+    66→    66→    const reservedHours = reservedSeconds / 3600;
+    67→    67→    const difference = reservedHours - actualHours;
+    68→    68→
+    69→    69→    if (!mockUsers[customerId]) {
+    70→    70→      throw new Error('User not found');
+    71→    71→    }
+    72→    72→
+    73→    73→    if (difference > 0) {
+    74→    74→      mockUsers[customerId].hoursRemaining += difference;
+    75→    75→    } else if (difference < 0) {
+    76→    76→      mockUsers[customerId].hoursRemaining = Math.max(0, mockUsers[customerId].hoursRemaining + difference);
+    77→    77→    }
+    78→    78→
+    79→    79→    return mockUsers[customerId];
+    80→    80→  },
+    81→    81→
+    82→    82→  async releaseReservation(customerId, reservedSeconds, endpoint, reason) {
+    83→    83→    const reservedHours = reservedSeconds / 3600;
+    84→    84→
+    85→    85→    if (!mockUsers[customerId]) {
+    86→    86→      throw new Error('User not found');
+    87→    87→    }
+    88→    88→
+    89→    89→    mockUsers[customerId].hoursRemaining += reservedHours;
+    90→    90→    return mockUsers[customerId];
+    91→    91→  },
+    92→    92→
+    93→    93→  async getBalance(customerId) {
+    94→    94→    if (!mockUsers[customerId]) {
+    95→    95→      mockUsers[customerId] = { hoursRemaining: 15, tier: 'starter' };
+    96→    96→    }
+    97→    97→    return mockUsers[customerId];
+    98→    98→  }
+    99→    99→};
+   100→   100→
+   101→   101→/**
+   102→   102→ * Mock License Service
+   103→   103→ */
+   104→   104→const mockLicenseService = {
+   105→   105→  keyCounter: 0,
+   106→   106→
+   107→   107→  async generateLicenseKey(customerId) {
+   108→   108→    if (!customerId) {
+   109→   109→      return { success: false, error: 'Customer ID required' };
+   110→   110→    }
+   111→   111→
+   112→   112→    // Check if already has key
+   113→   113→    const existingKey = Object.entries(mockLicenseKeys).find(
+   114→   114→      ([_, v]) => v.customerId === customerId
+   115→   115→    );
+   116→   116→    if (existingKey) {
+   117→   117→      return { success: true, key: existingKey[0], existing: true };
+   118→   118→    }
+   119→   119→
+   120→   120→    this.keyCounter++;
+   121→   121→    const key = `SPLICE-TEST-${String(this.keyCounter).padStart(4, '0')}-XXXX`;
+   122→   122→    mockLicenseKeys[key] = {
+   123→   123→      customerId,
+   124→   124→      activatedAt: null,
+   125→   125→      isActive: true
+   126→   126→    };
+   127→   127→
+   128→   128→    return { success: true, key };
+   129→   129→  },
+   130→   130→
+   131→   131→  async activateLicenseKey(key) {
+   132→   132→    // Simulate row lock with atomic operation
+   133→   133→    return new Promise(async (resolve) => {
+   134→   134→      // Simulate lock acquisition
+   135→   135→      await delay(Math.random() * 10);
+   136→   136→
+   137→   137→      if (!mockLicenseKeys[key]) {
+   138→   138→        resolve({ success: false, error: 'License key not found' });
+   139→   139→        return;
+   140→   140→      }
+   141→   141→
+   142→   142→      const license = mockLicenseKeys[key];
+   143→   143→
+   144→   144→      if (!license.isActive) {
+   145→   145→        resolve({ success: false, error: 'License key deactivated' });
+   146→   146→        return;
+   147→   147→      }
+   148→   148→
+   149→   149→      if (license.activatedAt) {
+   150→   150→        resolve({
+   151→   151→          success: true,
+   152→   152→          customerId: license.customerId,
+   153→   153→          alreadyActivated: true,
+   154→   154→          activatedAt: license.activatedAt
+   155→   155→        });
+   156→   156→        return;
+   157→   157→      }
+   158→   158→
+   159→   159→      // Atomic activation
+   160→   160→      license.activatedAt = new Date().toISOString();
+   161→   161→
+   162→   162→      resolve({
+   163→   163→        success: true,
+   164→   164→        customerId: license.customerId,
+   165→   165→        alreadyActivated: false
+   166→   166→      });
+   167→   167→    });
+   168→   168→  },
+   169→   169→
+   170→   170→  async getLicenseByCustomerId(customerId) {
+   171→   171→    const entry = Object.entries(mockLicenseKeys).find(
+   172→   172→      ([_, v]) => v.customerId === customerId
+   173→   173→    );
+   174→   174→    if (!entry) {
+   175→   175→      return { success: false, error: 'No license found' };
+   176→   176→    }
+   177→   177→    return {
+   178→   178→      success: true,
+   179→   179→      key: entry[0],
+   180→   180→      activated: !!entry[1].activatedAt
+   181→   181→    };
+   182→   182→  }
+   183→   183→};
+   184→   184→
+   185→   185→// ============================================================================
+   186→   186→// Test Helpers
+   187→   187→// ============================================================================
+   188→   188→
+   189→   189→function resetMocks() {
+   190→   190→  mockUsers = {};
+   191→   191→  mockLicenseKeys = {};
+   192→   192→  mockWebhookEvents = {};
+   193→   193→  mockStripeMetadata = {};
+   194→   194→  mockLicenseService.keyCounter = 0;
+   195→   195→}
+   196→   196→
+   197→   197→let passedTests = 0;
+   198→   198→let failedTests = 0;
+   199→   199→const testResults = [];
+   200→   200→
+   201→   201→async function runTest(name, testFn) {
+   202→   202→  try {
+   203→   203→    resetMocks();
+   204→   204→    await testFn();
+   205→   205→    passedTests++;
+   206→   206→    testResults.push({ name, passed: true });
+   207→   207→    console.log(`✓ ${name}`);
+   208→   208→  } catch (err) {
+   209→   209→    failedTests++;
+   210→   210→    testResults.push({ name, passed: false, error: err.message });
+   211→   211→    console.log(`✗ ${name}`);
+   212→   212→    console.log(`  Error: ${err.message}`);
+   213→   213→  }
+   214→   214→}
+   215→   215→
+   216→   216→// ============================================================================
+   217→   217→// Test Suite 1.1: Atomic Credit Reservation
+   218→   218→// ============================================================================
+   219→   219→
+   220→   220→async function testConcurrentCreditRequests() {
+   221→   221→  const customerId = 'cus_test_concurrent';
+   222→   222→  mockUsers[customerId] = { hoursRemaining: 0.5, tier: 'starter' };
+   223→   223→
+   224→   224→  // Each request reserves 0.1 hours (6 minutes)
+   225→   225→  const reservationSeconds = 360; // 0.1 hours
+   226→   226→
+   227→   227→  // Send 10 concurrent requests
+   228→   228→  const promises = Array(10).fill(null).map((_, i) =>
+   229→   229→    mockUsageTracking.reserveCredits(customerId, reservationSeconds, `test_${i}`)
+   230→   230→  );
+   231→   231→
+   232→   232→  const results = await Promise.all(promises);
+   233→   233→
+   234→   234→  const successful = results.filter(r => r.success);
+   235→   235→  const failed = results.filter(r => !r.success);
+   236→   236→
+   237→   237→  // With 0.5 hours and 0.1 hour reservations, only 5 should succeed
+   238→   238→  assert.strictEqual(successful.length, 5, `Expected 5 successful reservations, got ${successful.length}`);
+   239→   239→  assert.strictEqual(failed.length, 5, `Expected 5 failed reservations, got ${failed.length}`);
+   240→   240→
+   241→   241→  // Verify final balance is 0 (not negative) - use tolerance for floating point
+   242→   242→  const balance = await mockUsageTracking.getBalance(customerId);
+   243→   243→  assert.ok(
+   244→   244→    Math.abs(balance.hoursRemaining) < 0.0001,
+   245→   245→    `Expected ~0 hours remaining, got ${balance.hoursRemaining}`
+   246→   246→  );
+   247→   247→  assert.ok(
+   248→   248→    balance.hoursRemaining >= 0,
+   249→   249→    `Balance should not be negative, got ${balance.hoursRemaining}`
+   250→   250→  );
+   251→   251→}
+   252→   252→
+   253→   253→async function testNoNegativeBalance() {
+   254→   254→  const customerId = 'cus_test_negative';
+   255→   255→  mockUsers[customerId] = { hoursRemaining: 0.05, tier: 'starter' }; // 3 minutes
+   256→   256→
+   257→   257→  // Try to reserve 0.1 hours (6 minutes) - should fail
+   258→   258→  const result = await mockUsageTracking.reserveCredits(customerId, 360, 'test');
+   259→   259→
+   260→   260→  assert.strictEqual(result.success, false, 'Should fail when insufficient credits');
+   261→   261→
+   262→   262→  // Balance should remain unchanged
+   263→   263→  const balance = await mockUsageTracking.getBalance(customerId);
+   264→   264→  assert.strictEqual(balance.hoursRemaining, 0.05, 'Balance should remain unchanged');
+   265→   265→}
+   266→   266→
+   267→   267→async function testReservationRelease() {
+   268→   268→  const customerId = 'cus_test_release';
+   269→   269→  mockUsers[customerId] = { hoursRemaining: 1.0, tier: 'starter' };
+   270→   270→
+   271→   271→  // Reserve 0.5 hours
+   272→   272→  const reservation = await mockUsageTracking.reserveCredits(customerId, 1800, 'test');
+   273→   273→  assert.strictEqual(reservation.success, true, 'Reservation should succeed');
+   274→   274→
+   275→   275→  // Balance should be 0.5 after reservation
+   276→   276→  let balance = await mockUsageTracking.getBalance(customerId);
+   277→   277→  assert.strictEqual(balance.hoursRemaining, 0.5, 'Balance should be 0.5 after reservation');
+   278→   278→
+   279→   279→  // Release reservation (simulating processing failure)
+   280→   280→  await mockUsageTracking.releaseReservation(customerId, 1800, 'test', 'failed');
+   281→   281→
+   282→   282→  // Balance should be back to 1.0
+   283→   283→  balance = await mockUsageTracking.getBalance(customerId);
+   284→   284→  assert.strictEqual(balance.hoursRemaining, 1.0, 'Balance should be restored after release');
+   285→   285→}
+   286→   286→
+   287→   287→async function testReservationAdjustment() {
+   288→   288→  const customerId = 'cus_test_adjust';
+   289→   289→  mockUsers[customerId] = { hoursRemaining: 1.0, tier: 'starter' };
+   290→   290→
+   291→   291→  // Reserve 0.5 hours (30 minutes)
+   292→   292→  await mockUsageTracking.reserveCredits(customerId, 1800, 'test');
+   293→   293→
+   294→   294→  // Confirm with only 0.25 hours (15 minutes) actual usage
+   295→   295→  await mockUsageTracking.confirmReservation(customerId, 900, 1800, 'test');
+   296→   296→
+   297→   297→  // Balance should be 0.75 (1.0 - 0.25)
+   298→   298→  const balance = await mockUsageTracking.getBalance(customerId);
+   299→   299→  assert.strictEqual(balance.hoursRemaining, 0.75, 'Balance should reflect actual usage');
+   300→   300→}
+   301→   301→
+   302→   302→async function test402OnInsufficientCredits() {
+   303→   303→  const customerId = 'cus_test_402';
+   304→   304→  mockUsers[customerId] = { hoursRemaining: 0, tier: 'starter' };
+   305→   305→
+   306→   306→  const result = await mockUsageTracking.reserveCredits(customerId, 60, 'test');
+   307→   307→
+   308→   308→  assert.strictEqual(result.success, false, 'Should fail with no credits');
+   309→   309→  assert.strictEqual(result.error, 'Insufficient credits', 'Should return correct error');
+   310→   310→}
+   311→   311→
+   312→   312→// ============================================================================
+   313→   313→// Test Suite 1.2: License Key Delivery
+   314→   314→// ============================================================================
+   315→   315→
+   316→   316→async function testLicenseKeyGeneration() {
+   317→   317→  const customerId = 'cus_test_license';
+   318→   318→
+   319→   319→  const result = await mockLicenseService.generateLicenseKey(customerId);
+   320→   320→
+   321→   321→  assert.strictEqual(result.success, true, 'License key generation should succeed');
+   322→   322→  assert.ok(result.key.startsWith('SPLICE-'), 'Key should have SPLICE prefix');
+   323→   323→}
+   324→   324→
+   325→   325→async function testDuplicateLicenseKeyPrevention() {
+   326→   326→  const customerId = 'cus_test_duplicate';
+   327→   327→
+   328→   328→  // Generate first key
+   329→   329→  const result1 = await mockLicenseService.generateLicenseKey(customerId);
+   330→   330→  assert.strictEqual(result1.success, true, 'First key should succeed');
+   331→   331→
+   332→   332→  // Try to generate second key - should return existing
+   333→   333→  const result2 = await mockLicenseService.generateLicenseKey(customerId);
+   334→   334→  assert.strictEqual(result2.success, true, 'Second call should succeed');
+   335→   335→  assert.strictEqual(result2.key, result1.key, 'Should return same key');
+   336→   336→  assert.strictEqual(result2.existing, true, 'Should indicate existing key');
+   337→   337→}
+   338→   338→
+   339→   339→async function testLicenseResendWithNoExisting() {
+   340→   340→  const customerId = 'cus_test_resend';
+   341→   341→
+   342→   342→  // Call resend when no license exists - should generate one
+   343→   343→  let result = await mockLicenseService.getLicenseByCustomerId(customerId);
+   344→   344→  assert.strictEqual(result.success, false, 'Should not find license initially');
+   345→   345→
+   346→   346→  // Generate new license (simulating resend flow)
+   347→   347→  const newLicense = await mockLicenseService.generateLicenseKey(customerId);
+   348→   348→  assert.strictEqual(newLicense.success, true, 'Should generate new license');
+   349→   349→
+   350→   350→  // Now should find it
+   351→   351→  result = await mockLicenseService.getLicenseByCustomerId(customerId);
+   352→   352→  assert.strictEqual(result.success, true, 'Should find license after generation');
+   353→   353→}
+   354→   354→
+   355→   355→async function testRetryMechanism() {
+   356→   356→  let attempts = 0;
+   357→   357→  const maxRetries = 3;
+   358→   358→
+   359→   359→  // Simulate retry mechanism
+   360→   360→  async function generateWithRetry(customerId) {
+   361→   361→    let result = null;
+   362→   362→    let retryCount = 0;
+   363→   363→
+   364→   364→    while (retryCount < maxRetries) {
+   365→   365→      attempts++;
+   366→   366→      // Simulate 2 failures then success
+   367→   367→      if (attempts < 3) {
+   368→   368→        result = { success: false, error: 'Simulated failure' };
+   369→   369→        retryCount++;
+   370→   370→        continue;
+   371→   371→      }
+   372→   372→      result = await mockLicenseService.generateLicenseKey(customerId);
+   373→   373→      break;
+   374→   374→    }
+   375→   375→
+   376→   376→    return { result, attempts: retryCount };
+   377→   377→  }
+   378→   378→
+   379→   379→  const { result, attempts: retries } = await generateWithRetry('cus_test_retry');
+   380→   380→
+   381→   381→  assert.strictEqual(result.success, true, 'Should eventually succeed');
+   382→   382→  assert.ok(attempts >= 3, 'Should have made at least 3 attempts');
+   383→   383→}
+   384→   384→
+   385→   385→// ============================================================================
+   386→   386→// Test Suite 1.3: License Activation Row Locking
+   387→   387→// ============================================================================
+   388→   388→
+   389→   389→async function testConcurrentActivationSingleSuccess() {
+   390→   390→  const customerId = 'cus_test_activation';
+   391→   391→  const license = await mockLicenseService.generateLicenseKey(customerId);
+   392→   392→  const key = license.key;
+   393→   393→
+   394→   394→  // Send 5 concurrent activation requests
+   395→   395→  const promises = Array(5).fill(null).map(() =>
+   396→   396→    mockLicenseService.activateLicenseKey(key)
+   397→   397→  );
+   398→   398→
+   399→   399→  const results = await Promise.all(promises);
+   400→   400→
+   401→   401→  // All should succeed (returning customerId)
+   402→   402→  const successful = results.filter(r => r.success);
+   403→   403→  assert.strictEqual(successful.length, 5, 'All activations should succeed (same key)');
+   404→   404→
+   405→   405→  // But only 1 should be the first activation
+   406→   406→  const firstActivations = results.filter(r => r.success && !r.alreadyActivated);
+   407→   407→  const subsequentActivations = results.filter(r => r.success && r.alreadyActivated);
+   408→   408→
+   409→   409→  assert.strictEqual(firstActivations.length, 1, 'Only 1 should be first activation');
+   410→   410→  assert.strictEqual(subsequentActivations.length, 4, '4 should be already activated');
+   411→   411→}
+   412→   412→
+   413→   413→async function testSingleActivatedAtTimestamp() {
+   414→   414→  const customerId = 'cus_test_timestamp';
+   415→   415→  const license = await mockLicenseService.generateLicenseKey(customerId);
+   416→   416→  const key = license.key;
+   417→   417→
+   418→   418→  // Activate multiple times
+   419→   419→  await mockLicenseService.activateLicenseKey(key);
+   420→   420→  await delay(10);
+   421→   421→  await mockLicenseService.activateLicenseKey(key);
+   422→   422→  await delay(10);
+   423→   423→  await mockLicenseService.activateLicenseKey(key);
+   424→   424→
+   425→   425→  // Check that activatedAt is set
+   426→   426→  const licenseData = mockLicenseKeys[key];
+   427→   427→  assert.ok(licenseData.activatedAt, 'Should have activatedAt set');
+   428→   428→
+   429→   429→  // activatedAt should not change after first activation
+   430→   430→  const firstActivatedAt = licenseData.activatedAt;
+   431→   431→  await mockLicenseService.activateLicenseKey(key);
+   432→   432→  assert.strictEqual(licenseData.activatedAt, firstActivatedAt, 'activatedAt should not change');
+   433→   433→}
+   434→   434→
+   435→   435→async function testInvalidKeyFormat() {
+   436→   436→  const result = await mockLicenseService.activateLicenseKey('invalid-key');
+   437→   437→  assert.strictEqual(result.success, false, 'Should fail with invalid key');
+   438→   438→}
+   439→   439→
+   440→   440→async function testNonExistentKey() {
+   441→   441→  const result = await mockLicenseService.activateLicenseKey('SPLICE-XXXX-YYYY-ZZZZ');
+   442→   442→  assert.strictEqual(result.success, false, 'Should fail with non-existent key');
+   443→   443→  assert.strictEqual(result.error, 'License key not found', 'Should return correct error');
+   444→   444→}
+   445→   445→
+   446→   446→async function testAllActivationsReturnCustomerId() {
+   447→   447→  const customerId = 'cus_test_all_return';
+   448→   448→  const license = await mockLicenseService.generateLicenseKey(customerId);
+   449→   449→  const key = license.key;
+   450→   450→
+   451→   451→  // Activate 3 times
+   452→   452→  const results = await Promise.all([
+   453→   453→    mockLicenseService.activateLicenseKey(key),
+   454→   454→    mockLicenseService.activateLicenseKey(key),
+   455→   455→    mockLicenseService.activateLicenseKey(key)
+   456→   456→  ]);
+   457→   457→
+   458→   458→  // All should return the correct customerId
+   459→   459→  for (const result of results) {
+   460→   460→    assert.strictEqual(result.success, true, 'Should succeed');
+   461→   461→    assert.strictEqual(result.customerId, customerId, 'Should return correct customerId');
+   462→   462→  }
+   463→   463→}
+   464→   464→
+   465→   465→// ============================================================================
+   466→   466→// Run All Tests
+   467→   467→// ============================================================================
+   468→   468→
+   469→   469→async function runAllTests() {
+   470→   470→  console.log('\n========================================');
+   471→   471→  console.log('Phase 1: Critical Concurrency Fixes');
+   472→   472→  console.log('========================================\n');
+   473→   473→
+   474→   474→  console.log('--- 1.1 Atomic Credit Reservation ---');
+   475→   475→  await runTest('Concurrent credit requests should be atomic', testConcurrentCreditRequests);
+   476→   476→  await runTest('Should prevent negative balance', testNoNegativeBalance);
+   477→   477→  await runTest('Should release reservation on failure', testReservationRelease);
+   478→   478→  await runTest('Should adjust for actual usage', testReservationAdjustment);
+   479→   479→  await runTest('Should return 402 on insufficient credits', test402OnInsufficientCredits);
+   480→   480→
+   481→   481→  console.log('\n--- 1.2 License Key Delivery ---');
+   482→   482→  await runTest('Should generate license key on purchase', testLicenseKeyGeneration);
+   483→   483→  await runTest('Should prevent duplicate keys for same customer', testDuplicateLicenseKeyPrevention);
+   484→   484→  await runTest('Should handle resend with no existing license', testLicenseResendWithNoExisting);
+   485→   485→  await runTest('Should retry on generation failure', testRetryMechanism);
+   486→   486→
+   487→   487→  console.log('\n--- 1.3 License Activation Row Locking ---');
+   488→   488→  await runTest('Concurrent activations should result in single first activation', testConcurrentActivationSingleSuccess);
+   489→   489→  await runTest('Should have single activatedAt timestamp', testSingleActivatedAtTimestamp);
+   490→   490→  await runTest('Should reject invalid key format', testInvalidKeyFormat);
+   491→   491→  await runTest('Should reject non-existent key', testNonExistentKey);
+   492→   492→  await runTest('All activations should return correct customerId', testAllActivationsReturnCustomerId);
+   493→   493→
+   494→   494→  console.log('\n========================================');
+   495→   495→  console.log(`Results: ${passedTests} passed, ${failedTests} failed`);
+   496→   496→  console.log('========================================\n');
+   497→   497→
+   498→   498→  // Phase 1 Complete Checklist
+   499→   499→  console.log('Phase 1 Complete Checklist:');
+   500→   500→  console.log(`[${passedTests >= 5 ? '✓' : '✗'}] 1.1 Atomic credit reservation working`);
+   501→   501→  console.log(`[${passedTests >= 9 ? '✓' : '✗'}] 1.2 License key delivery working`);
+   502→   502→  console.log(`[${passedTests >= 14 ? '✓' : '✗'}] 1.3 License activation row locking working`);
+   503→   503→  console.log(`[${failedTests === 0 ? '✓' : '✗'}] All E2E tests passing`);
+   504→   504→  console.log(`[${failedTests === 0 ? '✓' : '✗'}] No race conditions in concurrent tests`);
+   505→   505→  console.log(`[${failedTests === 0 ? '✓' : '✗'}] Ready for Phase 2`);
+   506→   506→
+   507→   507→  return { passed: passedTests, failed: failedTests, results: testResults };
+   508→   508→}
+   509→   509→
+   510→   510→// Run tests
+   511→   511→runAllTests()
+   512→   512→  .then(({ passed, failed }) => {
+   513→   513→    process.exit(failed > 0 ? 1 : 0);
+   514→   514→  })
+   515→   515→  .catch(err => {
+   516→   516→    console.error('Test runner error:', err);
+   517→   517→    process.exit(1);
+   518→   518→  });
+   519→   519→
+   520→
+   521→<system-reminder>
+   522→Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+   523→</system-reminder>
+   524→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

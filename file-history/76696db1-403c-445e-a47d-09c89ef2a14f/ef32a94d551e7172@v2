@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+Production-Ready Qwen2.5-Coder XML → JSON Proxy for LibreChat
+Converts XML tool calls to OpenAI-compatible JSON format
+
+Based on vLLM's Qwen3XMLToolParser:
+https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/qwen3xml_tool_parser.py
+
+OpenAI API Reference:
+https://platform.openai.com/docs/api-reference/chat
+"""
+
+import os
+import json
+import uuid
+import re
+import logging
+from typing import Dict, List, Any
+
+from flask import Flask, request, Response, stream_with_context
+import requests
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Configuration
+FEATHERLESS_API_KEY = os.environ.get("FEATHERLESS_API_KEY")
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
+
+# Models that need XML → JSON conversion
+XML_MODELS = [
+    "qwen2.5-coder",
+    "qwq",
+    "qwen2.5",  # All Qwen2.5 models use XML format
+]
+
+
+class QwenXMLToJSONConverter:
+    """
+    Convert Qwen's XML tool call format to OpenAI JSON format
+
+    XML Format:
+    <tool_call>
+    <function=function_name>
+    <parameter=param1>value1</parameter>
+    <parameter=param2>value2</parameter>
+    </function>
+    </tool_call>
+
+    OpenAI JSON Format:
+    {
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "function_name",
+          "arguments": "{\"param1\":\"value1\",\"param2\":\"value2\"}"
+        }
+      }]
+    }
+    """
+
+    def __init__(self):
+        # XML patterns
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+        self.function_regex = re.compile(r"<function=(.*?)>(.*?)</function>", re.DOTALL)
+        self.parameter_regex = re.compile(
+            r"<parameter=(.*?)>(.*?)</parameter>", re.DOTALL
+        )
+
+    def needs_conversion(self, model: str) -> bool:
+        """Check if model needs XML → JSON conversion"""
+        model_lower = model.lower()
+        return any(xml_model in model_lower for xml_model in XML_MODELS)
+
+    def parse_xml_tool_calls(self, content: str) -> tuple[List[Dict], str]:
+        """
+        Parse XML tool calls from content
+
+        Returns:
+            (tool_calls, clean_content) where tool_calls is OpenAI format
+            and clean_content has XML removed
+        """
+        tool_calls = []
+
+        # Find all <tool_call> blocks
+        matches = self.tool_call_regex.findall(content)
+
+        for idx, tool_call_content in enumerate(matches):
+            # Parse function name and parameters
+            function_match = self.function_regex.search(tool_call_content)
+
+            if function_match:
+                function_name = function_match.group(1).strip()
+                function_body = function_match.group(2).strip()
+
+                # Parse all parameters
+                parameters = {}
+                param_matches = self.parameter_regex.findall(function_body)
+
+                for param_name, param_value in param_matches:
+                    param_name = param_name.strip()
+                    param_value = param_value.strip()
+
+                    # Try to convert to appropriate type
+                    parameters[param_name] = self._convert_value(param_value)
+
+                # Create OpenAI-compatible tool call
+                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_calls.append(
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": json.dumps(parameters, ensure_ascii=False),
+                        },
+                    }
+                )
+
+        # Remove XML from content
+        clean_content = self.tool_call_regex.sub("", content).strip()
+
+        return tool_calls, clean_content
+
+    def _convert_value(self, value: str) -> Any:
+        """Convert string value to appropriate Python type"""
+        # Try to parse as JSON first
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try numeric conversions
+        try:
+            if "." in value:
+                return float(value)
+            return int(value)
+        except ValueError:
+            pass
+
+        # Try boolean
+        if value.lower() in ("true", "false"):
+            return value.lower() == "true"
+
+        # Return as string
+        return value
+
+    def convert_response(self, response_data: Dict) -> Dict:
+        """Convert complete response with XML tool calls to JSON"""
+        try:
+            # Get message from response
+            if "choices" not in response_data or not response_data["choices"]:
+                return response_data
+
+            message = response_data["choices"][0].get("message", {})
+            content = message.get("content", "")
+
+            if not content or "<tool_call>" not in content:
+                return response_data
+
+            # Parse XML tool calls
+            tool_calls, clean_content = self.parse_xml_tool_calls(content)
+
+            if tool_calls:
+                # Update message with JSON tool calls
+                message["content"] = clean_content if clean_content else None
+                message["tool_calls"] = tool_calls
+
+                logger.info(f"Converted {len(tool_calls)} XML tool calls to JSON")
+
+            return response_data
+
+        except Exception as e:
+            logger.error(f"Error converting response: {e}", exc_info=True)
+            return response_data
+
+    def convert_streaming_chunk(self, chunk_data: Dict, state: Dict) -> Dict:
+        """
+        Convert streaming chunk with XML to JSON
+
+        state: Dictionary to maintain state across chunks
+               - 'accumulated': str - accumulated content
+               - 'tool_calls_sent': bool - whether tool calls were sent
+        """
+        try:
+            if "choices" not in chunk_data or not chunk_data["choices"]:
+                return chunk_data
+
+            delta = chunk_data["choices"][0].get("delta", {})
+            content_delta = delta.get("content", "")
+
+            if not content_delta:
+                return chunk_data
+
+            # Accumulate content
+            state["accumulated"] = state.get("accumulated", "") + content_delta
+
+            # Check if we have complete tool calls
+            if "</tool_call>" in state["accumulated"] and not state.get(
+                "tool_calls_sent"
+            ):
+                # Parse accumulated content
+                tool_calls, clean_content = self.parse_xml_tool_calls(
+                    state["accumulated"]
+                )
+
+                if tool_calls:
+                    # Send tool calls in delta format
+                    # Clear content delta
+                    delta["content"] = None
+
+                    # Add tool_calls to delta
+                    delta["tool_calls"] = tool_calls
+
+                    # Mark as sent
+                    state["tool_calls_sent"] = True
+
+                    # Keep any remaining clean content
+                    if clean_content:
+                        state["accumulated"] = clean_content
+                    else:
+                        state["accumulated"] = ""
+
+                    logger.info(f"Converted {len(tool_calls)} XML tool calls in stream")
+
+            return chunk_data
+
+        except Exception as e:
+            logger.error(f"Error converting streaming chunk: {e}", exc_info=True)
+            return chunk_data
+
+
+converter = QwenXMLToJSONConverter()
+
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    """Proxy models endpoint"""
+    try:
+        response = requests.get(
+            f"{FEATHERLESS_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {FEATHERLESS_API_KEY}"},
+        )
+        return Response(
+            response.content,
+            status=response.status_code,
+            content_type="application/json",
+        )
+    except Exception as e:
+        logger.error(f"Error listing models: {e}")
+        return {"error": str(e)}, 500
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    """Proxy chat completions with XML → JSON conversion"""
+    try:
+        data = request.get_json()
+        model = data.get("model", "")
+        stream = data.get("stream", False)
+
+        # Log request
+        logger.info(
+            f"Request: model={model}, stream={stream}, needs_conversion={converter.needs_conversion(model)}"
+        )
+
+        # Make request to Featherless
+        headers = {
+            "Authorization": f"Bearer {FEATHERLESS_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        featherless_response = requests.post(
+            f"{FEATHERLESS_BASE_URL}/chat/completions",
+            headers=headers,
+            json=data,
+            stream=stream,
+        )
+
+        if not converter.needs_conversion(model):
+            # Pass through for models that don't need conversion
+            logger.info("Pass-through mode (no conversion needed)")
+            if stream:
+                return Response(
+                    stream_with_context(
+                        featherless_response.iter_content(chunk_size=1024)
+                    ),
+                    content_type="text/event-stream",
+                )
+            else:
+                return Response(
+                    featherless_response.content,
+                    status=featherless_response.status_code,
+                    content_type="application/json",
+                )
+
+        # Convert XML → JSON
+        if stream:
+            return Response(
+                stream_with_context(convert_streaming_response(featherless_response)),
+                content_type="text/event-stream",
+            )
+        else:
+            response_data = featherless_response.json()
+            converted_data = converter.convert_response(response_data)
+            return Response(
+                json.dumps(converted_data), status=200, content_type="application/json"
+            )
+
+    except Exception as e:
+        logger.error(f"Proxy error: {e}", exc_info=True)
+        return {"error": str(e)}, 500
+
+
+def convert_streaming_response(response):
+    """Convert streaming response with XML → JSON"""
+    state = {"accumulated": "", "tool_calls_sent": False}
+
+    for line in response.iter_lines():
+        if not line:
+            yield b"\n"
+            continue
+
+        line_str = line.decode("utf-8")
+
+        if not line_str.startswith("data: "):
+            yield line + b"\n\n"
+            continue
+
+        data_str = line_str[6:]
+
+        if data_str == "[DONE]":
+            yield line + b"\n\n"
+            continue
+
+        try:
+            chunk = json.loads(data_str)
+            converted_chunk = converter.convert_streaming_chunk(chunk, state)
+            yield f"data: {json.dumps(converted_chunk)}\n\n".encode("utf-8")
+        except json.JSONDecodeError:
+            # Pass through invalid JSON
+            yield line + b"\n\n"
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "qwen-xml-to-json-proxy",
+        "featherless_connected": bool(FEATHERLESS_API_KEY),
+    }, 200
+
+
+if __name__ == "__main__":
+    if not FEATHERLESS_API_KEY:
+        logger.error("FEATHERLESS_API_KEY environment variable not set!")
+        exit(1)
+
+    logger.info(f"Starting Qwen XML→JSON Proxy on port {PROXY_PORT}")
+    logger.info(f"Proxying to: {FEATHERLESS_BASE_URL}")
+    logger.info(f"Converting models: {', '.join(XML_MODELS)}")
+    logger.info("Abliterated models will NEVER refuse requests (no safety filtering)")
+
+    app.run(host="0.0.0.0", port=PROXY_PORT, debug=False)

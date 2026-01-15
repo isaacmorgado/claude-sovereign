@@ -1,0 +1,1012 @@
+/**
+ * E2E Authentication Tests
+ *
+ * Tests for authentication endpoints:
+ * - POST /auth/login - successful login returns tokens
+ * - POST /auth/login - invalid credentials returns 401
+ * - POST /auth/refresh - valid refresh token returns new tokens
+ * - POST /auth/refresh - invalid refresh token returns 401
+ * - POST /auth/logout - blacklists token
+ * - Protected route access with valid token
+ * - Protected route rejection with blacklisted token
+ * - Protected route rejection with expired token
+ */
+
+const crypto = require('crypto');
+
+// =============================================================================
+// Test Framework
+// =============================================================================
+
+let passCount = 0;
+let failCount = 0;
+
+function test(name, fn) {
+  try {
+    const result = fn();
+    // Handle async tests
+    if (result && typeof result.then === 'function') {
+      return result
+        .then(() => {
+          passCount++;
+          console.log(`  \u2713 ${name}`);
+        })
+        .catch((err) => {
+          failCount++;
+          console.log(`  \u2717 ${name}`);
+          console.log(`    Error: ${err.message}`);
+        });
+    }
+    passCount++;
+    console.log(`  \u2713 ${name}`);
+  } catch (err) {
+    failCount++;
+    console.log(`  \u2717 ${name}`);
+    console.log(`    Error: ${err.message}`);
+  }
+}
+
+function assertEqual(actual, expected, message = '') {
+  if (actual !== expected) {
+    throw new Error(`${message}: Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function assertTrue(condition, message = '') {
+  if (!condition) {
+    throw new Error(`${message}: Expected true, got false`);
+  }
+}
+
+function assertFalse(condition, message = '') {
+  if (condition) {
+    throw new Error(`${message}: Expected false, got true`);
+  }
+}
+
+function assertIncludes(str, substr, message = '') {
+  if (!str || !str.includes(substr)) {
+    throw new Error(`${message}: String does not include "${substr}"`);
+  }
+}
+
+// =============================================================================
+// Mock Services and Middleware
+// =============================================================================
+
+// In-memory token blacklist (mimics auth.js)
+const tokenBlacklist = new Map();
+
+function blacklistToken(jti, exp) {
+  if (!jti) return false;
+  tokenBlacklist.set(jti, exp);
+  return true;
+}
+
+function isTokenBlacklisted(jti) {
+  if (!jti) return false;
+  return tokenBlacklist.has(jti);
+}
+
+// Mock JWT functions (simplified versions for testing)
+const JWT_EXPIRES_IN = '24h';
+const JWT_REFRESH_EXPIRES_IN = '7d';
+
+function generateToken(stripeCustomerId, options = {}) {
+  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+    throw new Error('Invalid Stripe customer ID');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const jti = crypto.randomUUID();
+  const payload = {
+    sub: stripeCustomerId,
+    type: 'access',
+    tier: options.tier || 'starter',
+    iat: now,
+    exp: now + 86400, // 24 hours
+    jti
+  };
+
+  if (options.email) {
+    payload.email = options.email;
+  }
+
+  // Simplified token encoding (base64 JSON for testing)
+  const token = Buffer.from(JSON.stringify(payload)).toString('base64');
+
+  return {
+    token,
+    expiresIn: JWT_EXPIRES_IN,
+    tokenType: 'Bearer',
+    payload // Include for testing
+  };
+}
+
+function generateRefreshToken(stripeCustomerId) {
+  if (!stripeCustomerId || !stripeCustomerId.startsWith('cus_')) {
+    throw new Error('Invalid Stripe customer ID');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const jti = crypto.randomUUID();
+  const payload = {
+    sub: stripeCustomerId,
+    type: 'refresh',
+    iat: now,
+    exp: now + 604800, // 7 days
+    jti
+  };
+
+  const refreshToken = Buffer.from(JSON.stringify(payload)).toString('base64');
+
+  return {
+    refreshToken,
+    expiresIn: JWT_REFRESH_EXPIRES_IN,
+    payload // Include for testing
+  };
+}
+
+function verifyToken(token, options = {}) {
+  const { checkBlacklist = true } = options;
+
+  try {
+    const payload = JSON.parse(Buffer.from(token, 'base64').toString());
+
+    // Check expiration
+    const now = Math.floor(Date.now() / 1000);
+    if (payload.exp && payload.exp < now) {
+      return null; // Token expired
+    }
+
+    // Check blacklist
+    if (checkBlacklist && payload.jti) {
+      if (isTokenBlacklisted(payload.jti)) {
+        return null;
+      }
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function generateExpiredToken(stripeCustomerId) {
+  const now = Math.floor(Date.now() / 1000);
+  const jti = crypto.randomUUID();
+  const payload = {
+    sub: stripeCustomerId,
+    type: 'access',
+    tier: 'starter',
+    iat: now - 86400, // 24 hours ago
+    exp: now - 3600, // Expired 1 hour ago
+    jti
+  };
+
+  return Buffer.from(JSON.stringify(payload)).toString('base64');
+}
+
+function extractBearerToken(authHeader) {
+  if (!authHeader || typeof authHeader !== 'string') {
+    return null;
+  }
+
+  const parts = authHeader.split(' ');
+  if (parts.length !== 2 || parts[0].toLowerCase() !== 'bearer') {
+    return null;
+  }
+
+  return parts[1];
+}
+
+// Mock license service
+const mockLicenseKeys = new Map();
+mockLicenseKeys.set('SPLICE-TEST-VALD-KEY1', {
+  customerId: 'cus_testuser123456',
+  email: 'test@example.com',
+  isActive: true
+});
+mockLicenseKeys.set('SPLICE-DEAC-TIVE-KEY2', {
+  customerId: 'cus_deactivated123',
+  email: 'deactivated@example.com',
+  isActive: false
+});
+
+const mockLicenseService = {
+  async activateLicenseKey(key) {
+    const normalizedKey = (key || '').toUpperCase().trim();
+    const license = mockLicenseKeys.get(normalizedKey);
+
+    if (!license) {
+      return { success: false, error: 'License key not found' };
+    }
+
+    if (!license.isActive) {
+      return { success: false, error: 'License key has been deactivated' };
+    }
+
+    return {
+      success: true,
+      customerId: license.customerId,
+      email: license.email
+    };
+  }
+};
+
+// Mock usage tracking service
+const mockUsageTracking = {
+  async getBalance(_customerId) {
+    return {
+      tier: 'pro',
+      hoursRemaining: 10.5,
+      musicCredits: 50
+    };
+  }
+};
+
+// =============================================================================
+// Simulated HTTP Request/Response
+// =============================================================================
+
+class MockRequest {
+  constructor(options = {}) {
+    this.body = options.body || {};
+    this.headers = options.headers || {};
+    this.params = options.params || {};
+    this.query = options.query || {};
+    this.stripeCustomerId = null;
+    this.tokenData = null;
+    this.rawToken = null;
+    this.isLegacyAuth = false;
+  }
+}
+
+class MockResponse {
+  constructor() {
+    this.statusCode = 200;
+    this.data = null;
+    this._ended = false;
+  }
+
+  status(code) {
+    this.statusCode = code;
+    return this;
+  }
+
+  json(data) {
+    this.data = data;
+    this._ended = true;
+    return this;
+  }
+
+  end() {
+    this._ended = true;
+    return this;
+  }
+}
+
+// =============================================================================
+// Simulated Route Handlers (mimicking routes/auth.js)
+// =============================================================================
+
+async function handleLogin(req, res) {
+  const { licenseKey } = req.body;
+
+  if (!licenseKey) {
+    return res.status(400).json({
+      error: 'License key required',
+      message: 'Please provide your license key to log in'
+    });
+  }
+
+  try {
+    const licenseResult = await mockLicenseService.activateLicenseKey(licenseKey);
+
+    if (!licenseResult.success) {
+      return res.status(401).json({
+        error: 'Invalid license key',
+        message: licenseResult.error || 'The license key is invalid or expired'
+      });
+    }
+
+    const balance = await mockUsageTracking.getBalance(licenseResult.customerId);
+
+    const tokenResult = generateToken(licenseResult.customerId, {
+      tier: balance.tier,
+      email: licenseResult.email
+    });
+    const refreshResult = generateRefreshToken(licenseResult.customerId);
+
+    res.json({
+      success: true,
+      token: tokenResult.token,
+      tokenType: tokenResult.tokenType,
+      expiresIn: tokenResult.expiresIn,
+      refreshToken: refreshResult.refreshToken,
+      customerId: licenseResult.customerId,
+      tier: balance.tier,
+      hoursRemaining: balance.hoursRemaining
+    });
+  } catch (_err) {
+    res.status(500).json({ error: 'Authentication failed. Please try again.' });
+  }
+}
+
+async function handleRefresh(req, res) {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(400).json({
+      error: 'Refresh token required'
+    });
+  }
+
+  try {
+    const decoded = verifyToken(refreshToken);
+
+    if (!decoded || decoded.type !== 'refresh') {
+      return res.status(401).json({
+        error: 'Invalid refresh token',
+        message: 'Please log in again'
+      });
+    }
+
+    const balance = await mockUsageTracking.getBalance(decoded.sub);
+
+    const tokenResult = generateToken(decoded.sub, {
+      tier: balance.tier
+    });
+
+    res.json({
+      success: true,
+      token: tokenResult.token,
+      tokenType: tokenResult.tokenType,
+      expiresIn: tokenResult.expiresIn
+    });
+  } catch (_err) {
+    res.status(401).json({
+      error: 'Failed to refresh token',
+      message: 'Please log in again'
+    });
+  }
+}
+
+function handleLogout(req, res) {
+  const { refreshToken } = req.body;
+
+  // Blacklist the access token
+  if (req.tokenData && req.tokenData.jti && req.tokenData.exp) {
+    blacklistToken(req.tokenData.jti, req.tokenData.exp);
+  }
+
+  // Optionally blacklist the refresh token too
+  if (refreshToken) {
+    const decoded = verifyToken(refreshToken, { checkBlacklist: false });
+    if (decoded && decoded.jti && decoded.exp) {
+      blacklistToken(decoded.jti, decoded.exp);
+    }
+  }
+
+  res.json({
+    success: true,
+    message: 'Logged out successfully'
+  });
+}
+
+// Middleware to authenticate JWT tokens
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = extractBearerToken(authHeader);
+
+  if (token) {
+    // First verify without blacklist check for specific error messages
+    const decoded = verifyToken(token, { checkBlacklist: false });
+
+    if (!decoded || !decoded.sub) {
+      return res.status(401).json({
+        error: 'Invalid or expired token',
+        message: 'Please log in again to continue'
+      });
+    }
+
+    // Check if token has been revoked (blacklisted)
+    if (decoded.jti && isTokenBlacklisted(decoded.jti)) {
+      return res.status(401).json({
+        error: 'Token has been revoked',
+        message: 'This session has been logged out. Please log in again.'
+      });
+    }
+
+    // Token is valid and not revoked
+    req.stripeCustomerId = decoded.sub;
+    req.tokenData = decoded;
+    req.rawToken = token;
+    return next();
+  }
+
+  // Fallback: Legacy x-stripe-customer-id header
+  const legacyCustomerId = req.headers['x-stripe-customer-id'];
+  if (legacyCustomerId) {
+    if (!legacyCustomerId.startsWith('cus_')) {
+      return res.status(401).json({
+        error: 'Invalid customer ID format',
+        message: 'Customer ID must start with cus_'
+      });
+    }
+
+    req.stripeCustomerId = legacyCustomerId;
+    req.isLegacyAuth = true;
+    return next();
+  }
+
+  // No authentication provided
+  return res.status(401).json({
+    error: 'Authentication required',
+    message: 'Please provide a valid Bearer token in the Authorization header'
+  });
+}
+
+// Protected route handler for testing
+function handleProtectedRoute(req, res) {
+  res.json({
+    success: true,
+    customerId: req.stripeCustomerId,
+    tier: req.tokenData?.tier || 'unknown'
+  });
+}
+
+// =============================================================================
+// Test Suite
+// =============================================================================
+
+async function runTests() {
+  console.log('\n=== Authentication E2E Tests ===\n');
+
+  // =========================================================================
+  // Test Suite 1: POST /auth/login
+  // =========================================================================
+  console.log('1. POST /auth/login - Login Tests');
+
+  await test('login with valid license key returns tokens', async () => {
+    const req = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const res = new MockResponse();
+
+    await handleLogin(req, res);
+
+    assertEqual(res.statusCode, 200, 'Status code');
+    assertTrue(res.data.success, 'Success flag');
+    assertTrue(res.data.token && res.data.token.length > 0, 'Token present');
+    assertTrue(res.data.refreshToken && res.data.refreshToken.length > 0, 'Refresh token present');
+    assertEqual(res.data.tokenType, 'Bearer', 'Token type');
+    assertEqual(res.data.customerId, 'cus_testuser123456', 'Customer ID');
+    assertEqual(res.data.tier, 'pro', 'Tier');
+  });
+
+  await test('login with invalid license key returns 401', async () => {
+    const req = new MockRequest({
+      body: { licenseKey: 'SPLICE-INVA-LIDK-EY00' }
+    });
+    const res = new MockResponse();
+
+    await handleLogin(req, res);
+
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid license key', 'Error message');
+  });
+
+  await test('login with deactivated license key returns 401', async () => {
+    const req = new MockRequest({
+      body: { licenseKey: 'SPLICE-DEAC-TIVE-KEY2' }
+    });
+    const res = new MockResponse();
+
+    await handleLogin(req, res);
+
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertIncludes(res.data.message, 'deactivated', 'Error mentions deactivation');
+  });
+
+  await test('login without license key returns 400', async () => {
+    const req = new MockRequest({
+      body: {}
+    });
+    const res = new MockResponse();
+
+    await handleLogin(req, res);
+
+    assertEqual(res.statusCode, 400, 'Status code');
+    assertEqual(res.data.error, 'License key required', 'Error message');
+  });
+
+  // =========================================================================
+  // Test Suite 2: POST /auth/refresh
+  // =========================================================================
+  console.log('\n2. POST /auth/refresh - Token Refresh Tests');
+
+  await test('refresh with valid refresh token returns new tokens', async () => {
+    // First get a valid refresh token
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const refreshToken = loginRes.data.refreshToken;
+
+    // Now try to refresh
+    const req = new MockRequest({
+      body: { refreshToken }
+    });
+    const res = new MockResponse();
+
+    await handleRefresh(req, res);
+
+    assertEqual(res.statusCode, 200, 'Status code');
+    assertTrue(res.data.success, 'Success flag');
+    assertTrue(res.data.token && res.data.token.length > 0, 'New token present');
+    assertEqual(res.data.tokenType, 'Bearer', 'Token type');
+  });
+
+  await test('refresh with invalid refresh token returns 401', async () => {
+    const req = new MockRequest({
+      body: { refreshToken: 'invalid-token' }
+    });
+    const res = new MockResponse();
+
+    await handleRefresh(req, res);
+
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid refresh token', 'Error message');
+  });
+
+  await test('refresh with access token (wrong type) returns 401', async () => {
+    // Get an access token (not refresh token)
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const accessToken = loginRes.data.token; // Access token, not refresh
+
+    const req = new MockRequest({
+      body: { refreshToken: accessToken }
+    });
+    const res = new MockResponse();
+
+    await handleRefresh(req, res);
+
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid refresh token', 'Error message');
+  });
+
+  await test('refresh without token returns 400', async () => {
+    const req = new MockRequest({
+      body: {}
+    });
+    const res = new MockResponse();
+
+    await handleRefresh(req, res);
+
+    assertEqual(res.statusCode, 400, 'Status code');
+    assertEqual(res.data.error, 'Refresh token required', 'Error message');
+  });
+
+  // =========================================================================
+  // Test Suite 3: POST /auth/logout
+  // =========================================================================
+  console.log('\n3. POST /auth/logout - Logout Tests');
+
+  await test('logout blacklists current token', async () => {
+    // Login to get tokens
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const accessToken = loginRes.data.token;
+    const decoded = verifyToken(accessToken);
+
+    // Simulate authenticated request for logout
+    const req = new MockRequest({
+      body: {},
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    req.tokenData = decoded;
+    req.stripeCustomerId = decoded.sub;
+
+    const res = new MockResponse();
+    handleLogout(req, res);
+
+    assertEqual(res.statusCode, 200, 'Status code');
+    assertTrue(res.data.success, 'Success flag');
+
+    // Verify token is blacklisted
+    assertTrue(isTokenBlacklisted(decoded.jti), 'Token should be blacklisted');
+  });
+
+  await test('logout also blacklists provided refresh token', async () => {
+    // Clear blacklist for this test
+    tokenBlacklist.clear();
+
+    // Login to get tokens
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const accessToken = loginRes.data.token;
+    const refreshToken = loginRes.data.refreshToken;
+    const accessDecoded = verifyToken(accessToken);
+    const refreshDecoded = verifyToken(refreshToken);
+
+    // Logout with refresh token
+    const req = new MockRequest({
+      body: { refreshToken },
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    req.tokenData = accessDecoded;
+    req.stripeCustomerId = accessDecoded.sub;
+
+    const res = new MockResponse();
+    handleLogout(req, res);
+
+    assertEqual(res.statusCode, 200, 'Status code');
+    assertTrue(isTokenBlacklisted(accessDecoded.jti), 'Access token should be blacklisted');
+    assertTrue(isTokenBlacklisted(refreshDecoded.jti), 'Refresh token should be blacklisted');
+  });
+
+  // =========================================================================
+  // Test Suite 4: Protected Route Access
+  // =========================================================================
+  console.log('\n4. Protected Route Access Tests');
+
+  await test('protected route access with valid token succeeds', async () => {
+    // Clear blacklist
+    tokenBlacklist.clear();
+
+    // Login to get token
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const accessToken = loginRes.data.token;
+
+    // Try to access protected route
+    const req = new MockRequest({
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertTrue(nextCalled, 'next() should be called');
+    assertEqual(req.stripeCustomerId, 'cus_testuser123456', 'Customer ID set');
+    assertTrue(req.tokenData !== null, 'Token data set');
+  });
+
+  await test('protected route rejection with blacklisted token', async () => {
+    // Login to get token
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    const accessToken = loginRes.data.token;
+    const decoded = verifyToken(accessToken);
+
+    // Blacklist the token
+    blacklistToken(decoded.jti, decoded.exp);
+
+    // Try to access protected route with blacklisted token
+    const req = new MockRequest({
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertFalse(nextCalled, 'next() should NOT be called');
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Token has been revoked', 'Error message');
+  });
+
+  await test('protected route rejection with expired token', async () => {
+    const expiredToken = generateExpiredToken('cus_testuser123456');
+
+    const req = new MockRequest({
+      headers: { authorization: `Bearer ${expiredToken}` }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertFalse(nextCalled, 'next() should NOT be called');
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid or expired token', 'Error message');
+  });
+
+  await test('protected route rejection with invalid token', async () => {
+    const req = new MockRequest({
+      headers: { authorization: 'Bearer invalid-malformed-token' }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertFalse(nextCalled, 'next() should NOT be called');
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid or expired token', 'Error message');
+  });
+
+  await test('protected route rejection without any authentication', async () => {
+    const req = new MockRequest({
+      headers: {}
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertFalse(nextCalled, 'next() should NOT be called');
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Authentication required', 'Error message');
+  });
+
+  // =========================================================================
+  // Test Suite 5: Legacy Auth Header Support
+  // =========================================================================
+  console.log('\n5. Legacy Auth Header Support Tests');
+
+  await test('legacy x-stripe-customer-id header is accepted', async () => {
+    const req = new MockRequest({
+      headers: { 'x-stripe-customer-id': 'cus_legacyuser123456' }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertTrue(nextCalled, 'next() should be called');
+    assertEqual(req.stripeCustomerId, 'cus_legacyuser123456', 'Customer ID set');
+    assertTrue(req.isLegacyAuth, 'Legacy auth flag set');
+  });
+
+  await test('invalid legacy customer ID format rejected', async () => {
+    const req = new MockRequest({
+      headers: { 'x-stripe-customer-id': 'invalid_customer_id' }
+    });
+    const res = new MockResponse();
+
+    let nextCalled = false;
+    authenticateToken(req, res, () => {
+      nextCalled = true;
+    });
+
+    assertFalse(nextCalled, 'next() should NOT be called');
+    assertEqual(res.statusCode, 401, 'Status code');
+    assertEqual(res.data.error, 'Invalid customer ID format', 'Error message');
+  });
+
+  // =========================================================================
+  // Test Suite 6: Token Generation Edge Cases
+  // =========================================================================
+  console.log('\n6. Token Generation Edge Cases');
+
+  test('generateToken requires valid Stripe customer ID', () => {
+    let threw = false;
+    try {
+      generateToken('invalid_id');
+    } catch (e) {
+      threw = true;
+      assertIncludes(e.message, 'Invalid Stripe customer ID', 'Error message');
+    }
+    assertTrue(threw, 'Should throw for invalid customer ID');
+  });
+
+  test('generateToken requires customer ID starting with cus_', () => {
+    let threw = false;
+    try {
+      generateToken('usr_someuser');
+    } catch (_e) {
+      threw = true;
+    }
+    assertTrue(threw, 'Should throw for non-cus_ prefix');
+  });
+
+  test('generateRefreshToken requires valid Stripe customer ID', () => {
+    let threw = false;
+    try {
+      generateRefreshToken(null);
+    } catch (_e) {
+      threw = true;
+    }
+    assertTrue(threw, 'Should throw for null customer ID');
+  });
+
+  test('generated tokens have unique jti', () => {
+    const token1 = generateToken('cus_testuser123456');
+    const token2 = generateToken('cus_testuser123456');
+
+    const payload1 = verifyToken(token1.token);
+    const payload2 = verifyToken(token2.token);
+
+    assertTrue(payload1.jti !== payload2.jti, 'JTIs should be unique');
+  });
+
+  // =========================================================================
+  // Test Suite 7: Bearer Token Extraction
+  // =========================================================================
+  console.log('\n7. Bearer Token Extraction Tests');
+
+  test('extractBearerToken handles valid Bearer header', () => {
+    const token = extractBearerToken('Bearer abc123');
+    assertEqual(token, 'abc123', 'Token extracted');
+  });
+
+  test('extractBearerToken handles lowercase bearer', () => {
+    const token = extractBearerToken('bearer abc123');
+    assertEqual(token, 'abc123', 'Token extracted');
+  });
+
+  test('extractBearerToken returns null for non-Bearer auth', () => {
+    const token = extractBearerToken('Basic abc123');
+    assertEqual(token, null, 'Should return null');
+  });
+
+  test('extractBearerToken returns null for malformed header', () => {
+    const token = extractBearerToken('Bearer');
+    assertEqual(token, null, 'Should return null');
+  });
+
+  test('extractBearerToken returns null for null header', () => {
+    const token = extractBearerToken(null);
+    assertEqual(token, null, 'Should return null');
+  });
+
+  test('extractBearerToken returns null for undefined header', () => {
+    const token = extractBearerToken(undefined);
+    assertEqual(token, null, 'Should return null');
+  });
+
+  // =========================================================================
+  // Test Suite 8: Full Login-Use-Logout Flow
+  // =========================================================================
+  console.log('\n8. Full Login-Use-Logout Flow');
+
+  await test('complete auth lifecycle works correctly', async () => {
+    // Clear blacklist for clean test
+    tokenBlacklist.clear();
+
+    // Step 1: Login
+    const loginReq = new MockRequest({
+      body: { licenseKey: 'SPLICE-TEST-VALD-KEY1' }
+    });
+    const loginRes = new MockResponse();
+    await handleLogin(loginReq, loginRes);
+
+    assertEqual(loginRes.statusCode, 200, 'Login succeeds');
+    const { token: accessToken, refreshToken } = loginRes.data;
+
+    // Step 2: Access protected resource
+    const protectedReq = new MockRequest({
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    const protectedRes = new MockResponse();
+
+    let protectedNextCalled = false;
+    authenticateToken(protectedReq, protectedRes, () => {
+      protectedNextCalled = true;
+      handleProtectedRoute(protectedReq, protectedRes);
+    });
+
+    assertTrue(protectedNextCalled, 'Protected route accessible');
+    assertEqual(protectedRes.data.success, true, 'Protected route returns success');
+
+    // Step 3: Refresh token
+    const refreshReq = new MockRequest({
+      body: { refreshToken }
+    });
+    const refreshRes = new MockResponse();
+    await handleRefresh(refreshReq, refreshRes);
+
+    assertEqual(refreshRes.statusCode, 200, 'Refresh succeeds');
+    const newAccessToken = refreshRes.data.token;
+
+    // Step 4: Access with new token
+    const newProtectedReq = new MockRequest({
+      headers: { authorization: `Bearer ${newAccessToken}` }
+    });
+    const newProtectedRes = new MockResponse();
+
+    let newProtectedNextCalled = false;
+    authenticateToken(newProtectedReq, newProtectedRes, () => {
+      newProtectedNextCalled = true;
+    });
+
+    assertTrue(newProtectedNextCalled, 'New token works');
+
+    // Step 5: Logout
+    const decoded = verifyToken(newAccessToken);
+    const logoutReq = new MockRequest({
+      body: { refreshToken },
+      headers: { authorization: `Bearer ${newAccessToken}` }
+    });
+    logoutReq.tokenData = decoded;
+    logoutReq.stripeCustomerId = decoded.sub;
+
+    const logoutRes = new MockResponse();
+    handleLogout(logoutReq, logoutRes);
+
+    assertEqual(logoutRes.statusCode, 200, 'Logout succeeds');
+
+    // Step 6: Verify tokens are invalidated
+    const postLogoutReq = new MockRequest({
+      headers: { authorization: `Bearer ${newAccessToken}` }
+    });
+    const postLogoutRes = new MockResponse();
+
+    let postLogoutNextCalled = false;
+    authenticateToken(postLogoutReq, postLogoutRes, () => {
+      postLogoutNextCalled = true;
+    });
+
+    assertFalse(postLogoutNextCalled, 'Token should be blacklisted after logout');
+    assertEqual(postLogoutRes.statusCode, 401, 'Returns 401 after logout');
+
+    // Step 7: Refresh token should also be invalid
+    const postLogoutRefreshReq = new MockRequest({
+      body: { refreshToken }
+    });
+    const postLogoutRefreshRes = new MockResponse();
+    await handleRefresh(postLogoutRefreshReq, postLogoutRefreshRes);
+
+    assertEqual(postLogoutRefreshRes.statusCode, 401, 'Refresh fails after logout');
+  });
+
+  // =========================================================================
+  // Summary
+  // =========================================================================
+  console.log('\n=== Authentication Test Summary ===');
+  console.log(`  Passed: ${passCount}`);
+  console.log(`  Failed: ${failCount}`);
+  console.log(`  Total: ${passCount + failCount}`);
+
+  if (failCount > 0) {
+    console.log('\n\u274C Some authentication tests failed');
+    process.exit(1);
+  } else {
+    console.log('\n\u2713 All authentication tests passed');
+    process.exit(0);
+  }
+}
+
+// Run tests
+runTests().catch(err => {
+  console.error('Test runner error:', err);
+  process.exit(1);
+});

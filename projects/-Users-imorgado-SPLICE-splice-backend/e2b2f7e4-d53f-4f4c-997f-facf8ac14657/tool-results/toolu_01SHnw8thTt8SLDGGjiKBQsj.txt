@@ -1,0 +1,102 @@
+   400→}
+   401→
+   402→// =============================================================================
+   403→// Stripe Webhook (must be before express.json())
+   404→// =============================================================================
+   405→
+   406→app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+   407→  const sig = req.headers['stripe-signature'];
+   408→  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+   409→
+   410→  let event;
+   411→
+   412→  try {
+   413→    if (webhookSecret) {
+   414→      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+   415→    } else if (isProduction) {
+   416→      // SECURITY: Reject unsigned webhooks in production
+   417→      console.error('[SPLICE] CRITICAL: STRIPE_WEBHOOK_SECRET not set in production');
+   418→      return res.status(500).json({ error: 'Webhook configuration error: secret not configured' });
+   419→    } else {
+   420→      // For local development testing only
+   421→      // req.body is a Buffer from express.raw(), convert to string for JSON.parse
+   422→      const bodyString = typeof req.body === 'string' ? req.body : req.body.toString('utf8');
+   423→      event = JSON.parse(bodyString);
+   424→      console.warn('[SPLICE] Warning: Processing webhook without signature verification (dev only)');
+   425→    }
+   426→  } catch (err) {
+   427→    console.error('[SPLICE] Webhook signature verification failed:', err.message);
+   428→    return res.status(400).json({ error: 'Webhook signature verification failed' });
+   429→  }
+   430→
+   431→  console.log(`[SPLICE] Webhook received: ${event.type} (${event.id})`);
+   432→
+   433→  // Idempotency check - skip if already processed
+   434→  if (await usageTracking.isEventProcessed(event.id)) {
+   435→    console.log(`[SPLICE] Event ${event.id} already processed, skipping`);
+   436→    return res.json({ received: true, skipped: true });
+   437→  }
+   438→
+   439→  try {
+   440→    switch (event.type) {
+   441→      case 'customer.subscription.created':
+   442→      case 'customer.subscription.updated': {
+   443→        const subscription = event.data.object;
+   444→        const customerId = subscription.customer;
+   445→
+   446→        // Validate customerId
+   447→        if (!customerId) {
+   448→          console.error('[SPLICE] Missing customer ID in subscription event');
+   449→          return res.status(400).json({ error: 'Missing customer ID' });
+   450→        }
+   451→
+   452→        // Get tier from price ID
+   453→        const priceId = subscription.items?.data?.[0]?.price?.id;
+   454→        const tier = getTierFromPriceId(priceId);
+   455→
+   456→        // Update user tier and reset hours
+   457→        await usageTracking.updateTier(customerId, tier);
+   458→        console.log(`[SPLICE] Updated customer ${customerId} to tier: ${tier}`);
+   459→
+   460→        // Initialize music credits for new subscriptions
+   461→        if (event.type === 'customer.subscription.created') {
+   462→          await usageTracking.resetMusicCredits(customerId, tier);
+   463→          console.log(`[SPLICE] Initialized music credits for customer ${customerId} (tier: ${tier})`);
+   464→        }
+   465→
+   466→        // Update trial end date if present
+   467→        if (subscription.trial_end) {
+   468→          await usageTracking.updateTrialEnd(customerId, subscription.trial_end);
+   469→        }
+   470→
+   471→        // Generate license key for new subscriptions with retry and delivery
+   472→        if (event.type === 'customer.subscription.created') {
+   473→          let licenseResult = null;
+   474→          let retryCount = 0;
+   475→          const maxRetries = 3;
+   476→
+   477→          // Retry mechanism for license key generation
+   478→          while (retryCount < maxRetries) {
+   479→            licenseResult = await licenseService.generateLicenseKey(customerId);
+   480→            if (licenseResult.success) {
+   481→              break;
+   482→            }
+   483→            retryCount++;
+   484→            console.warn(`[SPLICE] License key generation attempt ${retryCount}/${maxRetries} failed: ${licenseResult.error}`);
+   485→            // Wait before retry (exponential backoff)
+   486→            if (retryCount < maxRetries) {
+   487→              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+   488→            }
+   489→          }
+   490→
+   491→          if (licenseResult && licenseResult.success) {
+   492→            // SECURITY: Mask license key in logs
+   493→            console.log(`[SPLICE] Generated license key for ${maskSensitiveData(customerId)}: ${maskSensitiveData(licenseResult.key)}`);
+   494→
+   495→            // Store license key in Stripe subscription metadata as backup
+   496→            try {
+   497→              await stripe.subscriptions.update(subscription.id, {
+   498→                metadata: {
+   499→                  license_key: licenseResult.key,
+
+</system-reminder>

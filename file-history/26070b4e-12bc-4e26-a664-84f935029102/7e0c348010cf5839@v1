@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+Reverse Engineering Toolkit
+Integrates Ghidra, radare2, binwalk, and other RE tools with RunPod abliterated models
+
+Supports:
+- Binary analysis and disassembly
+- Firmware extraction
+- String analysis
+- Function identification
+- AI-powered analysis via RunPod
+"""
+import subprocess
+import json
+import os
+import sys
+import tempfile
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+
+class ToolStatus(Enum):
+    AVAILABLE = "available"
+    MISSING = "missing"
+    ERROR = "error"
+
+
+@dataclass
+class BinaryInfo:
+    path: str
+    size: int
+    file_type: str
+    arch: str
+    endian: str
+    bits: int
+    format: str
+    sha256: str
+
+
+@dataclass
+class AnalysisResult:
+    tool: str
+    success: bool
+    data: Dict
+    errors: List[str]
+
+
+class ReverseEngineeringToolkit:
+    """Unified RE toolkit with multiple tool support"""
+
+    def __init__(self, runpod_api_path: str = None):
+        self.runpod_api = runpod_api_path or os.path.expanduser("~/runpod_api.py")
+        self.temp_dir = Path(tempfile.gettempdir()) / "re_toolkit"
+        self.temp_dir.mkdir(exist_ok=True)
+
+        # Check available tools
+        self.tools = self._check_tools()
+
+    def _check_tools(self) -> Dict[str, ToolStatus]:
+        """Check which RE tools are available"""
+        tools = {}
+
+        # Ghidra (headless analyzer)
+        tools["ghidra"] = self._check_command("analyzeHeadless")
+
+        # radare2
+        tools["radare2"] = self._check_command("r2")
+
+        # binwalk (firmware analysis)
+        tools["binwalk"] = self._check_command("binwalk")
+
+        # strings (usually always available)
+        tools["strings"] = self._check_command("strings")
+
+        # file command
+        tools["file"] = self._check_command("file")
+
+        # objdump
+        tools["objdump"] = self._check_command("objdump")
+
+        # nm (symbol table)
+        tools["nm"] = self._check_command("nm")
+
+        # readelf
+        tools["readelf"] = self._check_command("readelf")
+
+        # xxd (hex dump)
+        tools["xxd"] = self._check_command("xxd")
+
+        # shasum
+        tools["shasum"] = self._check_command("shasum")
+
+        return tools
+
+    def _check_command(self, cmd: str) -> ToolStatus:
+        """Check if a command is available"""
+        try:
+            result = subprocess.run(
+                ["which", cmd],
+                capture_output=True,
+                timeout=5
+            )
+            return ToolStatus.AVAILABLE if result.returncode == 0 else ToolStatus.MISSING
+        except Exception:
+            return ToolStatus.ERROR
+
+    def get_available_tools(self) -> List[str]:
+        """Get list of available tools"""
+        return [tool for tool, status in self.tools.items() if status == ToolStatus.AVAILABLE]
+
+    def get_binary_info(self, binary_path: str) -> BinaryInfo:
+        """Get basic information about a binary"""
+        path = Path(binary_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Binary not found: {binary_path}")
+
+        # Get file size
+        size = path.stat().st_size
+
+        # Get file type
+        file_result = subprocess.run(
+            ["file", "-b", binary_path],
+            capture_output=True, text=True
+        )
+        file_type = file_result.stdout.strip()
+
+        # Parse architecture info
+        arch = "unknown"
+        endian = "unknown"
+        bits = 0
+        fmt = "unknown"
+
+        if "x86-64" in file_type or "x86_64" in file_type:
+            arch = "x86_64"
+            bits = 64
+        elif "x86" in file_type or "i386" in file_type:
+            arch = "x86"
+            bits = 32
+        elif "ARM64" in file_type or "aarch64" in file_type:
+            arch = "arm64"
+            bits = 64
+        elif "ARM" in file_type:
+            arch = "arm"
+            bits = 32
+
+        if "LSB" in file_type:
+            endian = "little"
+        elif "MSB" in file_type:
+            endian = "big"
+
+        if "ELF" in file_type:
+            fmt = "elf"
+        elif "Mach-O" in file_type:
+            fmt = "macho"
+        elif "PE32" in file_type:
+            fmt = "pe"
+
+        # Get SHA256
+        sha_result = subprocess.run(
+            ["shasum", "-a", "256", binary_path],
+            capture_output=True, text=True
+        )
+        sha256 = sha_result.stdout.split()[0] if sha_result.returncode == 0 else "unknown"
+
+        return BinaryInfo(
+            path=str(path.absolute()),
+            size=size,
+            file_type=file_type,
+            arch=arch,
+            endian=endian,
+            bits=bits,
+            format=fmt,
+            sha256=sha256
+        )
+
+    def extract_strings(self, binary_path: str, min_length: int = 4,
+                        encoding: str = "all") -> AnalysisResult:
+        """Extract strings from binary"""
+        errors = []
+
+        try:
+            args = ["strings"]
+
+            if min_length != 4:
+                args.extend(["-n", str(min_length)])
+
+            if encoding == "unicode":
+                args.append("-el")  # 16-bit little endian
+            elif encoding == "ascii":
+                pass  # default
+
+            args.append(binary_path)
+
+            result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+
+            strings_list = result.stdout.strip().split("\n") if result.stdout else []
+
+            # Categorize strings
+            categorized = {
+                "urls": [],
+                "paths": [],
+                "ips": [],
+                "emails": [],
+                "functions": [],
+                "interesting": [],
+                "all": strings_list[:500]  # Limit for display
+            }
+
+            url_pattern = re.compile(r'https?://[^\s]+')
+            path_pattern = re.compile(r'[/\\][\w/\\.-]+')
+            ip_pattern = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+            email_pattern = re.compile(r'[\w.-]+@[\w.-]+\.\w+')
+
+            for s in strings_list:
+                if url_pattern.search(s):
+                    categorized["urls"].append(s)
+                if path_pattern.search(s) and len(s) > 5:
+                    categorized["paths"].append(s)
+                if ip_pattern.search(s):
+                    categorized["ips"].append(s)
+                if email_pattern.search(s):
+                    categorized["emails"].append(s)
+                if any(kw in s.lower() for kw in ["password", "secret", "key", "token", "api", "auth"]):
+                    categorized["interesting"].append(s)
+
+            return AnalysisResult(
+                tool="strings",
+                success=True,
+                data={
+                    "total_count": len(strings_list),
+                    "categorized": categorized
+                },
+                errors=errors
+            )
+
+        except subprocess.TimeoutExpired:
+            errors.append("Strings extraction timed out")
+        except Exception as e:
+            errors.append(str(e))
+
+        return AnalysisResult(tool="strings", success=False, data={}, errors=errors)
+
+    def run_binwalk(self, binary_path: str, extract: bool = False) -> AnalysisResult:
+        """Run binwalk for firmware analysis"""
+        if self.tools["binwalk"] != ToolStatus.AVAILABLE:
+            return AnalysisResult(
+                tool="binwalk",
+                success=False,
+                data={},
+                errors=["binwalk not installed. Install with: brew install binwalk"]
+            )
+
+        errors = []
+        try:
+            args = ["binwalk"]
+
+            if extract:
+                extract_dir = self.temp_dir / "binwalk_extract"
+                args.extend(["-e", "-C", str(extract_dir)])
+
+            args.append(binary_path)
+
+            result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+
+            # Parse binwalk output
+            findings = []
+            for line in result.stdout.split("\n"):
+                if line.strip() and not line.startswith("DECIMAL"):
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0].isdigit():
+                        findings.append({
+                            "offset_dec": int(parts[0]),
+                            "offset_hex": parts[1] if len(parts) > 1 else "",
+                            "description": " ".join(parts[2:])
+                        })
+
+            return AnalysisResult(
+                tool="binwalk",
+                success=True,
+                data={
+                    "findings": findings,
+                    "raw_output": result.stdout,
+                    "extracted_to": str(extract_dir) if extract else None
+                },
+                errors=errors
+            )
+
+        except subprocess.TimeoutExpired:
+            errors.append("Binwalk timed out")
+        except Exception as e:
+            errors.append(str(e))
+
+        return AnalysisResult(tool="binwalk", success=False, data={}, errors=errors)
+
+    def run_radare2(self, binary_path: str, commands: List[str] = None) -> AnalysisResult:
+        """Run radare2 analysis"""
+        if self.tools["radare2"] != ToolStatus.AVAILABLE:
+            return AnalysisResult(
+                tool="radare2",
+                success=False,
+                data={},
+                errors=["radare2 not installed. Install with: brew install radare2"]
+            )
+
+        errors = []
+        default_commands = [
+            "aaa",          # Analyze all
+            "afl",          # List functions
+            "iI",           # Binary info
+            "iz",           # Strings in data section
+            "ii",           # Imports
+            "iE",           # Exports
+            "ir",           # Relocations
+        ]
+
+        commands = commands or default_commands
+
+        try:
+            results = {}
+
+            for cmd in commands:
+                r2_cmd = ["r2", "-q", "-c", cmd, binary_path]
+                result = subprocess.run(r2_cmd, capture_output=True, text=True, timeout=60)
+
+                if result.returncode == 0:
+                    results[cmd] = result.stdout.strip()
+                else:
+                    errors.append(f"Command '{cmd}' failed: {result.stderr}")
+
+            # Parse function list
+            functions = []
+            if "afl" in results:
+                for line in results["afl"].split("\n"):
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            functions.append({
+                                "address": parts[0],
+                                "size": parts[1] if len(parts) > 1 else "?",
+                                "name": parts[-1] if parts else "unknown"
+                            })
+
+            return AnalysisResult(
+                tool="radare2",
+                success=True,
+                data={
+                    "raw_output": results,
+                    "functions": functions[:100],  # Limit
+                    "function_count": len(functions)
+                },
+                errors=errors
+            )
+
+        except subprocess.TimeoutExpired:
+            errors.append("radare2 timed out")
+        except Exception as e:
+            errors.append(str(e))
+
+        return AnalysisResult(tool="radare2", success=False, data={}, errors=errors)
+
+    def run_ghidra(self, binary_path: str, analysis_type: str = "functions") -> AnalysisResult:
+        """Run Ghidra headless analysis"""
+        if self.tools["ghidra"] != ToolStatus.AVAILABLE:
+            return AnalysisResult(
+                tool="ghidra",
+                success=False,
+                data={},
+                errors=["Ghidra not installed or analyzeHeadless not in PATH"]
+            )
+
+        errors = []
+        project_dir = self.temp_dir / "ghidra_projects"
+        project_dir.mkdir(exist_ok=True)
+
+        try:
+            # Create analysis script based on type
+            script_content = self._get_ghidra_script(analysis_type)
+            script_path = self.temp_dir / f"ghidra_{analysis_type}.py"
+            script_path.write_text(script_content)
+
+            # Run Ghidra headless
+            output_file = self.temp_dir / "ghidra_output.json"
+
+            cmd = [
+                "analyzeHeadless",
+                str(project_dir),
+                "temp_project",
+                "-import", binary_path,
+                "-postScript", str(script_path),
+                "-scriptPath", str(self.temp_dir),
+                "-deleteProject",
+                "-noanalysis" if analysis_type == "quick" else ""
+            ]
+            cmd = [c for c in cmd if c]  # Remove empty strings
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            # Parse output
+            ghidra_data = {
+                "stdout": result.stdout[-5000:] if result.stdout else "",  # Last 5000 chars
+                "stderr": result.stderr[-1000:] if result.stderr else "",
+                "analysis_type": analysis_type
+            }
+
+            if output_file.exists():
+                ghidra_data["parsed"] = json.loads(output_file.read_text())
+
+            return AnalysisResult(
+                tool="ghidra",
+                success=result.returncode == 0,
+                data=ghidra_data,
+                errors=errors
+            )
+
+        except subprocess.TimeoutExpired:
+            errors.append("Ghidra analysis timed out (5 min limit)")
+        except Exception as e:
+            errors.append(str(e))
+
+        return AnalysisResult(tool="ghidra", success=False, data={}, errors=errors)
+
+    def _get_ghidra_script(self, analysis_type: str) -> str:
+        """Generate Ghidra Python script for analysis"""
+        scripts = {
+            "functions": '''
+# List all functions
+from ghidra.program.model.listing import FunctionManager
+fm = currentProgram.getFunctionManager()
+funcs = fm.getFunctions(True)
+for f in funcs:
+    print("FUNC: {} @ {}".format(f.getName(), f.getEntryPoint()))
+''',
+            "strings": '''
+# Extract strings
+from ghidra.program.util import DefinedDataIterator
+for data in DefinedDataIterator.definedStrings(currentProgram):
+    print("STR: {} @ {}".format(data.getValue(), data.getAddress()))
+''',
+            "imports": '''
+# List imports
+from ghidra.program.model.symbol import SymbolType
+st = currentProgram.getSymbolTable()
+for sym in st.getAllSymbols(True):
+    if sym.getSymbolType() == SymbolType.FUNCTION and sym.isExternal():
+        print("IMPORT: {}".format(sym.getName()))
+''',
+            "quick": '''
+# Quick analysis - just basic info
+print("Program: {}".format(currentProgram.getName()))
+print("Language: {}".format(currentProgram.getLanguage()))
+print("Compiler: {}".format(currentProgram.getCompiler()))
+'''
+        }
+        return scripts.get(analysis_type, scripts["functions"])
+
+    def full_analysis(self, binary_path: str, use_ai: bool = False,
+                      model: str = "architect") -> Dict:
+        """Run comprehensive analysis using all available tools"""
+        results = {
+            "binary_info": asdict(self.get_binary_info(binary_path)),
+            "tools_used": [],
+            "analyses": {}
+        }
+
+        # Always run strings
+        strings_result = self.extract_strings(binary_path)
+        results["analyses"]["strings"] = asdict(strings_result)
+        results["tools_used"].append("strings")
+
+        # Binwalk if available
+        if self.tools["binwalk"] == ToolStatus.AVAILABLE:
+            binwalk_result = self.run_binwalk(binary_path)
+            results["analyses"]["binwalk"] = asdict(binwalk_result)
+            results["tools_used"].append("binwalk")
+
+        # radare2 if available
+        if self.tools["radare2"] == ToolStatus.AVAILABLE:
+            r2_result = self.run_radare2(binary_path)
+            results["analyses"]["radare2"] = asdict(r2_result)
+            results["tools_used"].append("radare2")
+
+        # Ghidra if available (takes longer)
+        if self.tools["ghidra"] == ToolStatus.AVAILABLE:
+            ghidra_result = self.run_ghidra(binary_path, "functions")
+            results["analyses"]["ghidra"] = asdict(ghidra_result)
+            results["tools_used"].append("ghidra")
+
+        # AI analysis via RunPod
+        if use_ai:
+            ai_result = self.analyze_with_ai(results, model)
+            results["ai_analysis"] = ai_result
+
+        return results
+
+    def analyze_with_ai(self, analysis_data: Dict, model: str = "architect") -> str:
+        """Send analysis results to RunPod for AI interpretation"""
+        # Build prompt from analysis data
+        prompt = f"""You are a reverse engineering expert. Analyze this binary analysis report and provide insights.
+
+BINARY INFORMATION:
+{json.dumps(analysis_data.get('binary_info', {}), indent=2)}
+
+STRINGS ANALYSIS:
+- Total strings found: {analysis_data.get('analyses', {}).get('strings', {}).get('data', {}).get('total_count', 0)}
+- Interesting strings: {analysis_data.get('analyses', {}).get('strings', {}).get('data', {}).get('categorized', {}).get('interesting', [])[:20]}
+- URLs found: {analysis_data.get('analyses', {}).get('strings', {}).get('data', {}).get('categorized', {}).get('urls', [])[:10]}
+- IPs found: {analysis_data.get('analyses', {}).get('strings', {}).get('data', {}).get('categorized', {}).get('ips', [])[:10]}
+
+BINWALK FINDINGS:
+{json.dumps(analysis_data.get('analyses', {}).get('binwalk', {}).get('data', {}).get('findings', [])[:20], indent=2)}
+
+RADARE2 ANALYSIS:
+- Function count: {analysis_data.get('analyses', {}).get('radare2', {}).get('data', {}).get('function_count', 0)}
+- Notable functions: {analysis_data.get('analyses', {}).get('radare2', {}).get('data', {}).get('functions', [])[:20]}
+
+Please provide:
+1. What type of binary is this? (malware, utility, library, etc.)
+2. What is its likely purpose?
+3. Any suspicious indicators or red flags?
+4. Notable functions or capabilities
+5. Security concerns or vulnerabilities
+6. Recommendations for deeper analysis
+
+Be thorough and technical."""
+
+        try:
+            # Call RunPod API
+            result = subprocess.run(
+                ["python3", self.runpod_api, "ask", model, prompt],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            return result.stdout if result.returncode == 0 else f"AI analysis failed: {result.stderr}"
+        except Exception as e:
+            return f"AI analysis error: {e}"
+
+    def decompile_function(self, binary_path: str, function_name: str) -> str:
+        """Decompile a specific function using Ghidra or radare2"""
+        if self.tools["radare2"] == ToolStatus.AVAILABLE:
+            # Use radare2's built-in decompiler (pdc)
+            result = subprocess.run(
+                ["r2", "-q", "-c", f"aaa; s {function_name}; pdc", binary_path],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return result.stdout
+            return f"Decompilation failed: {result.stderr}"
+
+        return "No decompiler available. Install radare2 or Ghidra."
+
+
+def main():
+    """CLI interface"""
+    if len(sys.argv) < 2:
+        print("""
+Reverse Engineering Toolkit
+===========================
+
+USAGE:
+  python3 re_toolkit.py <command> [args]
+
+COMMANDS:
+  tools                    List available RE tools
+  info <binary>            Get basic binary info
+  strings <binary>         Extract and categorize strings
+  binwalk <binary>         Run binwalk analysis
+  radare2 <binary>         Run radare2 analysis
+  ghidra <binary>          Run Ghidra analysis
+  full <binary>            Run all available tools
+  ai <binary> [model]      Full analysis + AI interpretation
+
+EXAMPLES:
+  python3 re_toolkit.py tools
+  python3 re_toolkit.py info /bin/ls
+  python3 re_toolkit.py strings /bin/ls
+  python3 re_toolkit.py full suspicious.exe
+  python3 re_toolkit.py ai malware.bin architect
+
+MODELS (for AI analysis):
+  architect - DeepSeek-R1-32B (best for RE)
+  research  - Qwen3-80B (deep analysis)
+  quick     - Qwen3-4B (fast analysis)
+""")
+        return
+
+    toolkit = ReverseEngineeringToolkit()
+    command = sys.argv[1].lower()
+
+    if command == "tools":
+        print("\nAvailable RE Tools:")
+        print("=" * 40)
+        for tool, status in toolkit.tools.items():
+            icon = "✅" if status == ToolStatus.AVAILABLE else "❌"
+            print(f"  {icon} {tool}: {status.value}")
+
+        print("\nInstall missing tools:")
+        print("  brew install radare2 binwalk")
+        print("  # Ghidra: download from https://ghidra-sre.org/")
+
+    elif command == "info":
+        if len(sys.argv) < 3:
+            print("Usage: info <binary_path>")
+            return
+        info = toolkit.get_binary_info(sys.argv[2])
+        print(json.dumps(asdict(info), indent=2))
+
+    elif command == "strings":
+        if len(sys.argv) < 3:
+            print("Usage: strings <binary_path>")
+            return
+        result = toolkit.extract_strings(sys.argv[2])
+        print(json.dumps(asdict(result), indent=2))
+
+    elif command == "binwalk":
+        if len(sys.argv) < 3:
+            print("Usage: binwalk <binary_path>")
+            return
+        result = toolkit.run_binwalk(sys.argv[2])
+        print(json.dumps(asdict(result), indent=2))
+
+    elif command == "radare2":
+        if len(sys.argv) < 3:
+            print("Usage: radare2 <binary_path>")
+            return
+        result = toolkit.run_radare2(sys.argv[2])
+        print(json.dumps(asdict(result), indent=2))
+
+    elif command == "ghidra":
+        if len(sys.argv) < 3:
+            print("Usage: ghidra <binary_path>")
+            return
+        result = toolkit.run_ghidra(sys.argv[2])
+        print(json.dumps(asdict(result), indent=2))
+
+    elif command == "full":
+        if len(sys.argv) < 3:
+            print("Usage: full <binary_path>")
+            return
+        result = toolkit.full_analysis(sys.argv[2], use_ai=False)
+        print(json.dumps(result, indent=2, default=str))
+
+    elif command == "ai":
+        if len(sys.argv) < 3:
+            print("Usage: ai <binary_path> [model]")
+            return
+        model = sys.argv[3] if len(sys.argv) > 3 else "architect"
+        result = toolkit.full_analysis(sys.argv[2], use_ai=True, model=model)
+        print(json.dumps(result, indent=2, default=str))
+
+    elif command == "decompile":
+        if len(sys.argv) < 4:
+            print("Usage: decompile <binary_path> <function_name>")
+            return
+        result = toolkit.decompile_function(sys.argv[2], sys.argv[3])
+        print(result)
+
+    else:
+        print(f"Unknown command: {command}")
+        print("Run without arguments to see usage")
+
+
+if __name__ == "__main__":
+    main()

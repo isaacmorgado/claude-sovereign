@@ -1,0 +1,245 @@
+"""
+Face Detection Service using InsightFace
+Returns 106 raw landmarks + 28 mapped cephalometric landmarks
+"""
+
+import base64
+import math
+from typing import Optional
+import cv2
+import numpy as np
+
+# Try to import InsightFace (optional dependency)
+try:
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    INSIGHTFACE_AVAILABLE = False
+    FaceAnalysis = None
+
+# Mapping from InsightFace 106 landmarks to 28 cephalometric landmarks
+SIDE_LANDMARK_MAPPING = {
+    "vertex": 0,
+    "occiput": 0,
+    "trichion": 0,
+    "pronasale": 54,
+    "nasion": 51,
+    "rhinion": 52,
+    "supratip": 53,
+    "infratip": 55,
+    "columella": 55,
+    "subnasale": 56,
+    "subalare": 57,
+    "orbitale": 35,
+    "cornealApex": 33,
+    "porion": 0,
+    "tragus": 0,
+    "intertragicNotch": 0,
+    "cheekbone": 46,
+    "glabella": 51,
+    "labraleSuperius": 76,
+    "cheilion": 84,
+    "labraleInferius": 82,
+    "sublabiale": 83,
+    "pogonion": 16,
+    "menton": 16,
+    "cervicalPoint": 16,
+    "neckPoint": 16,
+    "gonionTop": 10,
+    "gonionBottom": 12,
+}
+
+
+class DetectionService:
+    _instance: Optional["DetectionService"] = None
+    _face_analyzer: Optional[FaceAnalysis] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    async def initialize(self):
+        """Initialize InsightFace model (call on startup)"""
+        if self._face_analyzer is not None:
+            return
+
+        if not INSIGHTFACE_AVAILABLE:
+            print("[DetectionService] InsightFace not installed - detection disabled")
+            return
+
+        try:
+            self._face_analyzer = FaceAnalysis(
+                name="buffalo_l",
+                providers=["CPUExecutionProvider"]
+            )
+            self._face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+            print("[DetectionService] InsightFace buffalo_l model loaded")
+        except Exception as e:
+            print(f"[DetectionService] Failed to load buffalo_l: {e}")
+            try:
+                self._face_analyzer = FaceAnalysis(
+                    name="buffalo_s",
+                    providers=["CPUExecutionProvider"]
+                )
+                self._face_analyzer.prepare(ctx_id=0, det_size=(320, 320))
+                print("[DetectionService] InsightFace buffalo_s model loaded (fallback)")
+            except Exception as e2:
+                print(f"[DetectionService] Failed to load any model: {e2}")
+                raise
+
+    def _decode_image(self, image_data: str) -> np.ndarray:
+        """Decode base64 image to OpenCV format"""
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+
+        image_bytes = base64.b64decode(image_data)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise ValueError("Failed to decode image")
+
+        return img
+
+    def _detect_direction(self, landmarks: np.ndarray) -> str:
+        """Detect if face is facing left or right"""
+        if landmarks is None or len(landmarks) < 60:
+            return "unknown"
+
+        nose_tip = landmarks[54]
+        left_jaw = landmarks[0]
+        right_jaw = landmarks[16]
+        jaw_center_x = (left_jaw[0] + right_jaw[0]) / 2
+
+        return "left" if nose_tip[0] < jaw_center_x else "right"
+
+    def _calculate_rotation(self, landmarks: np.ndarray) -> float:
+        """Calculate rotation angle from eye corners"""
+        if landmarks is None or len(landmarks) < 40:
+            return 0.0
+
+        left_eye = landmarks[33]
+        right_eye = landmarks[42]
+        dx = right_eye[0] - left_eye[0]
+        dy = right_eye[1] - left_eye[1]
+
+        return math.atan2(dy, dx) * 180 / math.pi
+
+    def _calculate_frankfort_plane(
+        self,
+        orbitale: dict,
+        porion: dict
+    ) -> dict:
+        """Calculate Frankfort Horizontal Plane"""
+        dx = porion["x"] - orbitale["x"]
+        dy = porion["y"] - orbitale["y"]
+        angle = math.atan2(dy, dx) * 180 / math.pi
+
+        return {
+            "angle": angle,
+            "orbitale": orbitale,
+            "porion": porion,
+        }
+
+    async def detect_side_profile(self, image_data: str) -> dict:
+        """
+        Detect side profile landmarks from base64 image
+
+        Returns:
+            - success: bool
+            - message: str
+            - direction: "left" | "right"
+            - rotation_angle: float
+            - raw_landmarks: list of {x, y}
+            - mapped_landmarks: dict of landmark_name -> {x, y}
+            - face_box: {x, y, width, height}
+            - frankfort_plane: {angle, orbitale, porion}
+        """
+        if self._face_analyzer is None:
+            return {
+                "success": False,
+                "message": "Detection model not loaded"
+            }
+
+        try:
+            img = self._decode_image(image_data)
+            img_height, img_width = img.shape[:2]
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            faces = self._face_analyzer.get(img_rgb)
+
+            if not faces:
+                return {
+                    "success": False,
+                    "message": "No face detected in image"
+                }
+
+            face = faces[0]
+
+            if not hasattr(face, 'landmark_2d_106') or face.landmark_2d_106 is None:
+                return {
+                    "success": False,
+                    "message": "Full landmarks not available"
+                }
+
+            landmarks_106 = face.landmark_2d_106
+
+            # Detect direction and rotation
+            direction = self._detect_direction(landmarks_106)
+            rotation = self._calculate_rotation(landmarks_106)
+
+            # Convert to normalized coordinates
+            raw_landmarks = [
+                {"x": float(pt[0]) / img_width, "y": float(pt[1]) / img_height}
+                for pt in landmarks_106
+            ]
+
+            # Map to cephalometric landmarks
+            mapped_landmarks = {}
+            for name, idx in SIDE_LANDMARK_MAPPING.items():
+                if idx < len(landmarks_106):
+                    pt = landmarks_106[idx]
+                    mapped_landmarks[name] = {
+                        "x": float(pt[0]) / img_width,
+                        "y": float(pt[1]) / img_height
+                    }
+                else:
+                    mapped_landmarks[name] = {"x": 0.5, "y": 0.5}
+
+            # Calculate Frankfort Plane
+            frankfort_plane = None
+            if "orbitale" in mapped_landmarks and "porion" in mapped_landmarks:
+                frankfort_plane = self._calculate_frankfort_plane(
+                    mapped_landmarks["orbitale"],
+                    mapped_landmarks["porion"]
+                )
+
+            # Face bounding box
+            bbox = face.bbox
+            face_box = {
+                "x": float(bbox[0]) / img_width,
+                "y": float(bbox[1]) / img_height,
+                "width": float(bbox[2] - bbox[0]) / img_width,
+                "height": float(bbox[3] - bbox[1]) / img_height
+            }
+
+            return {
+                "success": True,
+                "message": f"Detected {len(landmarks_106)} landmarks",
+                "direction": direction,
+                "rotation_angle": rotation,
+                "raw_landmarks": raw_landmarks,
+                "mapped_landmarks": mapped_landmarks,
+                "face_box": face_box,
+                "frankfort_plane": frankfort_plane,
+            }
+
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:
+            return {"success": False, "message": f"Detection failed: {str(e)}"}
+
+
+# Singleton instance
+detection_service = DetectionService()

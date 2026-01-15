@@ -1,0 +1,1075 @@
+     1→/**
+     2→ * Facial Analysis Scoring Functions
+     3→ * Uses correct landmark IDs from landmarks.ts
+     4→ * Includes FaceIQ-style bell curve scoring and percentile ranking
+     5→ */
+     6→
+     7→import {
+     8→  LandmarkPoint,
+     9→  ScoringConfig,
+    10→  FACEIQ_SCORING_CONFIGS,
+    11→  FACEIQ_IDEAL_VALUES,
+    12→  PopulationStats,
+    13→  POPULATION_STATS,
+    14→} from './landmarks';
+    15→
+    16→// ============================================
+    17→// UTILITY TYPES & FUNCTIONS
+    18→// ============================================
+    19→
+    20→export interface Point {
+    21→  x: number;
+    22→  y: number;
+    23→}
+    24→
+    25→export interface ScoreResult {
+    26→  value: number;
+    27→  score: number;
+    28→  idealRange: { min: number; max: number };
+    29→  rating: 'excellent' | 'good' | 'average' | 'below_average';
+    30→}
+    31→
+    32→/**
+    33→ * Calculate distance between two points
+    34→ */
+    35→export function distance(p1: Point, p2: Point): number {
+    36→  return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+    37→}
+    38→
+    39→/**
+    40→ * Calculate angle at vertex point (in degrees)
+    41→ * Angle is formed by points: p1 -> vertex -> p2
+    42→ */
+    43→export function calculateAngle(p1: Point, vertex: Point, p2: Point): number {
+    44→  const v1 = { x: p1.x - vertex.x, y: p1.y - vertex.y };
+    45→  const v2 = { x: p2.x - vertex.x, y: p2.y - vertex.y };
+    46→
+    47→  const dot = v1.x * v2.x + v1.y * v2.y;
+    48→  const cross = v1.x * v2.y - v1.y * v2.x;
+    49→
+    50→  const angle = Math.atan2(cross, dot) * (180 / Math.PI);
+    51→  return Math.abs(angle);
+    52→}
+    53→
+    54→/**
+    55→ * Calculate perpendicular distance from point to line
+    56→ * Positive = in front of line, Negative = behind line
+    57→ */
+    58→export function perpendicularDistance(
+    59→  point: Point,
+    60→  lineStart: Point,
+    61→  lineEnd: Point
+    62→): number {
+    63→  const A = point.x - lineStart.x;
+    64→  const B = point.y - lineStart.y;
+    65→  const C = lineEnd.x - lineStart.x;
+    66→  const D = lineEnd.y - lineStart.y;
+    67→
+    68→  const dot = A * C + B * D;
+    69→  const lenSq = C * C + D * D;
+    70→  const param = lenSq !== 0 ? dot / lenSq : -1;
+    71→
+    72→  let xx: number, yy: number;
+    73→
+    74→  if (param < 0) {
+    75→    xx = lineStart.x;
+    76→    yy = lineStart.y;
+    77→  } else if (param > 1) {
+    78→    xx = lineEnd.x;
+    79→    yy = lineEnd.y;
+    80→  } else {
+    81→    xx = lineStart.x + param * C;
+    82→    yy = lineStart.y + param * D;
+    83→  }
+    84→
+    85→  const dx = point.x - xx;
+    86→  const dy = point.y - yy;
+    87→
+    88→  // Determine sign (positive = in front of line, negative = behind)
+    89→  const sign =
+    90→    (lineEnd.y - lineStart.y) * point.x -
+    91→      (lineEnd.x - lineStart.x) * point.y +
+    92→      lineEnd.x * lineStart.y -
+    93→      lineEnd.y * lineStart.x >=
+    94→    0
+    95→      ? 1
+    96→      : -1;
+    97→
+    98→  return sign * Math.sqrt(dx * dx + dy * dy);
+    99→}
+   100→
+   101→/**
+   102→ * Get rating from score
+   103→ */
+   104→function getRating(score: number): ScoreResult['rating'] {
+   105→  if (score >= 90) return 'excellent';
+   106→  if (score >= 75) return 'good';
+   107→  if (score >= 50) return 'average';
+   108→  return 'below_average';
+   109→}
+   110→
+   111→/**
+   112→ * Helper to get landmark by ID from array
+   113→ */
+   114→function getLandmark(landmarks: LandmarkPoint[], id: string): Point | null {
+   115→  const lm = landmarks.find((l) => l.id === id);
+   116→  return lm ? { x: lm.x, y: lm.y } : null;
+   117→}
+   118→
+   119→// ============================================
+   120→// SIDE PROFILE SCORING (uses _side suffix landmarks)
+   121→// ============================================
+   122→
+   123→/**
+   124→ * Gonial Angle - Jaw angle measurement
+   125→ * Uses: tragion, gonion_inferior_side, menton_side
+   126→ * Ideal: 120° - 130° (male), 125° - 135° (female)
+   127→ */
+   128→export function calculateGonialAngle(
+   129→  sideLandmarks: LandmarkPoint[],
+   130→  gender: 'male' | 'female' = 'male'
+   131→): ScoreResult | null {
+   132→  const tragion = getLandmark(sideLandmarks, 'tragion');
+   133→  const gonion_inferior = getLandmark(sideLandmarks, 'gonion_inferior_side');
+   134→  const menton = getLandmark(sideLandmarks, 'menton_side');
+   135→
+   136→  if (!tragion || !gonion_inferior || !menton) return null;
+   137→
+   138→  const angle = calculateAngle(tragion, gonion_inferior, menton);
+   139→
+   140→  const idealMin = gender === 'male' ? 120 : 125;
+   141→  const idealMax = gender === 'male' ? 130 : 135;
+   142→
+   143→  let score: number;
+   144→  if (angle >= idealMin && angle <= idealMax) {
+   145→    score = 100;
+   146→  } else {
+   147→    const deviation = angle < idealMin ? idealMin - angle : angle - idealMax;
+   148→    score = Math.max(0, 100 - deviation * 5);
+   149→  }
+   150→
+   151→  return {
+   152→    value: angle,
+   153→    score,
+   154→    idealRange: { min: idealMin, max: idealMax },
+   155→    rating: getRating(score),
+   156→  };
+   157→}
+   158→
+   159→/**
+   160→ * Nasolabial Angle - Angle between columella and upper lip
+   161→ * Uses: columella_nasi, subnasale_side, labrale_superius_side
+   162→ * Ideal: 90° - 105° (male), 95° - 115° (female)
+   163→ */
+   164→export function calculateNasolabialAngle(
+   165→  sideLandmarks: LandmarkPoint[],
+   166→  gender: 'male' | 'female' = 'male'
+   167→): ScoreResult | null {
+   168→  const columella = getLandmark(sideLandmarks, 'columella_nasi');
+   169→  const subnasale = getLandmark(sideLandmarks, 'subnasale_side');
+   170→  const labrale_superius = getLandmark(sideLandmarks, 'labrale_superius_side');
+   171→
+   172→  if (!columella || !subnasale || !labrale_superius) return null;
+   173→
+   174→  const angle = calculateAngle(columella, subnasale, labrale_superius);
+   175→
+   176→  const idealMin = gender === 'male' ? 90 : 95;
+   177→  const idealMax = gender === 'male' ? 105 : 115;
+   178→
+   179→  let score: number;
+   180→  if (angle >= idealMin && angle <= idealMax) {
+   181→    score = 100;
+   182→  } else {
+   183→    const deviation = angle < idealMin ? idealMin - angle : angle - idealMax;
+   184→    score = Math.max(0, 100 - deviation * 4);
+   185→  }
+   186→
+   187→  return {
+   188→    value: angle,
+   189→    score,
+   190→    idealRange: { min: idealMin, max: idealMax },
+   191→    rating: getRating(score),
+   192→  };
+   193→}
+   194→
+   195→/**
+   196→ * E-Line (Ricketts' Esthetic Line) - Lip protrusion analysis
+   197→ * Uses: pronasale, pogonion, labrale_superius_side, labrale_inferius_side
+   198→ * Ideal: Upper lip 4mm behind (male) / 2mm behind (female)
+   199→ *        Lower lip 2mm behind (male) / 0mm (female)
+   200→ */
+   201→export function calculateELine(
+   202→  sideLandmarks: LandmarkPoint[],
+   203→  gender: 'male' | 'female' = 'male'
+   204→): { upperLip: ScoreResult; lowerLip: ScoreResult; combined: ScoreResult } | null {
+   205→  const pronasale = getLandmark(sideLandmarks, 'pronasale');
+   206→  const pogonion = getLandmark(sideLandmarks, 'pogonion');
+   207→  const labrale_superius = getLandmark(sideLandmarks, 'labrale_superius_side');
+   208→  const labrale_inferius = getLandmark(sideLandmarks, 'labrale_inferius_side');
+   209→
+   210→  if (!pronasale || !pogonion || !labrale_superius || !labrale_inferius) return null;
+   211→
+   212→  const upperLipDistance = perpendicularDistance(labrale_superius, pronasale, pogonion);
+   213→  const lowerLipDistance = perpendicularDistance(labrale_inferius, pronasale, pogonion);
+   214→
+   215→  // Ideal values (negative = behind the line, which is desirable)
+   216→  const idealUpperLip = gender === 'male' ? -4 : -2;
+   217→  const idealLowerLip = gender === 'male' ? -2 : 0;
+   218→  const tolerance = 2;
+   219→
+   220→  // Upper lip scoring
+   221→  const upperDeviation = Math.abs(upperLipDistance - idealUpperLip);
+   222→  const upperScore =
+   223→    upperDeviation <= tolerance
+   224→      ? 100
+   225→      : Math.max(0, 100 - (upperDeviation - tolerance) * 10);
+   226→
+   227→  // Lower lip scoring
+   228→  const lowerDeviation = Math.abs(lowerLipDistance - idealLowerLip);
+   229→  const lowerScore =
+   230→    lowerDeviation <= tolerance
+   231→      ? 100
+   232→      : Math.max(0, 100 - (lowerDeviation - tolerance) * 10);
+   233→
+   234→  const combinedScore = (upperScore + lowerScore) / 2;
+   235→
+   236→  return {
+   237→    upperLip: {
+   238→      value: upperLipDistance,
+   239→      score: upperScore,
+   240→      idealRange: { min: idealUpperLip - tolerance, max: idealUpperLip + tolerance },
+   241→      rating: getRating(upperScore),
+   242→    },
+   243→    lowerLip: {
+   244→      value: lowerLipDistance,
+   245→      score: lowerScore,
+   246→      idealRange: { min: idealLowerLip - tolerance, max: idealLowerLip + tolerance },
+   247→      rating: getRating(lowerScore),
+   248→    },
+   249→    combined: {
+   250→      value: (upperLipDistance + lowerLipDistance) / 2,
+   251→      score: combinedScore,
+   252→      idealRange: { min: -6, max: 2 },
+   253→      rating: getRating(combinedScore),
+   254→    },
+   255→  };
+   256→}
+   257→
+   258→/**
+   259→ * Mentolabial Angle - Angle at the labiomental fold
+   260→ * Uses: labrale_inferius_side, sublabiale, pogonion
+   261→ * Ideal: 120° - 140°
+   262→ */
+   263→export function calculateMentolabialAngle(
+   264→  sideLandmarks: LandmarkPoint[]
+   265→): ScoreResult | null {
+   266→  const labrale_inferius = getLandmark(sideLandmarks, 'labrale_inferius_side');
+   267→  const sublabiale = getLandmark(sideLandmarks, 'sublabiale');
+   268→  const pogonion = getLandmark(sideLandmarks, 'pogonion');
+   269→
+   270→  if (!labrale_inferius || !sublabiale || !pogonion) return null;
+   271→
+   272→  const angle = calculateAngle(labrale_inferius, sublabiale, pogonion);
+   273→
+   274→  const idealMin = 120;
+   275→  const idealMax = 140;
+   276→
+   277→  let score: number;
+   278→  if (angle >= idealMin && angle <= idealMax) {
+   279→    score = 100;
+   280→  } else {
+   281→    const deviation = angle < idealMin ? idealMin - angle : angle - idealMax;
+   282→    score = Math.max(0, 100 - deviation * 3);
+   283→  }
+   284→
+   285→  return {
+   286→    value: angle,
+   287→    score,
+   288→    idealRange: { min: idealMin, max: idealMax },
+   289→    rating: getRating(score),
+   290→  };
+   291→}
+   292→
+   293→/**
+   294→ * Nasofrontal Angle - Angle at the bridge of nose
+   295→ * Uses: glabella, nasion, rhinion
+   296→ * Ideal: 115° - 135°
+   297→ */
+   298→export function calculateNasofrontalAngle(
+   299→  sideLandmarks: LandmarkPoint[]
+   300→): ScoreResult | null {
+   301→  const glabella = getLandmark(sideLandmarks, 'glabella');
+   302→  const nasion = getLandmark(sideLandmarks, 'nasion');
+   303→  const rhinion = getLandmark(sideLandmarks, 'rhinion');
+   304→
+   305→  if (!glabella || !nasion || !rhinion) return null;
+   306→
+   307→  const angle = calculateAngle(glabella, nasion, rhinion);
+   308→
+   309→  const idealMin = 115;
+   310→  const idealMax = 135;
+   311→
+   312→  let score: number;
+   313→  if (angle >= idealMin && angle <= idealMax) {
+   314→    score = 100;
+   315→  } else {
+   316→    const deviation = angle < idealMin ? idealMin - angle : angle - idealMax;
+   317→    score = Math.max(0, 100 - deviation * 3);
+   318→  }
+   319→
+   320→  return {
+   321→    value: angle,
+   322→    score,
+   323→    idealRange: { min: idealMin, max: idealMax },
+   324→    rating: getRating(score),
+   325→  };
+   326→}
+   327→
+   328→// ============================================
+   329→// FRONT PROFILE SCORING (uses front landmarks)
+   330→// ============================================
+   331→
+   332→/**
+   333→ * Facial Thirds - Vertical face proportions
+   334→ * Uses: trichion, glabella (approx from nasion), subnasale, menton
+   335→ * Ideal: Each third ~33%
+   336→ * Note: For front profile, we use nasal_base as proxy for glabella area
+   337→ */
+   338→export function calculateFacialThirds(
+   339→  frontLandmarks: LandmarkPoint[]
+   340→): { upper: ScoreResult; middle: ScoreResult; lower: ScoreResult; overall: ScoreResult } | null {
+   341→  const trichion = getLandmark(frontLandmarks, 'trichion');
+   342→  const nasal_base = getLandmark(frontLandmarks, 'nasal_base'); // Using as glabella proxy
+   343→  const subnasale = getLandmark(frontLandmarks, 'subnasale');
+   344→  const menton = getLandmark(frontLandmarks, 'menton');
+   345→
+   346→  if (!trichion || !nasal_base || !subnasale || !menton) return null;
+   347→
+   348→  const totalHeight = distance(trichion, menton);
+   349→  if (totalHeight === 0) return null;
+   350→
+   351→  const upperThird = (distance(trichion, nasal_base) / totalHeight) * 100;
+   352→  const middleThird = (distance(nasal_base, subnasale) / totalHeight) * 100;
+   353→  const lowerThird = (distance(subnasale, menton) / totalHeight) * 100;
+   354→
+   355→  const ideal = 33.33;
+   356→  const tolerance = 3;
+   357→
+   358→  const scoreThird = (value: number): number => {
+   359→    const deviation = Math.abs(value - ideal);
+   360→    return deviation <= tolerance ? 100 : Math.max(0, 100 - (deviation - tolerance) * 8);
+   361→  };
+   362→
+   363→  const upperScore = scoreThird(upperThird);
+   364→  const middleScore = scoreThird(middleThird);
+   365→  const lowerScore = scoreThird(lowerThird);
+   366→  const overallScore = (upperScore + middleScore + lowerScore) / 3;
+   367→
+   368→  return {
+   369→    upper: {
+   370→      value: upperThird,
+   371→      score: upperScore,
+   372→      idealRange: { min: 30, max: 36 },
+   373→      rating: getRating(upperScore),
+   374→    },
+   375→    middle: {
+   376→      value: middleThird,
+   377→      score: middleScore,
+   378→      idealRange: { min: 30, max: 36 },
+   379→      rating: getRating(middleScore),
+   380→    },
+   381→    lower: {
+   382→      value: lowerThird,
+   383→      score: lowerScore,
+   384→      idealRange: { min: 30, max: 36 },
+   385→      rating: getRating(lowerScore),
+   386→    },
+   387→    overall: {
+   388→      value: Math.max(Math.abs(upperThird - ideal), Math.abs(middleThird - ideal), Math.abs(lowerThird - ideal)),
+   389→      score: overallScore,
+   390→      idealRange: { min: 0, max: 3 },
+   391→      rating: getRating(overallScore),
+   392→    },
+   393→  };
+   394→}
+   395→
+   396→/**
+   397→ * Facial Width-to-Height Ratio (FWHR)
+   398→ * Uses: left_zygion, right_zygion, nasal_base (as upper bound), labrale_superius
+   399→ * Ideal: 1.8 - 2.0
+   400→ */
+   401→export function calculateFWHR(frontLandmarks: LandmarkPoint[]): ScoreResult | null {
+   402→  const left_zygion = getLandmark(frontLandmarks, 'left_zygion');
+   403→  const right_zygion = getLandmark(frontLandmarks, 'right_zygion');
+   404→  const nasal_base = getLandmark(frontLandmarks, 'nasal_base');
+   405→  const labrale_superius = getLandmark(frontLandmarks, 'labrale_superius');
+   406→
+   407→  if (!left_zygion || !right_zygion || !nasal_base || !labrale_superius) return null;
+   408→
+   409→  const bizygomatic_width = distance(left_zygion, right_zygion);
+   410→  const upper_face_height = distance(nasal_base, labrale_superius);
+   411→
+   412→  if (upper_face_height === 0) return null;
+   413→
+   414→  const ratio = bizygomatic_width / upper_face_height;
+   415→
+   416→  const idealMin = 1.8;
+   417→  const idealMax = 2.0;
+   418→
+   419→  let score: number;
+   420→  if (ratio >= idealMin && ratio <= idealMax) {
+   421→    score = 100;
+   422→  } else {
+   423→    const deviation = ratio < idealMin ? idealMin - ratio : ratio - idealMax;
+   424→    score = Math.max(0, 100 - deviation * 50);
+   425→  }
+   426→
+   427→  return {
+   428→    value: ratio,
+   429→    score,
+   430→    idealRange: { min: idealMin, max: idealMax },
+   431→    rating: getRating(score),
+   432→  };
+   433→}
+   434→
+   435→/**
+   436→ * Interpupillary Distance Ratio
+   437→ * Uses: left_pupila, right_pupila, left_zygion, right_zygion
+   438→ * Ideal: IPD ~46% of bizygomatic width
+   439→ */
+   440→export function calculateIPDRatio(frontLandmarks: LandmarkPoint[]): ScoreResult | null {
+   441→  const left_pupila = getLandmark(frontLandmarks, 'left_pupila');
+   442→  const right_pupila = getLandmark(frontLandmarks, 'right_pupila');
+   443→  const left_zygion = getLandmark(frontLandmarks, 'left_zygion');
+   444→  const right_zygion = getLandmark(frontLandmarks, 'right_zygion');
+   445→
+   446→  if (!left_pupila || !right_pupila || !left_zygion || !right_zygion) return null;
+   447→
+   448→  const ipd = distance(left_pupila, right_pupila);
+   449→  const bizygomatic_width = distance(left_zygion, right_zygion);
+   450→
+   451→  if (bizygomatic_width === 0) return null;
+   452→
+   453→  const ratio = (ipd / bizygomatic_width) * 100;
+   454→
+   455→  const ideal = 46;
+   456→  const tolerance = 2;
+   457→
+   458→  const deviation = Math.abs(ratio - ideal);
+   459→  const score = deviation <= tolerance ? 100 : Math.max(0, 100 - (deviation - tolerance) * 8);
+   460→
+   461→  return {
+   462→    value: ratio,
+   463→    score,
+   464→    idealRange: { min: 44, max: 48 },
+   465→    rating: getRating(score),
+   466→  };
+   467→}
+   468→
+   469→/**
+   470→ * Nasal Index (Nose Width to Height)
+   471→ * Uses: left_ala_nasi, right_ala_nasi, nasal_base, subnasale
+   472→ * Classification varies by ethnicity
+   473→ */
+   474→export function calculateNasalIndex(frontLandmarks: LandmarkPoint[]): ScoreResult | null {
+   475→  const left_ala_nasi = getLandmark(frontLandmarks, 'left_ala_nasi');
+   476→  const right_ala_nasi = getLandmark(frontLandmarks, 'right_ala_nasi');
+   477→  const nasal_base = getLandmark(frontLandmarks, 'nasal_base');
+   478→  const subnasale = getLandmark(frontLandmarks, 'subnasale');
+   479→
+   480→  if (!left_ala_nasi || !right_ala_nasi || !nasal_base || !subnasale) return null;
+   481→
+   482→  const nasal_width = distance(left_ala_nasi, right_ala_nasi);
+   483→  const nasal_height = distance(nasal_base, subnasale);
+   484→
+   485→  if (nasal_height === 0) return null;
+   486→
+   487→  const index = (nasal_width / nasal_height) * 100;
+   488→
+   489→  // Using mesorrhine (medium) as ideal: 70-85
+   490→  const idealMin = 70;
+   491→  const idealMax = 85;
+   492→
+   493→  let score: number;
+   494→  if (index >= idealMin && index <= idealMax) {
+   495→    score = 100;
+   496→  } else {
+   497→    const deviation = index < idealMin ? idealMin - index : index - idealMax;
+   498→    score = Math.max(0, 100 - deviation * 3);
+   499→  }
+   500→
+   501→  return {
+   502→    value: index,
+   503→    score,
+   504→    idealRange: { min: idealMin, max: idealMax },
+   505→    rating: getRating(score),
+   506→  };
+   507→}
+   508→
+   509→/**
+   510→ * Eye Canthal Tilt
+   511→ * Uses: left_canthus_medialis, left_canthus_lateralis (or right)
+   512→ * Ideal: 4° - 8° positive tilt
+   513→ */
+   514→export function calculateCanthalTilt(
+   515→  frontLandmarks: LandmarkPoint[],
+   516→  side: 'left' | 'right' = 'left'
+   517→): ScoreResult | null {
+   518→  const medialId = side === 'left' ? 'left_canthus_medialis' : 'right_canthus_medialis';
+   519→  const lateralId = side === 'left' ? 'left_canthus_lateralis' : 'right_canthus_lateralis';
+   520→
+   521→  const canthus_medialis = getLandmark(frontLandmarks, medialId);
+   522→  const canthus_lateralis = getLandmark(frontLandmarks, lateralId);
+   523→
+   524→  if (!canthus_medialis || !canthus_lateralis) return null;
+   525→
+   526→  // Y is inverted in screen coordinates
+   527→  const deltaY = canthus_medialis.y - canthus_lateralis.y;
+   528→  const deltaX = canthus_lateralis.x - canthus_medialis.x;
+   529→
+   530→  const angle = Math.atan2(deltaY, deltaX) * (180 / Math.PI);
+   531→
+   532→  const idealMin = 4;
+   533→  const idealMax = 8;
+   534→
+   535→  let score: number;
+   536→  if (angle >= idealMin && angle <= idealMax) {
+   537→    score = 100;
+   538→  } else if (angle < 0) {
+   539→    // Negative tilt is worse
+   540→    score = Math.max(0, 50 + angle * 5);
+   541→  } else {
+   542→    const deviation = angle < idealMin ? idealMin - angle : angle - idealMax;
+   543→    score = Math.max(0, 100 - deviation * 10);
+   544→  }
+   545→
+   546→  return {
+   547→    value: angle,
+   548→    score,
+   549→    idealRange: { min: idealMin, max: idealMax },
+   550→    rating: getRating(score),
+   551→  };
+   552→}
+   553→
+   554→/**
+   555→ * Mouth Width to Nose Width Ratio
+   556→ * Uses: left_cheilion, right_cheilion, left_ala_nasi, right_ala_nasi
+   557→ * Ideal: 1.5 - 1.6
+   558→ */
+   559→export function calculateMouthNoseRatio(frontLandmarks: LandmarkPoint[]): ScoreResult | null {
+   560→  const left_cheilion = getLandmark(frontLandmarks, 'left_cheilion');
+   561→  const right_cheilion = getLandmark(frontLandmarks, 'right_cheilion');
+   562→  const left_ala_nasi = getLandmark(frontLandmarks, 'left_ala_nasi');
+   563→  const right_ala_nasi = getLandmark(frontLandmarks, 'right_ala_nasi');
+   564→
+   565→  if (!left_cheilion || !right_cheilion || !left_ala_nasi || !right_ala_nasi) return null;
+   566→
+   567→  const mouth_width = distance(left_cheilion, right_cheilion);
+   568→  const nose_width = distance(left_ala_nasi, right_ala_nasi);
+   569→
+   570→  if (nose_width === 0) return null;
+   571→
+   572→  const ratio = mouth_width / nose_width;
+   573→
+   574→  const idealMin = 1.5;
+   575→  const idealMax = 1.6;
+   576→
+   577→  let score: number;
+   578→  if (ratio >= idealMin && ratio <= idealMax) {
+   579→    score = 100;
+   580→  } else {
+   581→    const deviation = ratio < idealMin ? idealMin - ratio : ratio - idealMax;
+   582→    score = Math.max(0, 100 - deviation * 30);
+   583→  }
+   584→
+   585→  return {
+   586→    value: ratio,
+   587→    score,
+   588→    idealRange: { min: idealMin, max: idealMax },
+   589→    rating: getRating(score),
+   590→  };
+   591→}
+   592→
+   593→/**
+   594→ * Jaw Width to Face Width Ratio (Bigonial to Bizygomatic)
+   595→ * Uses: left_gonion_inferior, right_gonion_inferior, left_zygion, right_zygion
+   596→ * Ideal: 0.75 - 0.80 (male), 0.70 - 0.75 (female)
+   597→ */
+   598→export function calculateJawRatio(
+   599→  frontLandmarks: LandmarkPoint[],
+   600→  gender: 'male' | 'female' = 'male'
+   601→): ScoreResult | null {
+   602→  const left_gonion = getLandmark(frontLandmarks, 'left_gonion_inferior');
+   603→  const right_gonion = getLandmark(frontLandmarks, 'right_gonion_inferior');
+   604→  const left_zygion = getLandmark(frontLandmarks, 'left_zygion');
+   605→  const right_zygion = getLandmark(frontLandmarks, 'right_zygion');
+   606→
+   607→  if (!left_gonion || !right_gonion || !left_zygion || !right_zygion) return null;
+   608→
+   609→  const bigonial_width = distance(left_gonion, right_gonion);
+   610→  const bizygomatic_width = distance(left_zygion, right_zygion);
+   611→
+   612→  if (bizygomatic_width === 0) return null;
+   613→
+   614→  const ratio = bigonial_width / bizygomatic_width;
+   615→
+   616→  const idealMin = gender === 'male' ? 0.75 : 0.7;
+   617→  const idealMax = gender === 'male' ? 0.8 : 0.75;
+   618→
+   619→  let score: number;
+   620→  if (ratio >= idealMin && ratio <= idealMax) {
+   621→    score = 100;
+   622→  } else {
+   623→    const deviation = ratio < idealMin ? idealMin - ratio : ratio - idealMax;
+   624→    score = Math.max(0, 100 - deviation * 100);
+   625→  }
+   626→
+   627→  return {
+   628→    value: ratio,
+   629→    score,
+   630→    idealRange: { min: idealMin, max: idealMax },
+   631→    rating: getRating(score),
+   632→  };
+   633→}
+   634→
+   635→// ============================================
+   636→// COMPREHENSIVE ANALYSIS
+   637→// ============================================
+   638→
+   639→export interface FrontAnalysisResults {
+   640→  facialThirds: ReturnType<typeof calculateFacialThirds>;
+   641→  fwhr: ScoreResult | null;
+   642→  ipdRatio: ScoreResult | null;
+   643→  nasalIndex: ScoreResult | null;
+   644→  leftCanthalTilt: ScoreResult | null;
+   645→  rightCanthalTilt: ScoreResult | null;
+   646→  mouthNoseRatio: ScoreResult | null;
+   647→  jawRatio: ScoreResult | null;
+   648→  overallScore: number;
+   649→}
+   650→
+   651→export interface SideAnalysisResults {
+   652→  gonialAngle: ScoreResult | null;
+   653→  nasolabialAngle: ScoreResult | null;
+   654→  eLine: ReturnType<typeof calculateELine>;
+   655→  mentolabialAngle: ScoreResult | null;
+   656→  nasofrontalAngle: ScoreResult | null;
+   657→  overallScore: number;
+   658→}
+   659→
+   660→/**
+   661→ * Run all front profile analyses
+   662→ */
+   663→export function analyzeFrontProfile(
+   664→  frontLandmarks: LandmarkPoint[],
+   665→  gender: 'male' | 'female' = 'male'
+   666→): FrontAnalysisResults {
+   667→  const facialThirds = calculateFacialThirds(frontLandmarks);
+   668→  const fwhr = calculateFWHR(frontLandmarks);
+   669→  const ipdRatio = calculateIPDRatio(frontLandmarks);
+   670→  const nasalIndex = calculateNasalIndex(frontLandmarks);
+   671→  const leftCanthalTilt = calculateCanthalTilt(frontLandmarks, 'left');
+   672→  const rightCanthalTilt = calculateCanthalTilt(frontLandmarks, 'right');
+   673→  const mouthNoseRatio = calculateMouthNoseRatio(frontLandmarks);
+   674→  const jawRatio = calculateJawRatio(frontLandmarks, gender);
+   675→
+   676→  // Calculate overall score from valid results
+   677→  const scores: number[] = [];
+   678→  if (facialThirds) scores.push(facialThirds.overall.score);
+   679→  if (fwhr) scores.push(fwhr.score);
+   680→  if (ipdRatio) scores.push(ipdRatio.score);
+   681→  if (nasalIndex) scores.push(nasalIndex.score);
+   682→  if (leftCanthalTilt) scores.push(leftCanthalTilt.score);
+   683→  if (rightCanthalTilt) scores.push(rightCanthalTilt.score);
+   684→  if (mouthNoseRatio) scores.push(mouthNoseRatio.score);
+   685→  if (jawRatio) scores.push(jawRatio.score);
+   686→
+   687→  const overallScore = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+   688→
+   689→  return {
+   690→    facialThirds,
+   691→    fwhr,
+   692→    ipdRatio,
+   693→    nasalIndex,
+   694→    leftCanthalTilt,
+   695→    rightCanthalTilt,
+   696→    mouthNoseRatio,
+   697→    jawRatio,
+   698→    overallScore,
+   699→  };
+   700→}
+   701→
+   702→/**
+   703→ * Run all side profile analyses
+   704→ */
+   705→export function analyzeSideProfile(
+   706→  sideLandmarks: LandmarkPoint[],
+   707→  gender: 'male' | 'female' = 'male'
+   708→): SideAnalysisResults {
+   709→  const gonialAngle = calculateGonialAngle(sideLandmarks, gender);
+   710→  const nasolabialAngle = calculateNasolabialAngle(sideLandmarks, gender);
+   711→  const eLine = calculateELine(sideLandmarks, gender);
+   712→  const mentolabialAngle = calculateMentolabialAngle(sideLandmarks);
+   713→  const nasofrontalAngle = calculateNasofrontalAngle(sideLandmarks);
+   714→
+   715→  // Calculate overall score from valid results
+   716→  const scores: number[] = [];
+   717→  if (gonialAngle) scores.push(gonialAngle.score);
+   718→  if (nasolabialAngle) scores.push(nasolabialAngle.score);
+   719→  if (eLine) scores.push(eLine.combined.score);
+   720→  if (mentolabialAngle) scores.push(mentolabialAngle.score);
+   721→  if (nasofrontalAngle) scores.push(nasofrontalAngle.score);
+   722→
+   723→  const overallScore = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+   724→
+   725→  return {
+   726→    gonialAngle,
+   727→    nasolabialAngle,
+   728→    eLine,
+   729→    mentolabialAngle,
+   730→    nasofrontalAngle,
+   731→    overallScore,
+   732→  };
+   733→}
+   734→
+   735→// ============================================
+   736→// FACEIQ-STYLE BELL CURVE SCORING
+   737→// ============================================
+   738→
+   739→/**
+   740→ * Bell curve scoring function
+   741→ * score = e^(-0.5 × ((value-ideal)/stdDev)²) × 100
+   742→ */
+   743→export function calculateBellCurveScore(
+   744→  value: number,
+   745→  config: ScoringConfig
+   746→): number {
+   747→  const z = (value - config.idealValue) / config.standardDeviation;
+   748→  const bellCurve = Math.exp(-0.5 * z * z);
+   749→  return config.minScore + (config.maxScore - config.minScore) * bellCurve;
+   750→}
+   751→
+   752→/**
+   753→ * Get bell curve score with gender-specific ideal values
+   754→ */
+   755→export function calculateGenderAwareBellCurveScore(
+   756→  value: number,
+   757→  measurementKey: string,
+   758→  gender: 'male' | 'female'
+   759→): number {
+   760→  const idealValues = FACEIQ_IDEAL_VALUES[measurementKey];
+   761→  const config = FACEIQ_SCORING_CONFIGS[measurementKey];
+   762→
+   763→  if (!idealValues || !config) {
+   764→    return 0;
+   765→  }
+   766→
+   767→  const genderIdeal = idealValues[gender].ideal;
+   768→  const adjustedConfig = {
+   769→    ...config,
+   770→    idealValue: genderIdeal,
+   771→  };
+   772→
+   773→  return calculateBellCurveScore(value, adjustedConfig);
+   774→}
+   775→
+   776→/**
+   777→ * Calculate overall harmony score (weighted average)
+   778→ */
+   779→export function calculateHarmonyScore(
+   780→  scores: Record<string, number>
+   781→): number {
+   782→  let totalWeight = 0;
+   783→  let weightedSum = 0;
+   784→
+   785→  for (const [key, score] of Object.entries(scores)) {
+   786→    const config = FACEIQ_SCORING_CONFIGS[key];
+   787→    if (config) {
+   788→      weightedSum += score * config.weight;
+   789→      totalWeight += config.weight;
+   790→    }
+   791→  }
+   792→
+   793→  return totalWeight > 0 ? weightedSum / totalWeight : 0;
+   794→}
+   795→
+   796→// ============================================
+   797→// PERCENTILE RANKING (Population Comparison)
+   798→// ============================================
+   799→
+   800→/**
+   801→ * Standard normal CDF approximation (Abramowitz and Stegun formula)
+   802→ */
+   803→export function normalCDF(z: number): number {
+   804→  const a1 = 0.254829592;
+   805→  const a2 = -0.284496736;
+   806→  const a3 = 1.421413741;
+   807→  const a4 = -1.453152027;
+   808→  const a5 = 1.061405429;
+   809→  const p = 0.3275911;
+   810→
+   811→  const sign = z < 0 ? -1 : 1;
+   812→  const absZ = Math.abs(z) / Math.sqrt(2);
+   813→
+   814→  const t = 1.0 / (1.0 + p * absZ);
+   815→  const y =
+   816→    1.0 -
+   817→    ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-absZ * absZ);
+   818→
+   819→  return 0.5 * (1.0 + sign * y);
+   820→}
+   821→
+   822→/**
+   823→ * Calculate percentile (where you fall on the bell curve)
+   824→ */
+   825→export function calculatePercentile(
+   826→  value: number,
+   827→  stats: PopulationStats
+   828→): number {
+   829→  const z = (value - stats.mean) / stats.standardDeviation;
+   830→  return normalCDF(z) * 100;
+   831→}
+   832→
+   833→/**
+   834→ * Calculate percentile for a specific measurement
+   835→ */
+   836→export function calculateMeasurementPercentile(
+   837→  value: number,
+   838→  measurementKey: string
+   839→): number {
+   840→  const stats = POPULATION_STATS[measurementKey];
+   841→  if (!stats) {
+   842→    return 50; // Default to median if no stats available
+   843→  }
+   844→  return calculatePercentile(value, stats);
+   845→}
+   846→
+   847→// ============================================
+   848→// BELL CURVE DATA FOR VISUALIZATION
+   849→// ============================================
+   850→
+   851→export interface BellCurvePoint {
+   852→  x: number;
+   853→  y: number;
+   854→}
+   855→
+   856→export interface BellCurveData {
+   857→  points: BellCurvePoint[];
+   858→  userValue: number;
+   859→  userPercentile: number;
+   860→  mean: number;
+   861→  standardDeviation: number;
+   862→  idealValue?: number;
+   863→}
+   864→
+   865→/**
+   866→ * Generate bell curve data for visualization
+   867→ */
+   868→export function generateBellCurveData(
+   869→  stats: PopulationStats,
+   870→  userValue: number,
+   871→  idealValue?: number
+   872→): BellCurveData {
+   873→  const points: BellCurvePoint[] = [];
+   874→
+   875→  // Generate points from -4 to +4 standard deviations
+   876→  for (let i = -4; i <= 4; i += 0.1) {
+   877→    const x = stats.mean + i * stats.standardDeviation;
+   878→    const y =
+   879→      (1 / (stats.standardDeviation * Math.sqrt(2 * Math.PI))) *
+   880→      Math.exp(
+   881→        -0.5 * Math.pow((x - stats.mean) / stats.standardDeviation, 2)
+   882→      );
+   883→    points.push({ x, y });
+   884→  }
+   885→
+   886→  return {
+   887→    points,
+   888→    userValue,
+   889→    userPercentile: calculatePercentile(userValue, stats),
+   890→    mean: stats.mean,
+   891→    standardDeviation: stats.standardDeviation,
+   892→    idealValue,
+   893→  };
+   894→}
+   895→
+   896→/**
+   897→ * Generate bell curve data for a specific measurement
+   898→ */
+   899→export function generateMeasurementBellCurve(
+   900→  measurementKey: string,
+   901→  userValue: number,
+   902→  gender?: 'male' | 'female'
+   903→): BellCurveData | null {
+   904→  const stats = POPULATION_STATS[measurementKey];
+   905→  if (!stats) {
+   906→    return null;
+   907→  }
+   908→
+   909→  const idealValues = FACEIQ_IDEAL_VALUES[measurementKey];
+   910→  const idealValue = idealValues && gender ? idealValues[gender].ideal : undefined;
+   911→
+   912→  return generateBellCurveData(stats, userValue, idealValue);
+   913→}
+   914→
+   915→// ============================================
+   916→// ENHANCED SCORE RESULTS
+   917→// ============================================
+   918→
+   919→export interface EnhancedScoreResult extends ScoreResult {
+   920→  bellCurveScore: number;
+   921→  percentile: number;
+   922→  idealValue: number;
+   923→  deviation: number;
+   924→}
+   925→
+   926→/**
+   927→ * Create enhanced score result with bell curve and percentile
+   928→ */
+   929→export function createEnhancedScore(
+   930→  value: number,
+   931→  measurementKey: string,
+   932→  gender: 'male' | 'female' = 'male'
+   933→): EnhancedScoreResult | null {
+   934→  const config = FACEIQ_SCORING_CONFIGS[measurementKey];
+   935→  const idealValues = FACEIQ_IDEAL_VALUES[measurementKey];
+   936→  const stats = POPULATION_STATS[measurementKey];
+   937→
+   938→  if (!config) return null;
+   939→
+   940→  const idealValue = idealValues ? idealValues[gender].ideal : config.idealValue;
+   941→  const bellCurveScore = calculateBellCurveScore(value, {
+   942→    ...config,
+   943→    idealValue,
+   944→  });
+   945→  const percentile = stats ? calculatePercentile(value, stats) : 50;
+   946→  const deviation = value - idealValue;
+   947→
+   948→  return {
+   949→    value,
+   950→    score: bellCurveScore,
+   951→    idealRange: idealValues
+   952→      ? { min: idealValues[gender].range[0], max: idealValues[gender].range[1] }
+   953→      : { min: config.idealValue - config.standardDeviation, max: config.idealValue + config.standardDeviation },
+   954→    rating: getRating(bellCurveScore),
+   955→    bellCurveScore,
+   956→    percentile,
+   957→    idealValue,
+   958→    deviation,
+   959→  };
+   960→}
+   961→
+   962→// ============================================
+   963→// COMPREHENSIVE ANALYSIS WITH BELL CURVES
+   964→// ============================================
+   965→
+   966→export interface ComprehensiveFrontAnalysis extends FrontAnalysisResults {
+   967→  bellCurveScores: Record<string, number>;
+   968→  percentiles: Record<string, number>;
+   969→  harmonyScore: number;
+   970→}
+   971→
+   972→export interface ComprehensiveSideAnalysis extends SideAnalysisResults {
+   973→  bellCurveScores: Record<string, number>;
+   974→  percentiles: Record<string, number>;
+   975→  harmonyScore: number;
+   976→}
+   977→
+   978→/**
+   979→ * Run comprehensive front profile analysis with bell curves
+   980→ */
+   981→export function comprehensiveFrontAnalysis(
+   982→  frontLandmarks: LandmarkPoint[],
+   983→  gender: 'male' | 'female' = 'male'
+   984→): ComprehensiveFrontAnalysis {
+   985→  const baseAnalysis = analyzeFrontProfile(frontLandmarks, gender);
+   986→
+   987→  const bellCurveScores: Record<string, number> = {};
+   988→  const percentiles: Record<string, number> = {};
+   989→
+   990→  // Calculate bell curve scores for each measurement
+   991→  if (baseAnalysis.fwhr) {
+   992→    bellCurveScores.fwhr = calculateGenderAwareBellCurveScore(
+   993→      baseAnalysis.fwhr.value,
+   994→      'fwhr',
+   995→      gender
+   996→    );
+   997→    percentiles.fwhr = calculateMeasurementPercentile(
+   998→      baseAnalysis.fwhr.value,
+   999→      'fwhr'
+  1000→    );
+  1001→  }
+  1002→
+  1003→  if (baseAnalysis.leftCanthalTilt) {
+  1004→    bellCurveScores.canthalTilt = calculateGenderAwareBellCurveScore(
+  1005→      baseAnalysis.leftCanthalTilt.value,
+  1006→      'canthalTilt',
+  1007→      gender
+  1008→    );
+  1009→    percentiles.canthalTilt = calculateMeasurementPercentile(
+  1010→      baseAnalysis.leftCanthalTilt.value,
+  1011→      'canthalTilt'
+  1012→    );
+  1013→  }
+  1014→
+  1015→  if (baseAnalysis.nasalIndex) {
+  1016→    bellCurveScores.nasalIndex = calculateGenderAwareBellCurveScore(
+  1017→      baseAnalysis.nasalIndex.value,
+  1018→      'nasalIndex',
+  1019→      gender
+  1020→    );
+  1021→  }
+  1022→
+  1023→  const harmonyScore = calculateHarmonyScore(bellCurveScores);
+  1024→
+  1025→  return {
+  1026→    ...baseAnalysis,
+  1027→    bellCurveScores,
+  1028→    percentiles,
+  1029→    harmonyScore,
+  1030→  };
+  1031→}
+  1032→
+  1033→/**
+  1034→ * Run comprehensive side profile analysis with bell curves
+  1035→ */
+  1036→export function comprehensiveSideAnalysis(
+  1037→  sideLandmarks: LandmarkPoint[],
+  1038→  gender: 'male' | 'female' = 'male'
+  1039→): ComprehensiveSideAnalysis {
+  1040→  const baseAnalysis = analyzeSideProfile(sideLandmarks, gender);
+  1041→
+  1042→  const bellCurveScores: Record<string, number> = {};
+  1043→  const percentiles: Record<string, number> = {};
+  1044→
+  1045→  // Calculate bell curve scores for each measurement
+  1046→  if (baseAnalysis.gonialAngle) {
+  1047→    bellCurveScores.gonialAngle = calculateGenderAwareBellCurveScore(
+  1048→      baseAnalysis.gonialAngle.value,
+  1049→      'gonialAngle',
+  1050→      gender
+  1051→    );
+  1052→  }
+  1053→
+  1054→  if (baseAnalysis.nasolabialAngle) {
+  1055→    bellCurveScores.nasolabialAngle = calculateGenderAwareBellCurveScore(
+  1056→      baseAnalysis.nasolabialAngle.value,
+  1057→      'nasolabialAngle',
+  1058→      gender
+  1059→    );
+  1060→  }
+  1061→
+  1062→  const harmonyScore = calculateHarmonyScore(bellCurveScores);
+  1063→
+  1064→  return {
+  1065→    ...baseAnalysis,
+  1066→    bellCurveScores,
+  1067→    percentiles,
+  1068→    harmonyScore,
+  1069→  };
+  1070→}
+  1071→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

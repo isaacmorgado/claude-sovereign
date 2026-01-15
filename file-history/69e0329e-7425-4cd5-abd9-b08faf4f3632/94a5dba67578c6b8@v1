@@ -1,0 +1,482 @@
+/**
+ * SPLICE YouTube Content Generator Service
+ *
+ * Generates YouTube titles, descriptions, and metadata from transcripts.
+ * Uses GPT-4o-mini for intelligent content creation.
+ *
+ * Features:
+ * - Video title generation (SEO-optimized)
+ * - Full description with summary, key points, timestamps
+ * - Hashtag generation
+ * - Shorts/TikTok metadata
+ */
+
+const OpenAI = require('openai');
+
+// Lazy-load OpenAI client
+let openai = null;
+function getOpenAI() {
+  if (!openai) {
+    openai = new OpenAI();
+  }
+  return openai;
+}
+
+/**
+ * Generate YouTube video description from transcript
+ * @param {Object} transcript - Transcript with text and/or segments
+ * @param {Object} options - Generation options
+ * @returns {Promise<Object>} Generated description and metadata
+ */
+async function generateDescription(transcript, options = {}) {
+  const {
+    style = 'standard', // 'standard', 'seo', 'minimal'
+    includeTimestamps = true,
+    includeHashtags = true,
+    maxHashtags = 10,
+    language = 'en',
+    chapters = null, // Optional pre-detected chapters
+    keywords = [] // Optional focus keywords
+  } = options;
+
+  // Get full text from transcript
+  const text = extractText(transcript);
+
+  if (!text || text.length < 50) {
+    return {
+      success: false,
+      error: 'Transcript too short for description generation',
+      description: '',
+      metadata: { reason: 'transcript_too_short' }
+    };
+  }
+
+  // Get duration
+  const duration = transcript.duration ||
+    (transcript.segments?.length > 0 ? transcript.segments[transcript.segments.length - 1].end : 0);
+
+  console.log(`[SPLICE YouTube] Generating description (${text.length} chars, style: ${style})`);
+
+  try {
+    const prompt = buildDescriptionPrompt(text, {
+      style,
+      includeTimestamps,
+      includeHashtags,
+      maxHashtags,
+      chapters,
+      keywords,
+      duration
+    });
+
+    const response = await getOpenAI().chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a YouTube content optimization expert. Create engaging, SEO-optimized video descriptions that increase watch time and discoverability. Return structured JSON.`
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 1500,
+      response_format: { type: 'json_object' }
+    });
+
+    const content = response.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('No response from AI service');
+    }
+    const result = JSON.parse(content);
+
+    // Format the description
+    const formattedDescription = formatDescription(result, {
+      includeTimestamps,
+      includeHashtags,
+      chapters
+    });
+
+    console.log(`[SPLICE YouTube] Description generated (${formattedDescription.length} chars)`);
+
+    return {
+      success: true,
+      description: formattedDescription,
+      title: result.title || '',
+      summary: result.summary || '',
+      keyPoints: result.keyPoints || [],
+      hashtags: result.hashtags || [],
+      timestamps: result.timestamps || chapters?.map(ch => ({
+        time: ch.startTime,
+        label: ch.title
+      })) || [],
+      metadata: {
+        style,
+        characterCount: formattedDescription.length,
+        model: 'gpt-4o-mini',
+        duration
+      }
+    };
+
+  } catch (err) {
+    console.error('[SPLICE YouTube] Description generation error:', err);
+    throw new Error(`Description generation failed: ${err.message}`);
+  }
+}
+
+/**
+ * Generate YouTube video title from transcript
+ * @param {Object} transcript - Transcript with text
+ * @param {Object} options - Generation options
+ * @returns {Promise<Object>} Generated titles
+ */
+async function generateTitle(transcript, options = {}) {
+  const {
+    style = 'engaging', // 'engaging', 'seo', 'clickbait', 'professional'
+    count = 5, // Number of title options
+    maxLength = 70,
+    keywords = []
+  } = options;
+
+  const text = extractText(transcript);
+
+  if (!text || text.length < 50) {
+    return {
+      success: false,
+      error: 'Transcript too short for title generation',
+      titles: []
+    };
+  }
+
+  console.log(`[SPLICE YouTube] Generating ${count} title options (style: ${style})`);
+
+  try {
+    const prompt = buildTitlePrompt(text, { style, count, maxLength, keywords });
+
+    const response = await getOpenAI().chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a YouTube title optimization expert. Create compelling, click-worthy titles that accurately represent content while maximizing CTR. Return JSON with an array of title options.`
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.8,
+      max_tokens: 500,
+      response_format: { type: 'json_object' }
+    });
+
+    const result = JSON.parse(response.choices[0].message.content);
+    const titles = (result.titles || []).slice(0, count);
+
+    return {
+      success: true,
+      titles,
+      recommended: titles[0] || '',
+      metadata: { style, count: titles.length }
+    };
+
+  } catch (err) {
+    console.error('[SPLICE YouTube] Title generation error:', err);
+    throw new Error(`Title generation failed: ${err.message}`);
+  }
+}
+
+/**
+ * Generate Shorts/TikTok metadata
+ * @param {Object} transcript - Transcript with text
+ * @param {Object} options - Generation options
+ * @returns {Promise<Object>} Shorts metadata
+ */
+async function generateShortsMetadata(transcript, options = {}) {
+  const {
+    platform = 'youtube_shorts', // 'youtube_shorts', 'tiktok', 'reels'
+    maxHashtags = 5
+  } = options;
+
+  const text = extractText(transcript);
+
+  if (!text || text.length < 20) {
+    return {
+      success: false,
+      error: 'Transcript too short',
+      title: '',
+      caption: '',
+      hashtags: []
+    };
+  }
+
+  console.log(`[SPLICE YouTube] Generating ${platform} metadata`);
+
+  try {
+    const platformRules = {
+      youtube_shorts: 'YouTube Shorts - punchy titles under 40 chars, trending hashtags',
+      tiktok: 'TikTok - hook-style captions, viral hashtags, emoji usage encouraged',
+      reels: 'Instagram Reels - aesthetic titles, lifestyle hashtags'
+    };
+
+    const prompt = `Analyze this short-form video transcript and generate ${platformRules[platform] || platformRules.youtube_shorts} metadata.
+
+TRANSCRIPT:
+${text.substring(0, 2000)}
+
+Return JSON:
+{
+  "title": "Catchy title under 40 characters",
+  "caption": "Engaging caption under 150 characters with hook",
+  "hashtags": ["relevant", "trending", "hashtags"],
+  "hook": "Opening hook line"
+}`;
+
+    const response = await getOpenAI().chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are a viral short-form content expert.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.8,
+      max_tokens: 300,
+      response_format: { type: 'json_object' }
+    });
+
+    const result = JSON.parse(response.choices[0].message.content);
+
+    return {
+      success: true,
+      title: result.title || '',
+      caption: result.caption || '',
+      hashtags: (result.hashtags || []).slice(0, maxHashtags),
+      hook: result.hook || '',
+      platform,
+      metadata: { model: 'gpt-4o-mini' }
+    };
+
+  } catch (err) {
+    console.error('[SPLICE YouTube] Shorts metadata error:', err);
+    throw new Error(`Shorts metadata generation failed: ${err.message}`);
+  }
+}
+
+/**
+ * Extract plain text from transcript
+ */
+function extractText(transcript) {
+  if (typeof transcript === 'string') return transcript;
+  if (transcript.text) return transcript.text;
+  if (transcript.segments) {
+    return transcript.segments.map(s => s.text || s.content || '').join(' ').trim();
+  }
+  if (transcript.words) {
+    return transcript.words.map(w => w.word || w.text || '').join(' ').trim();
+  }
+  return '';
+}
+
+/**
+ * Build prompt for description generation
+ */
+function buildDescriptionPrompt(text, options) {
+  const { style, includeTimestamps, includeHashtags, maxHashtags, chapters, keywords, duration } = options;
+
+  // Truncate if too long
+  const truncatedText = text.length > 10000 ? text.substring(0, 10000) + '...' : text;
+
+  let styleInstructions = '';
+  switch (style) {
+    case 'seo':
+      styleInstructions = `Create an SEO-optimized description:
+- Front-load important keywords
+- Include searchable phrases
+- Use strategic keyword placement
+- Optimize for YouTube search algorithm`;
+      break;
+    case 'minimal':
+      styleInstructions = `Create a concise description:
+- Brief 2-3 sentence summary
+- Essential information only
+- Clean and professional`;
+      break;
+    default:
+      styleInstructions = `Create an engaging description:
+- Hook viewers in first line
+- Include value proposition
+- Balance information and engagement`;
+  }
+
+  const keywordSection = keywords.length > 0
+    ? `\nFOCUS KEYWORDS: ${keywords.join(', ')}`
+    : '';
+
+  const chapterSection = chapters?.length > 0
+    ? `\nCHAPTERS PROVIDED: ${chapters.map(ch => `${Math.floor(ch.startTime)}s - ${ch.title}`).join(', ')}`
+    : '';
+
+  return `Analyze this video transcript and generate a YouTube description.
+
+${styleInstructions}
+${keywordSection}
+${chapterSection}
+
+VIDEO DURATION: ${Math.floor(duration || 0)} seconds
+
+TRANSCRIPT:
+${truncatedText}
+
+Return JSON:
+{
+  "title": "Suggested video title (under 70 chars)",
+  "summary": "2-3 sentence video summary",
+  "keyPoints": ["Key point 1", "Key point 2", "Key point 3"],
+  ${includeHashtags ? `"hashtags": ["hashtag1", "hashtag2", ... up to ${maxHashtags}],` : ''}
+  ${includeTimestamps && !chapters ? `"timestamps": [{"time": 0, "label": "Intro"}, ...],` : ''}
+  "callToAction": "Subscribe call to action"
+}`;
+}
+
+/**
+ * Build prompt for title generation
+ */
+function buildTitlePrompt(text, options) {
+  const { style, count, maxLength, keywords } = options;
+
+  const truncatedText = text.length > 5000 ? text.substring(0, 5000) + '...' : text;
+
+  const styleRules = {
+    engaging: 'Create curiosity-driven titles that make viewers want to click',
+    seo: 'Prioritize searchable keywords and clear topic identification',
+    clickbait: 'Use power words, numbers, and emotional triggers (but stay accurate)',
+    professional: 'Clean, informative titles suitable for business/educational content'
+  };
+
+  const keywordNote = keywords.length > 0
+    ? `\nMUST INCLUDE KEYWORDS: ${keywords.join(', ')}`
+    : '';
+
+  return `Generate ${count} YouTube title options for this video.
+
+STYLE: ${styleRules[style] || styleRules.engaging}
+MAX LENGTH: ${maxLength} characters
+${keywordNote}
+
+TRANSCRIPT:
+${truncatedText}
+
+Return JSON:
+{
+  "titles": [
+    "Title option 1",
+    "Title option 2",
+    ...
+  ]
+}
+
+Each title should be unique and take a different angle on the content.`;
+}
+
+/**
+ * Format the final description string
+ */
+function formatDescription(result, options) {
+  const { includeTimestamps, includeHashtags, chapters } = options;
+
+  let description = '';
+
+  // Summary
+  if (result.summary) {
+    description += result.summary + '\n\n';
+  }
+
+  // Key points
+  if (result.keyPoints && result.keyPoints.length > 0) {
+    description += 'In this video:\n';
+    result.keyPoints.forEach(point => {
+      description += `• ${point}\n`;
+    });
+    description += '\n';
+  }
+
+  // Timestamps
+  if (includeTimestamps) {
+    const timestamps = chapters || result.timestamps || [];
+    if (timestamps.length > 0) {
+      description += 'Timestamps:\n';
+      timestamps.forEach(ts => {
+        const time = ts.startTime !== undefined ? ts.startTime : ts.time;
+        const label = ts.title || ts.label;
+        const formatted = formatTimestamp(time);
+        description += `${formatted} ${label}\n`;
+      });
+      description += '\n';
+    }
+  }
+
+  // Call to action
+  if (result.callToAction) {
+    description += result.callToAction + '\n\n';
+  }
+
+  // Hashtags
+  if (includeHashtags && result.hashtags && result.hashtags.length > 0) {
+    description += result.hashtags.map(h => h.startsWith('#') ? h : `#${h}`).join(' ');
+  }
+
+  return description.trim();
+}
+
+/**
+ * Format seconds to timestamp string (MM:SS or H:MM:SS)
+ */
+function formatTimestamp(seconds) {
+  const totalSeconds = Math.floor(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Get available generation options
+ */
+function getGeneratorOptions() {
+  return {
+    descriptionStyles: [
+      { id: 'standard', name: 'Standard', description: 'Engaging and informative' },
+      { id: 'seo', name: 'SEO Optimized', description: 'Keyword-focused for search' },
+      { id: 'minimal', name: 'Minimal', description: 'Brief and clean' }
+    ],
+    titleStyles: [
+      { id: 'engaging', name: 'Engaging', description: 'Curiosity-driven' },
+      { id: 'seo', name: 'SEO', description: 'Search-optimized' },
+      { id: 'clickbait', name: 'Clickbait', description: 'High CTR (use responsibly)' },
+      { id: 'professional', name: 'Professional', description: 'Business/educational' }
+    ],
+    platforms: [
+      { id: 'youtube_shorts', name: 'YouTube Shorts' },
+      { id: 'tiktok', name: 'TikTok' },
+      { id: 'reels', name: 'Instagram Reels' }
+    ],
+    defaults: {
+      maxHashtags: 10,
+      titleCount: 5,
+      maxTitleLength: 70
+    }
+  };
+}
+
+module.exports = {
+  generateDescription,
+  generateTitle,
+  generateShortsMetadata,
+  getGeneratorOptions,
+  extractText,
+  formatTimestamp
+};

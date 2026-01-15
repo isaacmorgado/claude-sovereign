@@ -1,0 +1,205 @@
+"""
+Authentication router - register, login, profile, password reset
+"""
+
+import secrets
+from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from uuid import uuid4
+
+from app.database import get_db
+from app.models.user import User, ReferralCode
+from app.schemas.user import (
+    UserCreate, UserLogin, UserResponse, Token,
+    ForgotPasswordRequest, ResetPasswordRequest
+)
+from app.services.auth import AuthService, get_current_user
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=Token)
+async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+    """Register a new user"""
+    # Check if email exists
+    result = await db.execute(select(User).where(User.email == user_data.email))
+    existing_user = result.scalar_one_or_none()
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+
+    # Check if username already exists (case-insensitive)
+    result = await db.execute(
+        select(User).where(func.lower(User.username) == user_data.username.lower())
+    )
+    existing_username = result.scalar_one_or_none()
+
+    if existing_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already taken"
+        )
+
+    # Validate referral code if provided
+    stripe_promo_id = None
+    if user_data.referral_code:
+        result = await db.execute(
+            select(ReferralCode).where(
+                func.upper(ReferralCode.code) == user_data.referral_code.upper(),
+                ReferralCode.is_active == True
+            )
+        )
+        referral = result.scalar_one_or_none()
+        if referral:
+            stripe_promo_id = referral.stripe_promotion_code_id
+            # Increment usage count
+            referral.total_uses += 1
+
+    # Create user
+    hashed_password = AuthService.hash_password(user_data.password)
+    user = User(
+        id=uuid4(),
+        email=user_data.email,
+        password_hash=hashed_password,
+        name=user_data.name,
+        username=user_data.username,
+        terms_accepted_at=datetime.utcnow() if user_data.terms_accepted else None,
+        referral_code=user_data.referral_code,
+        referred_by=stripe_promo_id,
+    )
+
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    # Generate token
+    access_token = AuthService.create_access_token(str(user.id))
+
+    return Token(access_token=access_token, token_type="bearer", user=user)
+
+
+@router.post("/login", response_model=Token)
+async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
+    """Login and get JWT token"""
+    result = await db.execute(select(User).where(User.email == credentials.email))
+    user = result.scalar_one_or_none()
+
+    if not user or not AuthService.verify_password(credentials.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = AuthService.create_access_token(str(user.id))
+
+    return Token(access_token=access_token, token_type="bearer", user=user)
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Get current user profile"""
+    return current_user
+
+
+@router.get("/check-username/{username}")
+async def check_username(username: str, db: AsyncSession = Depends(get_db)):
+    """Check if a username is available (no auth required)"""
+    # Validate format
+    if len(username) < 3:
+        return {"available": False, "reason": "Too short"}
+    if len(username) > 30:
+        return {"available": False, "reason": "Too long"}
+    if not all(c.isalnum() or c == '_' for c in username):
+        return {"available": False, "reason": "Invalid characters"}
+    if username.lower().startswith('user_'):
+        return {"available": False, "reason": "Reserved prefix"}
+
+    # Check database
+    result = await db.execute(
+        select(User).where(func.lower(User.username) == username.lower())
+    )
+    exists = result.scalar_one_or_none()
+
+    return {
+        "available": not exists,
+        "reason": "Username taken" if exists else None
+    }
+
+
+@router.get("/validate-referral/{code}")
+async def validate_referral_code(code: str, db: AsyncSession = Depends(get_db)):
+    """Validate a referral code (no auth required)"""
+    if len(code) < 3:
+        return {"valid": False, "message": "Invalid code format"}
+
+    result = await db.execute(
+        select(ReferralCode).where(
+            func.upper(ReferralCode.code) == code.upper(),
+            ReferralCode.is_active == True
+        )
+    )
+    referral = result.scalar_one_or_none()
+
+    if referral:
+        discount_msg = f"{referral.discount_percent}% discount" if referral.discount_percent else "Special offer"
+        return {
+            "valid": True,
+            "message": f"Code applied! {discount_msg} from {referral.influencer_name}"
+        }
+
+    return {"valid": False, "message": "Invalid or expired code"}
+
+
+@router.post("/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Request a password reset email"""
+    # Always return success to prevent email enumeration
+    result = await db.execute(select(User).where(User.email == data.email))
+    user = result.scalar_one_or_none()
+
+    if user:
+        # Generate secure reset token
+        reset_token = secrets.token_urlsafe(32)
+        user.password_reset_token = reset_token
+        user.password_reset_expires = datetime.utcnow() + timedelta(hours=1)
+        await db.commit()
+
+        # TODO: Send email with reset link
+        # For now, we log the token (in production, send email via SendGrid/SES)
+        # reset_url = f"{settings.frontend_url}/reset-password?token={reset_token}"
+        # await send_password_reset_email(user.email, reset_url)
+        print(f"Password reset requested for {user.email}. Token: {reset_token}")
+
+    return {"message": "If an account exists with this email, a reset link has been sent."}
+
+
+@router.post("/reset-password")
+async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Reset password using token"""
+    result = await db.execute(
+        select(User).where(
+            User.password_reset_token == data.token,
+            User.password_reset_expires > datetime.utcnow()
+        )
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token"
+        )
+
+    # Update password
+    user.password_hash = AuthService.hash_password(data.new_password)
+    user.password_reset_token = None
+    user.password_reset_expires = None
+    await db.commit()
+
+    return {"message": "Password has been reset successfully"}

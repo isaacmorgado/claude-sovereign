@@ -1,0 +1,280 @@
+/**
+ * Server-Side Detection Service for Side Profiles
+ *
+ * Calls the Railway-hosted InsightFace API for accurate side profile detection.
+ * Returns 106 raw landmarks mapped to our 28 cephalometric landmarks.
+ *
+ * Supports manual overrides for estimated landmarks (porion, tragus, intertragicNotch)
+ * to achieve FaceIQ-level Frankfort plane accuracy.
+ */
+
+import { SideLandmarkResponse } from '@/app/api/side-landmarks/route';
+
+/**
+ * Landmarks that are geometrically estimated and benefit from manual adjustment
+ */
+export const ESTIMATED_LANDMARK_IDS = ['porion', 'tragus', 'intertragicNotch'] as const;
+export type EstimatedLandmarkId = typeof ESTIMATED_LANDMARK_IDS[number];
+
+export interface ServerDetectionResult {
+  landmarks: Array<{ id: string; x: number; y: number }>;
+  rawLandmarks?: Array<{ x: number; y: number }>;  // Raw 106 landmarks for FaceIQ-style normalization
+  confidence: number;
+  faceBox: { x: number; y: number; width: number; height: number };
+  direction?: 'left' | 'right';
+  rotationAngle?: number;
+  frankfortPlane?: {
+    angle: number;
+    orbitale: { x: number; y: number };
+    porion: { x: number; y: number };
+  };
+  /** Tracks which landmarks were manually adjusted */
+  manuallyAdjusted?: string[];
+}
+
+/**
+ * Manual landmark override for estimated ear landmarks
+ */
+export interface LandmarkOverride {
+  id: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Convert image URL to base64
+ */
+async function imageUrlToBase64(imageUrl: string): Promise<string> {
+  // If it's already a data URL, extract the base64 part
+  if (imageUrl.startsWith('data:')) {
+    return imageUrl;
+  }
+
+  // If it's a blob URL or regular URL, fetch and convert
+  const response = await fetch(imageUrl);
+  const blob = await response.blob();
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+      } else {
+        reject(new Error('Failed to convert to base64'));
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+
+/**
+ * Get image dimensions
+ */
+function getImageDimensions(imageUrl: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = reject;
+    img.src = imageUrl;
+  });
+}
+
+/**
+ * Calculate Frankfort Horizontal Plane from orbitale and porion landmarks
+ */
+function calculateFrankfortPlane(
+  orbitale: { x: number; y: number },
+  porion: { x: number; y: number }
+): { angle: number; orbitale: { x: number; y: number }; porion: { x: number; y: number } } {
+  // Calculate angle from horizontal (in degrees)
+  const dx = porion.x - orbitale.x;
+  const dy = porion.y - orbitale.y;
+  const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+
+  return {
+    angle,
+    orbitale,
+    porion,
+  };
+}
+
+/**
+ * Detect side profile landmarks using server-side InsightFace API
+ */
+export async function detectSideProfileServer(
+  imageUrl: string
+): Promise<ServerDetectionResult | null> {
+  try {
+    console.log('[ServerDetection] Starting server-side detection...');
+
+    // Convert image to base64
+    const base64Image = await imageUrlToBase64(imageUrl);
+
+    // Call our API proxy
+    const response = await fetch('/api/side-landmarks', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ image: base64Image }),
+    });
+
+    if (!response.ok) {
+      console.error('[ServerDetection] API error:', response.status);
+      return null;
+    }
+
+    const data: SideLandmarkResponse = await response.json();
+
+    if (!data.success || !data.data?.namedLandmarks) {
+      console.log('[ServerDetection] Detection failed:', data.error || 'No landmarks found');
+      return null;
+    }
+
+    const resultData = data.data;
+    console.log('[ServerDetection] Detection successful, count:', resultData.landmarkCount);
+
+    // Get image dimensions for normalization
+    const { width, height } = await getImageDimensions(imageUrl);
+    console.log('[ServerDetection] Image dimensions:', width, 'x', height);
+
+    // FaceIQ PARITY FIX #1: Keep landmarks in PIXEL coordinates (NOT normalized 0-1)
+    // Normalization must happen AFTER FaceIQ rotation algorithm
+    const landmarks = Object.entries(resultData.namedLandmarks).map(([id, point]) => ({
+      id,
+      x: point.x,  // Keep pixel coordinates
+      y: point.y,  // Keep pixel coordinates
+    }));
+
+    // Keep raw landmarks in pixel coordinates for FaceIQ rotation (indices 10, 26, 75)
+    const rawLandmarks = resultData.landmarks?.map(pt => ({
+      x: pt.x,  // Keep pixel coordinates
+      y: pt.y,  // Keep pixel coordinates
+    })) || [];
+
+    // Use Frankfort Plane from server if available (future proof), otherwise calculate locally
+    let frankfortPlane: ServerDetectionResult['frankfortPlane'];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const serverFrankfort = (resultData as any).frankfort_plane;
+
+    if (serverFrankfort) {
+      frankfortPlane = serverFrankfort;
+      console.log('[ServerDetection] Frankfort Plane angle (from server):', serverFrankfort.angle.toFixed(2), 'degrees');
+    } else {
+      // Find normalized orbitale and porion from our processed list
+      const normOrbitale = landmarks.find(l => l.id === 'orbitale');
+      const normPorion = landmarks.find(l => l.id === 'porion');
+
+      if (normOrbitale && normPorion) {
+        frankfortPlane = calculateFrankfortPlane(normOrbitale, normPorion);
+        console.log('[ServerDetection] Frankfort Plane angle (calculated):', frankfortPlane.angle.toFixed(2), 'degrees');
+      }
+    }
+
+    return {
+      landmarks,
+      rawLandmarks,  // For FaceIQ-style normalization using indices 10, 26, 75
+      confidence: 0.95, // InsightFace is generally high confidence
+      faceBox: resultData.crop || { x: 0, y: 0, width: 1, height: 1 },
+      direction: resultData.direction,
+      rotationAngle: resultData.rotationAngle,
+      frankfortPlane,
+    };
+  } catch (error) {
+    console.error('[ServerDetection] Error:', error);
+    return null;
+  }
+}
+
+/**
+ * Merge manual landmark overrides with detected landmarks
+ *
+ * Used for applying user adjustments to estimated ear landmarks
+ * (porion, tragus, intertragicNotch) for FaceIQ-level accuracy.
+ *
+ * @param detectedLandmarks - Landmarks from server detection
+ * @param overrides - Manual adjustments from user
+ * @returns Merged landmarks with manual overrides applied
+ */
+export function mergeWithOverrides(
+  detectedLandmarks: Array<{ id: string; x: number; y: number }>,
+  overrides: LandmarkOverride[]
+): Array<{ id: string; x: number; y: number }> {
+  if (!overrides.length) return detectedLandmarks;
+
+  const overrideMap = new Map(overrides.map(o => [o.id, o]));
+
+  return detectedLandmarks.map(landmark => {
+    const override = overrideMap.get(landmark.id);
+    if (override) {
+      console.log(`[ServerDetection] Applied override for ${landmark.id}:`, {
+        original: { x: landmark.x.toFixed(4), y: landmark.y.toFixed(4) },
+        adjusted: { x: override.x.toFixed(4), y: override.y.toFixed(4) },
+      });
+      return { ...landmark, x: override.x, y: override.y };
+    }
+    return landmark;
+  });
+}
+
+/**
+ * Recalculate Frankfort Horizontal Plane after manual adjustments
+ *
+ * Call this after applying overrides to porion or orbitale to update
+ * the Frankfort plane angle used in side profile analysis.
+ *
+ * @param landmarks - Merged landmarks with overrides applied
+ * @returns Updated Frankfort plane calculation or null if landmarks not found
+ */
+export function recalculateFrankfortPlane(
+  landmarks: Array<{ id: string; x: number; y: number }>
+): ServerDetectionResult['frankfortPlane'] | null {
+  const orbitale = landmarks.find(l => l.id === 'orbitale');
+  const porion = landmarks.find(l => l.id === 'porion');
+
+  if (!orbitale || !porion) {
+    console.warn('[ServerDetection] Cannot calculate Frankfort plane: missing orbitale or porion');
+    return null;
+  }
+
+  const plane = calculateFrankfortPlane(orbitale, porion);
+  console.log('[ServerDetection] Recalculated Frankfort Plane angle:', plane.angle.toFixed(2), 'degrees');
+
+  return plane;
+}
+
+/**
+ * Apply manual overrides to a detection result and recalculate Frankfort plane
+ *
+ * Convenience function that combines merging and recalculation.
+ *
+ * @param result - Original detection result
+ * @param overrides - Manual landmark adjustments
+ * @returns Updated result with overrides applied
+ */
+export function applyManualOverrides(
+  result: ServerDetectionResult,
+  overrides: LandmarkOverride[]
+): ServerDetectionResult {
+  if (!overrides.length) return result;
+
+  const mergedLandmarks = mergeWithOverrides(result.landmarks, overrides);
+  const updatedFrankfort = recalculateFrankfortPlane(mergedLandmarks);
+  const adjustedIds = overrides.map(o => o.id);
+
+  return {
+    ...result,
+    landmarks: mergedLandmarks,
+    frankfortPlane: updatedFrankfort || result.frankfortPlane,
+    manuallyAdjusted: adjustedIds,
+  };
+}
+
+/**
+ * Check if a landmark is estimated (vs directly detected)
+ */
+export function isEstimatedLandmark(landmarkId: string): boolean {
+  return ESTIMATED_LANDMARK_IDS.includes(landmarkId as EstimatedLandmarkId);
+}

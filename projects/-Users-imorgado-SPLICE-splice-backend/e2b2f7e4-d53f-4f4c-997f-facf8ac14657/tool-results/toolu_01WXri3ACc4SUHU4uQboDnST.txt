@@ -1,0 +1,197 @@
+     1→import { NextRequest, NextResponse } from "next/server";
+     2→import Stripe from "stripe";
+     3→
+     4→// Lazy initialization to avoid errors during build
+     5→let stripe: Stripe | null = null;
+     6→function getStripe(): Stripe {
+     7→  if (!stripe) {
+     8→    if (!process.env.STRIPE_SECRET_KEY) {
+     9→      throw new Error("STRIPE_SECRET_KEY is not configured");
+    10→    }
+    11→    stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    12→  }
+    13→  return stripe;
+    14→}
+    15→
+    16→const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    17→
+    18→// Backend API URL for forwarding events
+    19→const BACKEND_API_URL =
+    20→  process.env.BACKEND_API_URL || "https://splice-api-production.up.railway.app";
+    21→
+    22→export async function POST(request: NextRequest) {
+    23→  // Validate webhook secret in production
+    24→  if (!webhookSecret && process.env.NODE_ENV === 'production') {
+    25→    console.error('[SPLICE] CRITICAL: STRIPE_WEBHOOK_SECRET not set in production');
+    26→    return NextResponse.json({ error: 'Webhook configuration error' }, { status: 500 });
+    27→  }
+    28→
+    29→  const body = await request.text();
+    30→  const signature = request.headers.get("stripe-signature");
+    31→
+    32→  if (!signature) {
+    33→    return NextResponse.json(
+    34→      { error: "Missing stripe-signature header" },
+    35→      { status: 400 }
+    36→    );
+    37→  }
+    38→
+    39→  let event: Stripe.Event;
+    40→
+    41→  try {
+    42→    event = getStripe().webhooks.constructEvent(body, signature, webhookSecret || "");
+    43→  } catch (error) {
+    44→    console.error("Webhook signature verification failed:", error);
+    45→    return NextResponse.json(
+    46→      {
+    47→        error:
+    48→          error instanceof Error ? error.message : "Webhook signature verification failed",
+    49→      },
+    50→      { status: 400 }
+    51→    );
+    52→  }
+    53→
+    54→  // Handle the event
+    55→  try {
+    56→    switch (event.type) {
+    57→      case "checkout.session.completed": {
+    58→        const session = event.data.object as Stripe.Checkout.Session;
+    59→        await handleCheckoutComplete(session);
+    60→        break;
+    61→      }
+    62→
+    63→      case "customer.subscription.created":
+    64→      case "customer.subscription.updated": {
+    65→        const subscription = event.data.object as Stripe.Subscription;
+    66→        await handleSubscriptionUpdate(subscription);
+    67→        break;
+    68→      }
+    69→
+    70→      case "customer.subscription.deleted": {
+    71→        const subscription = event.data.object as Stripe.Subscription;
+    72→        await handleSubscriptionCanceled(subscription);
+    73→        break;
+    74→      }
+    75→
+    76→      case "invoice.payment_succeeded": {
+    77→        const invoice = event.data.object as Stripe.Invoice;
+    78→        await handleInvoicePaid(invoice);
+    79→        break;
+    80→      }
+    81→
+    82→      case "invoice.payment_failed": {
+    83→        const invoice = event.data.object as Stripe.Invoice;
+    84→        await handleInvoicePaymentFailed(invoice);
+    85→        break;
+    86→      }
+    87→
+    88→      default:
+    89→        console.log(`Unhandled event type: ${event.type}`);
+    90→    }
+    91→
+    92→    // Forward the event to the backend API for processing
+    93→    await forwardToBackend(event);
+    94→
+    95→    return NextResponse.json({ received: true });
+    96→  } catch (error) {
+    97→    console.error("Error processing webhook:", error);
+    98→    return NextResponse.json(
+    99→      {
+   100→        error:
+   101→          error instanceof Error ? error.message : "Error processing webhook",
+   102→      },
+   103→      { status: 500 }
+   104→    );
+   105→  }
+   106→}
+   107→
+   108→async function handleCheckoutComplete(session: Stripe.Checkout.Session) {
+   109→  console.log("Checkout completed:", {
+   110→    sessionId: session.id,
+   111→    customerEmail: session.customer_details?.email,
+   112→    plan: session.metadata?.plan,
+   113→    subscriptionId: session.subscription,
+   114→  });
+   115→
+   116→  // Here you could:
+   117→  // - Send welcome email
+   118→  // - Provision user account
+   119→  // - Grant access to the plugin
+   120→}
+   121→
+   122→async function handleSubscriptionUpdate(subscription: Stripe.Subscription) {
+   123→  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+   124→  const sub = subscription as any;
+   125→  console.log("Subscription updated:", {
+   126→    subscriptionId: subscription.id,
+   127→    status: subscription.status,
+   128→    customerId: subscription.customer,
+   129→    currentPeriodEnd: sub.current_period_end
+   130→      ? new Date(sub.current_period_end * 1000)
+   131→      : null,
+   132→  });
+   133→
+   134→  // Here you could:
+   135→  // - Update user's plan in database
+   136→  // - Adjust feature access
+   137→}
+   138→
+   139→async function handleSubscriptionCanceled(subscription: Stripe.Subscription) {
+   140→  console.log("Subscription canceled:", {
+   141→    subscriptionId: subscription.id,
+   142→    customerId: subscription.customer,
+   143→  });
+   144→
+   145→  // Here you could:
+   146→  // - Revoke access at end of billing period
+   147→  // - Send cancellation confirmation
+   148→  // - Trigger win-back campaign
+   149→}
+   150→
+   151→async function handleInvoicePaid(invoice: Stripe.Invoice) {
+   152→  console.log("Invoice paid:", {
+   153→    invoiceId: invoice.id,
+   154→    customerId: invoice.customer,
+   155→    amount: invoice.amount_paid,
+   156→  });
+   157→
+   158→  // Here you could:
+   159→  // - Send receipt
+   160→  // - Reset usage limits
+   161→  // - Update billing history
+   162→}
+   163→
+   164→async function handleInvoicePaymentFailed(invoice: Stripe.Invoice) {
+   165→  console.log("Invoice payment failed:", {
+   166→    invoiceId: invoice.id,
+   167→    customerId: invoice.customer,
+   168→    amount: invoice.amount_due,
+   169→  });
+   170→
+   171→  // Here you could:
+   172→  // - Send payment failure notification
+   173→  // - Retry payment
+   174→  // - Pause account if needed
+   175→}
+   176→
+   177→async function forwardToBackend(event: Stripe.Event) {
+   178→  try {
+   179→    const response = await fetch(`${BACKEND_API_URL}/webhooks/stripe`, {
+   180→      method: "POST",
+   181→      headers: {
+   182→        "Content-Type": "application/json",
+   183→        "X-Webhook-Source": "splice-website",
+   184→      },
+   185→      body: JSON.stringify(event),
+   186→    });
+   187→
+   188→    if (!response.ok) {
+   189→      console.error("Failed to forward webhook to backend:", await response.text());
+   190→    }
+   191→  } catch (error) {
+   192→    console.error("Error forwarding webhook to backend:", error);
+   193→  }
+   194→}
+   195→
+
+</system-reminder>

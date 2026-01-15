@@ -1,0 +1,1396 @@
+     1→'use client';
+     2→
+     3→import React, { createContext, useContext, useState, useMemo, useCallback, ReactNode } from 'react';
+     4→import { LandmarkPoint } from '@/lib/landmarks';
+     5→import {
+     6→  analyzeFrontProfile,
+     7→  analyzeSideProfile,
+     8→  analyzeHarmony,
+     9→  HarmonyAnalysis,
+    10→  MetricScoreResult,
+    11→  METRIC_CONFIGS,
+    12→  Ethnicity,
+    13→  Gender,
+    14→} from '@/lib/harmony-scoring';
+    15→import {
+    16→  calculateHarmonyScore,
+    17→  getTopMetrics,
+    18→  getBottomMetrics,
+    19→  HarmonyScoreResult,
+    20→  RankedMetric,
+    21→} from '@/lib/looksmax-scoring';
+    22→import { harmonyToPSL } from '@/lib/recommendations/severity';
+    23→import {
+    24→  classifyInsights,
+    25→  convertToStrength,
+    26→  convertToFlaw,
+    27→  INSIGHTS_DEFINITIONS,
+    28→} from '@/lib/insights-engine';
+    29→import { classifyMetric } from '@/lib/taxonomy';
+    30→import {
+    31→  Ratio,
+    32→  Strength,
+    33→  Flaw,
+    34→  Recommendation,
+    35→  ResultsTab,
+    36→  FullHarmonyAnalysis,
+    37→} from '@/types/results';
+    38→import { generateRecommendations } from '@/lib/results/analysis';
+    39→
+    40→// ============================================
+    41→// CONTEXT TYPES
+    42→// ============================================
+    43→
+    44→interface ResultsContextType {
+    45→  // Raw data
+    46→  frontLandmarks: LandmarkPoint[];
+    47→  sideLandmarks: LandmarkPoint[];
+    48→  gender: Gender;
+    49→  ethnicity: Ethnicity;
+    50→  frontPhoto: string;
+    51→  sidePhoto: string | null;
+    52→
+    53→  // Computed results
+    54→  harmonyAnalysis: FullHarmonyAnalysis | null;
+    55→  frontRatios: Ratio[];
+    56→  sideRatios: Ratio[];
+    57→  strengths: Strength[];
+    58→  flaws: Flaw[];
+    59→  recommendations: Recommendation[];
+    60→
+    61→  // Scores (now using weighted harmony from looksmax_engine.py)
+    62→  overallScore: number;
+    63→  frontScore: number;
+    64→  sideScore: number;
+    65→
+    66→  // Weighted Harmony Score (from looksmax_engine.py)
+    67→  harmonyScoreResult: HarmonyScoreResult | null;
+    68→  harmonyPercentage: number;  // 0-100% weighted harmony
+    69→
+    70→  // Top 3 strengths and bottom 3 areas to improve with advice
+    71→  topMetrics: RankedMetric[];
+    72→  bottomMetrics: RankedMetric[];
+    73→
+    74→  // PSL Rating (1-10 scale)
+    75→  pslRating: {
+    76→    psl: number;
+    77→    tier: string;
+    78→    percentile: number;
+    79→    description: string;
+    80→  };
+    81→
+    82→  // UI state
+    83→  activeTab: ResultsTab;
+    84→  setActiveTab: (tab: ResultsTab) => void;
+    85→  expandedMeasurementId: string | null;
+    86→  setExpandedMeasurementId: (id: string | null) => void;
+    87→  selectedVisualizationMetric: string | null;
+    88→  setSelectedVisualizationMetric: (id: string | null) => void;
+    89→  categoryFilter: string | null;
+    90→  setCategoryFilter: (category: string | null) => void;
+    91→  showLandmarkOverlay: boolean;
+    92→  setShowLandmarkOverlay: (show: boolean) => void;
+    93→
+    94→  // Actions
+    95→  setResultsData: (data: ResultsInputData) => void;
+    96→}
+    97→
+    98→interface ResultsInputData {
+    99→  frontLandmarks: LandmarkPoint[];
+   100→  sideLandmarks: LandmarkPoint[];
+   101→  frontPhoto: string;
+   102→  sidePhoto?: string;
+   103→  gender: Gender;
+   104→  ethnicity?: Ethnicity;
+   105→}
+   106→
+   107→// ============================================
+   108→// HELPER FUNCTIONS
+   109→// ============================================
+   110→
+   111→function convertUnitToRatioUnit(unit: string): 'x' | 'mm' | '%' | '°' {
+   112→  switch (unit) {
+   113→    case 'ratio': return 'x';
+   114→    case 'percent': return '%';
+   115→    case 'degrees': return '°';
+   116→    case 'mm': return 'mm';
+   117→    default: return 'x';
+   118→  }
+   119→}
+   120→
+   121→function transformToRatio(result: MetricScoreResult, landmarks: LandmarkPoint[]): Ratio {
+   122→  const metricConfig = METRIC_CONFIGS[result.metricId];
+   123→
+   124→  // Generate illustration based on metric
+   125→  const illustration = generateIllustration(result.metricId, landmarks);
+   126→
+   127→  // Get flaw/strength mappings
+   128→  const { mayIndicateFlaws, mayIndicateStrengths } = getFlawStrengthMappings(result);
+   129→
+   130→  // Classify metric using Harmony taxonomy
+   131→  const taxonomyClassification = classifyMetric(result.name, result.category);
+   132→
+   133→  // Clamp scores to valid 0-10 range for display (defense-in-depth)
+   134→  const clampedScore = Math.max(0, Math.min(10, result.standardizedScore));
+   135→
+   136→  return {
+   137→    id: result.metricId,
+   138→    name: result.name,
+   139→    value: result.value,
+   140→    score: clampedScore,  // Use standardized 0-10 score for UI display
+   141→    standardizedScore: clampedScore,
+   142→    unit: convertUnitToRatioUnit(result.unit),
+   143→    idealMin: result.idealMin,
+   144→    idealMax: result.idealMax,
+   145→    rangeMin: metricConfig?.rangeMin || result.idealMin - 0.5,
+   146→    rangeMax: metricConfig?.rangeMax || result.idealMax + 0.5,
+   147→    description: metricConfig?.description || '',
+   148→    category: result.category,
+   149→    qualityLevel: result.qualityTier,
+   150→    severity: result.severity,
+   151→    illustration,
+   152→    mayIndicateFlaws,
+   153→    mayIndicateStrengths,
+   154→    usedLandmarks: getUsedLandmarks(result.metricId),
+   155→    scoringCurveConfig: metricConfig ? {
+   156→      decayRate: metricConfig.decayRate,
+   157→      maxScore: metricConfig.maxScore,
+   158→    } : undefined,
+   159→    taxonomyPrimary: taxonomyClassification?.primary,
+   160→    taxonomySecondary: taxonomyClassification?.secondary,
+   161→  };
+   162→}
+   163→
+   164→// Enhanced illustration configuration type
+   165→interface IllustrationConfig {
+   166→  points: string[];
+   167→  lines: Array<{
+   168→    from: string;
+   169→    to: string;
+   170→    label?: string;
+   171→    color?: string;
+   172→    labelPosition?: 'start' | 'middle' | 'end';  // Matches IllustrationLine type
+   173→  }>;
+   174→}
+   175→
+   176→// Comprehensive illustration configurations for all metrics
+   177→const ILLUSTRATION_CONFIGS: Record<string, IllustrationConfig> = {
+   178→  // ==========================================
+   179→  // FACE SHAPE / PROPORTIONS
+   180→  // ==========================================
+   181→  faceWidthToHeight: {
+   182→    points: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+   183→    lines: [
+   184→      { from: 'left_zygion', to: 'right_zygion', label: 'Width', color: '#67e8f9', labelPosition: 'middle' },
+   185→      { from: 'trichion', to: 'menton', label: 'Height', color: '#a78bfa', labelPosition: 'end' },
+   186→    ],
+   187→  },
+   188→  totalFacialWidthToHeight: {
+   189→    points: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+   190→    lines: [
+   191→      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek Width', color: '#67e8f9' },
+   192→      { from: 'trichion', to: 'menton', label: 'Total Height', color: '#a78bfa' },
+   193→    ],
+   194→  },
+   195→  lowerThirdProportion: {
+   196→    points: ['subnasale', 'menton', 'trichion'],
+   197→    lines: [
+   198→      { from: 'subnasale', to: 'menton', label: 'Lower Third', color: '#f97316', labelPosition: 'end' },
+   199→      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'start' },
+   200→    ],
+   201→  },
+   202→  middleThirdProportion: {
+   203→    points: ['nasal_base', 'subnasale', 'trichion', 'menton'],
+   204→    lines: [
+   205→      { from: 'nasal_base', to: 'subnasale', label: 'Middle Third', color: '#22c55e', labelPosition: 'end' },
+   206→      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'start' },
+   207→    ],
+   208→  },
+   209→  upperThirdProportion: {
+   210→    points: ['trichion', 'nasal_base', 'menton'],
+   211→    lines: [
+   212→      { from: 'trichion', to: 'nasal_base', label: 'Upper Third', color: '#fbbf24', labelPosition: 'end' },
+   213→      { from: 'trichion', to: 'menton', label: 'Full Height', color: '#67e8f9', labelPosition: 'start' },
+   214→    ],
+   215→  },
+   216→  bitemporalWidth: {
+   217→    points: ['left_temporal', 'right_temporal', 'left_zygion', 'right_zygion'],
+   218→    lines: [
+   219→      { from: 'left_temporal', to: 'right_temporal', label: 'Temple', color: '#fbbf24' },
+   220→      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek', color: '#67e8f9' },
+   221→    ],
+   222→  },
+   223→  cheekboneHeight: {
+   224→    points: ['left_zygion', 'right_zygion', 'left_canthus_lateralis', 'right_canthus_lateralis', 'menton'],
+   225→    lines: [
+   226→      { from: 'left_zygion', to: 'right_zygion', label: 'Cheekbone', color: '#ec4899' },
+   227→      { from: 'left_canthus_lateralis', to: 'left_zygion', color: '#67e8f9' },
+   228→    ],
+   229→  },
+   230→  midfaceRatio: {
+   231→    points: ['left_zygion', 'right_zygion', 'left_canthus_medialis', 'right_canthus_medialis', 'subnasale'],
+   232→    lines: [
+   233→      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Midface Width', color: '#67e8f9' },
+   234→      { from: 'left_canthus_medialis', to: 'subnasale', label: 'Midface Height', color: '#a78bfa' },
+   235→    ],
+   236→  },
+   237→
+   238→  // ==========================================
+   239→  // JAW MEASUREMENTS
+   240→  // ==========================================
+   241→  jawSlope: {
+   242→    points: ['left_gonion_inferior', 'left_mentum_lateralis', 'menton', 'right_mentum_lateralis', 'right_gonion_inferior'],
+   243→    lines: [
+   244→      { from: 'left_gonion_inferior', to: 'left_mentum_lateralis', label: 'Jaw Slope', color: '#f97316' },
+   245→      { from: 'right_gonion_inferior', to: 'right_mentum_lateralis', color: '#f97316' },
+   246→    ],
+   247→  },
+   248→  jawFrontalAngle: {
+   249→    points: ['left_gonion_inferior', 'menton', 'right_gonion_inferior'],
+   250→    lines: [
+   251→      { from: 'left_gonion_inferior', to: 'menton', label: 'Jaw Angle', color: '#f97316' },
+   252→      { from: 'menton', to: 'right_gonion_inferior', color: '#f97316' },
+   253→    ],
+   254→  },
+   255→  bigonialWidth: {
+   256→    points: ['left_gonion_inferior', 'right_gonion_inferior', 'left_zygion', 'right_zygion'],
+   257→    lines: [
+   258→      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw Width', color: '#f97316' },
+   259→      { from: 'left_zygion', to: 'right_zygion', label: 'Cheek Width', color: '#67e8f9' },
+   260→    ],
+   261→  },
+   262→  jawWidthRatio: {
+   263→    points: ['left_gonion_inferior', 'right_gonion_inferior', 'left_zygion', 'right_zygion'],
+   264→    lines: [
+   265→      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw', color: '#f97316' },
+   266→      { from: 'left_zygion', to: 'right_zygion', label: 'Face', color: '#67e8f9' },
+   267→    ],
+   268→  },
+   269→
+   270→  // ==========================================
+   271→  // EYE MEASUREMENTS
+   272→  // ==========================================
+   273→  lateralCanthalTilt: {
+   274→    points: ['left_canthus_medialis', 'left_canthus_lateralis', 'right_canthus_medialis', 'right_canthus_lateralis'],
+   275→    lines: [
+   276→      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Tilt', color: '#06b6d4', labelPosition: 'end' },
+   277→      { from: 'right_canthus_medialis', to: 'right_canthus_lateralis', color: '#06b6d4' },
+   278→    ],
+   279→  },
+   280→  eyeAspectRatio: {
+   281→    points: ['left_canthus_medialis', 'left_canthus_lateralis', 'left_palpebra_superior', 'left_palpebra_inferior'],
+   282→    lines: [
+   283→      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Width', color: '#06b6d4' },
+   284→      { from: 'left_palpebra_superior', to: 'left_palpebra_inferior', label: 'Height', color: '#a78bfa' },
+   285→    ],
+   286→  },
+   287→  eyeSeparationRatio: {
+   288→    points: ['left_canthus_medialis', 'right_canthus_medialis', 'left_zygion', 'right_zygion'],
+   289→    lines: [
+   290→      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Intercanthal', color: '#06b6d4' },
+   291→      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+   292→    ],
+   293→  },
+   294→  interpupillaryRatio: {
+   295→    points: ['left_pupila', 'right_pupila', 'left_zygion', 'right_zygion'],
+   296→    lines: [
+   297→      { from: 'left_pupila', to: 'right_pupila', label: 'IPD', color: '#06b6d4' },
+   298→      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+   299→    ],
+   300→  },
+   301→  interpupillaryMouthWidthRatio: {
+   302→    points: ['left_pupila', 'right_pupila', 'left_cheilion', 'right_cheilion'],
+   303→    lines: [
+   304→      { from: 'left_pupila', to: 'right_pupila', label: 'IPD', color: '#06b6d4' },
+   305→      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth', color: '#ec4899' },
+   306→    ],
+   307→  },
+   308→  oneEyeApartTest: {
+   309→    points: ['left_canthus_medialis', 'right_canthus_medialis', 'left_canthus_lateralis'],
+   310→    lines: [
+   311→      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Between Eyes', color: '#06b6d4' },
+   312→      { from: 'left_canthus_medialis', to: 'left_canthus_lateralis', label: 'Eye Width', color: '#a78bfa' },
+   313→    ],
+   314→  },
+   315→
+   316→  // ==========================================
+   317→  // EYEBROW MEASUREMENTS
+   318→  // ==========================================
+   319→  browLengthRatio: {
+   320→    points: ['left_supercilium_medialis', 'left_supercilium_lateralis', 'left_zygion', 'right_zygion'],
+   321→    lines: [
+   322→      { from: 'left_supercilium_medialis', to: 'left_supercilium_lateralis', label: 'Brow', color: '#84cc16' },
+   323→      { from: 'left_zygion', to: 'right_zygion', label: 'Face Width', color: '#67e8f9' },
+   324→    ],
+   325→  },
+   326→  eyebrowTilt: {
+   327→    points: ['left_supercilium_medialis', 'left_supercilium_apex', 'left_supercilium_lateralis'],
+   328→    lines: [
+   329→      { from: 'left_supercilium_medialis', to: 'left_supercilium_apex', label: 'Tilt', color: '#84cc16' },
+   330→      { from: 'left_supercilium_apex', to: 'left_supercilium_lateralis', color: '#84cc16' },
+   331→    ],
+   332→  },
+   333→  eyebrowLowSetedness: {
+   334→    points: ['left_supercilium_medialis', 'left_palpebra_superior', 'left_canthus_medialis'],
+   335→    lines: [
+   336→      { from: 'left_supercilium_medialis', to: 'left_palpebra_superior', label: 'Brow-Eye Gap', color: '#84cc16' },
+   337→    ],
+   338→  },
+   339→
+   340→  // ==========================================
+   341→  // NOSE MEASUREMENTS (FRONT)
+   342→  // ==========================================
+   343→  nasalIndex: {
+   344→    points: ['left_ala_nasi', 'right_ala_nasi', 'nasal_base', 'subnasale'],
+   345→    lines: [
+   346→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Width', color: '#fbbf24' },
+   347→      { from: 'nasal_base', to: 'subnasale', label: 'Height', color: '#a78bfa' },
+   348→    ],
+   349→  },
+   350→  intercanthalNasalRatio: {
+   351→    points: ['left_ala_nasi', 'right_ala_nasi', 'left_canthus_medialis', 'right_canthus_medialis'],
+   352→    lines: [
+   353→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Nose Width', color: '#fbbf24' },
+   354→      { from: 'left_canthus_medialis', to: 'right_canthus_medialis', label: 'Intercanthal', color: '#06b6d4' },
+   355→    ],
+   356→  },
+   357→  noseBridgeWidth: {
+   358→    points: ['left_dorsum_nasi', 'right_dorsum_nasi', 'left_ala_nasi', 'right_ala_nasi'],
+   359→    lines: [
+   360→      { from: 'left_dorsum_nasi', to: 'right_dorsum_nasi', label: 'Bridge', color: '#fbbf24' },
+   361→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Base', color: '#f97316' },
+   362→    ],
+   363→  },
+   364→  noseTipPosition: {
+   365→    points: ['subnasale', 'left_ala_nasi', 'right_ala_nasi'],
+   366→    lines: [
+   367→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Tip Position', color: '#fbbf24' },
+   368→    ],
+   369→  },
+   370→
+   371→  // ==========================================
+   372→  // MOUTH/LIP MEASUREMENTS
+   373→  // ==========================================
+   374→  mouthNoseWidthRatio: {
+   375→    points: ['left_cheilion', 'right_cheilion', 'left_ala_nasi', 'right_ala_nasi'],
+   376→    lines: [
+   377→      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth', color: '#ec4899' },
+   378→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Nose', color: '#fbbf24' },
+   379→    ],
+   380→  },
+   381→  lowerUpperLipRatio: {
+   382→    points: ['labrale_superius', 'mouth_middle', 'labrale_inferius'],
+   383→    lines: [
+   384→      { from: 'labrale_superius', to: 'mouth_middle', label: 'Upper', color: '#ec4899' },
+   385→      { from: 'mouth_middle', to: 'labrale_inferius', label: 'Lower', color: '#f97316' },
+   386→    ],
+   387→  },
+   388→  chinPhiltrumRatio: {
+   389→    points: ['subnasale', 'labrale_superius', 'labrale_inferius', 'menton'],
+   390→    lines: [
+   391→      { from: 'subnasale', to: 'labrale_superius', label: 'Philtrum', color: '#ec4899' },
+   392→      { from: 'labrale_inferius', to: 'menton', label: 'Chin', color: '#ef4444' },
+   393→    ],
+   394→  },
+   395→  mouthWidth: {
+   396→    points: ['left_cheilion', 'right_cheilion'],
+   397→    lines: [{ from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth Width', color: '#ec4899' }],
+   398→  },
+   399→
+   400→  // ==========================================
+   401→  // CHIN MEASUREMENTS
+   402→  // ==========================================
+   403→  chinHeight: {
+   404→    points: ['labrale_inferius', 'menton'],
+   405→    lines: [{ from: 'labrale_inferius', to: 'menton', label: 'Chin Height', color: '#ef4444' }],
+   406→  },
+   407→
+   408→  // ==========================================
+   409→  // NECK MEASUREMENTS
+   410→  // ==========================================
+   411→  neckWidthRatio: {
+   412→    points: ['left_cervical_lateralis', 'right_cervical_lateralis', 'left_gonion_inferior', 'right_gonion_inferior'],
+   413→    lines: [
+   414→      { from: 'left_cervical_lateralis', to: 'right_cervical_lateralis', label: 'Neck', color: '#14b8a6' },
+   415→      { from: 'left_gonion_inferior', to: 'right_gonion_inferior', label: 'Jaw', color: '#f97316' },
+   416→    ],
+   417→  },
+   418→
+   419→  // ==========================================
+   420→  // SIDE PROFILE MEASUREMENTS
+   421→  // ==========================================
+   422→  gonialAngle: {
+   423→    points: ['tragus', 'gonionBottom', 'menton'],
+   424→    lines: [
+   425→      { from: 'tragus', to: 'gonionBottom', label: 'Ramus', color: '#f97316' },
+   426→      { from: 'gonionBottom', to: 'menton', label: 'Mandible', color: '#ef4444' },
+   427→    ],
+   428→  },
+   429→  nasofrontalAngle: {
+   430→    points: ['glabella', 'nasion', 'pronasale'],
+   431→    lines: [
+   432→      { from: 'glabella', to: 'nasion', label: 'Forehead', color: '#84cc16' },
+   433→      { from: 'nasion', to: 'pronasale', label: 'Nose', color: '#fbbf24' },
+   434→    ],
+   435→  },
+   436→  nasofacialAngle: {
+   437→    points: ['nasion', 'pronasale', 'pogonion'],
+   438→    lines: [
+   439→      { from: 'nasion', to: 'pronasale', color: '#fbbf24' },
+   440→      { from: 'pronasale', to: 'pogonion', color: '#67e8f9' },
+   441→    ],
+   442→  },
+   443→  nasomentaAngle: {
+   444→    points: ['nasion', 'pronasale', 'pogonion'],
+   445→    lines: [
+   446→      { from: 'nasion', to: 'pronasale', label: 'Nose', color: '#fbbf24' },
+   447→      { from: 'pronasale', to: 'pogonion', label: 'To Chin', color: '#ef4444' },
+   448→    ],
+   449→  },
+   450→  submentalCervicalAngle: {
+   451→    points: ['menton', 'cervicalPoint', 'neckPoint'],
+   452→    lines: [
+   453→      { from: 'menton', to: 'cervicalPoint', label: 'Submental', color: '#14b8a6' },
+   454→      { from: 'cervicalPoint', to: 'neckPoint', label: 'Cervical', color: '#06b6d4' },
+   455→    ],
+   456→  },
+   457→  facialDepthToHeight: {
+   458→    points: ['pronasale', 'tragus', 'nasion', 'menton'],
+   459→    lines: [
+   460→      { from: 'pronasale', to: 'tragus', label: 'Depth', color: '#67e8f9' },
+   461→      { from: 'nasion', to: 'menton', label: 'Height', color: '#a78bfa' },
+   462→    ],
+   463→  },
+   464→  anteriorFacialDepth: {
+   465→    points: ['glabella', 'pronasale', 'pogonion'],
+   466→    lines: [
+   467→      { from: 'glabella', to: 'pronasale', color: '#67e8f9' },
+   468→      { from: 'pronasale', to: 'pogonion', color: '#a78bfa' },
+   469→    ],
+   470→  },
+   471→  mandibularPlaneAngle: {
+   472→    points: ['gonionBottom', 'menton', 'orbitale', 'porion'],
+   473→    lines: [
+   474→      { from: 'gonionBottom', to: 'menton', label: 'Mandibular', color: '#f97316' },
+   475→      { from: 'orbitale', to: 'porion', label: 'Frankfort', color: '#67e8f9' },
+   476→    ],
+   477→  },
+   478→  ramusToMandibleRatio: {
+   479→    points: ['gonionTop', 'gonionBottom', 'menton'],
+   480→    lines: [
+   481→      { from: 'gonionTop', to: 'gonionBottom', label: 'Ramus', color: '#f97316' },
+   482→      { from: 'gonionBottom', to: 'menton', label: 'Mandible', color: '#ef4444' },
+   483→    ],
+   484→  },
+   485→  orbitalVector: {
+   486→    points: ['cornealApex', 'orbitale', 'cheekbone'],
+   487→    lines: [
+   488→      { from: 'cornealApex', to: 'cheekbone', label: 'Orbital Vector', color: '#06b6d4' },
+   489→    ],
+   490→  },
+   491→  eLineLowerLip: {
+   492→    points: ['pronasale', 'pogonion', 'labraleInferius'],
+   493→    lines: [
+   494→      { from: 'pronasale', to: 'pogonion', label: 'E-Line', color: '#67e8f9' },
+   495→    ],
+   496→  },
+   497→  sLineLowerLip: {
+   498→    points: ['pronasale', 'pogonion', 'labraleInferius'],
+   499→    lines: [
+   500→      { from: 'pronasale', to: 'pogonion', label: 'S-Line', color: '#a78bfa' },
+   501→    ],
+   502→  },
+   503→  holdawayHLine: {
+   504→    points: ['pronasale', 'pogonion', 'labraleSuperius', 'labraleInferius'],
+   505→    lines: [
+   506→      { from: 'pronasale', to: 'pogonion', label: 'H-Line', color: '#ec4899' },
+   507→    ],
+   508→  },
+   509→  burstoneLowerLip: {
+   510→    points: ['subnasale', 'pogonion', 'labraleInferius'],
+   511→    lines: [
+   512→      { from: 'subnasale', to: 'pogonion', label: 'Burstone', color: '#fbbf24' },
+   513→    ],
+   514→  },
+   515→
+   516→  // ==========================================
+   517→  // ADDITIONAL FRONT PROFILE METRICS
+   518→  // ==========================================
+   519→  cupidsBowDepth: {
+   520→    points: ['labrale_superius', 'cupids_bow_left', 'cupids_bow_right', 'cupids_bow_center'],
+   521→    lines: [
+   522→      { from: 'cupids_bow_left', to: 'cupids_bow_center', label: 'Bow', color: '#ec4899' },
+   523→      { from: 'cupids_bow_center', to: 'cupids_bow_right', color: '#ec4899' },
+   524→    ],
+   525→  },
+   526→  mouthCornerPosition: {
+   527→    points: ['left_cheilion', 'right_cheilion', 'left_pupila', 'right_pupila'],
+   528→    lines: [
+   529→      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth Width', color: '#ec4899' },
+   530→      { from: 'left_pupila', to: 'right_pupila', label: 'IPD', color: '#06b6d4', labelPosition: 'start' },
+   531→    ],
+   532→  },
+   533→  iaaJfaDeviation: {
+   534→    points: ['left_ala_nasi', 'right_ala_nasi', 'left_gonion_inferior', 'menton', 'right_gonion_inferior'],
+   535→    lines: [
+   536→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'IAA', color: '#fbbf24' },
+   537→      { from: 'left_gonion_inferior', to: 'menton', label: 'JFA', color: '#f97316' },
+   538→      { from: 'menton', to: 'right_gonion_inferior', color: '#f97316' },
+   539→    ],
+   540→  },
+   541→  ipsilateralAlarAngle: {
+   542→    points: ['left_ala_nasi', 'subnasale', 'right_ala_nasi'],
+   543→    lines: [
+   544→      { from: 'left_ala_nasi', to: 'subnasale', label: 'Alar Angle', color: '#fbbf24' },
+   545→      { from: 'subnasale', to: 'right_ala_nasi', color: '#fbbf24' },
+   546→    ],
+   547→  },
+   548→  earProtrusionAngle: {
+   549→    points: ['left_ear_helix', 'left_ear_attachment', 'left_tragus'],
+   550→    lines: [
+   551→      { from: 'left_ear_helix', to: 'left_ear_attachment', label: 'Protrusion', color: '#a78bfa' },
+   552→    ],
+   553→  },
+   554→  earProtrusionRatio: {
+   555→    points: ['left_ear_helix', 'left_ear_attachment', 'left_ear_lobule'],
+   556→    lines: [
+   557→      { from: 'left_ear_helix', to: 'left_ear_attachment', label: 'Distance', color: '#a78bfa' },
+   558→      { from: 'left_ear_attachment', to: 'left_ear_lobule', label: 'Length', color: '#67e8f9' },
+   559→    ],
+   560→  },
+   561→  mouthWidthToNoseRatio: {
+   562→    points: ['left_cheilion', 'right_cheilion', 'left_ala_nasi', 'right_ala_nasi'],
+   563→    lines: [
+   564→      { from: 'left_cheilion', to: 'right_cheilion', label: 'Mouth', color: '#ec4899' },
+   565→      { from: 'left_ala_nasi', to: 'right_ala_nasi', label: 'Nose', color: '#fbbf24' },
+   566→    ],
+   567→  },
+   568→  lowerToUpperLipRatio: {
+   569→    points: ['labrale_superius', 'mouth_middle', 'labrale_inferius'],
+   570→    lines: [
+   571→      { from: 'labrale_superius', to: 'mouth_middle', label: 'Upper', color: '#ec4899' },
+   572→      { from: 'mouth_middle', to: 'labrale_inferius', label: 'Lower', color: '#f97316' },
+   573→    ],
+   574→  },
+   575→  chinToPhiltrumRatio: {
+   576→    points: ['subnasale', 'labrale_superius', 'labrale_inferius', 'menton'],
+   577→    lines: [
+   578→      { from: 'subnasale', to: 'labrale_superius', label: 'Philtrum', color: '#ec4899' },
+   579→      { from: 'labrale_inferius', to: 'menton', label: 'Chin', color: '#ef4444' },
+   580→    ],
+   581→  },
+   582→
+   583→  // ==========================================
+   584→  // ADDITIONAL SIDE PROFILE METRICS
+   585→  // ==========================================
+   586→  nasolabialAngle: {
+   587→    points: ['columella', 'subnasale', 'labraleSuperius'],
+   588→    lines: [
+   589→      { from: 'columella', to: 'subnasale', label: 'Columella', color: '#fbbf24' },
+   590→      { from: 'subnasale', to: 'labraleSuperius', label: 'Upper Lip', color: '#ec4899' },
+   591→    ],
+   592→  },
+   593→  nasalTipAngle: {
+   594→    points: ['nasion', 'pronasale', 'columella'],
+   595→    lines: [
+   596→      { from: 'nasion', to: 'pronasale', label: 'Dorsum', color: '#fbbf24' },
+   597→      { from: 'pronasale', to: 'columella', label: 'Tip', color: '#f97316' },
+   598→    ],
+   599→  },
+   600→  nasalProjection: {
+   601→    points: ['alar_crease', 'pronasale', 'subnasale'],
+   602→    lines: [
+   603→      { from: 'alar_crease', to: 'pronasale', label: 'Projection', color: '#fbbf24' },
+   604→    ],
+   605→  },
+   606→  nasalWToHRatio: {
+   607→    points: ['alar_crease', 'pronasale', 'nasion', 'subnasale'],
+   608→    lines: [
+   609→      { from: 'alar_crease', to: 'pronasale', label: 'Width', color: '#fbbf24' },
+   610→      { from: 'nasion', to: 'subnasale', label: 'Height', color: '#a78bfa' },
+   611→    ],
+   612→  },
+   613→  noseTipRotationAngle: {
+   614→    points: ['columella', 'subnasale', 'labraleSuperius'],
+   615→    lines: [
+   616→      { from: 'columella', to: 'subnasale', label: 'Rotation', color: '#fbbf24' },
+   617→    ],
+   618→  },
+   619→  frankfortTipAngle: {
+   620→    points: ['porion', 'orbitale', 'pronasale'],
+   621→    lines: [
+   622→      { from: 'porion', to: 'orbitale', label: 'Frankfort', color: '#67e8f9' },
+   623→      { from: 'orbitale', to: 'pronasale', label: 'To Tip', color: '#fbbf24' },
+   624→    ],
+   625→  },
+   626→  mentolabialAngle: {
+   627→    points: ['labraleInferius', 'mentolabialSulcus', 'pogonion'],
+   628→    lines: [
+   629→      { from: 'labraleInferius', to: 'mentolabialSulcus', label: 'Lip', color: '#ec4899' },
+   630→      { from: 'mentolabialSulcus', to: 'pogonion', label: 'Chin', color: '#ef4444' },
+   631→    ],
+   632→  },
+   633→  zAngle: {
+   634→    points: ['pogonion', 'labraleSuperius', 'frankfortHorizontal'],
+   635→    lines: [
+   636→      { from: 'pogonion', to: 'labraleSuperius', label: 'Z-Line', color: '#a78bfa' },
+   637→    ],
+   638→  },
+   639→  facialConvexityGlabella: {
+   640→    points: ['glabella', 'subnasale', 'pogonion'],
+   641→    lines: [
+   642→      { from: 'glabella', to: 'subnasale', label: 'Upper', color: '#84cc16' },
+   643→      { from: 'subnasale', to: 'pogonion', label: 'Lower', color: '#ef4444' },
+   644→    ],
+   645→  },
+   646→  facialConvexityNasion: {
+   647→    points: ['nasion', 'subnasale', 'pogonion'],
+   648→    lines: [
+   649→      { from: 'nasion', to: 'subnasale', label: 'Midface', color: '#22c55e' },
+   650→      { from: 'subnasale', to: 'pogonion', label: 'Lower', color: '#ef4444' },
+   651→    ],
+   652→  },
+   653→  totalFacialConvexity: {
+   654→    points: ['glabella', 'pronasale', 'pogonion'],
+   655→    lines: [
+   656→      { from: 'glabella', to: 'pronasale', label: 'Upper', color: '#84cc16' },
+   657→      { from: 'pronasale', to: 'pogonion', label: 'Lower', color: '#ef4444' },
+   658→    ],
+   659→  },
+   660→  interiorMidfaceProjectionAngle: {
+   661→    points: ['orbitale', 'subnasale', 'pronasale'],
+   662→    lines: [
+   663→      { from: 'orbitale', to: 'subnasale', label: 'Orbital', color: '#06b6d4' },
+   664→      { from: 'subnasale', to: 'pronasale', label: 'Midface', color: '#67e8f9' },
+   665→    ],
+   666→  },
+   667→  recessionFromFrankfort: {
+   668→    points: ['porion', 'orbitale', 'pogonion'],
+   669→    lines: [
+   670→      { from: 'porion', to: 'orbitale', label: 'Frankfort', color: '#67e8f9' },
+   671→      { from: 'orbitale', to: 'pogonion', label: 'Recession', color: '#ef4444' },
+   672→    ],
+   673→  },
+   674→  gonionToMouthLine: {
+   675→    points: ['gonionBottom', 'cheilion', 'tragus'],
+   676→    lines: [
+   677→      { from: 'gonionBottom', to: 'cheilion', label: 'Gonion-Mouth', color: '#f97316' },
+   678→    ],
+   679→  },
+   680→  eLineUpperLip: {
+   681→    points: ['pronasale', 'pogonion', 'labraleSuperius'],
+   682→    lines: [
+   683→      { from: 'pronasale', to: 'pogonion', label: 'E-Line', color: '#67e8f9' },
+   684→    ],
+   685→  },
+   686→  sLineUpperLip: {
+   687→    points: ['pronasale', 'pogonion', 'labraleSuperius'],
+   688→    lines: [
+   689→      { from: 'pronasale', to: 'pogonion', label: 'S-Line', color: '#a78bfa' },
+   690→    ],
+   691→  },
+   692→  burstoneUpperLip: {
+   693→    points: ['subnasale', 'pogonion', 'labraleSuperius'],
+   694→    lines: [
+   695→      { from: 'subnasale', to: 'pogonion', label: 'Burstone', color: '#fbbf24' },
+   696→    ],
+   697→  },
+   698→  chinProjection: {
+   699→    points: ['subnasale', 'pogonion', 'menton', 'frankfortHorizontal'],
+   700→    lines: [
+   701→      { from: 'subnasale', to: 'pogonion', label: 'Chin Proj', color: '#ef4444' },
+   702→    ],
+   703→  },
+   704→  recessionRelativeToFrankfort: {
+   705→    points: ['porion', 'orbitale', 'pogonion', 'menton'],
+   706→    lines: [
+   707→      { from: 'porion', to: 'orbitale', label: 'Frankfort', color: '#67e8f9' },
+   708→      { from: 'pogonion', to: 'menton', label: 'Recession', color: '#ef4444' },
+   709→    ],
+   710→  },
+   711→  browridgeInclinationAngle: {
+   712→    points: ['glabella', 'trichion', 'nasion'],
+   713→    lines: [
+   714→      { from: 'glabella', to: 'trichion', label: 'Brow Ridge', color: '#84cc16' },
+   715→      { from: 'glabella', to: 'nasion', color: '#67e8f9' },
+   716→    ],
+   717→  },
+   718→  upperForeheadSlope: {
+   719→    points: ['trichion', 'glabella', 'frankfortHorizontal'],
+   720→    lines: [
+   721→      { from: 'trichion', to: 'glabella', label: 'Forehead', color: '#84cc16' },
+   722→    ],
+   723→  },
+   724→  midfaceProjectionAngle: {
+   725→    points: ['orbitale', 'subnasale', 'pronasale'],
+   726→    lines: [
+   727→      { from: 'orbitale', to: 'subnasale', color: '#67e8f9' },
+   728→      { from: 'subnasale', to: 'pronasale', label: 'Projection', color: '#22c55e' },
+   729→    ],
+   730→  },
+   731→};
+   732→
+   733→function generateIllustration(metricId: string, landmarks: LandmarkPoint[]): Ratio['illustration'] {
+   734→  const landmarkMap: Record<string, LandmarkPoint> = {};
+   735→  landmarks.forEach(l => { landmarkMap[l.id] = l; });
+   736→
+   737→  const config = ILLUSTRATION_CONFIGS[metricId];
+   738→  const points: Record<string, { type: 'landmark'; landmarkId: string }> = {};
+   739→  const lines: Record<string, { from: string; to: string; color: string; label?: string; labelPosition?: 'start' | 'middle' | 'end' }> = {};
+   740→
+   741→  if (config) {
+   742→    config.points.forEach((pointId, i) => {
+   743→      if (landmarkMap[pointId]) {
+   744→        points[`point_${i}`] = { type: 'landmark', landmarkId: pointId };
+   745→      }
+   746→    });
+   747→    config.lines.forEach((line, i) => {
+   748→      lines[`line_${i}`] = {
+   749→        from: line.from,
+   750→        to: line.to,
+   751→        color: line.color || '#67e8f9',
+   752→        label: line.label,
+   753→        labelPosition: line.labelPosition,
+   754→      };
+   755→    });
+   756→  }
+   757→
+   758→  return { points, lines };
+   759→}
+   760→
+   761→function getUsedLandmarks(metricId: string): string[] {
+   762→  const landmarkMappings: Record<string, string[]> = {
+   763→    faceWidthToHeight: ['left_zygion', 'right_zygion', 'trichion', 'menton'],
+   764→    lateralCanthalTilt: ['left_canthus_medialis', 'left_canthus_lateralis'],
+   765→    nasalIndex: ['left_ala_nasi', 'right_ala_nasi', 'nasal_base', 'subnasale'],
+   766→    ipd: ['left_pupila', 'right_pupila'],
+   767→    mouthWidth: ['left_cheilion', 'right_cheilion'],
+   768→    jawWidth: ['left_gonion_inferior', 'right_gonion_inferior'],
+   769→    chinHeight: ['labrale_inferius', 'menton'],
+   770→    gonialAngle: ['tragus', 'gonionBottom', 'menton'],
+   771→  };
+   772→  return landmarkMappings[metricId] || [];
+   773→}
+   774→
+   775→function getFlawStrengthMappings(result: MetricScoreResult): { mayIndicateFlaws: string[]; mayIndicateStrengths: string[] } {
+   776→  const flawMappings: Record<string, { low: string[]; high: string[] }> = {
+   777→    faceWidthToHeight: {
+   778→      low: ['Narrow face', 'Vertically elongated face'],
+   779→      high: ['Wide face', 'Horizontally expanded face'],
+   780→    },
+   781→    lowerThirdProportion: {
+   782→      low: ['Short lower third', 'Deficient mandible'],
+   783→      high: ['Long lower third', 'Mandibular excess'],
+   784→    },
+   785→    lateralCanthalTilt: {
+   786→      low: ['Negative canthal tilt', 'Drooping eyes'],
+   787→      high: ['Excessive positive canthal tilt'],
+   788→    },
+   789→    nasalIndex: {
+   790→      low: ['Narrow nose', 'Leptorrhine nose'],
+   791→      high: ['Wide nose', 'Platyrrhine nose'],
+   792→    },
+   793→    gonialAngle: {
+   794→      low: ['Steep mandibular plane'],
+   795→      high: ['Flat mandibular plane', 'Weak jaw definition'],
+   796→    },
+   797→  };
+   798→
+   799→  const strengthMappings: Record<string, { ideal: string[] }> = {
+   800→    faceWidthToHeight: { ideal: ['Balanced facial proportions', 'Harmonious face shape'] },
+   801→    lateralCanthalTilt: { ideal: ['Attractive eye shape', 'Positive canthal tilt'] },
+   802→    nasalIndex: { ideal: ['Well-proportioned nose', 'Balanced nasal width'] },
+   803→    gonialAngle: { ideal: ['Well-defined jawline', 'Strong jaw structure'] },
+   804→  };
+   805→
+   806→  const mapping = flawMappings[result.metricId];
+   807→  const strengthMapping = strengthMappings[result.metricId];
+   808→
+   809→  let mayIndicateFlaws: string[] = [];
+   810→  let mayIndicateStrengths: string[] = [];
+   811→
+   812→  if (result.qualityTier === 'ideal' || result.qualityTier === 'excellent') {
+   813→    mayIndicateStrengths = strengthMapping?.ideal || [];
+   814→  } else if (mapping) {
+   815→    mayIndicateFlaws = result.deviationDirection === 'below' ? mapping.low : mapping.high;
+   816→  }
+   817→
+   818→  return { mayIndicateFlaws, mayIndicateStrengths };
+   819→}
+   820→
+   821→// Metric groupings for creating multi-ratio strengths
+   822→const STRENGTH_GROUPINGS: Record<string, {
+   823→  name: string;
+   824→  category: string;
+   825→  description: string;
+   826→  metrics: string[];
+   827→}> = {
+   828→  // Lip Proportions
+   829→  lipProportions: {
+   830→    name: 'Well Proportioned Lips',
+   831→    category: 'Lips',
+   832→    description: 'The lips demonstrate excellent proportions with balanced upper-to-lower lip ratio and appropriate projection.',
+   833→    metrics: ['lipRatio', 'philtrumLength', 'upperLipProjection', 'lowerLipProjection', 'lipChinDistance'],
+   834→  },
+   835→  // Eye Proportions
+   836→  eyeProportions: {
+   837→    name: 'Harmonious Eye Proportions',
+   838→    category: 'Eyes',
+   839→    description: 'The eyes display balanced proportions with attractive shape and ideal spacing.',
+   840→    metrics: ['lateralCanthalTilt', 'eyeAspectRatio', 'intercanthalWidth', 'eyeSeparationRatio', 'eyebrowHeight'],
+   841→  },
+   842→  // Nose Proportions
+   843→  noseProportions: {
+   844→    name: 'Balanced Nasal Proportions',
+   845→    category: 'Nose',
+   846→    description: 'The nose exhibits well-balanced width, height, and angles that harmonize with facial features.',
+   847→    metrics: ['nasalIndex', 'nasofrontalAngle', 'nasofacialAngle', 'nasomentaAngle', 'intercanthalNasalRatio', 'noseBridgeWidth'],
+   848→  },
+   849→  // Jaw Definition
+   850→  jawDefinition: {
+   851→    name: 'Well-Defined Jawline',
+   852→    category: 'Jaw Shape',
+   853→    description: 'The jawline displays strong definition with balanced angles and proportionate width.',
+   854→    metrics: ['gonialAngle', 'jawWidthRatio', 'bigonialWidth', 'mandibularPlaneAngle', 'jawFrontalAngle', 'jawSlope'],
+   855→  },
+   856→  // Chin Proportions
+   857→  chinProportions: {
+   858→    name: 'Balanced Chin Projection',
+   859→    category: 'Chin',
+   860→    description: 'The chin demonstrates ideal projection and proportions relative to the face.',
+   861→    metrics: ['chinPhiltrumRatio', 'chinHeight', 'facialDepthToHeight', 'anteriorFacialDepth'],
+   862→  },
+   863→  // Facial Thirds
+   864→  facialThirds: {
+   865→    name: 'Balanced Facial Thirds',
+   866→    category: 'Face Proportions',
+   867→    description: 'The face displays well-balanced vertical proportions across upper, middle, and lower thirds.',
+   868→    metrics: ['faceWidthToHeight', 'upperThirdProportion', 'middleThirdProportion', 'lowerThirdProportion'],
+   869→  },
+   870→  // Midface
+   871→  midfaceBalance: {
+   872→    name: 'Harmonious Midface',
+   873→    category: 'Midface/Face Shape',
+   874→    description: 'The midface shows balanced proportions with well-positioned cheekbones.',
+   875→    metrics: ['midfaceRatio', 'cheekboneHeight', 'cheekboneWidth', 'totalFacialWidthToHeight'],
+   876→  },
+   877→  // Forehead
+   878→  foreheadBalance: {
+   879→    name: 'Well-Proportioned Forehead',
+   880→    category: 'Forehead',
+   881→    description: 'The forehead displays ideal proportions in height and shape.',
+   882→    metrics: ['foreheadHeight', 'foreheadWidth', 'templeWidth'],
+   883→  },
+   884→};
+   885→
+   886→function generateStrengthsFromAnalysis(analysis: HarmonyAnalysis): Strength[] {
+   887→  const strengths: Strength[] = [];
+   888→  const usedMetricIds = new Set<string>();
+   889→
+   890→  // First pass: Create grouped strengths from related high-scoring metrics
+   891→  Object.entries(STRENGTH_GROUPINGS).forEach(([groupId, groupConfig]) => {
+   892→    // Find all high-scoring measurements that belong to this group
+   893→    const groupMeasurements = analysis.measurements.filter(m =>
+   894→      groupConfig.metrics.includes(m.metricId) &&
+   895→      m.score >= 7.5 &&
+   896→      !usedMetricIds.has(m.metricId)
+   897→    );
+   898→
+   899→    // Only create a grouped strength if we have 2+ metrics with good scores
+   900→    if (groupMeasurements.length >= 2) {
+   901→      const avgScore = groupMeasurements.reduce((sum, m) => sum + m.score, 0) / groupMeasurements.length;
+   902→      const bestQuality = avgScore >= 9 ? 'excellent' : avgScore >= 8 ? 'good' : 'below_average';
+   903→
+   904→      // Mark these metrics as used
+   905→      groupMeasurements.forEach(m => usedMetricIds.add(m.metricId));
+   906→
+   907→      // Create grouped strength with multiple contributing ratios
+   908→      strengths.push({
+   909→        id: `strength_group_${groupId}`,
+   910→        strengthName: groupConfig.name,
+   911→        summary: groupConfig.description,
+   912→        avgScore,
+   913→        qualityLevel: bestQuality,
+   914→        categoryName: groupConfig.category,
+   915→        responsibleRatios: groupMeasurements.map(m => ({
+   916→          ratioName: m.name,
+   917→          ratioId: m.metricId,
+   918→          score: m.score,
+   919→          value: m.value,
+   920→          idealMin: m.idealMin,
+   921→          idealMax: m.idealMax,
+   922→          unit: m.unit,
+   923→          category: m.category,
+   924→        })),
+   925→      });
+   926→    }
+   927→  });
+   928→
+   929→  // Second pass: Add remaining individual strengths that weren't grouped
+   930→  analysis.strengths.forEach((s, i) => {
+   931→    if (usedMetricIds.has(s.metricId)) return; // Skip if already used in a group
+   932→
+   933→    const matchingMeasurement = analysis.measurements.find(m => m.metricId === s.metricId);
+   934→
+   935→    strengths.push({
+   936→      id: `strength_${i}`,
+   937→      strengthName: s.metricName,
+   938→      summary: s.reasoning,
+   939→      avgScore: matchingMeasurement?.score || 8,
+   940→      qualityLevel: s.qualityTier,
+   941→      categoryName: s.category,
+   942→      responsibleRatios: [{
+   943→        ratioName: s.metricName,
+   944→        ratioId: s.metricId,
+   945→        score: matchingMeasurement?.score || 8,
+   946→        value: s.value,
+   947→        idealMin: matchingMeasurement?.idealMin || 0,
+   948→        idealMax: matchingMeasurement?.idealMax || 1,
+   949→        unit: matchingMeasurement?.unit || 'ratio',
+   950→        category: s.category,
+   951→      }],
+   952→    });
+   953→  });
+   954→
+   955→  // Sort by average score (highest first) then by number of contributing ratios
+   956→  return strengths.sort((a, b) => {
+   957→    if (b.responsibleRatios.length !== a.responsibleRatios.length) {
+   958→      return b.responsibleRatios.length - a.responsibleRatios.length;
+   959→    }
+   960→    return b.avgScore - a.avgScore;
+   961→  });
+   962→}
+   963→
+   964→// Flaw groupings - similar to strength groupings but for areas of improvement
+   965→const FLAW_GROUPINGS: Record<string, {
+   966→  name: string;
+   967→  category: string;
+   968→  description: string;
+   969→  metrics: string[];
+   970→}> = {
+   971→  // Lip Issues
+   972→  lipIssues: {
+   973→    name: 'Lip Proportion Concerns',
+   974→    category: 'Lips',
+   975→    description: 'The lip proportions show deviation from ideal ratios, affecting lower face harmony.',
+   976→    metrics: ['lipRatio', 'philtrumLength', 'upperLipProjection', 'lowerLipProjection', 'lipChinDistance'],
+   977→  },
+   978→  // Eye Issues
+   979→  eyeIssues: {
+   980→    name: 'Eye Shape Considerations',
+   981→    category: 'Eyes',
+   982→    description: 'The eye proportions or positioning could benefit from enhancement.',
+   983→    metrics: ['lateralCanthalTilt', 'eyeAspectRatio', 'intercanthalWidth', 'eyeSeparationRatio', 'eyebrowHeight'],
+   984→  },
+   985→  // Nose Issues
+   986→  noseIssues: {
+   987→    name: 'Nasal Proportion Concerns',
+   988→    category: 'Nose',
+   989→    description: 'The nasal proportions show deviations that affect facial harmony.',
+   990→    metrics: ['nasalIndex', 'nasofrontalAngle', 'nasofacialAngle', 'nasomentaAngle', 'intercanthalNasalRatio', 'noseBridgeWidth'],
+   991→  },
+   992→  // Jaw Issues
+   993→  jawIssues: {
+   994→    name: 'Jawline Definition Concerns',
+   995→    category: 'Jaw Shape',
+   996→    description: 'The jawline structure shows areas that could be enhanced for better definition.',
+   997→    metrics: ['gonialAngle', 'jawWidthRatio', 'bigonialWidth', 'mandibularPlaneAngle', 'jawFrontalAngle', 'jawSlope'],
+   998→  },
+   999→  // Chin Issues
+  1000→  chinIssues: {
+  1001→    name: 'Chin Projection Concerns',
+  1002→    category: 'Chin',
+  1003→    description: 'The chin proportions deviate from ideal, affecting facial profile balance.',
+  1004→    metrics: ['chinPhiltrumRatio', 'chinHeight', 'facialDepthToHeight', 'anteriorFacialDepth'],
+  1005→  },
+  1006→  // Face Proportion Issues
+  1007→  proportionIssues: {
+  1008→    name: 'Facial Proportion Imbalance',
+  1009→    category: 'Face Proportions',
+  1010→    description: 'The vertical face proportions show imbalance between facial thirds.',
+  1011→    metrics: ['faceWidthToHeight', 'upperThirdProportion', 'middleThirdProportion', 'lowerThirdProportion'],
+  1012→  },
+  1013→  // Midface Issues
+  1014→  midfaceIssues: {
+  1015→    name: 'Midface Development Concerns',
+  1016→    category: 'Midface/Face Shape',
+  1017→    description: 'The midface shows areas that could benefit from enhanced projection or balance.',
+  1018→    metrics: ['midfaceRatio', 'cheekboneHeight', 'cheekboneWidth', 'totalFacialWidthToHeight'],
+  1019→  },
+  1020→};
+  1021→
+  1022→function generateFlawsFromAnalysis(analysis: HarmonyAnalysis): Flaw[] {
+  1023→  const flaws: Flaw[] = [];
+  1024→  const usedMetricIds = new Set<string>();
+  1025→  let rollingLost = 0;
+  1026→
+  1027→  // First pass: Create grouped flaws from related low-scoring metrics
+  1028→  Object.entries(FLAW_GROUPINGS).forEach(([groupId, groupConfig]) => {
+  1029→    // Find all low-scoring measurements that belong to this group
+  1030→    const groupMeasurements = analysis.measurements.filter(m =>
+  1031→      groupConfig.metrics.includes(m.metricId) &&
+  1032→      m.score < 6 &&
+  1033→      !usedMetricIds.has(m.metricId)
+  1034→    );
+  1035→
+  1036→    // Only create a grouped flaw if we have 2+ metrics with low scores
+  1037→    if (groupMeasurements.length >= 2) {
+  1038→      // Mark these metrics as used
+  1039→      groupMeasurements.forEach(m => usedMetricIds.add(m.metricId));
+  1040→
+  1041→      // Calculate total impact from all metrics in this group
+  1042→      const totalImpact = groupMeasurements.reduce((sum, m) => sum + (10 - m.score) * 0.4, 0);
+  1043→      rollingLost += totalImpact;
+  1044→
+  1045→      // Create grouped flaw with multiple contributing ratios
+  1046→      flaws.push({
+  1047→        id: `flaw_group_${groupId}`,
+  1048→        flawName: groupConfig.name,
+  1049→        summary: groupConfig.description,
+  1050→        harmonyPercentageLost: totalImpact,
+  1051→        standardizedImpact: totalImpact / 10,
+  1052→        categoryName: groupConfig.category,
+  1053→        responsibleRatios: groupMeasurements.map(m => ({
+  1054→          ratioName: m.name,
+  1055→          ratioId: m.metricId,
+  1056→          score: m.score,
+  1057→          value: m.value,
+  1058→          idealMin: m.idealMin,
+  1059→          idealMax: m.idealMax,
+  1060→          unit: m.unit,
+  1061→          category: m.category,
+  1062→        })),
+  1063→        rollingPointsDeducted: rollingLost,
+  1064→        rollingHarmonyPercentageLost: rollingLost,
+  1065→        rollingStandardizedImpact: rollingLost / 10,
+  1066→      });
+  1067→    }
+  1068→  });
+  1069→
+  1070→  // Second pass: Add remaining individual flaws that weren't grouped
+  1071→  analysis.flaws.forEach((f, i) => {
+  1072→    if (usedMetricIds.has(f.metricId)) return; // Skip if already used in a group
+  1073→
+  1074→    const matchingMeasurement = analysis.measurements.find(m => m.metricId === f.metricId);
+  1075→    const impact = matchingMeasurement ? (10 - matchingMeasurement.score) * 0.5 : 2;
+  1076→    rollingLost += impact;
+  1077→
+  1078→    flaws.push({
+  1079→      id: `flaw_${i}`,
+  1080→      flawName: f.metricName,
+  1081→      summary: f.reasoning,
+  1082→      harmonyPercentageLost: impact,
+  1083→      standardizedImpact: impact / 10,
+  1084→      categoryName: f.category,
+  1085→      responsibleRatios: [{
+  1086→        ratioName: f.metricName,
+  1087→        ratioId: f.metricId,
+  1088→        score: matchingMeasurement?.score || 3,
+  1089→        value: matchingMeasurement?.value || 0,
+  1090→        idealMin: matchingMeasurement?.idealMin || 0,
+  1091→        idealMax: matchingMeasurement?.idealMax || 1,
+  1092→        unit: matchingMeasurement?.unit || 'ratio',
+  1093→        category: f.category,
+  1094→      }],
+  1095→      rollingPointsDeducted: rollingLost,
+  1096→      rollingHarmonyPercentageLost: rollingLost,
+  1097→      rollingStandardizedImpact: rollingLost / 10,
+  1098→    });
+  1099→  });
+  1100→
+  1101→  // Sort by impact (highest first) then by number of contributing ratios
+  1102→  return flaws.sort((a, b) => {
+  1103→    if (b.responsibleRatios.length !== a.responsibleRatios.length) {
+  1104→      return b.responsibleRatios.length - a.responsibleRatios.length;
+  1105→    }
+  1106→    return b.harmonyPercentageLost - a.harmonyPercentageLost;
+  1107→  });
+  1108→}
+  1109→
+  1110→// NOTE: PROCEDURE_DATABASE, ProcedureConfig, and recommendation generation functions
+  1111→// have been moved to @/lib/results/analysis.ts to reduce bundle size
+  1112→// Import generateRecommendations from there instead
+  1113→// ============================================
+  1114→// CONTEXT CREATION
+  1115→// ============================================
+  1116→
+  1117→const ResultsContext = createContext<ResultsContextType | null>(null);
+  1118→
+  1119→export function useResults(): ResultsContextType {
+  1120→  const context = useContext(ResultsContext);
+  1121→  if (!context) {
+  1122→    throw new Error('useResults must be used within a ResultsProvider');
+  1123→  }
+  1124→  return context;
+  1125→}
+  1126→
+  1127→interface ResultsProviderProps {
+  1128→  children: ReactNode;
+  1129→  initialData?: ResultsInputData;
+  1130→}
+  1131→
+  1132→export function ResultsProvider({ children, initialData }: ResultsProviderProps) {
+  1133→  // Raw data state
+  1134→  const [frontLandmarks, setFrontLandmarks] = useState<LandmarkPoint[]>(initialData?.frontLandmarks || []);
+  1135→  const [sideLandmarks, setSideLandmarks] = useState<LandmarkPoint[]>(initialData?.sideLandmarks || []);
+  1136→  const [gender, setGender] = useState<Gender>(initialData?.gender || 'male');
+  1137→  const [ethnicity, setEthnicity] = useState<Ethnicity>(initialData?.ethnicity || 'other');
+  1138→  const [frontPhoto, setFrontPhoto] = useState<string>(initialData?.frontPhoto || '');
+  1139→  const [sidePhoto, setSidePhoto] = useState<string | null>(initialData?.sidePhoto || null);
+  1140→
+  1141→  // UI state
+  1142→  const [activeTab, setActiveTab] = useState<ResultsTab>('overview');
+  1143→  const [expandedMeasurementId, setExpandedMeasurementId] = useState<string | null>(null);
+  1144→  const [selectedVisualizationMetric, setSelectedVisualizationMetric] = useState<string | null>(null);
+  1145→  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+  1146→  const [showLandmarkOverlay, setShowLandmarkOverlay] = useState(true);
+  1147→
+  1148→  // Compute analysis results (now with demographic-specific scoring)
+  1149→  const analysisResults = useMemo(() => {
+  1150→    if (frontLandmarks.length === 0) {
+  1151→      return null;
+  1152→    }
+  1153→
+  1154→    try {
+  1155→      const frontAnalysis = analyzeFrontProfile(frontLandmarks, gender, ethnicity);
+  1156→      const sideAnalysis = sideLandmarks.length > 0
+  1157→        ? analyzeSideProfile(sideLandmarks, gender, ethnicity)
+  1158→        : null;
+  1159→      // analyzeHarmony expects landmarks directly, not analysis results
+  1160→      const harmony = analyzeHarmony(frontLandmarks, sideLandmarks, gender, ethnicity);
+  1161→
+  1162→      return { frontAnalysis, sideAnalysis, harmony };
+  1163→    } catch (error) {
+  1164→      console.error('Analysis error:', error);
+  1165→      return null;
+  1166→    }
+  1167→  }, [frontLandmarks, sideLandmarks, gender, ethnicity]);
+  1168→
+  1169→  // Transform to Ratio format
+  1170→  const frontRatios = useMemo(() => {
+  1171→    if (!analysisResults?.frontAnalysis) return [];
+  1172→    return analysisResults.frontAnalysis.measurements.map(m => transformToRatio(m, frontLandmarks));
+  1173→  }, [analysisResults, frontLandmarks]);
+  1174→
+  1175→  const sideRatios = useMemo(() => {
+  1176→    if (!analysisResults?.sideAnalysis) return [];
+  1177→    return analysisResults.sideAnalysis.measurements.map(m => transformToRatio(m, sideLandmarks));
+  1178→  }, [analysisResults, sideLandmarks]);
+  1179→
+  1180→  // Generate strengths and flaws using INSIGHTS-BASED classification
+  1181→  // This processes insights.json definitions: calculates avg score of affected metrics,
+  1182→  // then classifies as strength (avg > threshold) or weakness (avg < threshold)
+  1183→  const { insightStrengths, insightFlaws } = useMemo(() => {
+  1184→    if (!analysisResults?.harmony) {
+  1185→      return { insightStrengths: [], insightFlaws: [] };
+  1186→    }
+  1187→
+  1188→    try {
+  1189→      // Classify using insights engine
+  1190→      const { strengths: classifiedStrengths, weaknesses: classifiedWeaknesses } =
+  1191→        classifyInsights(analysisResults.harmony.measurements, INSIGHTS_DEFINITIONS);
+  1192→
+  1193→      // Convert to UI-compatible types
+  1194→      const insightStrengths = classifiedStrengths.map((s) => convertToStrength(s));
+  1195→
+  1196→      let rollingLost = 0;
+  1197→      const insightFlaws = classifiedWeaknesses.map((w, i) => {
+  1198→        const flaw = convertToFlaw(w, i, rollingLost);
+  1199→        rollingLost = flaw.rollingPointsDeducted || 0;
+  1200→        return flaw;
+  1201→      });
+  1202→
+  1203→      return { insightStrengths, insightFlaws };
+  1204→    } catch (error) {
+  1205→      console.error('[ResultsContext] Error in insights classification:', error);
+  1206→      return { insightStrengths: [], insightFlaws: [] };
+  1207→    }
+  1208→  }, [analysisResults]);
+  1209→
+  1210→  // Generate grouping-based strengths/flaws (legacy approach for metrics not covered by insights)
+  1211→  const groupingStrengths = useMemo(() => {
+  1212→    if (!analysisResults?.harmony) return [];
+  1213→    return generateStrengthsFromAnalysis(analysisResults.harmony);
+  1214→  }, [analysisResults]);
+  1215→
+  1216→  const groupingFlaws = useMemo(() => {
+  1217→    if (!analysisResults?.harmony) return [];
+  1218→    return generateFlawsFromAnalysis(analysisResults.harmony);
+  1219→  }, [analysisResults]);
+  1220→
+  1221→  // Merge insights + groupings, preferring insights (dedupe by category/metric overlap)
+  1222→  const strengths = useMemo(() => {
+  1223→    // Use insights as primary source
+  1224→    const usedMetricIds = new Set<string>();
+  1225→    insightStrengths.forEach(s => {
+  1226→      s.responsibleRatios.forEach(r => usedMetricIds.add(r.ratioId));
+  1227→    });
+  1228→
+  1229→    // Add grouping-based strengths that don't overlap
+  1230→    const nonOverlappingGrouping = groupingStrengths.filter(gs => {
+  1231→      const overlap = gs.responsibleRatios.some(r => usedMetricIds.has(r.ratioId));
+  1232→      return !overlap;
+  1233→    });
+  1234→
+  1235→    return [...insightStrengths, ...nonOverlappingGrouping];
+  1236→  }, [insightStrengths, groupingStrengths]);
+  1237→
+  1238→  const flaws = useMemo(() => {
+  1239→    // Use insights as primary source
+  1240→    const usedMetricIds = new Set<string>();
+  1241→    insightFlaws.forEach(f => {
+  1242→      f.responsibleRatios.forEach(r => usedMetricIds.add(r.ratioId));
+  1243→    });
+  1244→
+  1245→    // Add grouping-based flaws that don't overlap
+  1246→    const nonOverlappingGrouping = groupingFlaws.filter(gf => {
+  1247→      const overlap = gf.responsibleRatios.some(r => usedMetricIds.has(r.ratioId));
+  1248→      return !overlap;
+  1249→    });
+  1250→
+  1251→    // Recalculate rolling totals for merged list
+  1252→    let rollingLost = 0;
+  1253→    const merged = [...insightFlaws, ...nonOverlappingGrouping];
+  1254→    return merged.map(f => {
+  1255→      rollingLost += f.harmonyPercentageLost;
+  1256→      return {
+  1257→        ...f,
+  1258→        rollingPointsDeducted: rollingLost,
+  1259→        rollingHarmonyPercentageLost: rollingLost,
+  1260→        rollingStandardizedImpact: rollingLost / 10,
+  1261→      };
+  1262→    });
+  1263→  }, [insightFlaws, groupingFlaws]);
+  1264→
+  1265→  // Generate recommendations with metric-aware matching and Bezier recalculation
+  1266→  const recommendations = useMemo(() => {
+  1267→    return generateRecommendations(flaws, frontRatios, sideRatios, gender, ethnicity);
+  1268→  }, [flaws, frontRatios, sideRatios, gender, ethnicity]);
+  1269→
+  1270→  // Build full harmony analysis
+  1271→  const harmonyAnalysis = useMemo((): FullHarmonyAnalysis | null => {
+  1272→    if (!analysisResults?.harmony) return null;
+  1273→
+  1274→    return {
+  1275→      standardizedScore: analysisResults.harmony.overallScore,
+  1276→      front: {
+  1277→        standardizedScore: analysisResults.harmony.frontScore,
+  1278→        ratios: frontRatios,
+  1279→      },
+  1280→      side: {
+  1281→        standardizedScore: analysisResults.harmony.sideScore,
+  1282→        ratios: sideRatios,
+  1283→      },
+  1284→      strengths,
+  1285→      flaws,
+  1286→    };
+  1287→  }, [analysisResults, frontRatios, sideRatios, strengths, flaws]);
+  1288→
+  1289→  // Calculate weighted harmony score using looksmax_engine.py algorithm
+  1290→  const harmonyScoreResult = useMemo((): HarmonyScoreResult | null => {
+  1291→    if (!analysisResults?.harmony) return null;
+  1292→
+  1293→    const allMeasurements = analysisResults.harmony.measurements.map(m => ({
+  1294→      metricId: m.metricId,
+  1295→      standardizedScore: m.standardizedScore,
+  1296→    }));
+  1297→
+  1298→    return calculateHarmonyScore(allMeasurements);
+  1299→  }, [analysisResults]);
+  1300→
+  1301→  // Get top 3 and bottom 3 metrics with advice
+  1302→  const topMetrics = useMemo((): RankedMetric[] => {
+  1303→    if (!analysisResults?.harmony) return [];
+  1304→    return getTopMetrics(analysisResults.harmony.measurements, 3);
+  1305→  }, [analysisResults]);
+  1306→
+  1307→  const bottomMetrics = useMemo((): RankedMetric[] => {
+  1308→    if (!analysisResults?.harmony) return [];
+  1309→    return getBottomMetrics(analysisResults.harmony.measurements, 3);
+  1310→  }, [analysisResults]);
+  1311→
+  1312→  // Scores - now using weighted harmony with explicit clamping to 0-10
+  1313→  const rawHarmonyPercentage = harmonyScoreResult?.harmonyPercentage || 0;
+  1314→  const harmonyPercentage = Math.max(0, Math.min(100, rawHarmonyPercentage));
+  1315→
+  1316→  const rawOverallScore = harmonyScoreResult?.weightedAverage || analysisResults?.harmony?.overallScore || 0;
+  1317→  const overallScore = Math.max(0, Math.min(10, rawOverallScore));
+  1318→
+  1319→  const rawFrontScore = analysisResults?.harmony?.frontScore || 0;
+  1320→  const frontScore = Math.max(0, Math.min(10, rawFrontScore));
+  1321→
+  1322→  const rawSideScore = analysisResults?.harmony?.sideScore || 0;
+  1323→  const sideScore = Math.max(0, Math.min(10, rawSideScore));
+  1324→
+  1325→  // PSL Rating (1-10 scale with tier/percentile)
+  1326→  const pslRating = useMemo(() => {
+  1327→    return harmonyToPSL(harmonyPercentage);
+  1328→  }, [harmonyPercentage]);
+  1329→
+  1330→  // Action to set all results data
+  1331→  const setResultsData = useCallback((data: ResultsInputData) => {
+  1332→    setFrontLandmarks(data.frontLandmarks);
+  1333→    setSideLandmarks(data.sideLandmarks);
+  1334→    setFrontPhoto(data.frontPhoto);
+  1335→    setSidePhoto(data.sidePhoto || null);
+  1336→    setGender(data.gender);
+  1337→    setEthnicity(data.ethnicity || 'other');
+  1338→  }, []);
+  1339→
+  1340→  // Memoize context value to prevent unnecessary re-renders
+  1341→  const value = useMemo<ResultsContextType>(() => ({
+  1342→    frontLandmarks,
+  1343→    sideLandmarks,
+  1344→    gender,
+  1345→    ethnicity,
+  1346→    frontPhoto,
+  1347→    sidePhoto,
+  1348→    harmonyAnalysis,
+  1349→    frontRatios,
+  1350→    sideRatios,
+  1351→    strengths,
+  1352→    flaws,
+  1353→    recommendations,
+  1354→    overallScore,
+  1355→    frontScore,
+  1356→    sideScore,
+  1357→    // Weighted harmony from looksmax_engine.py
+  1358→    harmonyScoreResult,
+  1359→    harmonyPercentage,
+  1360→    topMetrics,
+  1361→    bottomMetrics,
+  1362→    // PSL Rating
+  1363→    pslRating,
+  1364→    // UI state
+  1365→    activeTab,
+  1366→    setActiveTab,
+  1367→    expandedMeasurementId,
+  1368→    setExpandedMeasurementId,
+  1369→    selectedVisualizationMetric,
+  1370→    setSelectedVisualizationMetric,
+  1371→    categoryFilter,
+  1372→    setCategoryFilter,
+  1373→    showLandmarkOverlay,
+  1374→    setShowLandmarkOverlay,
+  1375→    setResultsData,
+  1376→  }), [
+  1377→    frontLandmarks, sideLandmarks, gender, ethnicity, frontPhoto, sidePhoto,
+  1378→    harmonyAnalysis, frontRatios, sideRatios, strengths, flaws, recommendations,
+  1379→    overallScore, frontScore, sideScore, harmonyScoreResult, harmonyPercentage,
+  1380→    topMetrics, bottomMetrics, pslRating, activeTab, setActiveTab,
+  1381→    expandedMeasurementId, setExpandedMeasurementId, selectedVisualizationMetric,
+  1382→    setSelectedVisualizationMetric, categoryFilter, setCategoryFilter,
+  1383→    showLandmarkOverlay, setShowLandmarkOverlay, setResultsData,
+  1384→  ]);
+  1385→
+  1386→  return (
+  1387→    <ResultsContext.Provider value={value}>
+  1388→      {children}
+  1389→    </ResultsContext.Provider>
+  1390→  );
+  1391→}
+  1392→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

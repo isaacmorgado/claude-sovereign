@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+Highly Accurate SIDE PROFILE Facial Landmark Generator using Face-Alignment (FAN)
+
+FAN (Face Alignment Network) by Adrian Bulat achieves 50%+ better accuracy on
+profile faces compared to other methods. It was specifically trained on the
+LS3D-W dataset with 230,000 images including large pose variations.
+
+The 68 landmarks follow the Multi-PIE/iBUG convention:
+- Points 0-16: Jawline (17 points) - includes gonion
+- Points 17-26: Eyebrows (10 points)
+- Points 27-35: Nose (9 points) - includes nasion, nose tip
+- Points 36-47: Eyes (12 points)
+- Points 48-67: Mouth (20 points)
+
+Key anatomical landmarks for side profiles:
+- Point 27: Nasion (bridge of nose)
+- Point 30: Pronasale (nose tip)
+- Point 33: Subnasale (base of nose/columella)
+- Point 6: Left Gonion (left jaw angle)
+- Point 10: Right Gonion area
+- Point 8: Menton/Gnathion (chin point)
+
+Usage:
+    python generate_side_profile_accurate.py --input BLONDESIDE.png --output-prefix blonde_side
+"""
+
+import cv2
+import numpy as np
+from pathlib import Path
+import argparse
+import face_alignment
+
+# Script directory
+SCRIPT_DIR = Path(__file__).parent
+
+# FAN landmark indices mapped to anatomical names for SIDE PROFILES
+# Using the 68-point Multi-PIE/iBUG convention
+SIDE_PROFILE_LANDMARKS = {
+    # Nose landmarks (critical for profile accuracy)
+    "nasion": 27,              # Bridge of nose (top)
+    "noseBridge": 28,          # Upper nose bridge
+    "noseBridgeLower": 29,     # Lower nose bridge
+    "pronasale": 30,           # Nose tip (most prominent point)
+    "columella": 33,           # Base of nose / columella
+    "subnasale": 33,           # Subnasale point
+    "noseLeft": 31,            # Left alar
+    "noseRight": 35,           # Right alar
+
+    # Forehead/Glabella (estimated from brow points)
+    "glabella": 27,            # Use nasion as glabella reference
+
+    # Jaw landmarks (gonion is critical for profile)
+    "gonionLeft": 4,           # Left jaw angle (gonion)
+    "gonionRight": 12,         # Right jaw angle
+    "gonionTop": 3,            # Upper gonion area
+    "gonionBottom": 5,         # Lower gonion area
+    "menton": 8,               # Chin bottom (gnathion/menton)
+    "pogonion": 8,             # Chin prominence
+
+    # Eye landmarks
+    "cornealApex": 36,         # Outer corner of eye (corneal reference)
+    "upperEyelid": 37,         # Upper eyelid
+    "lowerEyelid": 41,         # Lower eyelid
+    "eyeLateralCanthus": 36,   # Lateral canthus
+    "eyeMedialCanthus": 39,    # Medial canthus
+
+    # Mouth landmarks
+    "labraleSuperius": 51,     # Upper lip (cupid's bow)
+    "labraleInferius": 57,     # Lower lip center
+    "cheilion": 48,            # Corner of mouth
+    "stomion": 62,             # Mouth opening center
+
+    # Cheek/Face contour
+    "cheekbone": 1,            # Cheekbone area
+    "cervicalPoint": 8,        # Neck/chin junction
+
+    # Additional profile-specific points
+    "orbitale": 41,            # Lower eye orbit
+    "forehead": 19,            # Forehead reference (from brow)
+    "intertragicNotch": 0,     # Near ear (jawline start)
+}
+
+# Crop configurations optimized for side profile views
+CROP_CONFIGS = {
+    # Nose - critical for profiles
+    "nasion": {"size": 0.22, "aspect": 1.2},
+    "noseBridge": {"size": 0.20, "aspect": 1.1},
+    "noseBridgeLower": {"size": 0.20, "aspect": 1.1},
+    "pronasale": {"size": 0.18, "aspect": 1.0},
+    "columella": {"size": 0.18, "aspect": 1.0},
+    "subnasale": {"size": 0.18, "aspect": 1.0},
+    "noseLeft": {"size": 0.16, "aspect": 1.0},
+    "noseRight": {"size": 0.16, "aspect": 1.0},
+
+    # Forehead
+    "glabella": {"size": 0.22, "aspect": 1.2},
+    "forehead": {"size": 0.28, "aspect": 1.3},
+
+    # Jaw - critical for profiles
+    "gonionLeft": {"size": 0.20, "aspect": 1.1},
+    "gonionRight": {"size": 0.20, "aspect": 1.1},
+    "gonionTop": {"size": 0.20, "aspect": 1.1},
+    "gonionBottom": {"size": 0.20, "aspect": 1.1},
+    "menton": {"size": 0.20, "aspect": 1.1},
+    "pogonion": {"size": 0.20, "aspect": 1.1},
+
+    # Eyes
+    "cornealApex": {"size": 0.22, "aspect": 1.2},
+    "upperEyelid": {"size": 0.20, "aspect": 1.3},
+    "lowerEyelid": {"size": 0.20, "aspect": 1.3},
+    "eyeLateralCanthus": {"size": 0.20, "aspect": 1.2},
+    "eyeMedialCanthus": {"size": 0.20, "aspect": 1.2},
+    "orbitale": {"size": 0.20, "aspect": 1.2},
+
+    # Mouth
+    "labraleSuperius": {"size": 0.18, "aspect": 1.1},
+    "labraleInferius": {"size": 0.18, "aspect": 1.1},
+    "cheilion": {"size": 0.18, "aspect": 1.1},
+    "stomion": {"size": 0.18, "aspect": 1.1},
+
+    # Other
+    "cheekbone": {"size": 0.22, "aspect": 1.2},
+    "cervicalPoint": {"size": 0.20, "aspect": 1.0},
+    "intertragicNotch": {"size": 0.22, "aspect": 1.2},
+}
+
+
+# Global FAN detector (lazy loaded)
+fan_detector = None
+
+
+def get_fan_detector():
+    """Lazy load the FAN detector in 3D mode for better profile accuracy."""
+    global fan_detector
+    if fan_detector is None:
+        print("  Loading FAN (Face Alignment Network) in 3D mode...")
+        # Use 3D mode for better profile handling
+        # flip_input=True improves robustness
+        fan_detector = face_alignment.FaceAlignment(
+            face_alignment.LandmarksType.THREE_D,
+            flip_input=True,
+            device='cpu'  # Use 'cuda' if GPU available
+        )
+    return fan_detector
+
+
+def detect_landmarks_fan(image_path: str):
+    """
+    Detect facial landmarks using FAN (Face Alignment Network).
+
+    FAN is specifically trained on large pose variations and achieves
+    50%+ better accuracy on profile faces compared to alternatives.
+
+    Args:
+        image_path: Path to the image file
+
+    Returns:
+        Tuple of (image, landmarks_dict, image_height, image_width)
+    """
+    fa = get_fan_detector()
+
+    # Load image
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not load image: {image_path}")
+
+    h, w = image.shape[:2]
+
+    # Convert BGR to RGB for face-alignment
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Detect landmarks (returns list of arrays, one per face)
+    landmarks_list = fa.get_landmarks(rgb)
+
+    if landmarks_list is None or len(landmarks_list) == 0:
+        raise ValueError(f"No face detected in {image_path}")
+
+    # Get the first (or largest) face's landmarks
+    # landmarks shape: (68, 3) for 3D mode
+    landmarks_3d = landmarks_list[0]
+
+    # Build landmarks dictionary using 2D projection (x, y)
+    landmarks_dict = {}
+    for name, idx in SIDE_PROFILE_LANDMARKS.items():
+        if idx < len(landmarks_3d):
+            x = int(landmarks_3d[idx][0])
+            y = int(landmarks_3d[idx][1])
+            landmarks_dict[name] = (x, y)
+
+    return image, landmarks_dict, h, w
+
+
+def create_cropped_image(image, landmark_pos, landmark_name, img_height, img_width,
+                         circle_color=(255, 191, 0), circle_radius=6, circle_thickness=-1):
+    """
+    Create a cropped image around a landmark with a light blue circle marker.
+
+    Args:
+        image: Original image (BGR)
+        landmark_pos: (x, y) position of the landmark
+        landmark_name: Name of the landmark for crop configuration
+        img_height: Height of original image
+        img_width: Width of original image
+        circle_color: BGR color for the circle (default: light blue)
+        circle_radius: Radius of the circle marker
+        circle_thickness: Thickness of circle (-1 for filled)
+
+    Returns:
+        Cropped image with circle marker
+    """
+    x, y = landmark_pos
+
+    # Get crop configuration
+    config = CROP_CONFIGS.get(landmark_name, {"size": 0.22, "aspect": 1.2})
+    size_ratio = config["size"]
+    aspect_ratio = config["aspect"]
+
+    # Calculate crop dimensions based on image size
+    face_size = min(img_height, img_width)
+    crop_height = int(face_size * size_ratio)
+    crop_width = int(crop_height * aspect_ratio)
+
+    # Calculate crop boundaries centered on landmark
+    x1 = max(0, x - crop_width // 2)
+    y1 = max(0, y - crop_height // 2)
+    x2 = min(img_width, x1 + crop_width)
+    y2 = min(img_height, y1 + crop_height)
+
+    # Adjust if crop goes beyond image boundaries
+    if x2 - x1 < crop_width:
+        x1 = max(0, x2 - crop_width)
+    if y2 - y1 < crop_height:
+        y1 = max(0, y2 - crop_height)
+
+    # Create a copy of the image and draw the circle
+    image_with_marker = image.copy()
+    cv2.circle(image_with_marker, (x, y), circle_radius, circle_color, circle_thickness)
+
+    # Crop the image
+    cropped = image_with_marker[y1:y2, x1:x2]
+
+    return cropped
+
+
+def process_image(input_path: str, output_dir: str, output_prefix: str,
+                  output_format: str = "webp"):
+    """
+    Process a side profile image and generate all landmark crops.
+
+    Args:
+        input_path: Path to input image
+        output_dir: Directory to save output images
+        output_prefix: Prefix for output filenames
+        output_format: Output image format (webp, png, jpg)
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"Processing: {input_path}")
+
+    # Detect landmarks using FAN
+    image, landmarks, h, w = detect_landmarks_fan(input_path)
+
+    print(f"  Detected {len(landmarks)} landmarks (FAN 3D mode - optimized for profiles)")
+
+    # Light blue color in BGR format
+    light_blue = (255, 191, 0)
+
+    # Generate cropped images for each landmark
+    for landmark_name, pos in landmarks.items():
+        try:
+            cropped = create_cropped_image(
+                image, pos, landmark_name, h, w,
+                circle_color=light_blue,
+                circle_radius=6,
+                circle_thickness=-1
+            )
+
+            output_filename = f"{output_prefix}_{landmark_name}.{output_format}"
+            output_file = output_path / output_filename
+
+            cv2.imwrite(str(output_file), cropped)
+            print(f"  Created: {output_filename}")
+
+        except Exception as e:
+            print(f"  Error processing {landmark_name}: {e}")
+
+    print(f"  Completed: {len(landmarks)} images generated")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate accurate side profile landmark images using FAN"
+    )
+    parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Input side profile image path"
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default="./output",
+        help="Output directory (default: ./output)"
+    )
+    parser.add_argument(
+        "--output-prefix", "-p",
+        required=True,
+        help="Prefix for output filenames (e.g., 'blonde_side')"
+    )
+    parser.add_argument(
+        "--format", "-f",
+        default="webp",
+        choices=["webp", "png", "jpg"],
+        help="Output image format (default: webp)"
+    )
+
+    args = parser.parse_args()
+
+    process_image(
+        args.input,
+        args.output_dir,
+        args.output_prefix,
+        args.format
+    )
+
+
+if __name__ == "__main__":
+    main()

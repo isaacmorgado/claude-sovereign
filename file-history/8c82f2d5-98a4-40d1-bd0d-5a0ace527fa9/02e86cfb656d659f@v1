@@ -1,0 +1,407 @@
+/**
+ * SPLICE Face Detection Service (Production-Ready)
+ *
+ * Based on FireCut's approach using face-api.js
+ *
+ * Models:
+ * - SSD MobileNet v1 (fast, primary detection)
+ * - MTCNN (accurate, fallback detection)
+ *
+ * Features:
+ * - Face center calculation for zoom positioning
+ * - Frame extraction from video using FFmpeg
+ * - Safe zoom coordinate clamping
+ * - Batch detection at multiple timestamps
+ * - Retry with temporal fallback
+ */
+
+const path = require('path');
+const fs = require('fs').promises;
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
+
+// Face detection library
+const faceapi = require('face-api.js');
+const canvas = require('canvas');
+const { Canvas, Image, ImageData } = canvas;
+
+// Security utilities
+const { validateAudioPath } = require('./securityUtils');
+
+// Polyfill for Node.js environment
+faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const MODELS_DIR = path.join(__dirname, '../models/face-api');
+const TEMP_DIR = path.join(__dirname, '../../temp/face-detection');
+
+// Face detection options (matching FireCut settings)
+const SSD_OPTIONS = {
+  minConfidence: 0.5,
+  maxResults: 1
+};
+
+const MTCNN_OPTIONS = {
+  minFaceSize: 50,
+  scaleFactor: 0.709
+};
+
+// Retry offsets for temporal fallback (seconds)
+const DEFAULT_OFFSETS = [0, 1, -1]; // Try exact, +1s, -1s
+
+// Safe zoom margin (prevents edge cropping at 150% zoom)
+const SAFE_ZOOM_MARGIN = 25; // 25% margin (150% / 2 = 75%)
+
+// ============================================================================
+// FACE DETECTION SERVICE CLASS
+// ============================================================================
+
+class FaceDetectionService {
+  constructor() {
+    this.modelsLoaded = false;
+    this.loadingPromise = null;
+  }
+
+  /**
+   * Initialize face detection models
+   * Loads SSD MobileNet v1 and MTCNN models from disk
+   */
+  async initialize() {
+    if (this.modelsLoaded) return;
+    if (this.loadingPromise) return this.loadingPromise;
+
+    this.loadingPromise = (async () => {
+      try {
+        console.log('[Face Detection] Loading models from:', MODELS_DIR);
+
+        // Ensure models directory exists
+        await fs.mkdir(MODELS_DIR, { recursive: true });
+
+        // Check if models exist
+        const ssdExists = await this.checkModelExists('ssd_mobilenetv1');
+        const mtcnnExists = await this.checkModelExists('mtcnn');
+
+        if (!ssdExists || !mtcnnExists) {
+          throw new Error(
+            `Face detection models not found in ${MODELS_DIR}. ` +
+            `Please run: npm run install-face-models`
+          );
+        }
+
+        // Load models from disk
+        await faceapi.nets.ssdMobilenetv1.loadFromDisk(MODELS_DIR);
+        await faceapi.nets.mtcnn.loadFromDisk(MODELS_DIR);
+
+        this.modelsLoaded = true;
+        console.log('[Face Detection] ✓ Models loaded successfully');
+      } catch (error) {
+        this.loadingPromise = null;
+        throw new Error(`Failed to load face detection models: ${error.message}`);
+      }
+    })();
+
+    return this.loadingPromise;
+  }
+
+  /**
+   * Check if model files exist
+   */
+  async checkModelExists(modelName) {
+    try {
+      const manifestPath = path.join(MODELS_DIR, `${modelName}_model-weights_manifest.json`);
+      await fs.access(manifestPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Detect face in a single image
+   * Uses fallback chain: SSD MobileNet v1 → MTCNN
+   *
+   * @param {string} imagePath - Path to image file
+   * @returns {Promise<Object|null>} Face detection result with center coordinates
+   */
+  async detectFace(imagePath) {
+    await this.initialize();
+
+    try {
+      // Load image
+      const img = await canvas.loadImage(imagePath);
+
+      // Try fast detection first (SSD MobileNet v1)
+      let detection = await faceapi
+        .detectSingleFace(img, new faceapi.SsdMobilenetv1Options(SSD_OPTIONS));
+
+      // Fallback to accurate detection if none found (MTCNN)
+      if (!detection) {
+        detection = await faceapi
+          .detectSingleFace(img, new faceapi.MtcnnOptions(MTCNN_OPTIONS));
+      }
+
+      if (!detection) {
+        return null;
+      }
+
+      // Extract bounding box
+      const box = detection.box;
+      const confidence = detection.score;
+
+      // Calculate center as percentage of frame (0-100%)
+      const centerX = (box.x + box.width / 2) / img.width * 100;
+      const centerY = (box.y + box.height / 2) / img.height * 100;
+
+      // Clamp to safe zoom region (prevent edge cropping)
+      const safeCenterX = this.clampToSafeZone(centerX, SAFE_ZOOM_MARGIN);
+      const safeCenterY = this.clampToSafeZone(centerY, SAFE_ZOOM_MARGIN);
+
+      return {
+        x: safeCenterX,
+        y: safeCenterY,
+        confidence: confidence,
+        box: {
+          x: box.x / img.width * 100,
+          y: box.y / img.height * 100,
+          width: box.width / img.width * 100,
+          height: box.height / img.height * 100
+        },
+        imageSize: {
+          width: img.width,
+          height: img.height
+        },
+        model: detection.constructor.name.includes('Ssd') ? 'SSD MobileNet v1' : 'MTCNN'
+      };
+
+    } catch (error) {
+      console.error('[Face Detection] Detection error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Clamp coordinate to safe zoom zone
+   */
+  clampToSafeZone(value, margin) {
+    return Math.max(margin, Math.min(100 - margin, value));
+  }
+
+  /**
+   * Extract frame from video at specific timestamp
+   *
+   * @param {string} videoPath - Path to video file
+   * @param {number} timestamp - Timestamp in seconds
+   * @returns {Promise<string>} Path to extracted frame
+   */
+  async extractFrame(videoPath, timestamp) {
+    // Validate video path
+    const pathValidation = await validateAudioPath(videoPath);
+    if (!pathValidation.valid) {
+      throw new Error(`Invalid video path: ${pathValidation.error}`);
+    }
+    const validatedPath = pathValidation.path;
+
+    // Ensure temp directory exists
+    await fs.mkdir(TEMP_DIR, { recursive: true });
+
+    // Generate unique frame filename
+    const frameId = `frame_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.jpg`;
+    const framePath = path.join(TEMP_DIR, frameId);
+
+    // Extract frame using FFmpeg
+    // -ss: seek to timestamp
+    // -i: input file
+    // -vframes 1: extract single frame
+    // -q:v 2: quality (2 = high quality)
+    // -y: overwrite
+    const command = `ffmpeg -ss ${timestamp} -i "${validatedPath}" -vframes 1 -q:v 2 "${framePath}" -y`;
+
+    try {
+      await execAsync(command);
+      return framePath;
+    } catch (error) {
+      throw new Error(`Failed to extract frame at ${timestamp}s: ${error.message}`);
+    }
+  }
+
+  /**
+   * Detect face at specific timestamp with retry fallback
+   *
+   * Tries detection at:
+   * 1. Exact timestamp
+   * 2. Timestamp + 1 second (if face not found)
+   * 3. Timestamp - 1 second (if still not found)
+   *
+   * @param {string} videoPath - Path to video file
+   * @param {number} timestamp - Timestamp in seconds
+   * @param {Array<number>} offsets - Retry offsets in seconds
+   * @returns {Promise<Object|null>} Face detection result
+   */
+  async detectFaceAtTime(videoPath, timestamp, offsets = DEFAULT_OFFSETS) {
+    let framePath = null;
+
+    try {
+      // Try detection at exact time and fallback times
+      for (const offset of offsets) {
+        const adjustedTime = timestamp + offset;
+
+        // Skip negative timestamps
+        if (adjustedTime < 0) continue;
+
+        // Extract frame
+        framePath = await this.extractFrame(videoPath, adjustedTime);
+
+        // Detect face
+        const result = await this.detectFace(framePath);
+
+        // Clean up frame
+        await fs.unlink(framePath);
+        framePath = null;
+
+        // If face found, return result
+        if (result) {
+          result.detectedAt = adjustedTime;
+          result.requestedTime = timestamp;
+          result.offset = offset;
+          return result;
+        }
+      }
+
+      // No face found at any offset
+      return null;
+
+    } catch (error) {
+      // Clean up frame on error
+      if (framePath) {
+        try {
+          await fs.unlink(framePath);
+        } catch (_err) {
+          // Ignore cleanup errors
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Detect faces at multiple timestamps (batch processing)
+   *
+   * @param {string} videoPath - Path to video file
+   * @param {Array<number>} timestamps - Array of timestamps in seconds
+   * @returns {Promise<Array<Object>>} Array of face detection results
+   */
+  async detectFacesInVideo(videoPath, timestamps) {
+    await this.initialize();
+
+    const results = [];
+    const startTime = Date.now();
+
+    console.log(`[Face Detection] Starting batch detection: ${timestamps.length} frames`);
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const time = timestamps[i];
+
+      try {
+        const face = await this.detectFaceAtTime(videoPath, time);
+
+        results.push({
+          time: time,
+          index: i,
+          face: face,
+          success: face !== null
+        });
+
+        // Log progress every 5 frames or at completion
+        if ((i + 1) % 5 === 0 || i === timestamps.length - 1) {
+          const successCount = results.filter(r => r.success).length;
+          const progress = ((i + 1) / timestamps.length * 100).toFixed(0);
+          console.log(
+            `[Face Detection] Progress: ${i + 1}/${timestamps.length} (${progress}%) ` +
+            `- ${successCount} faces detected`
+          );
+        }
+
+      } catch (error) {
+        console.error(`[Face Detection] Error at time ${time}s:`, error.message);
+        results.push({
+          time: time,
+          index: i,
+          face: null,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+
+    const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    const successCount = results.filter(r => r.success).length;
+    const detectionRate = ((successCount / timestamps.length) * 100).toFixed(1);
+
+    console.log(
+      `[Face Detection] ✓ Complete: ${successCount}/${timestamps.length} faces detected ` +
+      `(${detectionRate}%) in ${elapsedTime}s`
+    );
+
+    return results;
+  }
+
+  /**
+   * Clean up temporary files older than 1 hour
+   */
+  async cleanup() {
+    try {
+      const files = await fs.readdir(TEMP_DIR);
+      const now = Date.now();
+      let deletedCount = 0;
+
+      for (const file of files) {
+        const filePath = path.join(TEMP_DIR, file);
+        const stats = await fs.stat(filePath);
+        const age = now - stats.mtimeMs;
+
+        // Delete files older than 1 hour
+        if (age > 3600000) {
+          await fs.unlink(filePath);
+          deletedCount++;
+        }
+      }
+
+      if (deletedCount > 0) {
+        console.log(`[Face Detection] Cleanup: deleted ${deletedCount} old frame(s)`);
+      }
+    } catch (error) {
+      console.error('[Face Detection] Cleanup error:', error);
+    }
+  }
+
+  /**
+   * Calculate zoom scale safe zone for given center point
+   * Returns safe clamping bounds based on zoom scale
+   */
+  calculateSafeZone(scale) {
+    // For 150% zoom (1.5x), margin is 25%
+    // For 200% zoom (2.0x), margin is 50%
+    const margin = (scale - 1) * 50;
+    return {
+      min: margin,
+      max: 100 - margin
+    };
+  }
+}
+
+// ============================================================================
+// EXPORT SINGLETON INSTANCE
+// ============================================================================
+
+const faceDetectionService = new FaceDetectionService();
+
+// Auto-cleanup every 30 minutes
+setInterval(() => {
+  faceDetectionService.cleanup();
+}, 1800000);
+
+module.exports = faceDetectionService;

@@ -1,0 +1,687 @@
+/**
+ * Settings Management
+ *
+ * Persists user preferences to localStorage
+ * v3.5: Added Persistent Token support for media folder access
+ */
+
+const uxpFs = require('uxp').storage.localFileSystem;
+
+const DEFAULT_SETTINGS = {
+  sensitivity: 50,
+  audioSource: 'original',
+  autoMarkBest: true,
+  enableTakesDetection: true,
+  rememberOptions: false,
+  optionsExpanded: false,
+  customerId: null,          // Stripe customer ID for billing
+  mediaFolderToken: null,    // Persistent token for media folder access
+  mediaFolderPath: null,     // Path to the media folder (for display)
+  activePreset: 'custom'     // Currently active preset
+};
+
+// =============================================================================
+// PRESET PROFILES
+// =============================================================================
+
+/**
+ * Detection presets for different content types.
+ * Each preset defines optimal settings for a specific use case.
+ */
+const PRESETS = {
+  // Custom - user-defined settings (default)
+  custom: {
+    name: 'Custom',
+    description: 'Your custom settings',
+    icon: 'settings',
+    settings: null // Uses current user settings
+  },
+
+  // Podcast - longer pauses are natural, be conservative
+  podcast: {
+    name: 'Podcast',
+    description: 'Longer natural pauses, conversational flow',
+    icon: 'mic',
+    settings: {
+      sensitivity: 35,           // Lower sensitivity (fewer cuts)
+      threshold: -35,            // Higher threshold (only deep silence)
+      minSilenceLength: 0.8,     // Longer minimum silence
+      paddingStart: 0.15,        // More padding for natural transitions
+      paddingEnd: 0.15,
+      mergeDistance: 0.3,        // Merge nearby silences
+      autoMarkBest: false,       // Don't auto-mark (manual review)
+      enableTakesDetection: true
+    }
+  },
+
+  // Interview - balanced, respects speaker pauses
+  interview: {
+    name: 'Interview',
+    description: 'Balanced cuts, preserves Q&A rhythm',
+    icon: 'people',
+    settings: {
+      sensitivity: 50,           // Medium sensitivity
+      threshold: -32,            // Moderate threshold
+      minSilenceLength: 0.5,     // Standard minimum silence
+      paddingStart: 0.12,        // Moderate padding
+      paddingEnd: 0.08,
+      mergeDistance: 0.2,
+      autoMarkBest: true,
+      enableTakesDetection: true
+    }
+  },
+
+  // Reaction video - fast pacing, quick cuts
+  reaction: {
+    name: 'Reaction',
+    description: 'Fast-paced, tight cuts for energy',
+    icon: 'bolt',
+    settings: {
+      sensitivity: 70,           // Higher sensitivity (more cuts)
+      threshold: -28,            // Lower threshold (catches more silence)
+      minSilenceLength: 0.3,     // Short minimum silence
+      paddingStart: 0.05,        // Minimal padding for snappy edits
+      paddingEnd: 0.03,
+      mergeDistance: 0.15,
+      autoMarkBest: true,
+      enableTakesDetection: false // Usually single-take content
+    }
+  },
+
+  // Tutorial/Educational - preserve thinking pauses
+  tutorial: {
+    name: 'Tutorial',
+    description: 'Preserves teaching pace, minimal cuts',
+    icon: 'school',
+    settings: {
+      sensitivity: 30,           // Low sensitivity
+      threshold: -38,            // Only deep silence
+      minSilenceLength: 1.0,     // Long minimum (preserve demo pauses)
+      paddingStart: 0.2,         // Extra padding for clarity
+      paddingEnd: 0.15,
+      mergeDistance: 0.4,
+      autoMarkBest: false,
+      enableTakesDetection: true
+    }
+  },
+
+  // Vlog/YouTube - punchy edits, engagement-focused
+  vlog: {
+    name: 'Vlog',
+    description: 'Punchy edits for YouTube engagement',
+    icon: 'videocam',
+    settings: {
+      sensitivity: 65,           // Higher sensitivity
+      threshold: -30,            // Moderate-low threshold
+      minSilenceLength: 0.35,    // Short silences
+      paddingStart: 0.08,        // Quick transitions
+      paddingEnd: 0.05,
+      mergeDistance: 0.2,
+      autoMarkBest: true,
+      enableTakesDetection: true
+    }
+  }
+};
+
+/**
+ * Get all available presets
+ * @returns {Object} All preset definitions
+ */
+function getPresets() {
+  return { ...PRESETS };
+}
+
+/**
+ * Get a specific preset by name
+ * @param {string} presetName - Name of the preset
+ * @returns {Object|null} Preset definition or null if not found
+ */
+function getPreset(presetName) {
+  return PRESETS[presetName] || null;
+}
+
+/**
+ * Get preset names as array (for UI)
+ * @returns {Array<string>} Array of preset names
+ */
+function getPresetNames() {
+  return Object.keys(PRESETS);
+}
+
+/**
+ * Apply a preset to current settings
+ * @param {string} presetName - Name of the preset to apply
+ * @returns {Object} The applied settings
+ */
+function applyPreset(presetName) {
+  const preset = PRESETS[presetName];
+
+  if (!preset) {
+    console.warn(`[SPLICE] Unknown preset: ${presetName}`);
+    return getSettings();
+  }
+
+  // Custom preset uses current settings
+  if (presetName === 'custom' || !preset.settings) {
+    saveSettings({ activePreset: 'custom' });
+    return getSettings();
+  }
+
+  // Apply preset settings
+  const newSettings = {
+    ...preset.settings,
+    activePreset: presetName
+  };
+
+  saveSettings(newSettings);
+  console.log(`[SPLICE] Applied preset: ${preset.name}`);
+
+  return getSettings();
+}
+
+/**
+ * Get the currently active preset
+ * @returns {string} Active preset name
+ */
+function getActivePreset() {
+  const settings = getSettings();
+  return settings.activePreset || 'custom';
+}
+
+/**
+ * Check if current settings match a preset
+ * @param {string} presetName - Preset to compare against
+ * @returns {boolean} True if settings match the preset
+ */
+function settingsMatchPreset(presetName) {
+  const preset = PRESETS[presetName];
+  if (!preset || !preset.settings) return presetName === 'custom';
+
+  const current = getSettings();
+
+  // Compare relevant settings
+  return Object.keys(preset.settings).every(key => {
+    if (key === 'activePreset') return true;
+    return current[key] === preset.settings[key];
+  });
+}
+
+let currentSettings = { ...DEFAULT_SETTINGS };
+
+/**
+ * Load settings from localStorage
+ */
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem('spliceSettings');
+    if (saved) {
+      currentSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+    }
+  } catch (e) {
+    console.warn('[SPLICE] Could not load settings:', e);
+    currentSettings = { ...DEFAULT_SETTINGS };
+  }
+  return currentSettings;
+}
+
+/**
+ * Save settings to localStorage
+ */
+function saveSettings(settings) {
+  try {
+    currentSettings = { ...currentSettings, ...settings };
+    localStorage.setItem('spliceSettings', JSON.stringify(currentSettings));
+  } catch (e) {
+    console.warn('[SPLICE] Could not save settings:', e);
+  }
+}
+
+/**
+ * Get current settings
+ */
+function getSettings() {
+  return { ...currentSettings };
+}
+
+/**
+ * Reset settings to defaults
+ */
+function resetSettings() {
+  currentSettings = { ...DEFAULT_SETTINGS };
+  try {
+    localStorage.removeItem('spliceSettings');
+  } catch (e) {
+    console.warn('[SPLICE] Could not clear settings:', e);
+  }
+}
+
+/**
+ * Initialize settings UI components
+ */
+function initSettingsUI() {
+  const settings = loadSettings();
+
+  // Apply saved sensitivity to slider
+  const sensitivitySlider = document.getElementById('sensitivitySlider');
+  if (sensitivitySlider) {
+    sensitivitySlider.value = settings.sensitivity;
+  }
+
+  // Apply saved audio source
+  const sourceOriginal = document.getElementById('sourceOriginal');
+  const sourceIsolated = document.getElementById('sourceIsolated');
+  if (sourceOriginal && sourceIsolated) {
+    sourceOriginal.checked = settings.audioSource === 'original' || settings.audioSource === 'both';
+    sourceIsolated.checked = settings.audioSource === 'isolated' || settings.audioSource === 'both';
+  }
+
+  // Apply auto-mark best setting
+  const autoMarkBest = document.getElementById('autoMarkBest');
+  if (autoMarkBest) {
+    autoMarkBest.checked = settings.autoMarkBest;
+  }
+
+  // Apply takes detection setting
+  const enableTakesDetection = document.getElementById('enableTakesDetection');
+  if (enableTakesDetection) {
+    enableTakesDetection.checked = settings.enableTakesDetection;
+  }
+
+  // Apply remember options setting
+  const rememberOptions = document.getElementById('rememberOptions');
+  if (rememberOptions) {
+    rememberOptions.checked = settings.rememberOptions;
+  }
+
+  // Restore expanded state if remember is enabled
+  if (settings.rememberOptions && settings.optionsExpanded) {
+    toggleOptionsPanel(true);
+  }
+}
+
+/**
+ * Toggle options panel visibility (unified panel)
+ */
+function toggleOptionsPanel(forceState) {
+  const toggle = document.getElementById('optionsToggle');
+  const panel = document.getElementById('optionsPanel');
+
+  if (!toggle || !panel) return;
+
+  const shouldExpand = forceState !== undefined ? forceState : panel.classList.contains('collapsed');
+
+  if (shouldExpand) {
+    panel.classList.remove('collapsed');
+    toggle.classList.add('expanded');
+  } else {
+    panel.classList.add('collapsed');
+    toggle.classList.remove('expanded');
+  }
+
+  // Save state if remember is enabled
+  const settings = getSettings();
+  if (settings.rememberOptions) {
+    saveSettings({ optionsExpanded: shouldExpand });
+  }
+}
+
+/**
+ * Initialize settings modal
+ */
+function initSettingsModal() {
+  const settingsBtn = document.getElementById('settingsBtn');
+  const modal = document.getElementById('settingsModal');
+  const closeBtn = document.getElementById('closeSettingsBtn');
+  const defaultSensitivity = document.getElementById('defaultSensitivity');
+  const rememberOptions = document.getElementById('rememberOptions');
+
+  if (settingsBtn && modal) {
+    settingsBtn.addEventListener('click', () => {
+      modal.classList.remove('hidden');
+      // Sync modal values with current settings
+      const settings = getSettings();
+      if (defaultSensitivity) defaultSensitivity.value = settings.sensitivity;
+      if (rememberOptions) rememberOptions.checked = settings.rememberOptions;
+    });
+  }
+
+  if (closeBtn && modal) {
+    closeBtn.addEventListener('click', () => {
+      modal.classList.add('hidden');
+    });
+  }
+
+  // Close on backdrop click
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        modal.classList.add('hidden');
+      }
+    });
+  }
+
+  // Save default sensitivity when changed
+  if (defaultSensitivity) {
+    defaultSensitivity.addEventListener('change', () => {
+      saveSettings({ sensitivity: parseInt(defaultSensitivity.value) });
+      // Also update the main slider
+      const mainSlider = document.getElementById('sensitivitySlider');
+      if (mainSlider) mainSlider.value = defaultSensitivity.value;
+    });
+  }
+
+  // Save remember options when changed
+  if (rememberOptions) {
+    rememberOptions.addEventListener('change', () => {
+      saveSettings({ rememberOptions: rememberOptions.checked });
+    });
+  }
+}
+
+/**
+ * Initialize options toggle (unified panel)
+ */
+function initOptionsToggles() {
+  const toggle = document.getElementById('optionsToggle');
+
+  if (toggle) {
+    toggle.addEventListener('click', () => toggleOptionsPanel());
+  }
+}
+
+/**
+ * Initialize help button
+ */
+function initHelpButton() {
+  const helpBtn = document.getElementById('helpBtn');
+  if (helpBtn) {
+    helpBtn.addEventListener('click', () => {
+      setStatus('Silence: removes quiet gaps | Takes: detects repeated content');
+    });
+  }
+}
+
+// =============================================================================
+// PERSISTENT TOKEN MANAGEMENT (v3.5)
+// =============================================================================
+
+/**
+ * Media folder entry (cached after selection)
+ * @type {Object|null}
+ */
+let mediaFolderEntry = null;
+
+/**
+ * Prompt user to select a media folder and create a persistent token.
+ * This allows silent file access without repeated permission prompts.
+ *
+ * @returns {Promise<{success: boolean, path?: string, error?: string}>}
+ */
+async function setupMediaFolder() {
+  try {
+    // Open folder picker dialog
+    const folder = await uxpFs.getFolder();
+
+    if (!folder) {
+      return { success: false, error: 'No folder selected' };
+    }
+
+    // Create a persistent token for this folder
+    const token = await uxpFs.createPersistentToken(folder);
+
+    if (!token) {
+      return { success: false, error: 'Failed to create persistent token' };
+    }
+
+    // Get the folder path for display
+    const folderPath = folder.nativePath || folder.name;
+
+    // Save to settings
+    saveSettings({
+      mediaFolderToken: token,
+      mediaFolderPath: folderPath
+    });
+
+    // Cache the folder entry
+    mediaFolderEntry = folder;
+
+    console.log(`[SPLICE] Media folder set: ${folderPath}`);
+
+    return {
+      success: true,
+      path: folderPath,
+      token
+    };
+  } catch (err) {
+    console.error('[SPLICE] Error setting up media folder:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Get the media folder entry using the stored persistent token.
+ * Falls back to prompting if token is invalid.
+ *
+ * @returns {Promise<Object|null>} The folder entry or null
+ */
+async function getMediaFolder() {
+  // Return cached entry if available
+  if (mediaFolderEntry) {
+    return mediaFolderEntry;
+  }
+
+  const settings = getSettings();
+
+  // Try to restore from persistent token
+  if (settings.mediaFolderToken) {
+    try {
+      const folder = await uxpFs.getEntryForPersistentToken(settings.mediaFolderToken);
+      if (folder) {
+        mediaFolderEntry = folder;
+        console.log(`[SPLICE] Restored media folder from token: ${settings.mediaFolderPath}`);
+        return folder;
+      }
+    } catch (err) {
+      console.warn('[SPLICE] Could not restore media folder from token:', err.message);
+      // Clear invalid token
+      saveSettings({ mediaFolderToken: null, mediaFolderPath: null });
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Check if a media folder is configured
+ * @returns {boolean}
+ */
+function hasMediaFolder() {
+  const settings = getSettings();
+  return !!settings.mediaFolderToken;
+}
+
+/**
+ * Get the configured media folder path (for display)
+ * @returns {string|null}
+ */
+function getMediaFolderPath() {
+  const settings = getSettings();
+  return settings.mediaFolderPath;
+}
+
+/**
+ * Clear the media folder configuration
+ */
+function clearMediaFolder() {
+  mediaFolderEntry = null;
+  saveSettings({
+    mediaFolderToken: null,
+    mediaFolderPath: null
+  });
+  console.log('[SPLICE] Media folder cleared');
+}
+
+/**
+ * Read a file from the media folder
+ * @param {string} filename - Name of the file to read
+ * @returns {Promise<ArrayBuffer|null>} File contents or null
+ */
+async function readMediaFile(filename) {
+  const folder = await getMediaFolder();
+  if (!folder) {
+    console.warn('[SPLICE] No media folder configured');
+    return null;
+  }
+
+  try {
+    const file = await folder.getEntry(filename);
+    if (!file) {
+      console.warn(`[SPLICE] File not found in media folder: ${filename}`);
+      return null;
+    }
+
+    const contents = await file.read({ format: uxpFs.formats.binary });
+    return contents;
+  } catch (err) {
+    console.error(`[SPLICE] Error reading file ${filename}:`, err);
+    return null;
+  }
+}
+
+// =============================================================================
+// LOGIN MODAL
+// =============================================================================
+
+/**
+ * Initialize login modal handlers
+ */
+function initLoginModal() {
+  const loginModal = document.getElementById('loginModal');
+  const closeLoginBtn = document.getElementById('closeLoginBtn');
+  const saveLoginBtn = document.getElementById('saveLoginBtn');
+  const customerIdInput = document.getElementById('customerIdInput');
+  const loginError = document.getElementById('loginError');
+  const creditBadge = document.getElementById('creditBadge');
+
+  // Show login modal when clicking credit badge (if not logged in)
+  if (creditBadge) {
+    creditBadge.addEventListener('click', () => {
+      const settings = getSettings();
+      if (!settings.customerId) {
+        showLoginModal();
+      }
+    });
+  }
+
+  // Close login modal
+  if (closeLoginBtn && loginModal) {
+    closeLoginBtn.addEventListener('click', () => {
+      loginModal.classList.add('hidden');
+    });
+  }
+
+  // Close on backdrop click
+  if (loginModal) {
+    loginModal.addEventListener('click', (e) => {
+      if (e.target === loginModal) {
+        loginModal.classList.add('hidden');
+      }
+    });
+  }
+
+  // Save customer ID
+  if (saveLoginBtn) {
+    saveLoginBtn.addEventListener('click', async () => {
+      const customerId = customerIdInput?.value?.trim();
+
+      if (!customerId) {
+        showLoginError('Please enter your customer ID');
+        return;
+      }
+
+      if (!customerId.startsWith('cus_')) {
+        showLoginError('Customer ID should start with "cus_"');
+        return;
+      }
+
+      // Save to settings
+      saveSettings({ customerId });
+
+      // Hide modal
+      loginModal?.classList.add('hidden');
+
+      // Refresh credits display
+      if (typeof refreshCredits === 'function') {
+        await refreshCredits();
+      }
+
+      if (typeof setStatus === 'function') {
+        setStatus('Logged in successfully');
+      }
+    });
+  }
+
+  // Load existing customer ID into input
+  const settings = getSettings();
+  if (customerIdInput && settings.customerId) {
+    customerIdInput.value = settings.customerId;
+  }
+}
+
+/**
+ * Show login modal
+ */
+function showLoginModal() {
+  const loginModal = document.getElementById('loginModal');
+  const loginError = document.getElementById('loginError');
+
+  if (loginError) {
+    loginError.style.display = 'none';
+  }
+
+  if (loginModal) {
+    loginModal.classList.remove('hidden');
+  }
+}
+
+/**
+ * Show login error message
+ */
+function showLoginError(message) {
+  const loginError = document.getElementById('loginError');
+  if (loginError) {
+    loginError.textContent = message;
+    loginError.style.display = 'block';
+  }
+}
+
+/**
+ * Check if user is logged in
+ * @returns {boolean}
+ */
+function isLoggedIn() {
+  const settings = getSettings();
+  return !!settings.customerId;
+}
+
+/**
+ * Get customer ID
+ * @returns {string|null}
+ */
+function getCustomerId() {
+  const settings = getSettings();
+  return settings.customerId || null;
+}
+
+/**
+ * Logout - clear customer ID
+ */
+function logout() {
+  saveSettings({ customerId: null });
+  if (typeof setStatus === 'function') {
+    setStatus('Logged out');
+  }
+}
+
+// Load settings on script load
+loadSettings();

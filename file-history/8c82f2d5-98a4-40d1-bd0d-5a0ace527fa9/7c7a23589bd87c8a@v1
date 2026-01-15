@@ -1,0 +1,290 @@
+/**
+ * Webhook Delivery Service
+ * HIGH-010: Outbound webhook delivery with exponential backoff retry
+ * 
+ * Provides reliable webhook delivery with:
+ * - Configurable retry attempts with exponential backoff
+ * - HMAC signature generation for security
+ * - Request timeout handling
+ * - Detailed delivery tracking
+ */
+
+const crypto = require('crypto');
+
+// Try to import axios, fall back gracefully
+let axios;
+try {
+  axios = require('axios');
+} catch (_err) {
+  console.warn('[WebhookService] axios not installed - webhook delivery disabled');
+}
+
+// Configuration
+const DEFAULT_CONFIG = {
+  maxRetries: 5,
+  baseDelay: 1000, // 1 second
+  maxDelay: 60000, // 60 seconds max
+  timeout: 10000, // 10 second timeout per request
+  retryStatusCodes: [408, 429, 500, 502, 503, 504], // Retry on these status codes
+};
+
+/**
+ * Webhook Delivery Service
+ * Handles outbound webhook delivery with retry logic
+ */
+class WebhookService {
+  constructor(config = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.deliveryLog = new Map(); // Track recent deliveries for debugging
+    this.maxLogSize = 1000;
+  }
+
+  /**
+   * Deliver a webhook payload to a URL with retry logic
+   * @param {string} url - Destination URL
+   * @param {Object} payload - JSON payload to send
+   * @param {Object} options - Delivery options
+   * @param {string} options.secret - HMAC secret for signature
+   * @param {number} options.timeout - Request timeout in ms
+   * @param {Object} options.headers - Additional headers
+   * @param {string} options.eventType - Event type for logging
+   * @returns {Promise<Object>} Delivery result
+   */
+  async deliver(url, payload, options = {}) {
+    if (!axios) {
+      return {
+        success: false,
+        error: 'axios not installed',
+        attempts: 0,
+      };
+    }
+
+    const deliveryId = crypto.randomUUID();
+    const startTime = Date.now();
+    let lastError = null;
+    let lastStatusCode = null;
+
+    for (let attempt = 0; attempt < this.config.maxRetries; attempt++) {
+      try {
+        const signature = this.sign(payload, options.secret);
+        const timestamp = Math.floor(Date.now() / 1000);
+
+        const response = await axios.post(url, payload, {
+          timeout: options.timeout || this.config.timeout,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Webhook-Signature': signature,
+            'X-Webhook-Timestamp': timestamp.toString(),
+            'X-Webhook-Delivery-Id': deliveryId,
+            'X-Webhook-Attempt': (attempt + 1).toString(),
+            'User-Agent': 'SPLICE-Webhook/1.0',
+            ...(options.headers || {}),
+          },
+          // Don't throw on non-2xx status codes
+          validateStatus: () => true,
+        });
+
+        lastStatusCode = response.status;
+
+        // Success: 2xx status codes
+        if (response.status >= 200 && response.status < 300) {
+          const result = {
+            success: true,
+            deliveryId,
+            attempt: attempt + 1,
+            statusCode: response.status,
+            duration: Date.now() - startTime,
+          };
+          
+          this.logDelivery(deliveryId, url, options.eventType, result);
+          return result;
+        }
+
+        // Don't retry client errors (4xx except 429)
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          const result = {
+            success: false,
+            deliveryId,
+            attempt: attempt + 1,
+            statusCode: response.status,
+            error: `Client error: ${response.status} ${response.statusText}`,
+            duration: Date.now() - startTime,
+            retriable: false,
+          };
+          
+          this.logDelivery(deliveryId, url, options.eventType, result);
+          return result;
+        }
+
+        // Server error or rate limit - will retry
+        lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        
+      } catch (err) {
+        lastError = err;
+        
+        // Network errors are retriable
+        if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+          lastError.message = `Timeout after ${this.config.timeout}ms`;
+        }
+      }
+
+      // Calculate exponential backoff delay
+      if (attempt < this.config.maxRetries - 1) {
+        const delay = this.calculateDelay(attempt);
+        console.log(`[WebhookService] Delivery ${deliveryId} attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        await this.sleep(delay);
+      }
+    }
+
+    // All retries exhausted
+    const result = {
+      success: false,
+      deliveryId,
+      attempts: this.config.maxRetries,
+      statusCode: lastStatusCode,
+      error: lastError?.message || 'Unknown error',
+      duration: Date.now() - startTime,
+      retriable: true,
+    };
+    
+    this.logDelivery(deliveryId, url, options.eventType, result);
+    console.error(`[WebhookService] Delivery ${deliveryId} failed after ${this.config.maxRetries} attempts:`, lastError?.message);
+    
+    return result;
+  }
+
+  /**
+   * Generate HMAC-SHA256 signature for payload
+   * @param {Object} payload - Payload to sign
+   * @param {string} secret - HMAC secret
+   * @returns {string} Hex-encoded signature or empty string if no secret
+   */
+  sign(payload, secret) {
+    if (!secret) {
+      return '';
+    }
+
+    const payloadString = typeof payload === 'string' 
+      ? payload 
+      : JSON.stringify(payload);
+
+    return crypto
+      .createHmac('sha256', secret)
+      .update(payloadString)
+      .digest('hex');
+  }
+
+  /**
+   * Verify a webhook signature (for incoming webhooks)
+   * @param {string|Object} payload - Received payload
+   * @param {string} signature - Received signature
+   * @param {string} secret - Expected HMAC secret
+   * @returns {boolean} True if signature is valid
+   */
+  verify(payload, signature, secret) {
+    if (!signature || !secret) {
+      return false;
+    }
+
+    const expected = this.sign(payload, secret);
+    
+    // Use timing-safe comparison to prevent timing attacks
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(signature, 'hex'),
+        Buffer.from(expected, 'hex')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Calculate exponential backoff delay
+   * @param {number} attempt - Current attempt (0-indexed)
+   * @returns {number} Delay in milliseconds
+   */
+  calculateDelay(attempt) {
+    // Exponential backoff with jitter
+    const exponentialDelay = this.config.baseDelay * Math.pow(2, attempt);
+    const jitter = Math.random() * 0.3 * exponentialDelay; // 0-30% jitter
+    const delay = Math.min(exponentialDelay + jitter, this.config.maxDelay);
+    return Math.floor(delay);
+  }
+
+  /**
+   * Sleep for specified duration
+   * @param {number} ms - Milliseconds to sleep
+   * @returns {Promise<void>}
+   */
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Log delivery for debugging/monitoring
+   * @param {string} deliveryId - Unique delivery ID
+   * @param {string} url - Target URL
+   * @param {string} eventType - Event type
+   * @param {Object} result - Delivery result
+   */
+  logDelivery(deliveryId, url, eventType, result) {
+    // Keep log size bounded
+    if (this.deliveryLog.size >= this.maxLogSize) {
+      const oldestKey = this.deliveryLog.keys().next().value;
+      this.deliveryLog.delete(oldestKey);
+    }
+
+    this.deliveryLog.set(deliveryId, {
+      url,
+      eventType,
+      result,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Get recent delivery history
+   * @param {number} limit - Maximum entries to return
+   * @returns {Array} Recent deliveries
+   */
+  getRecentDeliveries(limit = 100) {
+    const entries = Array.from(this.deliveryLog.entries())
+      .slice(-limit)
+      .map(([id, data]) => ({ id, ...data }));
+    
+    return entries.reverse(); // Most recent first
+  }
+
+  /**
+   * Get delivery statistics
+   * @returns {Object} Statistics
+   */
+  getStats() {
+    const deliveries = Array.from(this.deliveryLog.values());
+    const successful = deliveries.filter(d => d.result.success).length;
+    const failed = deliveries.length - successful;
+    
+    return {
+      total: deliveries.length,
+      successful,
+      failed,
+      successRate: deliveries.length > 0 
+        ? ((successful / deliveries.length) * 100).toFixed(2) + '%'
+        : 'N/A',
+    };
+  }
+
+  /**
+   * Clear delivery log
+   */
+  clearLog() {
+    this.deliveryLog.clear();
+  }
+}
+
+// Singleton instance
+const webhookService = new WebhookService();
+
+module.exports = webhookService;
+module.exports.WebhookService = WebhookService;

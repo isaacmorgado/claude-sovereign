@@ -1,0 +1,858 @@
+#!/bin/bash
+# Agent Loop - Autonomous execution with tool calling
+# Based on patterns from: Roo-Code AgentLoopState, UI-TARS AgentComposer, PraisonAI, TanStack
+
+set -uo pipefail
+
+AGENT_DIR="${HOME}/.claude/agent"
+AGENT_STATE="$AGENT_DIR/state.json"
+TOOL_REGISTRY="$AGENT_DIR/tools.json"
+EXECUTION_LOG="$AGENT_DIR/execution.log"
+LOG_FILE="${HOME}/.claude/agent-loop.log"
+
+# Memory integration
+MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+
+# Loop control
+MAX_ITERATIONS="${MAX_ITERATIONS:-50}"
+MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+init_agent() {
+    mkdir -p "$AGENT_DIR"
+
+    # Initialize tool registry if not exists
+    if [[ ! -f "$TOOL_REGISTRY" ]]; then
+        cat > "$TOOL_REGISTRY" << 'EOF'
+{
+    "tools": {
+        "read_file": {
+            "description": "Read file contents",
+            "command": "cat",
+            "requiresPath": true
+        },
+        "write_file": {
+            "description": "Write to file",
+            "command": "tee",
+            "requiresPath": true
+        },
+        "search_code": {
+            "description": "Search in codebase",
+            "command": "grep -r",
+            "requiresPattern": true
+        },
+        "run_tests": {
+            "description": "Run test suite",
+            "command": "npm test || pytest || go test ./...",
+            "requiresPath": false
+        },
+        "lint_code": {
+            "description": "Run linter",
+            "command": "npm run lint || ruff check . || go vet ./...",
+            "requiresPath": false
+        },
+        "typecheck": {
+            "description": "Run type checker",
+            "command": "npm run typecheck || mypy . || go build ./...",
+            "requiresPath": false
+        },
+        "shell": {
+            "description": "Execute shell command",
+            "command": "bash -c",
+            "requiresCommand": true
+        }
+    }
+}
+EOF
+    fi
+}
+
+# =============================================================================
+# MEMORY INTEGRATION (from Generative Agents, MemGPT patterns)
+# =============================================================================
+
+# Initialize memory for agent session
+memory_init() {
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" init 2>/dev/null
+        log "Memory system initialized"
+    fi
+}
+
+# Set current task in working memory
+memory_set_task() {
+    local goal="$1"
+    local context="${2:-}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" set-task "$goal" "$context" 2>/dev/null
+        log "Memory: Set task - $goal"
+    fi
+}
+
+# Retrieve relevant context from memory before execution
+memory_retrieve_context() {
+    local query="$1"
+    local limit="${2:-5}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        # Use scored retrieval (recency + relevance + importance)
+        local memories
+        memories=$("$MEMORY_MANAGER" remember-scored "$query" "$limit" 2>/dev/null)
+
+        if [[ -n "$memories" && "$memories" != "[]" ]]; then
+            echo "$memories"
+            log "Memory: Retrieved $(echo "$memories" | jq 'length') relevant memories"
+        fi
+    fi
+}
+
+# Record a successful action to memory
+memory_record_success() {
+    local action_type="$1"
+    local description="$2"
+    local details="${3:-}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        # Record episode
+        "$MEMORY_MANAGER" record "$action_type" "$description" "success" "$details" 2>/dev/null
+
+        # Log action
+        "$MEMORY_MANAGER" log-action "$action_type" "$description" "success" '{"outcome":"success"}' 2>/dev/null
+
+        log "Memory: Recorded success - $description"
+    fi
+}
+
+# Record a failure to memory for learning
+memory_record_failure() {
+    local action_type="$1"
+    local description="$2"
+    local error="${3:-}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        # Record episode
+        "$MEMORY_MANAGER" record "failure" "$description" "failure" "$error" 2>/dev/null
+
+        # Log action
+        "$MEMORY_MANAGER" log-action "$action_type" "$description" "$error" '{"outcome":"failure"}' 2>/dev/null
+
+        log "Memory: Recorded failure - $description"
+    fi
+}
+
+# Learn a pattern from experience
+memory_learn_pattern() {
+    local pattern_type="$1"    # error_fix, optimization, workflow
+    local trigger="$2"          # What triggers this pattern
+    local solution="$3"         # The solution/action
+    local success_rate="${4:-1.0}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        local pattern_id
+        pattern_id=$("$MEMORY_MANAGER" add-pattern "$pattern_type" "$trigger" "$solution" "$success_rate" 2>/dev/null)
+
+        log "Memory: Learned pattern $pattern_id - $trigger -> $solution"
+        echo "$pattern_id"
+    fi
+}
+
+# Search for known patterns that might help
+memory_find_patterns() {
+    local query="$1"
+    local limit="${2:-3}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        local patterns
+        patterns=$("$MEMORY_MANAGER" find-patterns "$query" "$limit" 2>/dev/null)
+
+        if [[ -n "$patterns" && "$patterns" != "[]" ]]; then
+            echo "$patterns"
+            log "Memory: Found $(echo "$patterns" | jq 'length') matching patterns"
+        fi
+    fi
+}
+
+# Create a reflection after significant work
+memory_reflect() {
+    local focus="$1"
+    local content="$2"
+    local insights="${3:-}"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" reflect "$focus" "$content" "$insights" 2>/dev/null
+        log "Memory: Created reflection - $focus"
+    fi
+}
+
+# Store a fact learned during execution
+memory_store_fact() {
+    local category="$1"
+    local key="$2"
+    local value="$3"
+
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" add-fact "$category" "$key" "$value" 2>/dev/null
+        log "Memory: Stored fact - $category/$key"
+    fi
+}
+
+# Get memory statistics
+memory_stats() {
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        "$MEMORY_MANAGER" stats 2>/dev/null
+    fi
+}
+
+# =============================================================================
+# AGENT STATE MACHINE (from Roo-Code patterns)
+# =============================================================================
+
+# Agent states: idle, planning, executing, validating, reflecting, paused, completed, failed
+
+start_agent() {
+    local goal="$1"
+    local context="${2:-}"
+
+    init_agent
+
+    # Initialize memory system
+    memory_init
+
+    local agent_id
+    agent_id="agent_$(date +%s)"
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Retrieve relevant memories for this goal
+    local relevant_memories=""
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        relevant_memories=$(memory_retrieve_context "$goal" 5 2>/dev/null | jq -c '.' 2>/dev/null || echo "[]")
+    fi
+
+    cat > "$AGENT_STATE" << EOF
+{
+    "id": "$agent_id",
+    "goal": "$goal",
+    "context": "$context",
+    "state": "planning",
+    "iteration": 0,
+    "maxIterations": $MAX_ITERATIONS,
+    "consecutiveFailures": 0,
+    "startedAt": "$timestamp",
+    "plan": [],
+    "currentStep": null,
+    "executionHistory": [],
+    "toolCalls": [],
+    "pauseRequested": false,
+    "stopRequested": false,
+    "relevantMemories": $relevant_memories
+}
+EOF
+
+    # Set task in working memory
+    memory_set_task "$goal" "$context"
+
+    log "Started agent: $agent_id with goal: $goal"
+    echo "$agent_id"
+}
+
+# Transition agent state
+transition_state() {
+    local new_state="$1"
+    local reason="${2:-}"
+
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local old_state
+    old_state=$(jq -r '.state' "$AGENT_STATE")
+
+    jq --arg state "$new_state" \
+       --arg reason "$reason" \
+       --arg ts "$timestamp" \
+       --arg old "$old_state" \
+       '
+       .state = $state |
+       .lastTransition = {
+           from: $old,
+           to: $state,
+           reason: $reason,
+           timestamp: $ts
+       }
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "State transition: $old_state -> $new_state (reason: $reason)"
+}
+
+# =============================================================================
+# LOOP CONTROL (from TanStack patterns)
+# =============================================================================
+
+# Check if loop should continue
+should_continue() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        echo "false:no_agent"
+        return 1
+    fi
+
+    local result
+    result=$(jq -r '
+        if .stopRequested then
+            "false:stop_requested"
+        elif .pauseRequested then
+            "false:paused"
+        elif .state == "completed" then
+            "false:completed"
+        elif .state == "failed" then
+            "false:failed"
+        elif .iteration >= .maxIterations then
+            "false:max_iterations"
+        elif .consecutiveFailures >= '"$MAX_CONSECUTIVE_FAILURES"' then
+            "false:consecutive_failures"
+        else
+            "true:continue"
+        end
+    ' "$AGENT_STATE")
+
+    echo "$result"
+}
+
+# Increment iteration
+increment_iteration() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    jq '.iteration += 1' "$AGENT_STATE" > "$temp_file"
+    mv "$temp_file" "$AGENT_STATE"
+}
+
+# Record failure
+record_failure() {
+    local error="${1:-unknown}"
+
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local goal
+    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+
+    jq --arg error "$error" \
+       --arg ts "$timestamp" \
+       '
+       .consecutiveFailures += 1 |
+       .lastError = {
+           message: $error,
+           timestamp: $ts,
+           iteration: .iteration
+       }
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Recorded failure: $error"
+
+    # Record failure to memory for learning
+    memory_record_failure "execution" "$goal" "$error"
+}
+
+# Record success (resets consecutive failures)
+record_success() {
+    local result="${1:-success}"
+
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    jq --arg result "$result" \
+       --arg ts "$timestamp" \
+       '
+       .consecutiveFailures = 0 |
+       .lastSuccess = {
+           result: $result,
+           timestamp: $ts,
+           iteration: .iteration
+       }
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+}
+
+# =============================================================================
+# TOOL EXECUTION (from UI-TARS patterns)
+# =============================================================================
+
+# Execute a tool call
+execute_tool() {
+    local tool_name="$1"
+    shift
+    local args=("$@")
+
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        echo '{"success":false,"error":"no_active_agent"}'
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local tool_call_id
+    tool_call_id="tool_$(date +%s%N | cut -c1-13)"
+
+    # Record tool call start
+    jq --arg id "$tool_call_id" \
+       --arg name "$tool_name" \
+       --arg args "${args[*]}" \
+       --arg ts "$timestamp" \
+       '
+       .toolCalls += [{
+           id: $id,
+           name: $name,
+           args: $args,
+           startedAt: $ts,
+           status: "running"
+       }]
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Executing tool: $tool_name (id: $tool_call_id)"
+
+    # Execute the tool
+    local result
+    local exit_code
+    local start_time
+    start_time=$(date +%s%N)
+
+    case "$tool_name" in
+        read_file)
+            result=$(cat "${args[0]}" 2>&1)
+            exit_code=$?
+            ;;
+        search_code)
+            result=$(grep -r "${args[0]}" "${args[1]:-.}" 2>&1 | head -50)
+            exit_code=$?
+            ;;
+        run_tests)
+            result=$(npm test 2>&1 || pytest 2>&1 || go test ./... 2>&1)
+            exit_code=$?
+            ;;
+        lint_code)
+            result=$(npm run lint 2>&1 || ruff check . 2>&1 || go vet ./... 2>&1)
+            exit_code=$?
+            ;;
+        typecheck)
+            result=$(npm run typecheck 2>&1 || npx tsc --noEmit 2>&1 || mypy . 2>&1)
+            exit_code=$?
+            ;;
+        shell)
+            result=$(bash -c "${args[*]}" 2>&1)
+            exit_code=$?
+            ;;
+        *)
+            result="Unknown tool: $tool_name"
+            exit_code=1
+            ;;
+    esac
+
+    local end_time
+    end_time=$(date +%s%N)
+    local duration=$(( (end_time - start_time) / 1000000 ))  # ms
+
+    # Update tool call with result
+    temp_file=$(mktemp)
+    local end_timestamp
+    end_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Truncate result if too long
+    if [[ ${#result} -gt 10000 ]]; then
+        result="${result:0:10000}... (truncated)"
+    fi
+
+    jq --arg id "$tool_call_id" \
+       --arg result "$result" \
+       --argjson code "$exit_code" \
+       --argjson duration "$duration" \
+       --arg ts "$end_timestamp" \
+       '
+       .toolCalls = [.toolCalls[] |
+           if .id == $id then
+               . + {
+                   result: $result,
+                   exitCode: $code,
+                   duration: $duration,
+                   completedAt: $ts,
+                   status: (if $code == 0 then "success" else "failed" end)
+               }
+           else . end
+       ]
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Tool completed: $tool_name (exit: $exit_code, duration: ${duration}ms)"
+
+    # Return result as JSON
+    jq -n \
+        --arg id "$tool_call_id" \
+        --arg name "$tool_name" \
+        --argjson success "$([ $exit_code -eq 0 ] && echo true || echo false)" \
+        --arg result "$result" \
+        --argjson exitCode "$exit_code" \
+        --argjson duration "$duration" \
+        '{
+            id: $id,
+            name: $name,
+            success: $success,
+            result: $result,
+            exitCode: $exitCode,
+            durationMs: $duration
+        }'
+}
+
+# =============================================================================
+# LOOP LIFECYCLE HOOKS (from UI-TARS AgentComposer patterns)
+# =============================================================================
+
+# Called at start of each iteration
+on_loop_start() {
+    local iteration
+    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+    log "Loop iteration $iteration starting"
+
+    # Log to execution log
+    echo "=== Iteration $iteration ===" >> "$EXECUTION_LOG"
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$EXECUTION_LOG"
+
+    # Check health
+    if [[ -x "${HOME}/.claude/hooks/self-healing.sh" ]]; then
+        local health
+        health=$("${HOME}/.claude/hooks/self-healing.sh" health 2>/dev/null)
+        if [[ "$health" != "healthy" ]]; then
+            log "Health check: $health - attempting recovery"
+            "${HOME}/.claude/hooks/self-healing.sh" recover 2>/dev/null
+        fi
+    fi
+}
+
+# Called at end of each iteration
+on_loop_end() {
+    local iteration
+    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+    local state
+    state=$(jq -r '.state' "$AGENT_STATE" 2>/dev/null || echo "unknown")
+
+    local goal
+    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+
+    log "Loop iteration $iteration ended (state: $state)"
+
+    # Update metrics
+    if [[ -x "${HOME}/.claude/hooks/metrics-collector.sh" ]]; then
+        "${HOME}/.claude/hooks/metrics-collector.sh" tool "agent_loop" 0 2>/dev/null
+    fi
+
+    # Update progress
+    if [[ -x "${HOME}/.claude/hooks/progress-tracker.sh" ]]; then
+        "${HOME}/.claude/hooks/progress-tracker.sh" update "$iteration" "Iteration $iteration" "Processing..." 2>/dev/null
+    fi
+
+    # Record iteration to memory (every 5 iterations to avoid noise)
+    if [[ $((iteration % 5)) -eq 0 && -x "$MEMORY_MANAGER" ]]; then
+        local tool_count
+        tool_count=$(jq '.toolCalls | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+        "$MEMORY_MANAGER" add-context "Iteration $iteration: state=$state, tools=$tool_count" 3 2>/dev/null
+    fi
+}
+
+# =============================================================================
+# CONTROL COMMANDS
+# =============================================================================
+
+# Request pause
+request_pause() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    jq '.pauseRequested = true' "$AGENT_STATE" > "$temp_file"
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Pause requested"
+}
+
+# Resume from pause
+resume() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    jq '.pauseRequested = false | .state = "executing"' "$AGENT_STATE" > "$temp_file"
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Resumed from pause"
+}
+
+# Request stop
+request_stop() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    jq '.stopRequested = true' "$AGENT_STATE" > "$temp_file"
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Stop requested"
+}
+
+# Complete agent
+complete_agent() {
+    local result="${1:-success}"
+    local summary="${2:-}"
+
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local goal
+    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+
+    local iteration
+    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+    local tool_count
+    tool_count=$(jq '.toolCalls | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+    local success_count
+    success_count=$(jq '[.toolCalls[] | select(.status == "success")] | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+
+    jq --arg result "$result" \
+       --arg summary "$summary" \
+       --arg ts "$timestamp" \
+       '
+       .state = "completed" |
+       .result = $result |
+       .summary = $summary |
+       .completedAt = $ts |
+       .totalDuration = (
+           (($ts | fromdate) - (.startedAt | fromdate)) | floor
+       )
+       ' "$AGENT_STATE" > "$temp_file"
+
+    mv "$temp_file" "$AGENT_STATE"
+
+    log "Agent completed: $result"
+
+    # Record to memory
+    if [[ -x "$MEMORY_MANAGER" ]]; then
+        # Record episode
+        local details="iterations=$iteration, tools=$tool_count, success=$success_count"
+        memory_record_success "task_complete" "$goal" "$details"
+
+        # Create reflection
+        local reflection_content="Completed: $goal. Used $tool_count tools across $iteration iterations. Result: $result"
+        memory_reflect "progress" "$reflection_content" "$summary"
+
+        # Clear working memory for next task
+        "$MEMORY_MANAGER" clear-working 2>/dev/null
+    fi
+}
+
+# Get agent status
+get_status() {
+    if [[ -f "$AGENT_STATE" ]]; then
+        jq '.' "$AGENT_STATE"
+    else
+        echo '{"state":"no_agent"}'
+    fi
+}
+
+# Get execution summary
+get_summary() {
+    if [[ ! -f "$AGENT_STATE" ]]; then
+        echo "No active agent"
+        return
+    fi
+
+    jq -r '
+        "=== Agent Status ===\n" +
+        "Goal: \(.goal)\n" +
+        "State: \(.state)\n" +
+        "Iteration: \(.iteration)/\(.maxIterations)\n" +
+        "Failures: \(.consecutiveFailures)\n" +
+        "Tool Calls: \(.toolCalls | length)\n" +
+        "Successful Tools: \([.toolCalls[] | select(.status == "success")] | length)\n" +
+        "Duration: \(if .completedAt then .totalDuration else "running" end)\n"
+    ' "$AGENT_STATE"
+}
+
+# =============================================================================
+# COMMAND INTERFACE
+# =============================================================================
+
+case "${1:-help}" in
+    start)
+        start_agent "${2:-goal}" "${3:-}"
+        ;;
+    transition)
+        transition_state "${2:-executing}" "${3:-}"
+        ;;
+    should-continue)
+        should_continue
+        ;;
+    iterate)
+        increment_iteration
+        ;;
+    failure)
+        record_failure "${2:-unknown}"
+        ;;
+    success)
+        record_success "${2:-success}"
+        ;;
+    execute)
+        tool_name="${2:-shell}"
+        shift 2 2>/dev/null || shift 1
+        execute_tool "$tool_name" "$@"
+        ;;
+    on-start)
+        on_loop_start
+        ;;
+    on-end)
+        on_loop_end
+        ;;
+    pause)
+        request_pause
+        ;;
+    resume)
+        resume
+        ;;
+    stop)
+        request_stop
+        ;;
+    complete)
+        complete_agent "${2:-success}" "${3:-}"
+        ;;
+    status)
+        get_status
+        ;;
+    summary)
+        get_summary
+        ;;
+
+    # Memory commands
+    memory-init)
+        memory_init
+        ;;
+    memory-context)
+        memory_retrieve_context "${2:-}" "${3:-5}"
+        ;;
+    memory-patterns)
+        memory_find_patterns "${2:-}" "${3:-3}"
+        ;;
+    memory-learn)
+        memory_learn_pattern "${2:-workflow}" "${3:-}" "${4:-}" "${5:-1.0}"
+        ;;
+    memory-record)
+        memory_record_success "${2:-task}" "${3:-}" "${4:-}"
+        ;;
+    memory-reflect)
+        memory_reflect "${2:-progress}" "${3:-}" "${4:-}"
+        ;;
+    memory-stats)
+        memory_stats
+        ;;
+
+    help|*)
+        echo "Agent Loop - Autonomous Execution System"
+        echo ""
+        echo "Usage: $0 <command> [args]"
+        echo ""
+        echo "Lifecycle Commands:"
+        echo "  start <goal> [context]      - Start new agent"
+        echo "  transition <state> [reason] - Change agent state"
+        echo "  complete <result> [summary] - Complete agent"
+        echo ""
+        echo "Loop Control:"
+        echo "  should-continue             - Check if loop should continue"
+        echo "  iterate                     - Increment iteration counter"
+        echo "  failure <error>             - Record a failure"
+        echo "  success <result>            - Record a success"
+        echo "  pause                       - Request pause"
+        echo "  resume                      - Resume from pause"
+        echo "  stop                        - Request stop"
+        echo ""
+        echo "Tool Execution:"
+        echo "  execute <tool> [args...]    - Execute a tool"
+        echo "    Tools: read_file, search_code, run_tests, lint_code, typecheck, shell"
+        echo ""
+        echo "Hooks:"
+        echo "  on-start                    - Call at loop start"
+        echo "  on-end                      - Call at loop end"
+        echo ""
+        echo "Status:"
+        echo "  status                      - Get full status JSON"
+        echo "  summary                     - Get human-readable summary"
+        echo ""
+        echo "Memory Integration:"
+        echo "  memory-init                 - Initialize memory system"
+        echo "  memory-context <query>      - Retrieve relevant memories"
+        echo "  memory-patterns <query>     - Find known patterns"
+        echo "  memory-learn <type> <trigger> <solution>"
+        echo "                              - Learn a new pattern"
+        echo "  memory-record <type> <desc> - Record to memory"
+        echo "  memory-reflect <focus> <content>"
+        echo "                              - Create reflection"
+        echo "  memory-stats                - Get memory statistics"
+        ;;
+esac

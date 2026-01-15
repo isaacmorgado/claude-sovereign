@@ -1,0 +1,252 @@
+#!/bin/bash
+# SPLICE CEP Patch for Danny - Fixes Tests 3-6 EvalScript errors
+# Run with: bash patch-danny-cep.sh
+
+CEP_DIR="$HOME/Library/Application Support/Adobe/CEP/extensions/com.splice.cep"
+
+echo ""
+echo "=== SPLICE CEP Patch ==="
+echo ""
+
+# Check if extension exists
+if [ ! -d "$CEP_DIR" ]; then
+    echo "ERROR: SPLICE not found at: $CEP_DIR"
+    exit 1
+fi
+
+echo "Found SPLICE extension"
+
+# Backup
+BACKUP="$CEP_DIR/backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
+cp "$CEP_DIR/jsx/hostScript.jsx" "$BACKUP/"
+cp "$CEP_DIR/panel/js/main.js" "$BACKUP/"
+echo "Backup: $BACKUP"
+
+# ============================================
+# PATCH 1: Fix getActiveSequence + add getAllSequences
+# ============================================
+echo ""
+echo "Patching hostScript.jsx..."
+
+python3 << 'PYEOF'
+import re
+
+path = "$HOME/Library/Application Support/Adobe/CEP/extensions/com.splice.cep/jsx/hostScript.jsx"
+path = path.replace("$HOME", __import__("os").environ["HOME"])
+
+with open(path, "r") as f:
+    content = f.read()
+
+# New fixed functions
+NEW_FUNCTIONS = '''function getActiveSequence() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ error: "No active sequence" });
+
+        var frameRate = null;
+        try {
+            var settings = seq.getSettings();
+            if (settings && settings.videoFrameRate) {
+                frameRate = settings.videoFrameRate.seconds;
+            }
+        } catch (settingsErr) {
+            $.writeln('[SPLICE] getActiveSequence: Failed to get settings: ' + settingsErr.message);
+        }
+
+        return JSON.stringify({
+            name: seq.name || "Unknown",
+            id: seq.sequenceID || null,
+            duration: seq.end || 0,
+            videoTrackCount: seq.videoTracks ? seq.videoTracks.numTracks : 0,
+            audioTrackCount: seq.audioTracks ? seq.audioTracks.numTracks : 0,
+            frameRate: frameRate,
+            width: seq.frameSizeHorizontal || 0,
+            height: seq.frameSizeVertical || 0
+        });
+    } catch (e) {
+        $.writeln('[SPLICE] getActiveSequence error: ' + e.message);
+        return JSON.stringify({ error: "getActiveSequence failed: " + e.message });
+    }
+}
+
+function getAllSequences() {
+    try {
+        if (!app || !app.project || !app.project.sequences) {
+            return JSON.stringify({ error: "No project open" });
+        }
+
+        var sequences = [];
+        var numSeqs = app.project.sequences.numSequences;
+
+        for (var i = 0; i < numSeqs; i++) {
+            var seq = app.project.sequences[i];
+            if (seq) {
+                sequences.push({
+                    name: seq.name || "Unknown",
+                    id: seq.sequenceID || null,
+                    index: i
+                });
+            }
+        }
+
+        return JSON.stringify(sequences);
+    } catch (e) {
+        $.writeln('[SPLICE] getAllSequences error: ' + e.message);
+        return JSON.stringify({ error: "getAllSequences failed: " + e.message });
+    }
+}'''
+
+# Pattern for old getActiveSequence (without try/catch)
+old_pattern = r'function getActiveSequence\(\) \{\s*var seq = app\.project\.activeSequence;\s*if \(!seq\) return JSON\.stringify\(\{ error: "No active sequence" \}\);\s*return JSON\.stringify\(\{[^}]+\}\);\s*\}'
+
+if re.search(old_pattern, content):
+    content = re.sub(old_pattern, NEW_FUNCTIONS, content)
+    print("  - Replaced getActiveSequence (added try/catch)")
+    print("  - Added getAllSequences function")
+elif "function getAllSequences" not in content:
+    # Just add getAllSequences after getActiveSequence
+    content = content.replace(
+        "function getSequenceSettings()",
+        '''function getAllSequences() {
+    try {
+        if (!app || !app.project || !app.project.sequences) {
+            return JSON.stringify({ error: "No project open" });
+        }
+        var sequences = [];
+        var numSeqs = app.project.sequences.numSequences;
+        for (var i = 0; i < numSeqs; i++) {
+            var seq = app.project.sequences[i];
+            if (seq) {
+                sequences.push({
+                    name: seq.name || "Unknown",
+                    id: seq.sequenceID || null,
+                    index: i
+                });
+            }
+        }
+        return JSON.stringify(sequences);
+    } catch (e) {
+        $.writeln('[SPLICE] getAllSequences error: ' + e.message);
+        return JSON.stringify({ error: "getAllSequences failed: " + e.message });
+    }
+}
+
+function getSequenceSettings()'''
+    )
+    print("  - Added getAllSequences function")
+else:
+    print("  - Already patched")
+
+with open(path, "w") as f:
+    f.write(content)
+
+print("  Done!")
+PYEOF
+
+# ============================================
+# PATCH 2: Fix Test 5 and Test 6 in main.js
+# ============================================
+echo "Patching main.js..."
+
+python3 << 'PYEOF'
+import re
+
+path = "$HOME/Library/Application Support/Adobe/CEP/extensions/com.splice.cep/panel/js/main.js"
+path = path.replace("$HOME", __import__("os").environ["HOME"])
+
+with open(path, "r") as f:
+    content = f.read()
+
+changed = False
+
+# Fix Test 5 - if blocks don't return values, need IIFE
+old_test5 = '''const result = await jsx.evalScript(`
+                if (app && app.project && app.project.activeSequence) {
+                    JSON.stringify({
+                        success: true,
+                        name: app.project.activeSequence.name,
+                        id: app.project.activeSequence.sequenceID
+                    });
+                } else {
+                    JSON.stringify({
+                        success: false,
+                        reason: app ? (app.project ? 'app.project.activeSequence is null' : 'app.project is null') : 'app is null'
+                    });
+                }
+            `);'''
+
+new_test5 = '''const result = await jsx.evalScript(`
+                (function() {
+                    try {
+                        if (app && app.project && app.project.activeSequence) {
+                            return JSON.stringify({
+                                success: true,
+                                name: app.project.activeSequence.name,
+                                id: app.project.activeSequence.sequenceID
+                            });
+                        } else {
+                            return JSON.stringify({
+                                success: false,
+                                reason: app ? (app.project ? 'app.project.activeSequence is null' : 'app.project is null') : 'app is null'
+                            });
+                        }
+                    } catch (e) {
+                        return JSON.stringify({ success: false, reason: 'Error: ' + e.message });
+                    }
+                })()
+            `);'''
+
+if old_test5 in content:
+    content = content.replace(old_test5, new_test5)
+    print("  - Fixed Test 5 (wrapped in IIFE)")
+    changed = True
+
+# Fix Test 6
+old_test6 = '''const qeResult = await jsx.evalScript(`
+                if (typeof qe !== 'undefined' && qe !== null) {
+                    JSON.stringify({ available: true });
+                } else {
+                    JSON.stringify({ available: false });
+                }
+            `);'''
+
+new_test6 = '''const qeResult = await jsx.evalScript(`
+                (function() {
+                    try {
+                        if (typeof qe !== 'undefined' && qe !== null) {
+                            return JSON.stringify({ available: true });
+                        } else {
+                            return JSON.stringify({ available: false });
+                        }
+                    } catch (e) {
+                        return JSON.stringify({ available: false, error: e.message });
+                    }
+                })()
+            `);'''
+
+if old_test6 in content:
+    content = content.replace(old_test6, new_test6)
+    print("  - Fixed Test 6 (wrapped in IIFE)")
+    changed = True
+
+if not changed:
+    print("  - Already patched or different version")
+
+with open(path, "w") as f:
+    f.write(content)
+
+print("  Done!")
+PYEOF
+
+echo ""
+echo "=== PATCH COMPLETE ==="
+echo ""
+echo "Next steps:"
+echo "  1. QUIT Premiere Pro completely"
+echo "  2. Reopen Premiere Pro"
+echo "  3. Open SPLICE panel"
+echo "  4. Click 'Run Diagnostics'"
+echo ""
+echo "Tests 3-6 should now pass!"
+echo ""

@@ -1,0 +1,1561 @@
+     1→/**
+     2→ * SPLICE CEP Host Script
+     3→ * ExtendScript for Premiere Pro
+     4→ *
+     5→ * Provides all Premiere Pro API functions called via jsx.evalScript()
+     6→ * Based on proven patterns from FireCut and SPLICE UXP builder
+     7→ */
+     8→
+     9→// ============================================================================
+    10→// GLOBAL CONSTANTS & STATE
+    11→// ============================================================================
+    12→var SPLICE_VERSION = "6.0.3";
+    13→var TICKS_PER_SECOND = 254016000000;
+    14→var time_tolerance = 0.01; // 10ms tolerance for clip matching
+    15→var temp_bin = null;
+    16→var sequence_default_timecode = null;
+    17→
+    18→// Color label indices (Premiere Pro standard)
+    19→var COLOR_LABELS = {
+    20→    NONE: 0,
+    21→    VIOLET: 1,
+    22→    IRIS: 2,
+    23→    CARIBBEAN: 3,
+    24→    LAVENDER: 4,
+    25→    CERULEAN: 5,
+    26→    FOREST: 6,
+    27→    ROSE: 7,
+    28→    MANGO: 8,
+    29→    PURPLE: 9,
+    30→    BLUE: 10,
+    31→    TEAL: 11,
+    32→    MAGENTA: 12,
+    33→    TAN: 13,
+    34→    GREEN: 14,
+    35→    BROWN: 15,
+    36→    YELLOW: 16
+    37→};
+    38→
+    39→// Segment type to color mapping
+    40→var SEGMENT_COLORS = {
+    41→    speech: COLOR_LABELS.FOREST,
+    42→    take: COLOR_LABELS.LAVENDER,
+    43→    best_take: COLOR_LABELS.CERULEAN,
+    44→    silence: COLOR_LABELS.VIOLET,
+    45→    wide_shot: COLOR_LABELS.YELLOW,
+    46→    speaker_a: COLOR_LABELS.MANGO,
+    47→    speaker_b: COLOR_LABELS.CARIBBEAN
+    48→};
+    49→
+    50→// Timecode display formats
+    51→var TIMECODES = {
+    52→    TIMEDISPLAY_Frames: 4
+    53→};
+    54→
+    55→// Translation map for localized effect names
+    56→var translations = {
+    57→    "Motion": ["Motion", "Mouvement", "Bewegung", "Movimiento", "Movimento"],
+    58→    "Transform": ["Transform", "Transformation", "Transformieren", "Transformar"],
+    59→    "Scale": ["Scale", "Echelle", "Skalierung", "Escala"],
+    60→    "Scale Height": ["Scale Height", "Hauteur de l'echelle", "Skalierungshoehe"],
+    61→    "Scale Width": ["Scale Width", "Largeur de l'echelle", "Skalierungsbreite"],
+    62→    "Position": ["Position", "Posicion", "Posicao"],
+    63→    "Anchor Point": ["Anchor Point", "Point d'ancrage", "Ankerpunkt"],
+    64→    "Rotation": ["Rotation", "Rotacion", "Rotacao"],
+    65→    "Opacity": ["Opacity", "Opacite", "Deckkraft", "Opacidad"]
+    66→};
+    67→
+    68→// Project item types
+    69→var project_item_type = {
+    70→    "clip": 1,
+    71→    "bin": 2,
+    72→    "root": 3,
+    73→    "file": 4
+    74→};
+    75→
+    76→// ============================================================================
+    77→// INITIALIZATION
+    78→// ============================================================================
+    79→
+    80→/**
+    81→ * Check if QE (Quality Engine) DOM is available
+    82→ * QE provides extended functionality not available in standard DOM
+    83→ */
+    84→function isQEAvailable() {
+    85→    try {
+    86→        return typeof qe !== 'undefined' && qe !== null && qe.project;
+    87→    } catch (e) {
+    88→        return false;
+    89→    }
+    90→}
+    91→
+    92→/**
+    93→ * Enable QE DOM if not already enabled
+    94→ * @returns {boolean} true if QE is now available
+    95→ */
+    96→function enableQE() {
+    97→    try {
+    98→        if (isQEAvailable()) return true;
+    99→        app.enableQE();
+   100→        return isQEAvailable();
+   101→    } catch (e) {
+   102→        $.writeln('[SPLICE] enableQE failed: ' + e.message);
+   103→        return false;
+   104→    }
+   105→}
+   106→
+   107→/**
+   108→ * Safe wrapper for QE operations
+   109→ * @param {Function} operation - The QE operation to execute
+   110→ * @param {string} operationName - Name for error reporting
+   111→ * @returns {Object} Result or error object
+   112→ */
+   113→function safeQEOperation(operation, operationName) {
+   114→    try {
+   115→        if (!isQEAvailable()) {
+   116→            if (!enableQE()) {
+   117→                return { error: "QE not available. Please ensure Premiere Pro supports QE DOM." };
+   118→            }
+   119→        }
+   120→        return operation();
+   121→    } catch (e) {
+   122→        return { error: operationName + " failed: " + e.message };
+   123→    }
+   124→}
+   125→
+   126→function initialise() {
+   127→    storeDefaultTimecode();
+   128→    // Try to enable QE on startup
+   129→    var qeStatus = enableQE();
+   130→    return JSON.stringify({ success: true, version: SPLICE_VERSION, qeAvailable: qeStatus });
+   131→}
+   132→
+   133→function storeDefaultTimecode() {
+   134→    if (app.project.activeSequence) {
+   135→        sequence_default_timecode = app.project.activeSequence.getSettings().videoDisplayFormat;
+   136→    }
+   137→}
+   138→
+   139→/**
+   140→ * Check if a sequence is currently open/active in the Timeline
+   141→ * Uses multiple fallbacks to ensure accurate detection
+   142→ * @returns {boolean} true if a sequence is open
+   143→ */
+   144→function checkSequenceOpen() {
+   145→    try {
+   146→        // Primary check: Standard DOM
+   147→        if (app.project && app.project.activeSequence) {
+   148→            $.writeln('[SPLICE] checkSequenceOpen: Found active sequence via DOM');
+   149→            return true;
+   150→        }
+   151→
+   152→        // Fallback: Try QE DOM (requires enableQE first)
+   153→        if (enableQE()) {
+   154→            try {
+   155→                var qeSeq = qe.project.getActiveSequence();
+   156→                if (qeSeq && qeSeq.name) {
+   157→                    $.writeln('[SPLICE] checkSequenceOpen: Found active sequence via QE DOM: ' + qeSeq.name);
+   158→                    return true;
+   159→                }
+   160→            } catch (qeErr) {
+   161→                $.writeln('[SPLICE] QE sequence check failed: ' + qeErr.message);
+   162→            }
+   163→        }
+   164→
+   165→        // Debug: Log available sequences
+   166→        if (app.project && app.project.sequences && app.project.sequences.numSequences > 0) {
+   167→            $.writeln('[SPLICE] checkSequenceOpen: ' + app.project.sequences.numSequences + ' sequences exist but none active in Timeline');
+   168→            for (var i = 0; i < app.project.sequences.numSequences; i++) {
+   169→                var seq = app.project.sequences[i];
+   170→                if (seq) {
+   171→                    $.writeln('[SPLICE]   - Sequence: ' + seq.name);
+   172→                }
+   173→            }
+   174→        }
+   175→
+   176→        $.writeln('[SPLICE] checkSequenceOpen: No active sequence found');
+   177→        return false;
+   178→    } catch (e) {
+   179→        $.writeln('[SPLICE] checkSequenceOpen error: ' + e.message);
+   180→        return false;
+   181→    }
+   182→}
+   183→
+   184→function getVersion() {
+   185→    return SPLICE_VERSION;
+   186→}
+   187→
+   188→// ============================================================================
+   189→// TIME CONVERSION UTILITIES
+   190→// ============================================================================
+   191→
+   192→/**
+   193→ * Get the actual frames per second from the sequence
+   194→ * videoFrameRate.seconds gives seconds per frame, so we need to invert it
+   195→ */
+   196→function getActualFrameRate() {
+   197→    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+   198→    // secsPerFrame is e.g., 0.03333... for 30fps, so 1/secsPerFrame = 30
+   199→    return 1 / secsPerFrame;
+   200→}
+   201→
+   202→function quantise_time(time_seconds) {
+   203→    // Get seconds per frame (e.g., 0.0333 for 30fps)
+   204→    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+   205→    // Round to nearest frame boundary
+   206→    return secsPerFrame * Math.round(time_seconds / secsPerFrame);
+   207→}
+   208→
+   209→function frames_to_time(number_of_frames) {
+   210→    // seconds per frame * number of frames = total seconds
+   211→    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+   212→    return number_of_frames * secsPerFrame;
+   213→}
+   214→
+   215→function frames_to_ticks(number_of_frames) {
+   216→    // Convert frames to ticks: frames * seconds_per_frame * ticks_per_second
+   217→    var secsPerFrame = app.project.activeSequence.getSettings().videoFrameRate.seconds;
+   218→    return number_of_frames * secsPerFrame * TICKS_PER_SECOND;
+   219→}
+   220→
+   221→function seconds_to_ticks(seconds) {
+   222→    return seconds * TICKS_PER_SECOND;
+   223→}
+   224→
+   225→function ticks_to_seconds(ticks) {
+   226→    return ticks / TICKS_PER_SECOND;
+   227→}
+   228→
+   229→function getVideoFrameRateInSeconds() {
+   230→    return app.project.activeSequence.getSettings().videoFrameRate.seconds;
+   231→}
+   232→
+   233→function secondsToCurrentTimecode(seconds) {
+   234→    var seq = app.project.activeSequence;
+   235→    if (seq) {
+   236→        var t = new Time();
+   237→        t.seconds = parseFloat(seconds);
+   238→        var settings = app.project.activeSequence.getSettings();
+   239→        return t.getFormatted(settings.videoFrameRate, settings.videoDisplayFormat);
+   240→    }
+   241→    return false;
+   242→}
+   243→
+   244→// ============================================================================
+   245→// TIMECODE FORMAT
+   246→// ============================================================================
+   247→
+   248→function setTimecodeToFrames() {
+   249→    var seq = app.project.activeSequence;
+   250→    if (seq) {
+   251→        var currentSeqSettings = app.project.activeSequence.getSettings();
+   252→        if (currentSeqSettings.videoDisplayFormat != TIMECODES.TIMEDISPLAY_Frames) {
+   253→            currentSeqSettings.videoDisplayFormat = TIMECODES.TIMEDISPLAY_Frames;
+   254→            app.project.activeSequence.setSettings(currentSeqSettings);
+   255→        }
+   256→    }
+   257→}
+   258→
+   259→function setTimecodeToDefault() {
+   260→    var seq = app.project.activeSequence;
+   261→    if (seq && sequence_default_timecode) {
+   262→        var currentSeqSettings = app.project.activeSequence.getSettings();
+   263→        currentSeqSettings.videoDisplayFormat = sequence_default_timecode;
+   264→        app.project.activeSequence.setSettings(currentSeqSettings);
+   265→    }
+   266→}
+   267→
+   268→function getTimecodeFormat() {
+   269→    return app.project.activeSequence.getSettings().videoDisplayFormat;
+   270→}
+   271→
+   272→function setTimecodeFormat(format) {
+   273→    format = parseInt(format);
+   274→    var seq = app.project.activeSequence;
+   275→    if (seq) {
+   276→        var currentSeqSettings = app.project.activeSequence.getSettings();
+   277→        currentSeqSettings.videoDisplayFormat = format;
+   278→        app.project.activeSequence.setSettings(currentSeqSettings);
+   279→    }
+   280→    return true;
+   281→}
+   282→
+   283→// ============================================================================
+   284→// SEQUENCE & PROJECT OPERATIONS
+   285→// ============================================================================
+   286→
+   287→function getActiveSequence() {
+   288→    var seq = app.project.activeSequence;
+   289→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+   290→
+   291→    return JSON.stringify({
+   292→        name: seq.name,
+   293→        id: seq.sequenceID,
+   294→        duration: seq.end,
+   295→        videoTrackCount: seq.videoTracks.numTracks,
+   296→        audioTrackCount: seq.audioTracks.numTracks,
+   297→        frameRate: seq.getSettings().videoFrameRate.seconds,
+   298→        width: seq.frameSizeHorizontal,
+   299→        height: seq.frameSizeVertical
+   300→    });
+   301→}
+   302→
+   303→function getSequenceSettings() {
+   304→    var seq = app.project.activeSequence;
+   305→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+   306→
+   307→    var settings = seq.getSettings();
+   308→    return JSON.stringify({
+   309→        frameRate: settings.videoFrameRate.seconds,
+   310→        width: settings.videoFrameWidth,
+   311→        height: settings.videoFrameHeight,
+   312→        displayFormat: settings.videoDisplayFormat
+   313→    });
+   314→}
+   315→
+   316→function cloneSequence(newName) {
+   317→    var seq = app.project.activeSequence;
+   318→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+   319→
+   320→    try {
+   321→        // Clone the sequence
+   322→        seq.clone();
+   323→
+   324→        // Find the cloned sequence (last one with matching name pattern)
+   325→        var clonedSeq = null;
+   326→        for (var i = app.project.sequences.numSequences - 1; i >= 0; i--) {
+   327→            var s = app.project.sequences[i];
+   328→            if (s.name.indexOf(seq.name) === 0 && s.sequenceID !== seq.sequenceID) {
+   329→                clonedSeq = s;
+   330→                break;
+   331→            }
+   332→        }
+   333→
+   334→        if (clonedSeq && newName) {
+   335→            clonedSeq.name = newName;
+   336→        }
+   337→
+   338→        return JSON.stringify({
+   339→            success: true,
+   340→            sequenceId: clonedSeq ? clonedSeq.sequenceID : null,
+   341→            name: clonedSeq ? clonedSeq.name : newName
+   342→        });
+   343→    } catch (e) {
+   344→        return JSON.stringify({ error: e.message });
+   345→    }
+   346→}
+   347→
+   348→function createNewSequence(name) {
+   349→    try {
+   350→        app.project.createNewSequence(name);
+   351→        var seq = app.project.activeSequence;
+   352→        return JSON.stringify({
+   353→            success: true,
+   354→            sequenceId: seq.sequenceID,
+   355→            name: seq.name
+   356→        });
+   357→    } catch (e) {
+   358→        return JSON.stringify({ error: e.message });
+   359→    }
+   360→}
+   361→
+   362→function setActiveSequence(sequenceId) {
+   363→    for (var i = 0; i < app.project.sequences.numSequences; i++) {
+   364→        if (app.project.sequences[i].sequenceID === sequenceId) {
+   365→            app.project.activeSequence = app.project.sequences[i];
+   366→            return JSON.stringify({ success: true });
+   367→        }
+   368→    }
+   369→    return JSON.stringify({ error: "Sequence not found" });
+   370→}
+   371→
+   372→/**
+   373→ * Seek playhead to a specific time in seconds
+   374→ */
+   375→function seekToTime(seconds) {
+   376→    var seq = app.project.activeSequence;
+   377→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+   378→
+   379→    try {
+   380→        // Convert seconds to ticks
+   381→        var ticks = seconds * TICKS_PER_SECOND;
+   382→
+   383→        // Create a Time object and set position
+   384→        var playerPos = seq.getPlayerPosition();
+   385→        playerPos.seconds = seconds;
+   386→        seq.setPlayerPosition(playerPos.ticks.toString());
+   387→
+   388→        return JSON.stringify({ success: true, position: seconds });
+   389→    } catch (e) {
+   390→        return JSON.stringify({ error: e.message });
+   391→    }
+   392→}
+   393→
+   394→/**
+   395→ * Get current playhead position in seconds
+   396→ */
+   397→function getPlayerPosition() {
+   398→    var seq = app.project.activeSequence;
+   399→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+   400→
+   401→    try {
+   402→        var pos = seq.getPlayerPosition();
+   403→        return JSON.stringify({
+   404→            ticks: pos.ticks,
+   405→            seconds: pos.seconds
+   406→        });
+   407→    } catch (e) {
+   408→        return JSON.stringify({ error: e.message });
+   409→    }
+   410→}
+   411→
+   412→// ============================================================================
+   413→// RAZOR OPERATIONS
+   414→// ============================================================================
+   415→
+   416→function razorSequenceAtFrames(frames) {
+   417→    if (!isQEAvailable() && !enableQE()) {
+   418→        return JSON.stringify({ error: "QE not available for razor operation" });
+   419→    }
+   420→    try {
+   421→        frames = String(frames);
+   422→        setTimecodeToFrames();
+   423→        qe.project.getActiveSequence().razor(frames);
+   424→        return JSON.stringify({ success: true });
+   425→    } catch (e) {
+   426→        return JSON.stringify({ error: "Razor failed: " + e.message });
+   427→    }
+   428→}
+   429→
+   430→function razorSequenceAtSeconds(seconds) {
+   431→    try {
+   432→        var frames = parseInt(Math.round(seconds / app.project.activeSequence.getSettings().videoFrameRate.seconds)).toString();
+   433→        return razorSequenceAtFrames(frames);
+   434→    } catch (e) {
+   435→        return JSON.stringify({ error: "Razor at seconds failed: " + e.message });
+   436→    }
+   437→}
+   438→
+   439→function razorSequenceAtFramesArray(silences_array) {
+   440→    if (!isQEAvailable() && !enableQE()) {
+   441→        return JSON.stringify({ error: "QE not available for razor operation" });
+   442→    }
+   443→    try {
+   444→        setTimecodeToFrames();
+   445→        silences_array = JSON.parse(silences_array);
+   446→        var razorCount = 0;
+   447→        for (var i = 0; i < silences_array.length; i++) {
+   448→            for (var j = 0; j < silences_array[i].length; j++) {
+   449→                var frames = String(silences_array[i][j]);
+   450→                qe.project.getActiveSequence().razor(frames);
+   451→                razorCount++;
+   452→            }
+   453→        }
+   454→        return JSON.stringify({ success: true, razorCount: razorCount });
+   455→    } catch (e) {
+   456→        return JSON.stringify({ error: "Razor array failed: " + e.message });
+   457→    }
+   458→}
+   459→
+   460→function razorTrackAtFrames(trackType, trackIndex, frames) {
+   461→    if (!isQEAvailable() && !enableQE()) {
+   462→        return JSON.stringify({ error: "QE not available for track razor" });
+   463→    }
+   464→    try {
+   465→        frames = String(frames);
+   466→        setTimecodeToFrames();
+   467→        if (trackType == "video") {
+   468→            qe.project.getActiveSequence().getVideoTrackAt(trackIndex).razor(frames);
+   469→        } else if (trackType == "audio") {
+   470→            qe.project.getActiveSequence().getAudioTrackAt(trackIndex).razor(frames);
+   471→        }
+   472→        return JSON.stringify({ success: true });
+   473→    } catch (e) {
+   474→        return JSON.stringify({ error: "Track razor failed: " + e.message });
+   475→    }
+   476→}
+   477→
+   478→function razorTrackAtSeconds(trackType, trackIndex, seconds) {
+   479→    try {
+   480→        var frames = parseInt(Math.round(seconds / app.project.activeSequence.getSettings().videoFrameRate.seconds)).toString();
+   481→        return razorTrackAtFrames(trackType, trackIndex, frames);
+   482→    } catch (e) {
+   483→        return JSON.stringify({ error: "Track razor at seconds failed: " + e.message });
+   484→    }
+   485→}
+   486→
+   487→// ============================================================================
+   488→// CLIP OPERATIONS
+   489→// ============================================================================
+   490→
+   491→function getClipsInTrack(trackIndex, trackType) {
+   492→    var clips = [];
+   493→    if (trackType == "audio") {
+   494→        for (var i = 0; i < app.project.activeSequence.audioTracks[trackIndex].clips.numItems; i++) {
+   495→            var clip = app.project.activeSequence.audioTracks[trackIndex].clips[i];
+   496→            clips.push({
+   497→                index: i,
+   498→                name: clip.name,
+   499→                start: clip.start.seconds,
+   500→                end: clip.end.seconds,
+   501→                duration: clip.duration.seconds,
+   502→                inPoint: clip.inPoint.seconds,
+   503→                outPoint: clip.outPoint.seconds,
+   504→                mediaPath: clip.projectItem ? clip.projectItem.getMediaPath() : null
+   505→            });
+   506→        }
+   507→    } else if (trackType == "video") {
+   508→        for (var i = 0; i < app.project.activeSequence.videoTracks[trackIndex].clips.numItems; i++) {
+   509→            var clip = app.project.activeSequence.videoTracks[trackIndex].clips[i];
+   510→            clips.push({
+   511→                index: i,
+   512→                name: clip.name,
+   513→                start: clip.start.seconds,
+   514→                end: clip.end.seconds,
+   515→                duration: clip.duration.seconds,
+   516→                inPoint: clip.inPoint.seconds,
+   517→                outPoint: clip.outPoint.seconds,
+   518→                mediaPath: clip.projectItem ? clip.projectItem.getMediaPath() : null
+   519→            });
+   520→        }
+   521→    }
+   522→    return JSON.stringify(clips);
+   523→}
+   524→
+   525→function getClipsInTrack_Timings_Seconds(trackIndex, trackType) {
+   526→    var clips = [];
+   527→    if (trackType == "audio") {
+   528→        for (var i = 0; i < app.project.activeSequence.audioTracks[trackIndex].clips.numItems; i++) {
+   529→            clips.push([
+   530→                app.project.activeSequence.audioTracks[trackIndex].clips[i].start.seconds,
+   531→                app.project.activeSequence.audioTracks[trackIndex].clips[i].end.seconds
+   532→            ]);
+   533→        }
+   534→    } else if (trackType == "video") {
+   535→        for (var i = 0; i < app.project.activeSequence.videoTracks[trackIndex].clips.numItems; i++) {
+   536→            clips.push([
+   537→                app.project.activeSequence.videoTracks[trackIndex].clips[i].start.seconds,
+   538→                app.project.activeSequence.videoTracks[trackIndex].clips[i].end.seconds
+   539→            ]);
+   540→        }
+   541→    }
+   542→    return JSON.stringify(clips);
+   543→}
+   544→
+   545→function deleteClipsAtSilencePointsInTrack(silences, trackType, trackIndex) {
+   546→    silences = JSON.parse(silences);
+   547→    var clips;
+   548→    if (trackType == "video") {
+   549→        clips = app.project.activeSequence.videoTracks[trackIndex].clips;
+   550→    } else if (trackType == "audio") {
+   551→        clips = app.project.activeSequence.audioTracks[trackIndex].clips;
+   552→    }
+   553→
+   554→    var deleted = 0;
+   555→    for (var i = clips.length - 1; i >= 0; i--) {
+   556→        var clip = clips[i];
+   557→        var start = clip.start.seconds;
+   558→        var end = clip.end.seconds;
+   559→        var center = (start + end) / 2;
+   560→
+   561→        for (var j = 0; j < silences.length; j++) {
+   562→            var silence = silences[j];
+   563→            var silenceCenter = (silence[0] + silence[1]) / 2;
+   564→            if (silenceCenter > start && silenceCenter < end) {
+   565→                clip.remove(false, false);
+   566→                deleted++;
+   567→                break;
+   568→            }
+   569→        }
+   570→    }
+   571→    return JSON.stringify({ deleted: deleted });
+   572→}
+   573→
+   574→function makeRemainingClipsContiguousInTrack(silences, deltas, trackType, trackIndex) {
+   575→    silences = JSON.parse(silences);
+   576→    deltas = JSON.parse(deltas);
+   577→
+   578→    var clips;
+   579→    if (trackType == "video") {
+   580→        clips = app.project.activeSequence.videoTracks[trackIndex].clips;
+   581→    } else if (trackType == "audio") {
+   582→        clips = app.project.activeSequence.audioTracks[trackIndex].clips;
+   583→    }
+   584→
+   585→    for (var i = 0; i < clips.length; i++) {
+   586→        var clip = clips[i];
+   587→        var end = clip.end.seconds;
+   588→        var num_silences = -1;
+   589→
+   590→        for (var j = 0; j < silences.length; j++) {
+   591→            if (end > silences[j][1]) {
+   592→                num_silences++;
+   593→            }
+   594→        }
+   595→
+   596→        if (num_silences > -1 && num_silences < deltas.length) {
+   597→            var delta = deltas[num_silences];
+   598→            var t_start = clip.start;
+   599→            t_start.seconds = t_start.seconds - delta;
+   600→            clip.start = t_start;
+   601→            var t_end = clip.end;
+   602→            t_end.seconds = t_end.seconds - delta;
+   603→            clip.end = t_end;
+   604→        }
+   605→    }
+   606→    return JSON.stringify({ success: true });
+   607→}
+   608→
+   609→function removeClipByIndex(trackType, trackIndex, clipIndex) {
+   610→    try {
+   611→        if (trackType == "video") {
+   612→            app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex].remove(false, false);
+   613→        } else if (trackType == "audio") {
+   614→            app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex].remove(false, false);
+   615→        }
+   616→        return JSON.stringify({ success: true });
+   617→    } catch (e) {
+   618→        return JSON.stringify({ error: e.message });
+   619→    }
+   620→}
+   621→
+   622→function setClipInOutPoints(trackType, trackIndex, clipIndex, inPoint, outPoint) {
+   623→    try {
+   624→        var clip;
+   625→        if (trackType == "video") {
+   626→            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+   627→        } else if (trackType == "audio") {
+   628→            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+   629→        }
+   630→
+   631→        if (inPoint !== null) {
+   632→            var inTime = new Time();
+   633→            inTime.seconds = inPoint;
+   634→            clip.inPoint = inTime;
+   635→        }
+   636→        if (outPoint !== null) {
+   637→            var outTime = new Time();
+   638→            outTime.seconds = outPoint;
+   639→            clip.outPoint = outTime;
+   640→        }
+   641→        return JSON.stringify({ success: true });
+   642→    } catch (e) {
+   643→        return JSON.stringify({ error: e.message });
+   644→    }
+   645→}
+   646→
+   647→function setClipStartEnd(trackType, trackIndex, clipIndex, startSeconds, endSeconds) {
+   648→    try {
+   649→        var clip;
+   650→        if (trackType == "video") {
+   651→            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+   652→        } else if (trackType == "audio") {
+   653→            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+   654→        }
+   655→
+   656→        if (startSeconds !== null) {
+   657→            var startTime = clip.start;
+   658→            startTime.seconds = startSeconds;
+   659→            clip.start = startTime;
+   660→        }
+   661→        if (endSeconds !== null) {
+   662→            var endTime = clip.end;
+   663→            endTime.seconds = endSeconds;
+   664→            clip.end = endTime;
+   665→        }
+   666→        return JSON.stringify({ success: true });
+   667→    } catch (e) {
+   668→        return JSON.stringify({ error: e.message });
+   669→    }
+   670→}
+   671→
+   672→// ============================================================================
+   673→// TRACK OPERATIONS
+   674→// ============================================================================
+   675→
+   676→function getTrackNames(trackType) {
+   677→    if (!isQEAvailable() && !enableQE()) {
+   678→        // Fallback: use standard DOM
+   679→        var ret = [];
+   680→        try {
+   681→            if (trackType == "video") {
+   682→                for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+   683→                    ret.push("V" + (i + 1));
+   684→                }
+   685→            } else if (trackType == "audio") {
+   686→                for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+   687→                    ret.push("A" + (i + 1));
+   688→                }
+   689→            }
+   690→        } catch (e) {
+   691→            return JSON.stringify({ error: "Failed to get track names: " + e.message });
+   692→        }
+   693→        return JSON.stringify(ret);
+   694→    }
+   695→
+   696→    try {
+   697→        var ret = [];
+   698→        if (trackType == "video") {
+   699→            for (var i = 0; i < qe.project.getActiveSequence().numVideoTracks; i++) {
+   700→                ret.push(qe.project.getActiveSequence().getVideoTrackAt(i).name);
+   701→            }
+   702→        } else if (trackType == "audio") {
+   703→            for (var i = 0; i < qe.project.getActiveSequence().numAudioTracks; i++) {
+   704→                ret.push(qe.project.getActiveSequence().getAudioTrackAt(i).name);
+   705→            }
+   706→        }
+   707→        return JSON.stringify(ret);
+   708→    } catch (e) {
+   709→        return JSON.stringify({ error: "Failed to get track names: " + e.message });
+   710→    }
+   711→}
+   712→
+   713→function getNumTracks(trackType) {
+   714→    try {
+   715→        if (trackType == "video") {
+   716→            return app.project.activeSequence.videoTracks.numTracks;
+   717→        } else if (trackType == "audio") {
+   718→            return app.project.activeSequence.audioTracks.numTracks;
+   719→        }
+   720→        return 0;
+   721→    } catch (e) {
+   722→        return JSON.stringify({ error: "Failed to get track count: " + e.message });
+   723→    }
+   724→}
+   725→
+   726→function addVideoTrack() {
+   727→    if (!isQEAvailable() && !enableQE()) {
+   728→        return JSON.stringify({ error: "QE not available for adding tracks" });
+   729→    }
+   730→    try {
+   731→        var trackId = qe.project.getActiveSequence().numVideoTracks;
+   732→        qe.project.getActiveSequence().addTracks(1, trackId, 0, 0);
+   733→        return JSON.stringify({ success: true, trackId: trackId });
+   734→    } catch (e) {
+   735→        return JSON.stringify({ error: "Failed to add video track: " + e.message });
+   736→    }
+   737→}
+   738→
+   739→function addAudioTrack() {
+   740→    if (!isQEAvailable() && !enableQE()) {
+   741→        return JSON.stringify({ error: "QE not available for adding tracks" });
+   742→    }
+   743→    try {
+   744→        var trackId = qe.project.getActiveSequence().numAudioTracks;
+   745→        qe.project.getActiveSequence().addTracks(0, 0, 1, 1, trackId);
+   746→        return JSON.stringify({ success: true, trackId: trackId });
+   747→    } catch (e) {
+   748→        return JSON.stringify({ error: "Failed to add audio track: " + e.message });
+   749→    }
+   750→}
+   751→
+   752→function removeVideoTrack(trackIndex) {
+   753→    if (!isQEAvailable() && !enableQE()) {
+   754→        return JSON.stringify({ error: "QE not available for removing tracks" });
+   755→    }
+   756→    try {
+   757→        qe.project.getActiveSequence().removeVideoTrack(trackIndex);
+   758→        return JSON.stringify({ success: true });
+   759→    } catch (e) {
+   760→        return JSON.stringify({ error: "Failed to remove video track: " + e.message });
+   761→    }
+   762→}
+   763→
+   764→function removeAudioTrack(trackIndex) {
+   765→    if (!isQEAvailable() && !enableQE()) {
+   766→        return JSON.stringify({ error: "QE not available for removing tracks" });
+   767→    }
+   768→    try {
+   769→        qe.project.getActiveSequence().removeAudioTrack(trackIndex);
+   770→        return JSON.stringify({ success: true });
+   771→    } catch (e) {
+   772→        return JSON.stringify({ error: "Failed to remove audio track: " + e.message });
+   773→    }
+   774→}
+   775→
+   776→// ============================================================================
+   777→// MUTE STATE
+   778→// ============================================================================
+   779→
+   780→function getMuteState() {
+   781→    var mute_state_video = [];
+   782→    for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+   783→        mute_state_video.push(app.project.activeSequence.videoTracks[i].isMuted());
+   784→    }
+   785→    var mute_state_audio = [];
+   786→    for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+   787→        mute_state_audio.push(app.project.activeSequence.audioTracks[i].isMuted());
+   788→    }
+   789→    return JSON.stringify({ audio: mute_state_audio, video: mute_state_video });
+   790→}
+   791→
+   792→function setMuteState(mute_state) {
+   793→    mute_state = JSON.parse(mute_state);
+   794→    for (var i = 0; i < app.project.activeSequence.videoTracks.numTracks; i++) {
+   795→        if (i < mute_state.video.length) {
+   796→            app.project.activeSequence.videoTracks[i].setMute(mute_state.video[i]);
+   797→        }
+   798→    }
+   799→    for (var i = 0; i < app.project.activeSequence.audioTracks.numTracks; i++) {
+   800→        if (i < mute_state.audio.length) {
+   801→            app.project.activeSequence.audioTracks[i].setMute(mute_state.audio[i]);
+   802→        }
+   803→    }
+   804→    return true;
+   805→}
+   806→
+   807→// ============================================================================
+   808→// PROJECT ITEM OPERATIONS
+   809→// ============================================================================
+   810→
+   811→function findItemByName(bin, name) {
+   812→    for (var i = 0; i < bin.children.numItems; i++) {
+   813→        if (bin.children[i].name === name) {
+   814→            return bin.children[i];
+   815→        }
+   816→        if (bin.children[i].children !== undefined) {
+   817→            var item = findItemByName(bin.children[i], name);
+   818→            if (item) return item;
+   819→        }
+   820→    }
+   821→    return null;
+   822→}
+   823→
+   824→function findItemByPath(bin, path) {
+   825→    for (var i = 0; i < bin.children.numItems; i++) {
+   826→        var item = bin.children[i];
+   827→        if (item.getMediaPath && item.getMediaPath() === path) {
+   828→            return item;
+   829→        }
+   830→        if (item.children !== undefined) {
+   831→            var found = findItemByPath(item, path);
+   832→            if (found) return found;
+   833→        }
+   834→    }
+   835→    return null;
+   836→}
+   837→
+   838→function importFile(filePath) {
+   839→    try {
+   840→        var success = app.project.importFiles([filePath], true, app.project.rootItem, false);
+   841→        if (success) {
+   842→            // Find the imported item
+   843→            var item = findItemByPath(app.project.rootItem, filePath);
+   844→            return JSON.stringify({
+   845→                success: true,
+   846→                nodeId: item ? item.nodeId : null
+   847→            });
+   848→        }
+   849→        return JSON.stringify({ error: "Import failed" });
+   850→    } catch (e) {
+   851→        return JSON.stringify({ error: e.message });
+   852→    }
+   853→}
+   854→
+   855→function getSpliceBin() {
+   856→    var rootItemChildren = app.project.rootItem.children;
+   857→    var spliceBin = null;
+   858→
+   859→    for (var i = 0; i < rootItemChildren.numItems; i++) {
+   860→        if (rootItemChildren[i].name === "SPLICE" && rootItemChildren[i].type === 2) {
+   861→            spliceBin = rootItemChildren[i];
+   862→            break;
+   863→        }
+   864→    }
+   865→
+   866→    if (!spliceBin) {
+   867→        app.project.rootItem.createBin("SPLICE");
+   868→        return getSpliceBin();
+   869→    }
+   870→
+   871→    return spliceBin;
+   872→}
+   873→
+   874→function getAllProjectItems() {
+   875→    var items = [];
+   876→
+   877→    function collectItems(bin, path) {
+   878→        for (var i = 0; i < bin.children.numItems; i++) {
+   879→            var item = bin.children[i];
+   880→            var itemPath = path + "/" + item.name;
+   881→
+   882→            items.push({
+   883→                nodeId: item.nodeId,
+   884→                name: item.name,
+   885→                type: item.type,
+   886→                treePath: itemPath,
+   887→                mediaPath: item.getMediaPath ? item.getMediaPath() : null
+   888→            });
+   889→
+   890→            if (item.children !== undefined && item.type === 2) {
+   891→                collectItems(item, itemPath);
+   892→            }
+   893→        }
+   894→    }
+   895→
+   896→    collectItems(app.project.rootItem, "");
+   897→    return JSON.stringify(items);
+   898→}
+   899→
+   900→// ============================================================================
+   901→// CLIP INSERTION
+   902→// ============================================================================
+   903→
+   904→function insertClipAtTime(projectItemNodeId, trackIndex, startSeconds, trackType) {
+   905→    try {
+   906→        var item = findItemByNodeId(app.project.rootItem, projectItemNodeId);
+   907→        if (!item) {
+   908→            return JSON.stringify({ error: "Project item not found" });
+   909→        }
+   910→
+   911→        var targetTime = new Time();
+   912→        targetTime.seconds = startSeconds;
+   913→
+   914→        if (trackType === "video") {
+   915→            app.project.activeSequence.videoTracks[trackIndex].insertClip(item, targetTime);
+   916→        } else if (trackType === "audio") {
+   917→            app.project.activeSequence.audioTracks[trackIndex].insertClip(item, targetTime);
+   918→        }
+   919→
+   920→        return JSON.stringify({ success: true });
+   921→    } catch (e) {
+   922→        return JSON.stringify({ error: e.message });
+   923→    }
+   924→}
+   925→
+   926→function findItemByNodeId(bin, nodeId) {
+   927→    for (var i = 0; i < bin.children.numItems; i++) {
+   928→        if (bin.children[i].nodeId === nodeId) {
+   929→            return bin.children[i];
+   930→        }
+   931→        if (bin.children[i].children !== undefined) {
+   932→            var found = findItemByNodeId(bin.children[i], nodeId);
+   933→            if (found) return found;
+   934→        }
+   935→    }
+   936→    return null;
+   937→}
+   938→
+   939→// ============================================================================
+   940→// MARKER OPERATIONS
+   941→// ============================================================================
+   942→
+   943→function createMarker(timeSeconds, name, duration, comments, colorIndex) {
+   944→    try {
+   945→        var seq = app.project.activeSequence;
+   946→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+   947→
+   948→        var markers = seq.markers;
+   949→        var marker = markers.createMarker(timeSeconds);
+   950→
+   951→        if (name) marker.name = name;
+   952→        if (comments) marker.comments = comments;
+   953→        if (colorIndex !== undefined) marker.setColorByIndex(colorIndex);
+   954→        if (duration && duration > 0) {
+   955→            // Set marker end time properly using a Time object
+   956→            var endTime = new Time();
+   957→            endTime.seconds = marker.start.seconds + duration;
+   958→            marker.end = endTime;
+   959→        }
+   960→
+   961→        return JSON.stringify({
+   962→            success: true,
+   963→            guid: marker.guid
+   964→        });
+   965→    } catch (e) {
+   966→        return JSON.stringify({ error: e.message });
+   967→    }
+   968→}
+   969→
+   970→function getMarkers() {
+   971→    try {
+   972→        var seq = app.project.activeSequence;
+   973→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+   974→
+   975→        var markers = seq.markers;
+   976→        var result = [];
+   977→
+   978→        for (var i = 0; i < markers.numMarkers; i++) {
+   979→            var marker = markers[i];
+   980→            result.push({
+   981→                guid: marker.guid,
+   982→                name: marker.name,
+   983→                comments: marker.comments,
+   984→                start: marker.start.seconds,
+   985→                end: marker.end.seconds,
+   986→                type: marker.type
+   987→            });
+   988→        }
+   989→
+   990→        return JSON.stringify(result);
+   991→    } catch (e) {
+   992→        return JSON.stringify({ error: e.message });
+   993→    }
+   994→}
+   995→
+   996→function deleteMarker(markerGuid) {
+   997→    try {
+   998→        var seq = app.project.activeSequence;
+   999→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1000→
+  1001→        var markers = seq.markers;
+  1002→        for (var i = 0; i < markers.numMarkers; i++) {
+  1003→            if (markers[i].guid === markerGuid) {
+  1004→                markers[i].remove();
+  1005→                return JSON.stringify({ success: true });
+  1006→            }
+  1007→        }
+  1008→        return JSON.stringify({ error: "Marker not found" });
+  1009→    } catch (e) {
+  1010→        return JSON.stringify({ error: e.message });
+  1011→    }
+  1012→}
+  1013→
+  1014→function deleteAllMarkers() {
+  1015→    try {
+  1016→        var seq = app.project.activeSequence;
+  1017→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1018→
+  1019→        var markers = seq.markers;
+  1020→        var count = markers.numMarkers;
+  1021→
+  1022→        // Delete from end to beginning to avoid index shifting
+  1023→        for (var i = count - 1; i >= 0; i--) {
+  1024→            markers[i].remove();
+  1025→        }
+  1026→
+  1027→        return JSON.stringify({ success: true, deleted: count });
+  1028→    } catch (e) {
+  1029→        return JSON.stringify({ error: e.message });
+  1030→    }
+  1031→}
+  1032→
+  1033→function deleteMarkersByName(namePattern) {
+  1034→    try {
+  1035→        var seq = app.project.activeSequence;
+  1036→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1037→
+  1038→        var markers = seq.markers;
+  1039→        var deleted = 0;
+  1040→
+  1041→        for (var i = markers.numMarkers - 1; i >= 0; i--) {
+  1042→            if (markers[i].name && markers[i].name.indexOf(namePattern) !== -1) {
+  1043→                markers[i].remove();
+  1044→                deleted++;
+  1045→            }
+  1046→        }
+  1047→
+  1048→        return JSON.stringify({ success: true, deleted: deleted });
+  1049→    } catch (e) {
+  1050→        return JSON.stringify({ error: e.message });
+  1051→    }
+  1052→}
+  1053→
+  1054→// ============================================================================
+  1055→// COLOR LABEL OPERATIONS
+  1056→// ============================================================================
+  1057→
+  1058→function setClipColorLabel(trackType, trackIndex, clipIndex, colorIndex) {
+  1059→    try {
+  1060→        var clip;
+  1061→        if (trackType == "video") {
+  1062→            clip = app.project.activeSequence.videoTracks[trackIndex].clips[clipIndex];
+  1063→        } else if (trackType == "audio") {
+  1064→            clip = app.project.activeSequence.audioTracks[trackIndex].clips[clipIndex];
+  1065→        }
+  1066→
+  1067→        if (clip && clip.projectItem) {
+  1068→            clip.projectItem.setColorLabel(colorIndex);
+  1069→        }
+  1070→        return JSON.stringify({ success: true });
+  1071→    } catch (e) {
+  1072→        return JSON.stringify({ error: e.message });
+  1073→    }
+  1074→}
+  1075→
+  1076→function setProjectItemColorLabel(nodeId, colorIndex) {
+  1077→    try {
+  1078→        var item = findItemByNodeId(app.project.rootItem, nodeId);
+  1079→        if (item) {
+  1080→            item.setColorLabel(colorIndex);
+  1081→            return JSON.stringify({ success: true });
+  1082→        }
+  1083→        return JSON.stringify({ error: "Item not found" });
+  1084→    } catch (e) {
+  1085→        return JSON.stringify({ error: e.message });
+  1086→    }
+  1087→}
+  1088→
+  1089→// ============================================================================
+  1090→// SEQUENCE BUILDING (CORE v3.5 FUNCTIONALITY)
+  1091→// ============================================================================
+  1092→
+  1093→function buildSequenceFromCutList(cutListJson) {
+  1094→    try {
+  1095→        var cutList = JSON.parse(cutListJson);
+  1096→        var seq = app.project.activeSequence;
+  1097→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1098→
+  1099→        // Clone the sequence
+  1100→        var newSequenceName = seq.name + "_SPLICE";
+  1101→        seq.clone();
+  1102→
+  1103→        // Find the cloned sequence
+  1104→        var newSeq = null;
+  1105→        for (var i = app.project.sequences.numSequences - 1; i >= 0; i--) {
+  1106→            var s = app.project.sequences[i];
+  1107→            if (s.name.indexOf(seq.name) === 0 && s.sequenceID !== seq.sequenceID) {
+  1108→                newSeq = s;
+  1109→                break;
+  1110→            }
+  1111→        }
+  1112→
+  1113→        if (!newSeq) {
+  1114→            return JSON.stringify({ error: "Failed to clone sequence" });
+  1115→        }
+  1116→
+  1117→        newSeq.name = newSequenceName;
+  1118→        app.project.activeSequence = newSeq;
+  1119→
+  1120→        // Clear all clips from the new sequence
+  1121→        clearSequence();
+  1122→
+  1123→        // Insert segments
+  1124→        var currentPosition = 0;
+  1125→        var stats = {
+  1126→            segmentsInserted: 0,
+  1127→            totalDuration: 0
+  1128→        };
+  1129→
+  1130→        for (var i = 0; i < cutList.segments.length; i++) {
+  1131→            var segment = cutList.segments[i];
+  1132→
+  1133→            // Find the source project item
+  1134→            var sourceItem = null;
+  1135→            if (segment.sourcePath) {
+  1136→                sourceItem = findItemByPath(app.project.rootItem, segment.sourcePath);
+  1137→            }
+  1138→            if (!sourceItem && segment.sourceName) {
+  1139→                sourceItem = findItemByName(app.project.rootItem, segment.sourceName);
+  1140→            }
+  1141→
+  1142→            if (!sourceItem) continue;
+  1143→
+  1144→            // Set color label
+  1145→            if (segment.colorHint && SEGMENT_COLORS[segment.colorHint]) {
+  1146→                sourceItem.setColorLabel(SEGMENT_COLORS[segment.colorHint]);
+  1147→            } else if (segment.type && SEGMENT_COLORS[segment.type]) {
+  1148→                sourceItem.setColorLabel(SEGMENT_COLORS[segment.type]);
+  1149→            }
+  1150→
+  1151→            // Insert clip at current position
+  1152→            var targetTime = new Time();
+  1153→            targetTime.seconds = currentPosition;
+  1154→
+  1155→            newSeq.videoTracks[0].insertClip(sourceItem, targetTime);
+  1156→
+  1157→            // Set in/out points
+  1158→            var clipDuration = segment.outPoint - segment.inPoint;
+  1159→            var videoClips = newSeq.videoTracks[0].clips;
+  1160→            var insertedClip = videoClips[videoClips.numItems - 1];
+  1161→
+  1162→            if (insertedClip) {
+  1163→                var inTime = new Time();
+  1164→                inTime.seconds = segment.inPoint;
+  1165→                insertedClip.inPoint = inTime;
+  1166→
+  1167→                var outTime = new Time();
+  1168→                outTime.seconds = segment.outPoint;
+  1169→                insertedClip.outPoint = outTime;
+  1170→
+  1171→                // Set clip name if takeLabel provided
+  1172→                if (segment.takeLabel) {
+  1173→                    insertedClip.name = segment.takeLabel;
+  1174→                }
+  1175→            }
+  1176→
+  1177→            currentPosition += clipDuration;
+  1178→            stats.segmentsInserted++;
+  1179→            stats.totalDuration += clipDuration;
+  1180→        }
+  1181→
+  1182→        return JSON.stringify({
+  1183→            success: true,
+  1184→            sequenceName: newSequenceName,
+  1185→            stats: stats
+  1186→        });
+  1187→    } catch (e) {
+  1188→        return JSON.stringify({ error: e.message });
+  1189→    }
+  1190→}
+  1191→
+  1192→function clearSequence() {
+  1193→    var seq = app.project.activeSequence;
+  1194→    if (!seq) return false;
+  1195→
+  1196→    // Remove all video clips
+  1197→    for (var t = 0; t < seq.videoTracks.numTracks; t++) {
+  1198→        var clips = seq.videoTracks[t].clips;
+  1199→        for (var i = clips.numItems - 1; i >= 0; i--) {
+  1200→            clips[i].remove(false, false);
+  1201→        }
+  1202→    }
+  1203→
+  1204→    // Remove all audio clips
+  1205→    for (var t = 0; t < seq.audioTracks.numTracks; t++) {
+  1206→        var clips = seq.audioTracks[t].clips;
+  1207→        for (var i = clips.numItems - 1; i >= 0; i--) {
+  1208→            clips[i].remove(false, false);
+  1209→        }
+  1210→    }
+  1211→
+  1212→    return true;
+  1213→}
+  1214→
+  1215→// ============================================================================
+  1216→// WORK AREA
+  1217→// ============================================================================
+  1218→
+  1219→function getWorkArea() {
+  1220→    var seq = app.project.activeSequence;
+  1221→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1222→
+  1223→    return JSON.stringify({
+  1224→        inPoint: seq.getInPoint(),
+  1225→        outPoint: seq.getOutPoint()
+  1226→    });
+  1227→}
+  1228→
+  1229→function setWorkArea(inPoint, outPoint) {
+  1230→    var seq = app.project.activeSequence;
+  1231→    if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1232→
+  1233→    seq.setInPoint(inPoint);
+  1234→    seq.setOutPoint(outPoint);
+  1235→    return JSON.stringify({ success: true });
+  1236→}
+  1237→
+  1238→// ============================================================================
+  1239→// AUDIO EXPORT
+  1240→// ============================================================================
+  1241→
+  1242→function exportSequenceAudio(outputPath, inPoint, outPoint) {
+  1243→    try {
+  1244→        var seq = app.project.activeSequence;
+  1245→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1246→
+  1247→        // Use the AME (Adobe Media Encoder) for export
+  1248→        var encoder = app.encoder;
+  1249→        if (!encoder) {
+  1250→            return JSON.stringify({ error: "Media Encoder not available" });
+  1251→        }
+  1252→
+  1253→        // Create export preset for WAV
+  1254→        var presetPath = encoder.getDefaultPresetPath();
+  1255→
+  1256→        // Queue the export
+  1257→        encoder.encodeSequence(
+  1258→            seq,
+  1259→            outputPath,
+  1260→            presetPath,
+  1261→            0, // WorkAreaType: 0 = entire, 1 = work area
+  1262→            false // removeOnCompletion
+  1263→        );
+  1264→
+  1265→        return JSON.stringify({ success: true, outputPath: outputPath });
+  1266→    } catch (e) {
+  1267→        return JSON.stringify({ error: e.message });
+  1268→    }
+  1269→}
+  1270→
+  1271→/**
+  1272→ * Export sequence audio for SPLICE analysis
+  1273→ * Uses AME to export WAV audio to temp folder
+  1274→ * @returns {Object} { success, outputPath } or { error }
+  1275→ */
+  1276→function exportSequenceAudioForAnalysis() {
+  1277→    try {
+  1278→        var seq = app.project.activeSequence;
+  1279→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1280→
+  1281→        // Generate temp file path
+  1282→        var tempFolder = Folder.temp.fsName;
+  1283→        var timestamp = new Date().getTime();
+  1284→        var outputPath = tempFolder + "/splice_audio_" + timestamp + ".wav";
+  1285→
+  1286→        // Check if we have audio tracks with content
+  1287→        var hasAudio = false;
+  1288→        for (var i = 0; i < seq.audioTracks.numTracks; i++) {
+  1289→            if (seq.audioTracks[i].clips.numItems > 0) {
+  1290→                hasAudio = true;
+  1291→                break;
+  1292→            }
+  1293→        }
+  1294→
+  1295→        if (!hasAudio) {
+  1296→            return JSON.stringify({ error: "Sequence has no audio clips" });
+  1297→        }
+  1298→
+  1299→        // Use AME for export if available
+  1300→        if (app.encoder && app.encoder.encodeSequence) {
+  1301→            // Find audio-only preset or use default
+  1302→            var presetPath = null;
+  1303→            try {
+  1304→                // Try to find WAV preset in common locations
+  1305→                var presetFolders = [
+  1306→                    Folder.appData.fsName + "/Adobe/Common/AME/15.0/Presets",
+  1307→                    Folder.appData.fsName + "/Adobe/Common/AME/14.0/Presets",
+  1308→                    app.path + "/MediaIO/systempresets/58534430_4d756c74-6962697400000000/WAV 48kHz.epr"
+  1309→                ];
+  1310→
+  1311→                for (var i = 0; i < presetFolders.length; i++) {
+  1312→                    var presetFile = new File(presetFolders[i]);
+  1313→                    if (presetFile.exists) {
+  1314→                        presetPath = presetFile.fsName;
+  1315→                        break;
+  1316→                    }
+  1317→                }
+  1318→
+  1319→                // Fall back to default preset
+  1320→                if (!presetPath) {
+  1321→                    presetPath = app.encoder.getDefaultPresetPath();
+  1322→                }
+  1323→            } catch (e) {
+  1324→                presetPath = app.encoder.getDefaultPresetPath();
+  1325→            }
+  1326→
+  1327→            // Start the encode
+  1328→            var success = app.encoder.encodeSequence(
+  1329→                seq,
+  1330→                outputPath,
+  1331→                presetPath,
+  1332→                0, // WorkAreaType: 0 = entire sequence
+  1333→                false // removeOnCompletion
+  1334→            );
+  1335→
+  1336→            if (success) {
+  1337→                return JSON.stringify({ success: true, outputPath: outputPath, method: "ame" });
+  1338→            }
+  1339→        }
+  1340→
+  1341→        // Fallback: Try to get the source audio path from first clip
+  1342→        return getFirstClipAudioPath();
+  1343→
+  1344→    } catch (e) {
+  1345→        return JSON.stringify({ error: e.message });
+  1346→    }
+  1347→}
+  1348→
+  1349→/**
+  1350→ * Get the audio/video file path from the first clip in the timeline
+  1351→ * Used as fallback when AME export is not available
+  1352→ * @returns {Object} { success, path } or { error }
+  1353→ */
+  1354→function getFirstClipAudioPath() {
+  1355→    try {
+  1356→        var seq = app.project.activeSequence;
+  1357→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1358→
+  1359→        // First try audio tracks
+  1360→        for (var i = 0; i < seq.audioTracks.numTracks; i++) {
+  1361→            var track = seq.audioTracks[i];
+  1362→            if (track.clips.numItems > 0) {
+  1363→                var clip = track.clips[0];
+  1364→                if (clip.projectItem && clip.projectItem.getMediaPath) {
+  1365→                    var mediaPath = clip.projectItem.getMediaPath();
+  1366→                    if (mediaPath && mediaPath.length > 0) {
+  1367→                        return JSON.stringify({ success: true, path: mediaPath, method: "audio_track" });
+  1368→                    }
+  1369→                }
+  1370→            }
+  1371→        }
+  1372→
+  1373→        // Fall back to video tracks (which may have linked audio)
+  1374→        for (var i = 0; i < seq.videoTracks.numTracks; i++) {
+  1375→            var track = seq.videoTracks[i];
+  1376→            if (track.clips.numItems > 0) {
+  1377→                var clip = track.clips[0];
+  1378→                if (clip.projectItem && clip.projectItem.getMediaPath) {
+  1379→                    var mediaPath = clip.projectItem.getMediaPath();
+  1380→                    if (mediaPath && mediaPath.length > 0) {
+  1381→                        return JSON.stringify({ success: true, path: mediaPath, method: "video_track" });
+  1382→                    }
+  1383→                }
+  1384→            }
+  1385→        }
+  1386→
+  1387→        return JSON.stringify({ error: "No clips with media paths found in sequence" });
+  1388→    } catch (e) {
+  1389→        return JSON.stringify({ error: e.message });
+  1390→    }
+  1391→}
+  1392→
+  1393→// ============================================================================
+  1394→// UTILITY FUNCTIONS
+  1395→// ============================================================================
+  1396→
+  1397→function moveClipByNTracks(currentTrackId, clipStartTime, nTracksToMove, trackType) {
+  1398→    if (!isQEAvailable() && !enableQE()) {
+  1399→        return JSON.stringify({ error: "QE not available for moving clips between tracks" });
+  1400→    }
+  1401→
+  1402→    try {
+  1403→        var accuracy = 3;
+  1404→        var search_start_time = clipStartTime.toFixed(accuracy);
+  1405→
+  1406→        if (trackType == "audio") {
+  1407→            var numClipsInTrack = qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).numItems;
+  1408→            for (var j = 0; j < numClipsInTrack; j++) {
+  1409→                if (qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).getItemAt(j).start.secs.toFixed(accuracy) == search_start_time) {
+  1410→                    qe.project.getActiveSequence().getAudioTrackAt(currentTrackId).getItemAt(j).moveToTrack(0, nTracksToMove, "0");
+  1411→                    return JSON.stringify({ success: true });
+  1412→                }
+  1413→            }
+  1414→        } else if (trackType == "video") {
+  1415→            var numClipsInTrack = qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).numItems;
+  1416→            for (var j = 0; j < numClipsInTrack; j++) {
+  1417→                if (qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).getItemAt(j).start.secs.toFixed(accuracy) == search_start_time) {
+  1418→                    qe.project.getActiveSequence().getVideoTrackAt(currentTrackId).getItemAt(j).moveToTrack(nTracksToMove, 0, "0");
+  1419→                    return JSON.stringify({ success: true });
+  1420→                }
+  1421→            }
+  1422→        }
+  1423→        return JSON.stringify({ error: "Clip not found at specified time" });
+  1424→    } catch (e) {
+  1425→        return JSON.stringify({ error: "Move clip failed: " + e.message });
+  1426→    }
+  1427→}
+  1428→
+  1429→function linkIdenticalClipsInTracks(videoTrackIndex, audioTrackIndex) {
+  1430→    var selected_clips = app.project.activeSequence.getSelection();
+  1431→    for (var i = 0; i < selected_clips.length; i++) {
+  1432→        selected_clips[i].setSelected(false, false);
+  1433→    }
+  1434→
+  1435→    var video_clips = app.project.activeSequence.videoTracks[videoTrackIndex].clips;
+  1436→    var audio_clips = app.project.activeSequence.audioTracks[audioTrackIndex].clips;
+  1437→
+  1438→    for (var i = 0; i < video_clips.numItems; i++) {
+  1439→        var video_clip = video_clips[i];
+  1440→        var video_start = video_clip.start.seconds;
+  1441→
+  1442→        for (var j = 0; j < audio_clips.numItems; j++) {
+  1443→            var audio_clip = audio_clips[j];
+  1444→            var audio_start = audio_clip.start.seconds;
+  1445→
+  1446→            if (Math.abs(video_start - audio_start) < time_tolerance) {
+  1447→                video_clip.setSelected(true, false);
+  1448→                audio_clip.setSelected(true, false);
+  1449→                app.project.activeSequence.linkSelection();
+  1450→                video_clip.setSelected(false, false);
+  1451→                audio_clip.setSelected(false, false);
+  1452→                break;
+  1453→            }
+  1454→        }
+  1455→    }
+  1456→    return true;
+  1457→}
+  1458→
+  1459→// ============================================================================
+  1460→// ZOOM OPERATIONS (Phase 3)
+  1461→// ============================================================================
+  1462→
+  1463→function addZoomMarker(startSeconds, scale, duration, easing) {
+  1464→    try {
+  1465→        var name = "ZOOM: " + scale + "%";
+  1466→        var comments = "Duration: " + duration + "s | Easing: " + (easing || "ease-in-out");
+  1467→        return createMarker(startSeconds, name, duration, comments, COLOR_LABELS.YELLOW);
+  1468→    } catch (e) {
+  1469→        return JSON.stringify({ error: e.message });
+  1470→    }
+  1471→}
+  1472→
+  1473→// ============================================================================
+  1474→// CHAPTER OPERATIONS (Phase 3)
+  1475→// ============================================================================
+  1476→
+  1477→function addChapterMarker(timeSeconds, title, description) {
+  1478→    try {
+  1479→        var seq = app.project.activeSequence;
+  1480→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1481→
+  1482→        var markers = seq.markers;
+  1483→        var marker = markers.createMarker(timeSeconds);
+  1484→
+  1485→        marker.name = title;
+  1486→        if (description) marker.comments = description;
+  1487→        marker.setColorByIndex(COLOR_LABELS.BLUE);
+  1488→        marker.setTypeAsChapter();
+  1489→
+  1490→        return JSON.stringify({
+  1491→            success: true,
+  1492→            guid: marker.guid
+  1493→        });
+  1494→    } catch (e) {
+  1495→        return JSON.stringify({ error: e.message });
+  1496→    }
+  1497→}
+  1498→
+  1499→function getChapterMarkers() {
+  1500→    try {
+  1501→        var seq = app.project.activeSequence;
+  1502→        if (!seq) return JSON.stringify({ error: "No active sequence" });
+  1503→
+  1504→        var markers = seq.markers;
+  1505→        var chapters = [];
+  1506→
+  1507→        for (var i = 0; i < markers.numMarkers; i++) {
+  1508→            var marker = markers[i];
+  1509→            if (marker.type === "Chapter") {
+  1510→                chapters.push({
+  1511→                    guid: marker.guid,
+  1512→                    name: marker.name,
+  1513→                    comments: marker.comments,
+  1514→                    start: marker.start.seconds
+  1515→                });
+  1516→            }
+  1517→        }
+  1518→
+  1519→        return JSON.stringify(chapters);
+  1520→    } catch (e) {
+  1521→        return JSON.stringify({ error: e.message });
+  1522→    }
+  1523→}
+  1524→
+  1525→// ============================================================================
+  1526→// UNDO OPERATIONS
+  1527→// ============================================================================
+  1528→
+  1529→function undo() {
+  1530→    app.project.undo();
+  1531→    return true;
+  1532→}
+  1533→
+  1534→function redo() {
+  1535→    app.project.redo();
+  1536→    return true;
+  1537→}
+  1538→
+  1539→// ============================================================================
+  1540→// DEBUG / LOGGING
+  1541→// ============================================================================
+  1542→
+  1543→function log(message) {
+  1544→    $.writeln("[SPLICE] " + message);
+  1545→}
+  1546→
+  1547→function getDebugInfo() {
+  1548→    return JSON.stringify({
+  1549→        version: SPLICE_VERSION,
+  1550→        hasActiveSequence: app.project.activeSequence ? true : false,
+  1551→        sequenceName: app.project.activeSequence ? app.project.activeSequence.name : null,
+  1552→        numSequences: app.project.sequences.numSequences,
+  1553→        numProjectItems: app.project.rootItem.children.numItems
+  1554→    });
+  1555→}
+  1556→
+  1557→// Initialize on load
+  1558→initialise();
+  1559→
+
+</system-reminder>

@@ -1,0 +1,350 @@
+#!/usr/bin/env node
+/**
+ * GLM MCP Server Proxy
+ * Integrates GLM (ZhipuAI) models with Claude Code via MCP protocol
+ *
+ * This server acts as a bridge between Claude Code and the GLM API,
+ * allowing you to use GLM models through Claude Code's MCP system.
+ */
+
+const GLM_API_KEY = process.env.GLM_API_KEY || '79a58c7331504f3cbaef3f2f95cb375b.BrfNpV8TbeF5tCaK';
+const GLM_BASE_URL = 'https://api.z.ai/api/coding/paas/v4';
+
+// Available GLM models
+const GLM_MODELS = {
+  'glm-4': 'GLM-4 - Most capable model',
+  'glm-4-air': 'GLM-4-Air - Faster, cost-effective',
+  'glm-4-airx': 'GLM-4-AirX - Ultra-fast inference',
+  'glm-4-flash': 'GLM-4-Flash - Fastest response',
+  'glm-3-turbo': 'GLM-3-Turbo - Legacy model'
+};
+
+/**
+ * Simple MCP server implementation without external dependencies
+ */
+class SimpleMCPServer {
+  constructor() {
+    this.handlers = new Map();
+    this.buffer = '';
+  }
+
+  /**
+   * Set request handler for a method
+   */
+  setRequestHandler(method, handler) {
+    this.handlers.set(method, handler);
+  }
+
+  /**
+   * Handle incoming JSON-RPC message
+   */
+  async handleMessage(message) {
+    try {
+      const request = JSON.parse(message);
+      const handler = this.handlers.get(request.method);
+
+      if (!handler) {
+        return this.createError(request.id, -32601, `Method not found: ${request.method}`);
+      }
+
+      const result = await handler(request);
+      return this.createResponse(request.id, result);
+    } catch (error) {
+      console.error('Error handling message:', error);
+      return this.createError(null, -32603, error.message);
+    }
+  }
+
+  /**
+   * Create JSON-RPC response
+   */
+  createResponse(id, result) {
+    return JSON.stringify({
+      jsonrpc: '2.0',
+      id,
+      result
+    });
+  }
+
+  /**
+   * Create JSON-RPC error response
+   */
+  createError(id, code, message) {
+    return JSON.stringify({
+      jsonrpc: '2.0',
+      id,
+      error: { code, message }
+    });
+  }
+
+  /**
+   * Start listening on stdin
+   */
+  start() {
+    console.error('GLM MCP Server starting...');
+    console.error(`API Key configured: ${GLM_API_KEY.substring(0, 20)}...`);
+    console.error(`Available models: ${Object.keys(GLM_MODELS).join(', ')}`);
+
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', async (chunk) => {
+      this.buffer += chunk;
+      const lines = this.buffer.split('\n');
+      this.buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.trim()) {
+          const response = await this.handleMessage(line);
+          process.stdout.write(response + '\n');
+        }
+      }
+    });
+
+    process.stdin.on('end', () => {
+      console.error('GLM MCP Server shutting down...');
+      process.exit(0);
+    });
+
+    // Send initialization message
+    const initMessage = this.createResponse(null, {
+      protocolVersion: '1.0.0',
+      capabilities: {
+        tools: {},
+        prompts: {},
+        resources: {}
+      },
+      serverInfo: {
+        name: 'glm-proxy',
+        version: '1.0.0'
+      }
+    });
+    process.stdout.write(initMessage + '\n');
+  }
+}
+
+/**
+ * Call GLM API
+ */
+async function callGLM(model, messages, options = {}) {
+  try {
+    const response = await fetch(`${GLM_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GLM_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: model || 'glm-4',
+        messages: messages,
+        temperature: options.temperature || 0.7,
+        top_p: options.top_p || 0.9,
+        max_tokens: options.max_tokens || 2048,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.text();
+      throw new Error(`GLM API error: ${response.status} - ${errorData}`);
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error('Error calling GLM API:', error);
+    throw error;
+  }
+}
+
+/**
+ * Initialize and start the MCP server
+ */
+function main() {
+  const server = new SimpleMCPServer();
+
+  // Handle initialization
+  server.setRequestHandler('initialize', async (request) => {
+    return {
+      protocolVersion: '1.0.0',
+      capabilities: {
+        tools: {},
+        prompts: {},
+        resources: {}
+      },
+      serverInfo: {
+        name: 'glm-proxy',
+        version: '1.0.0'
+      }
+    };
+  });
+
+  // List available tools
+  server.setRequestHandler('tools/list', async () => {
+    return {
+      tools: [
+        {
+          name: 'glm_chat',
+          description: 'Chat with GLM models (glm-4, glm-4-air, glm-4-airx, glm-4-flash)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string',
+                description: 'The user prompt or question'
+              },
+              model: {
+                type: 'string',
+                description: 'GLM model to use',
+                enum: Object.keys(GLM_MODELS),
+                default: 'glm-4'
+              },
+              temperature: {
+                type: 'number',
+                description: 'Sampling temperature (0-1)',
+                default: 0.7
+              },
+              max_tokens: {
+                type: 'number',
+                description: 'Maximum tokens to generate',
+                default: 2048
+              }
+            },
+            required: ['prompt']
+          }
+        },
+        {
+          name: 'glm_list_models',
+          description: 'List available GLM models',
+          inputSchema: {
+            type: 'object',
+            properties: {}
+          }
+        }
+      ]
+    };
+  });
+
+  // Call tools
+  server.setRequestHandler('tools/call', async (request) => {
+    const { name, arguments: args } = request.params;
+
+    if (name === 'glm_chat') {
+      const { prompt, model = 'glm-4', temperature = 0.7, max_tokens = 2048 } = args;
+
+      const messages = [
+        { role: 'user', content: prompt }
+      ];
+
+      const response = await callGLM(model, messages, { temperature, max_tokens });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: response.choices[0].message.content
+          }
+        ],
+        isError: false
+      };
+    }
+
+    if (name === 'glm_list_models') {
+      const modelList = Object.entries(GLM_MODELS)
+        .map(([id, desc]) => `- **${id}**: ${desc}`)
+        .join('\n');
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Available GLM Models:\n\n${modelList}`
+          }
+        ],
+        isError: false
+      };
+    }
+
+    throw new Error(`Unknown tool: ${name}`);
+  });
+
+  // List available prompts
+  server.setRequestHandler('prompts/list', async () => {
+    return {
+      prompts: [
+        {
+          name: 'use_glm',
+          description: 'Template for using GLM models',
+          arguments: [
+            {
+              name: 'task',
+              description: 'The task to perform',
+              required: true
+            }
+          ]
+        }
+      ]
+    };
+  });
+
+  // Get prompt
+  server.setRequestHandler('prompts/get', async (request) => {
+    const { name, arguments: args } = request.params;
+
+    if (name === 'use_glm') {
+      return {
+        messages: [
+          {
+            role: 'user',
+            content: {
+              type: 'text',
+              text: `Please use the GLM model to: ${args.task}\n\nUse the glm_chat tool with an appropriate model selection.`
+            }
+          }
+        ]
+      };
+    }
+
+    throw new Error(`Unknown prompt: ${name}`);
+  });
+
+  // List resources
+  server.setRequestHandler('resources/list', async () => {
+    return {
+      resources: [
+        {
+          uri: 'glm://models',
+          name: 'GLM Models',
+          description: 'Available GLM models and their capabilities',
+          mimeType: 'text/plain'
+        }
+      ]
+    };
+  });
+
+  // Read resource
+  server.setRequestHandler('resources/read', async (request) => {
+    const { uri } = request.params;
+
+    if (uri === 'glm://models') {
+      const modelInfo = Object.entries(GLM_MODELS)
+        .map(([id, desc]) => `${id}: ${desc}`)
+        .join('\n');
+
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: 'text/plain',
+            text: `GLM Models:\n\n${modelInfo}\n\nAPI Endpoint: ${GLM_BASE_URL}\nAPI Key: ${GLM_API_KEY.substring(0, 20)}...`
+          }
+        ]
+      };
+    }
+
+    throw new Error(`Unknown resource: ${uri}`);
+  });
+
+  server.start();
+}
+
+// Run the server
+main();

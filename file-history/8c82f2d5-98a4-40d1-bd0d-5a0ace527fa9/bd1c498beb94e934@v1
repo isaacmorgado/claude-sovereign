@@ -1,0 +1,337 @@
+/**
+ * Circuit Breaker Pattern Implementation
+ * 
+ * Prevents cascading failures when external services are degraded or unavailable.
+ * 
+ * States:
+ * - CLOSED: Normal operation, requests pass through
+ * - OPEN: Service failing, requests rejected immediately
+ * - HALF_OPEN: Testing if service recovered, limited requests allowed
+ * 
+ * @class CircuitBreaker
+ */
+
+const EventEmitter = require('events');
+
+const CircuitState = {
+  CLOSED: 'CLOSED',
+  OPEN: 'OPEN',
+  HALF_OPEN: 'HALF_OPEN'
+};
+
+class CircuitBreaker extends EventEmitter {
+  /**
+   * Create a circuit breaker
+   * @param {Object} options - Configuration options
+   * @param {string} options.name - Circuit breaker name (for logging/metrics)
+   * @param {number} options.failureThreshold - Failure rate (0-1) that triggers OPEN state
+   * @param {number} options.successThreshold - Success count in HALF_OPEN to transition to CLOSED
+   * @param {number} options.timeout - Request timeout in milliseconds
+   * @param {number} options.resetTimeout - Time in milliseconds before attempting HALF_OPEN
+   * @param {number} options.volumeThreshold - Minimum requests before calculating failure rate
+   * @param {number} options.rollingWindowSize - Number of recent requests to track
+   */
+  constructor(options) {
+    super();
+    
+    this.name = options.name || 'unnamed';
+    this.failureThreshold = options.failureThreshold || 0.5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 30000;
+    this.resetTimeout = options.resetTimeout || 60000;
+    this.volumeThreshold = options.volumeThreshold || 10;
+    this.rollingWindowSize = options.rollingWindowSize || 100;
+    
+    this.state = CircuitState.CLOSED;
+    this.failures = 0;
+    this.successes = 0;
+    this.consecutiveSuccesses = 0;
+    this.consecutiveFailures = 0;
+    this.lastFailureTime = null;
+    this.lastStateChange = Date.now();
+    this.nextAttempt = Date.now();
+    
+    // Rolling window for tracking recent results
+    this.window = [];
+    
+    // Metrics
+    this.metrics = {
+      totalRequests: 0,
+      totalSuccesses: 0,
+      totalFailures: 0,
+      totalTimeouts: 0,
+      totalRejected: 0,
+      lastFailure: null,
+      lastSuccess: null
+    };
+  }
+
+  /**
+   * Execute a function with circuit breaker protection
+   * @param {Function} fn - Async function to execute
+   * @param {*} fallback - Fallback value/function if circuit is OPEN
+   * @returns {Promise<*>} Result of function or fallback
+   */
+  async execute(fn, fallback = null) {
+    this.metrics.totalRequests++;
+
+    // Check if circuit is OPEN
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() < this.nextAttempt) {
+        this.metrics.totalRejected++;
+        this.emit('rejected', {
+          name: this.name,
+          state: this.state
+        });
+        return this._handleFallback(fallback, new Error(`Circuit breaker ${this.name} is OPEN`));
+      }
+      
+      // Transition to HALF_OPEN to test recovery
+      this._changeState(CircuitState.HALF_OPEN);
+    }
+
+    // Execute the function with timeout
+    try {
+      const result = await this._executeWithTimeout(fn);
+      this._onSuccess();
+      return result;
+    } catch (error) {
+      this._onFailure(error);
+      return this._handleFallback(fallback, error);
+    }
+  }
+
+  /**
+   * Execute function with timeout
+   * @private
+   */
+  async _executeWithTimeout(fn) {
+    return Promise.race([
+      fn(),
+      new Promise((_, reject) => 
+        setTimeout(() => {
+          this.metrics.totalTimeouts++;
+          reject(new Error(`Request timeout after ${this.timeout}ms`));
+        }, this.timeout)
+      )
+    ]);
+  }
+
+  /**
+   * Handle successful execution
+   * @private
+   */
+  _onSuccess() {
+    this.successes++;
+    this.consecutiveSuccesses++;
+    this.consecutiveFailures = 0;
+    this.metrics.totalSuccesses++;
+    this.metrics.lastSuccess = Date.now();
+    
+    this._recordResult(true);
+    
+    this.emit('success', {
+      name: this.name,
+      state: this.state,
+      consecutiveSuccesses: this.consecutiveSuccesses
+    });
+
+    // Transition from HALF_OPEN to CLOSED after enough successes
+    if (this.state === CircuitState.HALF_OPEN && 
+        this.consecutiveSuccesses >= this.successThreshold) {
+      this._changeState(CircuitState.CLOSED);
+    }
+  }
+
+  /**
+   * Handle failed execution
+   * @private
+   */
+  _onFailure(error) {
+    this.failures++;
+    this.consecutiveFailures++;
+    this.consecutiveSuccesses = 0;
+    this.lastFailureTime = Date.now();
+    this.metrics.totalFailures++;
+    this.metrics.lastFailure = {
+      time: Date.now(),
+      error: error.message
+    };
+    
+    this._recordResult(false);
+    
+    this.emit('failure', {
+      name: this.name,
+      state: this.state,
+      error: error.message,
+      consecutiveFailures: this.consecutiveFailures
+    });
+
+    // Check if we should open the circuit
+    if (this._shouldTrip()) {
+      this._changeState(CircuitState.OPEN);
+    }
+  }
+
+  /**
+   * Record result in rolling window
+   * @private
+   */
+  _recordResult(success) {
+    this.window.push({
+      success,
+      timestamp: Date.now()
+    });
+    
+    // Maintain window size
+    if (this.window.length > this.rollingWindowSize) {
+      this.window.shift();
+    }
+  }
+
+  /**
+   * Check if circuit should trip to OPEN state
+   * @private
+   */
+  _shouldTrip() {
+    // Need minimum volume of requests
+    if (this.window.length < this.volumeThreshold) {
+      return false;
+    }
+
+    // Calculate failure rate from rolling window
+    const failures = this.window.filter(r => !r.success).length;
+    const failureRate = failures / this.window.length;
+
+    return failureRate >= this.failureThreshold;
+  }
+
+  /**
+   * Change circuit breaker state
+   * @private
+   */
+  _changeState(newState) {
+    const oldState = this.state;
+    
+    if (oldState === newState) {
+      return;
+    }
+
+    this.state = newState;
+    this.lastStateChange = Date.now();
+
+    if (newState === CircuitState.OPEN) {
+      this.nextAttempt = Date.now() + this.resetTimeout;
+      
+      this.emit('open', {
+        name: this.name,
+        failures: this.failures,
+        successes: this.successes,
+        nextAttempt: this.nextAttempt
+      });
+    } else if (newState === CircuitState.HALF_OPEN) {
+      this.consecutiveSuccesses = 0;
+      this.consecutiveFailures = 0;
+      
+      this.emit('halfOpen', {
+        name: this.name
+      });
+    } else if (newState === CircuitState.CLOSED) {
+      this.failures = 0;
+      this.successes = 0;
+      this.consecutiveSuccesses = 0;
+      this.consecutiveFailures = 0;
+      
+      this.emit('closed', {
+        name: this.name
+      });
+    }
+
+    this.emit('stateChange', {
+      name: this.name,
+      from: oldState,
+      to: newState,
+      timestamp: this.lastStateChange
+    });
+  }
+
+  /**
+   * Handle fallback when circuit is OPEN or request fails
+   * @private
+   */
+  async _handleFallback(fallback, error) {
+    if (fallback === null) {
+      throw error;
+    }
+
+    if (typeof fallback === 'function') {
+      try {
+        return await fallback(error);
+      } catch (_fallbackError) {
+        throw error; // Throw original error if fallback fails
+      }
+    }
+
+    return fallback;
+  }
+
+  /**
+   * Get current circuit breaker state
+   * @returns {string} Current state
+   */
+  getState() {
+    return this.state;
+  }
+
+  /**
+   * Get circuit breaker metrics
+   * @returns {Object} Metrics object
+   */
+  getMetrics() {
+    const windowFailures = this.window.filter(r => !r.success).length;
+    const currentFailureRate = this.window.length > 0 
+      ? windowFailures / this.window.length 
+      : 0;
+
+    return {
+      name: this.name,
+      state: this.state,
+      failures: this.failures,
+      successes: this.successes,
+      consecutiveFailures: this.consecutiveFailures,
+      consecutiveSuccesses: this.consecutiveSuccesses,
+      currentFailureRate: currentFailureRate,
+      windowSize: this.window.length,
+      lastStateChange: this.lastStateChange,
+      nextAttempt: this.state === CircuitState.OPEN ? this.nextAttempt : null,
+      ...this.metrics
+    };
+  }
+
+  /**
+   * Manually reset circuit breaker to CLOSED state
+   * Use with caution - typically for testing or emergency recovery
+   */
+  reset() {
+    this.window = [];
+    this.failures = 0;
+    this.successes = 0;
+    this.consecutiveFailures = 0;
+    this.consecutiveSuccesses = 0;
+    this._changeState(CircuitState.CLOSED);
+    
+    this.emit('reset', {
+      name: this.name
+    });
+  }
+
+  /**
+   * Check if circuit breaker is healthy
+   * @returns {boolean} True if CLOSED or HALF_OPEN, false if OPEN
+   */
+  isHealthy() {
+    return this.state !== CircuitState.OPEN;
+  }
+}
+
+module.exports = CircuitBreaker;

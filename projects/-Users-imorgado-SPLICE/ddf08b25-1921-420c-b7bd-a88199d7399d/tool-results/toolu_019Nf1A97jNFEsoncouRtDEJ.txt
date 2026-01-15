@@ -1,0 +1,281 @@
+     1→/**
+     2→ * Slice 8: Silence Detection Utilities (CEP Port)
+     3→ *
+     4→ * Provides core functionality for silence detection and removal.
+     5→ * Port of UXP slice8-silence.js for CEP compatibility.
+     6→ */
+     7→
+     8→// Store detected silences
+     9→let currentSilences = [];
+    10→
+    11→/**
+    12→ * Get current silences
+    13→ */
+    14→function getCurrentSilences() {
+    15→    return currentSilences;
+    16→}
+    17→
+    18→/**
+    19→ * Set current silences (used by main.js)
+    20→ */
+    21→function setCurrentSilences(silences) {
+    22→    currentSilences = silences;
+    23→}
+    24→
+    25→/**
+    26→ * Clear current silences
+    27→ */
+    28→function clearCurrentSilences() {
+    29→    currentSilences = [];
+    30→}
+    31→
+    32→/**
+    33→ * Maps 0-100 sensitivity slider to detection parameters
+    34→ * Lower = keep more pauses, Higher = remove more aggressively
+    35→ */
+    36→function mapSensitivity(value) {
+    37→    const t = value / 100;
+    38→    return {
+    39→        dbThreshold: Math.round(-50 + (30 * t)),                    // -50dB to -20dB
+    40→        minDuration: parseFloat((2.0 - (1.7 * t)).toFixed(2)),      // 2.0s to 0.3s
+    41→        padding: parseFloat((0.2 - (0.15 * t)).toFixed(2))          // 0.2s to 0.05s
+    42→    };
+    43→}
+    44→
+    45→/**
+    46→ * Get silence statistics
+    47→ * @returns {Object} Statistics about current silences
+    48→ */
+    49→function getSilenceStats() {
+    50→    if (!currentSilences || currentSilences.length === 0) {
+    51→        return {
+    52→            count: 0,
+    53→            totalDuration: 0,
+    54→            averageDuration: 0
+    55→        };
+    56→    }
+    57→
+    58→    let totalDuration = 0;
+    59→    for (const silence of currentSilences) {
+    60→        totalDuration += (silence.end - silence.start);
+    61→    }
+    62→
+    63→    return {
+    64→        count: currentSilences.length,
+    65→        totalDuration,
+    66→        averageDuration: totalDuration / currentSilences.length
+    67→    };
+    68→}
+    69→
+    70→/**
+    71→ * Remove silences from timeline using razor and delete
+    72→ * Returns count of removed sections
+    73→ *
+    74→ * FIX: CEP-ERR-001 - Added comprehensive error handling for JSX calls
+    75→ * to prevent crashes on different Mac configurations
+    76→ */
+    77→async function removeSilencesFromTimeline() {
+    78→    if (!currentSilences || currentSilences.length === 0) {
+    79→        return 0;
+    80→    }
+    81→
+    82→    // Check if sequence is open with timeout protection
+    83→    let seqResult;
+    84→    try {
+    85→        seqResult = await jsx.callWithTimeout('getActiveSequence', [], JSX_TIMEOUTS.QUICK);
+    86→        if (!seqResult || seqResult.error) {
+    87→            throw new Error('No project or sequence open');
+    88→        }
+    89→    } catch (e) {
+    90→        console.error('[SPLICE Silence] Failed to get active sequence:', e);
+    91→        if (e.code === 'JSX_TIMEOUT') {
+    92→            throw new Error('Premiere Pro is not responding. Try restarting the application.');
+    93→        }
+    94→        throw new Error('No project or sequence open: ' + e.message);
+    95→    }
+    96→
+    97→    // Get sequence settings with error handling
+    98→    let settings;
+    99→    try {
+   100→        settings = await jsx.callWithTimeout('getSequenceSettings', [], JSX_TIMEOUTS.QUICK);
+   101→        if (!settings || !settings.frameRate) {
+   102→            throw new Error('Could not get sequence settings');
+   103→        }
+   104→    } catch (e) {
+   105→        console.error('[SPLICE Silence] Failed to get sequence settings:', e);
+   106→        throw new Error('Could not read sequence settings: ' + e.message);
+   107→    }
+   108→
+   109→    // settings.frameRate is seconds per frame, so 1/frameRate = fps
+   110→    const frameRate = 1 / settings.frameRate; // frames per second
+   111→
+   112→    // Sort silences by start time DESCENDING (work from end to avoid time shifts)
+   113→    const sortedSilences = [...currentSilences].sort((a, b) => b.start - a.start);
+   114→
+   115→    let removedCount = 0;
+   116→    let numVideoTracks = 0;
+   117→    let numAudioTracks = 0;
+   118→
+   119→    // Get track counts with error handling
+   120→    try {
+   121→        numVideoTracks = await jsx.callWithTimeout('getNumTracks', ['video'], JSX_TIMEOUTS.QUICK);
+   122→        numAudioTracks = await jsx.callWithTimeout('getNumTracks', ['audio'], JSX_TIMEOUTS.QUICK);
+   123→    } catch (e) {
+   124→        console.error('[SPLICE Silence] Failed to get track counts:', e);
+   125→        throw new Error('Could not read timeline tracks: ' + e.message);
+   126→    }
+   127→
+   128→    for (const silence of sortedSilences) {
+   129→        const startSeconds = silence.start;
+   130→        const endSeconds = silence.end;
+   131→
+   132→        // Convert to frames for razor operations
+   133→        const startFrames = Math.round(startSeconds * frameRate);
+   134→        const endFrames = Math.round(endSeconds * frameRate);
+   135→
+   136→        // Razor at silence boundaries with error handling
+   137→        try {
+   138→            await jsx.callWithTimeout('razorSequenceAtSeconds', [startSeconds], JSX_TIMEOUTS.DEFAULT);
+   139→            await jsx.callWithTimeout('razorSequenceAtSeconds', [endSeconds], JSX_TIMEOUTS.DEFAULT);
+   140→        } catch (e) {
+   141→            console.warn('[SPLICE Silence] Razor operation failed at', startSeconds, '-', endSeconds, ':', e.message);
+   142→            // Continue with next silence - partial success is better than total failure
+   143→            continue;
+   144→        }
+   145→
+   146→        // Delete clips that fall within silence regions
+   147→        // Process video tracks
+   148→        for (let trackIndex = 0; trackIndex < numVideoTracks; trackIndex++) {
+   149→            try {
+   150→                const clips = await jsx.callWithTimeout('getClipsInTrack', [trackIndex, 'video'], JSX_TIMEOUTS.DEFAULT);
+   151→                if (!clips || !Array.isArray(clips)) continue;
+   152→
+   153→                // Process from end to avoid index shifting
+   154→                for (let clipIndex = clips.length - 1; clipIndex >= 0; clipIndex--) {
+   155→                    const clip = clips[clipIndex];
+   156→                    if (!clip) continue;
+   157→
+   158→                    const clipCenter = (clip.start + clip.end) / 2;
+   159→
+   160→                    // Check if clip center is within silence region
+   161→                    if (clipCenter > startSeconds && clipCenter < endSeconds) {
+   162→                        try {
+   163→                            await jsx.callWithTimeout('removeClipByIndex', ['video', trackIndex, clipIndex], JSX_TIMEOUTS.DEFAULT);
+   164→                            removedCount++;
+   165→                        } catch (removeErr) {
+   166→                            console.warn('[SPLICE Silence] Failed to remove video clip:', removeErr.message);
+   167→                        }
+   168→                    }
+   169→                }
+   170→            } catch (e) {
+   171→                console.warn('[SPLICE Silence] Failed to process video track', trackIndex, ':', e.message);
+   172→            }
+   173→        }
+   174→
+   175→        // Process audio tracks
+   176→        for (let trackIndex = 0; trackIndex < numAudioTracks; trackIndex++) {
+   177→            try {
+   178→                const clips = await jsx.callWithTimeout('getClipsInTrack', [trackIndex, 'audio'], JSX_TIMEOUTS.DEFAULT);
+   179→                if (!clips || !Array.isArray(clips)) continue;
+   180→
+   181→                // Process from end to avoid index shifting
+   182→                for (let clipIndex = clips.length - 1; clipIndex >= 0; clipIndex--) {
+   183→                    const clip = clips[clipIndex];
+   184→                    if (!clip) continue;
+   185→
+   186→                    const clipCenter = (clip.start + clip.end) / 2;
+   187→
+   188→                    // Check if clip center is within silence region
+   189→                    if (clipCenter > startSeconds && clipCenter < endSeconds) {
+   190→                        try {
+   191→                            await jsx.callWithTimeout('removeClipByIndex', ['audio', trackIndex, clipIndex], JSX_TIMEOUTS.DEFAULT);
+   192→                            removedCount++;
+   193→                        } catch (removeErr) {
+   194→                            console.warn('[SPLICE Silence] Failed to remove audio clip:', removeErr.message);
+   195→                        }
+   196→                    }
+   197→                }
+   198→            } catch (e) {
+   199→                console.warn('[SPLICE Silence] Failed to process audio track', trackIndex, ':', e.message);
+   200→            }
+   201→        }
+   202→    }
+   203→
+   204→    return removedCount;
+   205→}
+   206→
+   207→/**
+   208→ * Add silence markers to timeline without removing
+   209→ * FIX: CEP-ERR-002 - Added error handling with partial success support
+   210→ * @returns {Promise<number>} Number of markers added
+   211→ */
+   212→async function addSilenceMarkers() {
+   213→    if (!currentSilences || currentSilences.length === 0) {
+   214→        return 0;
+   215→    }
+   216→
+   217→    let markerCount = 0;
+   218→    let failCount = 0;
+   219→
+   220→    for (const silence of currentSilences) {
+   221→        try {
+   222→            const duration = silence.end - silence.start;
+   223→            const name = `Silence: ${duration.toFixed(1)}s`;
+   224→            const comments = `Start: ${formatTime(silence.start)} | End: ${formatTime(silence.end)}`;
+   225→            const colorIndex = 1; // Violet for silences
+   226→
+   227→            await jsx.callWithTimeout('createMarker', [silence.start, name, duration, comments, colorIndex], JSX_TIMEOUTS.DEFAULT);
+   228→            markerCount++;
+   229→        } catch (e) {
+   230→            console.warn('[SPLICE Silence] Failed to add marker at', silence.start, ':', e.message);
+   231→            failCount++;
+   232→            // Continue adding other markers - partial success is acceptable
+   233→        }
+   234→    }
+   235→
+   236→    if (failCount > 0) {
+   237→        console.warn(`[SPLICE Silence] Added ${markerCount} markers, ${failCount} failed`);
+   238→    }
+   239→
+   240→    return markerCount;
+   241→}
+   242→
+   243→/**
+   244→ * Delete all SPLICE silence markers from timeline
+   245→ * FIX: CEP-ERR-003 - Added error handling for marker deletion
+   246→ * @returns {Promise<number>} Number of markers deleted
+   247→ */
+   248→async function clearSilenceMarkers() {
+   249→    try {
+   250→        const result = await jsx.callWithTimeout('deleteMarkersByName', ['Silence:'], JSX_TIMEOUTS.DEFAULT);
+   251→        return result?.deleted || 0;
+   252→    } catch (e) {
+   253→        console.error('[SPLICE Silence] Failed to clear markers:', e.message);
+   254→        return 0;
+   255→    }
+   256→}
+   257→
+   258→// Legacy function name for compatibility
+   259→function showSilenceSection() {
+   260→    // No longer needed in new UI
+   261→}
+   262→
+   263→// Legacy init function - no longer needed
+   264→function initDetectRemove() {
+   265→    // Workflow is now handled by main.js initSilenceWorkflow()
+   266→}
+   267→
+   268→// Export for window access
+   269→window.getCurrentSilences = getCurrentSilences;
+   270→window.setCurrentSilences = setCurrentSilences;
+   271→window.clearCurrentSilences = clearCurrentSilences;
+   272→window.mapSensitivity = mapSensitivity;
+   273→window.getSilenceStats = getSilenceStats;
+   274→window.removeSilencesFromTimeline = removeSilencesFromTimeline;
+   275→window.addSilenceMarkers = addSilenceMarkers;
+   276→window.clearSilenceMarkers = clearSilenceMarkers;
+   277→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

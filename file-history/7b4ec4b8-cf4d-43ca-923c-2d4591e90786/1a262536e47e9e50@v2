@@ -1,0 +1,473 @@
+"""
+Physique & Vision Router - Photo upload and comprehensive feature extraction
+
+Endpoints:
+- POST /physique/upload - Upload physique photos
+- GET /physique/my-photos - Get stored physique photos
+- POST /physique/analyze - Analyze body composition
+- GET /physique/my-analysis - Get body analysis results
+- POST /physique/extract-face - Extract facial features from face photos
+- GET /physique/my-face-features - Get stored face features
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import boto3
+from botocore.exceptions import ClientError
+
+from app.database import get_db
+from app.models.user import User
+from app.models.physique import PhysiqueAnalysis, VisionExtraction
+from app.services.auth import get_current_user
+from app.config import get_settings
+
+
+router = APIRouter(prefix="/physique", tags=["physique"])
+settings = get_settings()
+
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+# ============================================
+# SCHEMAS
+# ============================================
+
+class PhysiquePhotoUrls(BaseModel):
+    front_photo_url: Optional[str] = None
+    side_photo_url: Optional[str] = None
+    back_photo_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class BodyAnalysisResponse(BaseModel):
+    front_photo_url: Optional[str] = None
+    side_photo_url: Optional[str] = None
+    back_photo_url: Optional[str] = None
+    estimated_body_fat: Optional[float] = None
+    muscle_mass: Optional[str] = None
+    frame_size: Optional[str] = None
+    shoulder_width: Optional[str] = None
+    waist_definition: Optional[str] = None
+    posture: Optional[str] = None
+    analysis_confidence: Optional[float] = None
+    analysis_notes: Optional[str] = None
+    analyzed_at: Optional[datetime] = None
+
+
+class AnalyzeRequest(BaseModel):
+    gender: str = Field(..., pattern="^(male|female)$")
+
+
+class AnalyzeBodyResponse(BaseModel):
+    estimated_body_fat: float
+    muscle_mass: str
+    frame_size: str
+    shoulder_width: str
+    waist_definition: str
+    posture: str
+    confidence: float
+    notes: Optional[str] = None
+
+
+class SkinResponse(BaseModel):
+    clarity: float
+    tone: str
+    acne_level: str
+    acne_scarring: str
+    pore_visibility: str
+    texture_issues: List[str]
+
+
+class HairResponse(BaseModel):
+    hairline_nw: int
+    density: str
+    texture: str
+    color: str
+
+
+class EyesResponse(BaseModel):
+    color: str
+    under_eye_darkness: float
+    under_eye_puffiness: float
+
+
+class FacialFeaturesResponse(BaseModel):
+    hollow_cheeks: float
+    eyebrow_density: str
+    facial_hair_potential: str
+
+
+class TeethResponse(BaseModel):
+    color: str
+    alignment: str
+    visible_in_photo: bool
+
+
+class FaceExtractionResponse(BaseModel):
+    skin: SkinResponse
+    hair: HairResponse
+    eyes: EyesResponse
+    facial_features: FacialFeaturesResponse
+    teeth: TeethResponse
+    confidence: float
+
+
+class ExtractFaceRequest(BaseModel):
+    front_face_url: str
+    side_face_url: Optional[str] = None
+
+
+# ============================================
+# S3 HELPERS
+# ============================================
+
+def get_s3_client():
+    return boto3.client(
+        's3',
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=settings.s3_region,
+    )
+
+
+async def upload_to_s3(file: UploadFile, user_id: str, angle: str) -> str:
+    s3_client = get_s3_client()
+    ext = file.filename.split('.')[-1] if file.filename else 'jpg'
+    key = f"physique/{user_id}/{angle}_{uuid.uuid4()}.{ext}"
+    content = await file.read()
+
+    try:
+        s3_client.put_object(
+            Bucket=settings.s3_bucket,
+            Key=key,
+            Body=content,
+            ContentType=file.content_type or 'image/jpeg',
+        )
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
+
+    return f"https://{settings.s3_bucket}.s3.{settings.s3_region}.amazonaws.com/{key}"
+
+
+def validate_image_file(file: UploadFile) -> None:
+    if not file.content_type or file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_CONTENT_TYPES)}"
+        )
+
+
+# ============================================
+# BODY ENDPOINTS
+# ============================================
+
+@router.post("/upload", response_model=PhysiquePhotoUrls)
+async def upload_physique_photos(
+    front: Optional[UploadFile] = File(None),
+    side: Optional[UploadFile] = File(None),
+    back: Optional[UploadFile] = File(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload physique photos (front, side, back)."""
+    if not any([front, side, back]):
+        raise HTTPException(status_code=400, detail="At least one photo required")
+
+    for file, name in [(front, "front"), (side, "side"), (back, "back")]:
+        if file:
+            validate_image_file(file)
+
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        physique = PhysiqueAnalysis(id=uuid.uuid4(), user_id=current_user.id)
+        db.add(physique)
+
+    user_id_str = str(current_user.id)
+    if front:
+        physique.front_photo_url = await upload_to_s3(front, user_id_str, "front")
+    if side:
+        physique.side_photo_url = await upload_to_s3(side, user_id_str, "side")
+    if back:
+        physique.back_photo_url = await upload_to_s3(back, user_id_str, "back")
+
+    physique.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(physique)
+
+    return PhysiquePhotoUrls(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        created_at=physique.created_at,
+        updated_at=physique.updated_at,
+    )
+
+
+@router.get("/my-photos", response_model=Optional[PhysiquePhotoUrls])
+async def get_my_photos(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get stored physique photos."""
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+    if not physique:
+        return None
+
+    return PhysiquePhotoUrls(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        created_at=physique.created_at,
+        updated_at=physique.updated_at,
+    )
+
+
+@router.post("/analyze", response_model=AnalyzeBodyResponse)
+async def analyze_physique(
+    request: AnalyzeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Analyze body composition using Claude Vision."""
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique or not physique.front_photo_url:
+        raise HTTPException(status_code=400, detail="No front photo found. Upload photos first.")
+
+    from app.services.vision_service import extract_body_features
+
+    body_result = await extract_body_features(
+        front_url=physique.front_photo_url,
+        side_url=physique.side_photo_url,
+        back_url=physique.back_photo_url,
+        gender=request.gender,
+    )
+
+    # Store results
+    physique.estimated_body_fat = body_result.body_fat_percent
+    physique.muscle_mass = body_result.muscle_mass
+    physique.muscle_level = body_result.muscle_mass  # Legacy compatibility
+    physique.frame_size = body_result.frame_size
+    physique.shoulder_width = body_result.shoulder_width
+    physique.waist_definition = body_result.waist_definition
+    physique.posture = body_result.posture
+    physique.analysis_confidence = body_result.confidence
+    physique.analysis_notes = body_result.notes
+    physique.analyzed_at = datetime.utcnow()
+    physique.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(physique)
+
+    return AnalyzeBodyResponse(
+        estimated_body_fat=body_result.body_fat_percent,
+        muscle_mass=body_result.muscle_mass,
+        frame_size=body_result.frame_size,
+        shoulder_width=body_result.shoulder_width,
+        waist_definition=body_result.waist_definition,
+        posture=body_result.posture,
+        confidence=body_result.confidence,
+        notes=body_result.notes,
+    )
+
+
+@router.get("/my-analysis", response_model=Optional[BodyAnalysisResponse])
+async def get_my_analysis(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get stored body analysis."""
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+    if not physique:
+        return None
+
+    return BodyAnalysisResponse(
+        front_photo_url=physique.front_photo_url,
+        side_photo_url=physique.side_photo_url,
+        back_photo_url=physique.back_photo_url,
+        estimated_body_fat=physique.estimated_body_fat,
+        muscle_mass=physique.muscle_mass,
+        frame_size=physique.frame_size,
+        shoulder_width=physique.shoulder_width,
+        waist_definition=physique.waist_definition,
+        posture=physique.posture,
+        analysis_confidence=physique.analysis_confidence,
+        analysis_notes=physique.analysis_notes,
+        analyzed_at=physique.analyzed_at,
+    )
+
+
+# ============================================
+# FACE FEATURE EXTRACTION ENDPOINTS
+# ============================================
+
+@router.post("/extract-face", response_model=FaceExtractionResponse)
+async def extract_face_features_endpoint(
+    request: ExtractFaceRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Extract facial features (skin, hair, eyes, hollow cheeks, etc.) from face photos."""
+    from app.services.vision_service import extract_face_features
+
+    face_result = await extract_face_features(
+        front_photo_url=request.front_face_url,
+        side_photo_url=request.side_face_url,
+    )
+
+    # Store results
+    result = await db.execute(
+        select(VisionExtraction).where(VisionExtraction.user_id == current_user.id)
+    )
+    extraction = result.scalar_one_or_none()
+
+    if not extraction:
+        extraction = VisionExtraction(id=uuid.uuid4(), user_id=current_user.id)
+        db.add(extraction)
+
+    extraction.front_face_url = request.front_face_url
+    extraction.side_face_url = request.side_face_url
+    extraction.skin_clarity = face_result.skin.clarity
+    extraction.skin_tone = face_result.skin.tone
+    extraction.acne_level = face_result.skin.acne_level
+    extraction.acne_scarring = face_result.skin.acne_scarring
+    extraction.pore_visibility = face_result.skin.pore_visibility
+    extraction.texture_issues = face_result.skin.texture_issues
+    extraction.hairline_nw = face_result.hair.hairline_nw
+    extraction.hair_density = face_result.hair.density
+    extraction.hair_texture = face_result.hair.texture
+    extraction.hair_color = face_result.hair.color
+    extraction.eye_color = face_result.eyes.color
+    extraction.under_eye_darkness = face_result.eyes.under_eye_darkness
+    extraction.under_eye_puffiness = face_result.eyes.under_eye_puffiness
+    extraction.hollow_cheeks = face_result.facial_features.hollow_cheeks
+    extraction.eyebrow_density = face_result.facial_features.eyebrow_density
+    extraction.facial_hair_potential = face_result.facial_features.facial_hair_potential
+    extraction.teeth_color = face_result.teeth.color
+    extraction.teeth_alignment = face_result.teeth.alignment
+    extraction.teeth_visible = str(face_result.teeth.visible_in_photo)
+    extraction.confidence = face_result.confidence
+    extraction.extracted_at = datetime.utcnow()
+    extraction.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(extraction)
+
+    return FaceExtractionResponse(
+        skin=SkinResponse(
+            clarity=face_result.skin.clarity,
+            tone=face_result.skin.tone,
+            acne_level=face_result.skin.acne_level,
+            acne_scarring=face_result.skin.acne_scarring,
+            pore_visibility=face_result.skin.pore_visibility,
+            texture_issues=face_result.skin.texture_issues,
+        ),
+        hair=HairResponse(
+            hairline_nw=face_result.hair.hairline_nw,
+            density=face_result.hair.density,
+            texture=face_result.hair.texture,
+            color=face_result.hair.color,
+        ),
+        eyes=EyesResponse(
+            color=face_result.eyes.color,
+            under_eye_darkness=face_result.eyes.under_eye_darkness,
+            under_eye_puffiness=face_result.eyes.under_eye_puffiness,
+        ),
+        facial_features=FacialFeaturesResponse(
+            hollow_cheeks=face_result.facial_features.hollow_cheeks,
+            eyebrow_density=face_result.facial_features.eyebrow_density,
+            facial_hair_potential=face_result.facial_features.facial_hair_potential,
+        ),
+        teeth=TeethResponse(
+            color=face_result.teeth.color,
+            alignment=face_result.teeth.alignment,
+            visible_in_photo=face_result.teeth.visible_in_photo,
+        ),
+        confidence=face_result.confidence,
+    )
+
+
+@router.get("/my-face-features", response_model=Optional[FaceExtractionResponse])
+async def get_my_face_features(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get stored facial feature extraction."""
+    result = await db.execute(
+        select(VisionExtraction).where(VisionExtraction.user_id == current_user.id)
+    )
+    extraction = result.scalar_one_or_none()
+    if not extraction:
+        return None
+
+    return FaceExtractionResponse(
+        skin=SkinResponse(
+            clarity=extraction.skin_clarity or 5.0,
+            tone=extraction.skin_tone or "medium",
+            acne_level=extraction.acne_level or "none",
+            acne_scarring=extraction.acne_scarring or "none",
+            pore_visibility=extraction.pore_visibility or "visible",
+            texture_issues=extraction.texture_issues or [],
+        ),
+        hair=HairResponse(
+            hairline_nw=int(extraction.hairline_nw or 1),
+            density=extraction.hair_density or "medium",
+            texture=extraction.hair_texture or "straight",
+            color=extraction.hair_color or "brown",
+        ),
+        eyes=EyesResponse(
+            color=extraction.eye_color or "brown",
+            under_eye_darkness=extraction.under_eye_darkness or 3.0,
+            under_eye_puffiness=extraction.under_eye_puffiness or 3.0,
+        ),
+        facial_features=FacialFeaturesResponse(
+            hollow_cheeks=extraction.hollow_cheeks or 5.0,
+            eyebrow_density=extraction.eyebrow_density or "medium",
+            facial_hair_potential=extraction.facial_hair_potential or "medium",
+        ),
+        teeth=TeethResponse(
+            color=extraction.teeth_color or "off-white",
+            alignment=extraction.teeth_alignment or "aligned",
+            visible_in_photo=extraction.teeth_visible == "True",
+        ),
+        confidence=extraction.confidence or 0.5,
+    )
+
+
+@router.delete("/my-photos")
+async def delete_my_photos(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all physique photos and analysis."""
+    result = await db.execute(
+        select(PhysiqueAnalysis).where(PhysiqueAnalysis.user_id == current_user.id)
+    )
+    physique = result.scalar_one_or_none()
+
+    if not physique:
+        raise HTTPException(status_code=404, detail="No physique data found")
+
+    await db.delete(physique)
+    await db.commit()
+    return {"message": "Physique data deleted"}

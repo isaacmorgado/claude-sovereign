@@ -1,0 +1,924 @@
+     1→/**
+     2→ * Music Generation Job Queue Service
+     3→ * Uses BullMQ with Upstash Redis for reliable background processing
+     4→ *
+     5→ * HIGH-006: Added Dead Letter Queue (DLQ) for permanently failed jobs
+     6→ */
+     7→
+     8→const { Queue } = require('bullmq');
+     9→
+    10→// Redis connection (lazy initialization)
+    11→let redisConnection = null;
+    12→let musicQueue = null;
+    13→let musicWorker = null;
+    14→let deadLetterQueue = null;
+    15→
+    16→// ============================================================================
+    17→// HIGH-006: Dead Letter Queue Configuration
+    18→// Jobs that fail after all retry attempts are moved here for inspection/recovery
+    19→// ============================================================================
+    20→
+    21→const DLQ_CONFIG = {
+    22→  queueName: 'music-generation-dlq',
+    23→  // Keep failed jobs in DLQ for 30 days
+    24→  retentionDays: 30,
+    25→  // Maximum DLQ jobs to keep
+    26→  maxJobs: 10000
+    27→};
+    28→
+    29→// Job statuses
+    30→const JOB_STATUS = {
+    31→  PENDING: 'pending',
+    32→  EXTRACTING: 'extracting',
+    33→  IDENTIFYING: 'identifying',
+    34→  GENERATING: 'generating',
+    35→  UPLOADING: 'uploading',
+    36→  COMPLETED: 'completed',
+    37→  FAILED: 'failed',
+    38→  // Variations-specific statuses
+    39→  GENERATING_VARIATIONS: 'generating_variations',
+    40→  SELECTING: 'selecting',  // Waiting for user to select a variation
+    41→  // Scene-aware specific statuses
+    42→  ANALYZING: 'analyzing'  // Analyzing transcript for scene context
+    43→};
+    44→
+    45→// Progress percentages for each step
+    46→const PROGRESS_MAP = {
+    47→  [JOB_STATUS.PENDING]: 0,
+    48→  [JOB_STATUS.EXTRACTING]: 10,
+    49→  [JOB_STATUS.IDENTIFYING]: 30,
+    50→  [JOB_STATUS.GENERATING]: 60,
+    51→  [JOB_STATUS.UPLOADING]: 90,
+    52→  [JOB_STATUS.COMPLETED]: 100,
+    53→  // Variations progress
+    54→  [JOB_STATUS.GENERATING_VARIATIONS]: 50,
+    55→  [JOB_STATUS.SELECTING]: 95,
+    56→  // Scene-aware progress
+    57→  [JOB_STATUS.ANALYZING]: 15
+    58→};
+    59→
+    60→/**
+    61→ * Initialize Redis connection
+    62→ * Supports both Railway Redis (REDIS_URL) and Upstash Redis (UPSTASH_REDIS_URL)
+    63→ * @returns {Object} IORedis connection options
+    64→ */
+    65→function getRedisConnection() {
+    66→  if (!redisConnection) {
+    67→    // Support both Railway Redis URL and Upstash Redis URL
+    68→    const redisUrl = process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL;
+    69→
+    70→    if (!redisUrl) {
+    71→      throw new Error('Missing REDIS_URL or UPSTASH_REDIS_URL environment variable');
+    72→    }
+    73→
+    74→    // Parse Redis URL
+    75→    const url = new URL(redisUrl);
+    76→
+    77→    redisConnection = {
+    78→      host: url.hostname,
+    79→      port: parseInt(url.port) || 6379,
+    80→      password: url.password,
+    81→      username: url.username || undefined,
+    82→      tls: url.protocol === 'rediss:' ? {} : undefined,
+    83→      maxRetriesPerRequest: null // Required for BullMQ workers
+    84→    };
+    85→    
+    86→    console.log(`[Queue] Redis connection configured for ${url.hostname}:${url.port} (${url.protocol === 'rediss:' ? 'TLS' : 'plain'})`);
+    87→  }
+    88→  return redisConnection;
+    89→}
+    90→
+    91→// ============================================================================
+    92→// HIGH-006: Dead Letter Queue Functions
+    93→// ============================================================================
+    94→
+    95→/**
+    96→ * Get or create the dead letter queue for permanently failed jobs
+    97→ * @returns {Queue} BullMQ Queue instance for DLQ
+    98→ */
+    99→function getDeadLetterQueue() {
+   100→  if (!deadLetterQueue) {
+   101→    deadLetterQueue = new Queue(DLQ_CONFIG.queueName, {
+   102→      connection: getRedisConnection(),
+   103→      defaultJobOptions: {
+   104→        // DLQ jobs don't retry - they're already failed
+   105→        attempts: 1,
+   106→        // Keep for inspection/debugging
+   107→        removeOnComplete: {
+   108→          age: DLQ_CONFIG.retentionDays * 24 * 3600,
+   109→          count: DLQ_CONFIG.maxJobs
+   110→        },
+   111→        removeOnFail: false // Never auto-remove failed DLQ entries
+   112→      }
+   113→    });
+   114→    console.log('[Queue] Dead Letter Queue initialized');
+   115→  }
+   116→  return deadLetterQueue;
+   117→}
+   118→
+   119→/**
+   120→ * Move a permanently failed job to the Dead Letter Queue
+   121→ * Called by the worker when a job exhausts all retry attempts
+   122→ * @param {Object} job - The failed BullMQ job
+   123→ * @param {Error|string} error - The error that caused the failure
+   124→ * @returns {Promise<{dlqJobId: string}>}
+   125→ */
+   126→async function moveToDeadLetterQueue(job, error) {
+   127→  const dlq = getDeadLetterQueue();
+   128→  
+   129→  const dlqJobId = `dlq_${job.id}_${Date.now()}`;
+   130→  
+   131→  const dlqData = {
+   132→    // Original job metadata
+   133→    originalJobId: job.id,
+   134→    originalQueue: 'music-generation',
+   135→    
+   136→    // Copy of original job data
+   137→    originalData: job.data,
+   138→    
+   139→    // Failure information
+   140→    error: typeof error === 'string' ? error : error?.message || 'Unknown error',
+   141→    errorStack: error?.stack || null,
+   142→    failedAt: new Date().toISOString(),
+   143→    attemptsMade: job.attemptsMade || 0,
+   144→    
+   145→    // Job history for debugging
+   146→    processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+   147→    createdAt: job.data?.createdAt || null,
+   148→    
+   149→    // Recovery flags
+   150→    canRetry: !isUnrecoverableError(error),
+   151→    recovered: false,
+   152→    recoveredAt: null,
+   153→    recoveryNotes: null
+   154→  };
+   155→  
+   156→  await dlq.add('failed-job', dlqData, {
+   157→    jobId: dlqJobId
+   158→  });
+   159→  
+   160→  console.log(`[DLQ] Job ${job.id} moved to dead letter queue as ${dlqJobId}`);
+   161→  console.log(`[DLQ] Reason: ${dlqData.error}`);
+   162→  
+   163→  return { dlqJobId };
+   164→}
+   165→
+   166→/**
+   167→ * Check if an error indicates an unrecoverable failure
+   168→ * @param {Error|string} error - The error to check
+   169→ * @returns {boolean}
+   170→ */
+   171→function isUnrecoverableError(error) {
+   172→  const message = typeof error === 'string' ? error : error?.message || '';
+   173→  
+   174→  const unrecoverablePatterns = [
+   175→    /quota exceeded/i,
+   176→    /invalid api key/i,
+   177→    /authentication failed/i,
+   178→    /insufficient credits/i,
+   179→    /account suspended/i,
+   180→    /content policy violation/i,
+   181→    /customer not found/i,
+   182→    /invalid customer/i
+   183→  ];
+   184→  
+   185→  return unrecoverablePatterns.some(pattern => pattern.test(message));
+   186→}
+   187→
+   188→/**
+   189→ * Get jobs from the Dead Letter Queue with pagination
+   190→ * @param {Object} options - Query options
+   191→ * @param {number} options.limit - Max jobs to return (default 50)
+   192→ * @param {number} options.offset - Offset for pagination (default 0)
+   193→ * @param {boolean} options.includeRecovered - Include already recovered jobs (default false)
+   194→ * @returns {Promise<{jobs: Object[], total: number}>}
+   195→ */
+   196→async function getDeadLetterJobs(options = {}) {
+   197→  const dlq = getDeadLetterQueue();
+   198→  const limit = options.limit || 50;
+   199→  const offset = options.offset || 0;
+   200→  const includeRecovered = options.includeRecovered || false;
+   201→  
+   202→  // Get waiting and completed jobs from DLQ
+   203→  const [waiting, completed] = await Promise.all([
+   204→    dlq.getWaiting(0, 1000),
+   205→    dlq.getCompleted(0, 1000)
+   206→  ]);
+   207→  
+   208→  // Combine and filter
+   209→  let allJobs = [...waiting, ...completed];
+   210→  
+   211→  if (!includeRecovered) {
+   212→    allJobs = allJobs.filter(job => !job.data.recovered);
+   213→  }
+   214→  
+   215→  // Sort by failedAt descending (newest first)
+   216→  allJobs.sort((a, b) => {
+   217→    const aDate = new Date(a.data.failedAt || 0);
+   218→    const bDate = new Date(b.data.failedAt || 0);
+   219→    return bDate - aDate;
+   220→  });
+   221→  
+   222→  const total = allJobs.length;
+   223→  const paginatedJobs = allJobs.slice(offset, offset + limit);
+   224→  
+   225→  return {
+   226→    jobs: paginatedJobs.map(job => ({
+   227→      dlqJobId: job.id,
+   228→      originalJobId: job.data.originalJobId,
+   229→      customerId: job.data.originalData?.customerId,
+   230→      error: job.data.error,
+   231→      failedAt: job.data.failedAt,
+   232→      attemptsMade: job.data.attemptsMade,
+   233→      canRetry: job.data.canRetry,
+   234→      recovered: job.data.recovered,
+   235→      recoveredAt: job.data.recoveredAt,
+   236→      // Include original job context
+   237→      mood: job.data.originalData?.mood,
+   238→      duration: job.data.originalData?.duration,
+   239→      isSceneAware: job.data.originalData?.isSceneAware
+   240→    })),
+   241→    total,
+   242→    limit,
+   243→    offset
+   244→  };
+   245→}
+   246→
+   247→/**
+   248→ * Recover a job from the Dead Letter Queue by re-queueing it
+   249→ * @param {string} dlqJobId - Dead Letter Queue job ID
+   250→ * @param {Object} options - Recovery options
+   251→ * @param {string} options.notes - Recovery notes for audit trail
+   252→ * @returns {Promise<{success: boolean, newJobId: string}>}
+   253→ */
+   254→async function recoverFromDeadLetterQueue(dlqJobId, options = {}) {
+   255→  const dlq = getDeadLetterQueue();
+   256→  const mainQueue = getMusicQueue();
+   257→  
+   258→  const dlqJob = await dlq.getJob(dlqJobId);
+   259→  
+   260→  if (!dlqJob) {
+   261→    throw new Error(`DLQ job ${dlqJobId} not found`);
+   262→  }
+   263→  
+   264→  if (dlqJob.data.recovered) {
+   265→    throw new Error(`DLQ job ${dlqJobId} has already been recovered`);
+   266→  }
+   267→  
+   268→  if (!dlqJob.data.canRetry) {
+   269→    throw new Error(`DLQ job ${dlqJobId} is marked as unrecoverable`);
+   270→  }
+   271→  
+   272→  // Generate new job ID for the recovered job
+   273→  const newJobId = `recovered_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+   274→  
+   275→  // Re-queue with original data
+   276→  await mainQueue.add('generate', {
+   277→    ...dlqJob.data.originalData,
+   278→    jobId: newJobId,
+   279→    recoveredFrom: dlqJobId,
+   280→    step: JOB_STATUS.PENDING,
+   281→    createdAt: new Date().toISOString()
+   282→  }, {
+   283→    jobId: newJobId,
+   284→    priority: 0
+   285→  });
+   286→  
+   287→  // Mark DLQ job as recovered
+   288→  await dlqJob.updateData({
+   289→    ...dlqJob.data,
+   290→    recovered: true,
+   291→    recoveredAt: new Date().toISOString(),
+   292→    recoveryNotes: options.notes || null,
+   293→    newJobId
+   294→  });
+   295→  
+   296→  console.log(`[DLQ] Job ${dlqJobId} recovered as ${newJobId}`);
+   297→  
+   298→  return { success: true, newJobId };
+   299→}
+   300→
+   301→/**
+   302→ * Get Dead Letter Queue statistics
+   303→ * @returns {Promise<Object>} DLQ stats
+   304→ */
+   305→async function getDeadLetterQueueStats() {
+   306→  const dlq = getDeadLetterQueue();
+   307→  
+   308→  const [waiting, completed] = await Promise.all([
+   309→    dlq.getWaiting(0, 10000),
+   310→    dlq.getCompleted(0, 10000)
+   311→  ]);
+   312→  
+   313→  const allJobs = [...waiting, ...completed];
+   314→  
+   315→  const stats = {
+   316→    total: allJobs.length,
+   317→    recoverable: 0,
+   318→    unrecoverable: 0,
+   319→    recovered: 0,
+   320→    pending: 0,
+   321→    oldestFailure: null,
+   322→    newestFailure: null,
+   323→    byError: {}
+   324→  };
+   325→  
+   326→  for (const job of allJobs) {
+   327→    if (job.data.recovered) {
+   328→      stats.recovered++;
+   329→    } else if (job.data.canRetry) {
+   330→      stats.recoverable++;
+   331→      stats.pending++;
+   332→    } else {
+   333→      stats.unrecoverable++;
+   334→      stats.pending++;
+   335→    }
+   336→    
+   337→    // Track error types
+   338→    const errorKey = job.data.error?.substring(0, 50) || 'Unknown';
+   339→    stats.byError[errorKey] = (stats.byError[errorKey] || 0) + 1;
+   340→    
+   341→    // Track oldest/newest
+   342→    const failedAt = new Date(job.data.failedAt);
+   343→    if (!stats.oldestFailure || failedAt < new Date(stats.oldestFailure)) {
+   344→      stats.oldestFailure = job.data.failedAt;
+   345→    }
+   346→    if (!stats.newestFailure || failedAt > new Date(stats.newestFailure)) {
+   347→      stats.newestFailure = job.data.failedAt;
+   348→    }
+   349→  }
+   350→  
+   351→  return stats;
+   352→}
+   353→
+   354→/**
+   355→ * Get or create the music generation queue
+   356→ * @returns {Queue} BullMQ Queue instance
+   357→ */
+   358→function getMusicQueue() {
+   359→  if (!musicQueue) {
+   360→    musicQueue = new Queue('music-generation', {
+   361→      connection: getRedisConnection(),
+   362→      defaultJobOptions: {
+   363→        attempts: 3,
+   364→        backoff: {
+   365→          type: 'exponential',
+   366→          delay: 5000 // Start with 5s, then 10s, then 20s
+   367→        },
+   368→        removeOnComplete: {
+   369→          age: 24 * 3600, // Keep completed jobs for 24 hours
+   370→          count: 1000 // Keep max 1000 completed jobs
+   371→        },
+   372→        removeOnFail: {
+   373→          age: 7 * 24 * 3600 // Keep failed jobs for 7 days
+   374→        }
+   375→      }
+   376→    });
+   377→  }
+   378→  return musicQueue;
+   379→}
+   380→
+   381→/**
+   382→ * Generate a unique job ID
+   383→ * @param {string} customerId - Stripe customer ID
+   384→ * @returns {string} Unique job ID
+   385→ */
+   386→function generateJobId(_customerId) {
+   387→  const timestamp = Date.now();
+   388→  const random = Math.random().toString(36).substring(2, 8);
+   389→  return `music_${timestamp}_${random}`;
+   390→}
+   391→
+   392→/**
+   393→ * Add a new music generation job to the queue
+   394→ * @param {Object} jobData - Job data
+   395→ * @param {string} jobData.customerId - Stripe customer ID
+   396→ * @param {string} jobData.youtubeUrl - YouTube URL for reference song (optional)
+   397→ * @param {string} jobData.prompt - Text prompt for music generation
+   398→ * @param {number} jobData.duration - Duration in seconds (30-180)
+   399→ * @param {string} jobData.mood - Mood setting
+   400→ * @param {string[]} jobData.instruments - Preferred instruments
+   401→ * @param {boolean} jobData.isSceneAware - Whether to use scene analysis
+   402→ * @param {Object[]} jobData.segments - Transcript segments for scene analysis
+   403→ * @returns {Promise<{jobId: string, status: string}>}
+   404→ */
+   405→async function addMusicJob(jobData) {
+   406→  const queue = getMusicQueue();
+   407→
+   408→  // Validate required fields
+   409→  if (!jobData.customerId) {
+   410→    throw new Error('customerId is required');
+   411→  }
+   412→
+   413→  // For scene-aware jobs, segments are required
+   414→  if (jobData.isSceneAware && (!jobData.segments || jobData.segments.length === 0)) {
+   415→    throw new Error('Transcript segments are required for scene-aware music');
+   416→  }
+   417→
+   418→  // Generate unique job ID
+   419→  const jobId = jobData.isSceneAware
+   420→    ? `scene_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+   421→    : generateJobId(jobData.customerId);
+   422→
+   423→  // Prepare job data with defaults
+   424→  const data = {
+   425→    jobId,
+   426→    customerId: jobData.customerId,
+   427→    youtubeUrl: jobData.youtubeUrl || null,
+   428→    prompt: jobData.prompt || '',
+   429→    duration: Math.min(Math.max(jobData.duration || 60, 30), 180), // Clamp 30-180
+   430→    mood: jobData.mood || 'neutral',
+   431→    instruments: jobData.instruments || [],
+   432→    step: JOB_STATUS.PENDING,
+   433→    createdAt: new Date().toISOString(),
+   434→    // Reference song metadata (populated during identification)
+   435→    referenceSong: jobData.referenceSong || null,
+   436→    // Generated music info (populated after generation)
+   437→    musicResult: null,
+   438→    // Scene-aware specific data
+   439→    isSceneAware: !!jobData.isSceneAware,
+   440→    segments: jobData.isSceneAware ? jobData.segments : null,
+   441→    sceneContext: null  // Populated during scene analysis
+   442→  };
+   443→
+   444→  // Add to queue
+   445→  await queue.add('generate', data, {
+   446→    jobId,
+   447→    priority: 0 // Normal priority
+   448→  });
+   449→
+   450→  return {
+   451→    jobId,
+   452→    status: JOB_STATUS.PENDING,
+   453→    isSceneAware: data.isSceneAware,
+   454→    estimatedTime: data.isSceneAware ? '4-6 minutes' : '3-5 minutes'
+   455→  };
+   456→}
+   457→
+   458→/**
+   459→ * Get job status by job ID
+   460→ * @param {string} jobId - Job ID
+   461→ * @returns {Promise<Object|null>} Job status or null if not found
+   462→ */
+   463→async function getJobStatus(jobId) {
+   464→  const queue = getMusicQueue();
+   465→
+   466→  const job = await queue.getJob(jobId);
+   467→
+   468→  if (!job) {
+   469→    return null;
+   470→  }
+   471→
+   472→  const state = await job.getState();
+   473→  const progress = job.progress || 0;
+   474→
+   475→  return {
+   476→    jobId: job.id,
+   477→    status: job.data.step || state,
+   478→    progress,
+   479→    isSceneAware: job.data.isSceneAware || false,
+   480→    data: {
+   481→      customerId: job.data.customerId,
+   482→      youtubeUrl: job.data.youtubeUrl,
+   483→      prompt: job.data.prompt,
+   484→      duration: job.data.duration,
+   485→      mood: job.data.mood,
+   486→      instruments: job.data.instruments,
+   487→      referenceSong: job.data.referenceSong,
+   488→      musicResult: job.data.musicResult,
+   489→      // Scene-aware context (if applicable)
+   490→      sceneContext: job.data.sceneContext || null
+   491→    },
+   492→    createdAt: job.data.createdAt,
+   493→    processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+   494→    completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+   495→    failedReason: job.failedReason || null,
+   496→    attemptsMade: job.attemptsMade || 0
+   497→  };
+   498→}
+   499→
+   500→/**
+   501→ * Get all jobs for a customer
+   502→ * @param {string} customerId - Stripe customer ID
+   503→ * @param {Object} options - Pagination options
+   504→ * @param {number} options.limit - Max jobs to return (default 50)
+   505→ * @param {number} options.offset - Offset for pagination (default 0)
+   506→ * @returns {Promise<Object[]>} Array of job statuses
+   507→ */
+   508→async function getCustomerJobs(customerId, options = {}) {
+   509→  const queue = getMusicQueue();
+   510→  const limit = options.limit || 50;
+   511→  const offset = options.offset || 0;
+   512→
+   513→  // Get all job types
+   514→  const [completed, active, waiting, delayed, failed] = await Promise.all([
+   515→    queue.getCompleted(0, 1000),
+   516→    queue.getActive(),
+   517→    queue.getWaiting(),
+   518→    queue.getDelayed(),
+   519→    queue.getFailed(0, 100)
+   520→  ]);
+   521→
+   522→  // Combine and filter by customer
+   523→  const allJobs = [...completed, ...active, ...waiting, ...delayed, ...failed];
+   524→  const customerJobs = allJobs
+   525→    .filter(job => job.data.customerId === customerId)
+   526→    .sort((a, b) => new Date(b.data.createdAt) - new Date(a.data.createdAt));
+   527→
+   528→  // Apply pagination
+   529→  const paginatedJobs = customerJobs.slice(offset, offset + limit);
+   530→
+   531→  // Format results
+   532→  return Promise.all(paginatedJobs.map(async job => {
+   533→    const state = await job.getState();
+   534→    return {
+   535→      jobId: job.id,
+   536→      status: job.data.step || state,
+   537→      progress: job.progress || 0,
+   538→      title: job.data.musicResult?.title || `Generated Music - ${job.data.mood}`,
+   539→      duration: job.data.duration,
+   540→      mood: job.data.mood,
+   541→      createdAt: job.data.createdAt,
+   542→      completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+   543→      failedReason: job.failedReason || null
+   544→    };
+   545→  }));
+   546→}
+   547→
+   548→/**
+   549→ * Cancel a pending job
+   550→ * @param {string} jobId - Job ID
+   551→ * @returns {Promise<{success: boolean}>}
+   552→ */
+   553→async function cancelJob(jobId) {
+   554→  const queue = getMusicQueue();
+   555→
+   556→  const job = await queue.getJob(jobId);
+   557→
+   558→  if (!job) {
+   559→    throw new Error(`Job ${jobId} not found`);
+   560→  }
+   561→
+   562→  const state = await job.getState();
+   563→
+   564→  if (state === 'active') {
+   565→    throw new Error('Cannot cancel job that is already processing');
+   566→  }
+   567→
+   568→  if (state === 'completed' || state === 'failed') {
+   569→    throw new Error(`Cannot cancel job that is already ${state}`);
+   570→  }
+   571→
+   572→  await job.remove();
+   573→
+   574→  return { success: true };
+   575→}
+   576→
+   577→/**
+   578→ * Retry a failed job
+   579→ * @param {string} jobId - Job ID
+   580→ * @returns {Promise<{success: boolean}>}
+   581→ */
+   582→async function retryJob(jobId) {
+   583→  const queue = getMusicQueue();
+   584→
+   585→  const job = await queue.getJob(jobId);
+   586→
+   587→  if (!job) {
+   588→    throw new Error(`Job ${jobId} not found`);
+   589→  }
+   590→
+   591→  const state = await job.getState();
+   592→
+   593→  if (state !== 'failed') {
+   594→    throw new Error(`Can only retry failed jobs, current state: ${state}`);
+   595→  }
+   596→
+   597→  await job.retry();
+   598→
+   599→  return { success: true };
+   600→}
+   601→
+   602→/**
+   603→ * Update job data (used internally by worker)
+   604→ * @param {string} jobId - Job ID
+   605→ * @param {Object} updates - Data updates
+   606→ * @returns {Promise<void>}
+   607→ */
+   608→async function updateJobData(jobId, updates) {
+   609→  const queue = getMusicQueue();
+   610→
+   611→  const job = await queue.getJob(jobId);
+   612→
+   613→  if (!job) {
+   614→    throw new Error(`Job ${jobId} not found`);
+   615→  }
+   616→
+   617→  await job.updateData({
+   618→    ...job.data,
+   619→    ...updates
+   620→  });
+   621→}
+   622→
+   623→/**
+   624→ * Get queue statistics
+   625→ * @returns {Promise<Object>} Queue stats
+   626→ */
+   627→async function getQueueStats() {
+   628→  const queue = getMusicQueue();
+   629→
+   630→  const [waiting, active, completed, failed, delayed] = await Promise.all([
+   631→    queue.getWaitingCount(),
+   632→    queue.getActiveCount(),
+   633→    queue.getCompletedCount(),
+   634→    queue.getFailedCount(),
+   635→    queue.getDelayedCount()
+   636→  ]);
+   637→
+   638→  return {
+   639→    waiting,
+   640→    active,
+   641→    completed,
+   642→    failed,
+   643→    delayed,
+   644→    total: waiting + active + completed + failed + delayed
+   645→  };
+   646→}
+   647→
+   648→/**
+   649→ * Close queue connections (for graceful shutdown)
+   650→ */
+   651→async function closeQueue() {
+   652→  if (musicQueue) {
+   653→    await musicQueue.close();
+   654→    musicQueue = null;
+   655→  }
+   656→  if (musicWorker) {
+   657→    await musicWorker.close();
+   658→    musicWorker = null;
+   659→  }
+   660→}
+   661→
+   662→/**
+   663→ * Add a new variations job to the queue
+   664→ * Generates 3 variations in parallel for user selection
+   665→ * @param {Object} jobData - Job data
+   666→ * @param {string} jobData.customerId - Stripe customer ID
+   667→ * @param {string} jobData.prompt - Text prompt for music generation
+   668→ * @param {number} jobData.duration - Duration in seconds (30-180)
+   669→ * @param {string} jobData.mood - Mood setting
+   670→ * @param {string[]} jobData.instruments - Preferred instruments
+   671→ * @param {Object} jobData.referenceSong - Reference song info (optional)
+   672→ * @returns {Promise<{jobId: string, status: string}>}
+   673→ */
+   674→async function addVariationsJob(jobData) {
+   675→  const queue = getMusicQueue();
+   676→
+   677→  // Validate required fields
+   678→  if (!jobData.customerId) {
+   679→    throw new Error('customerId is required');
+   680→  }
+   681→
+   682→  // Generate unique job ID with variations prefix
+   683→  const jobId = `variations_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+   684→
+   685→  // Prepare job data with defaults
+   686→  const data = {
+   687→    jobId,
+   688→    customerId: jobData.customerId,
+   689→    isVariations: true,  // Flag to identify this as a variations job
+   690→    prompt: jobData.prompt || '',
+   691→    duration: Math.min(Math.max(jobData.duration || 60, 30), 180),
+   692→    mood: jobData.mood || 'neutral',
+   693→    instruments: jobData.instruments || [],
+   694→    referenceSong: jobData.referenceSong || null,
+   695→    step: JOB_STATUS.PENDING,
+   696→    createdAt: new Date().toISOString(),
+   697→    // Variations-specific data
+   698→    variations: [],  // Will be populated during generation
+   699→    variationProgress: [0, 0, 0],  // Progress for each variation
+   700→    selectedVariation: null,  // Index of user-selected variation
+   701→    // Generated music info (populated after selection)
+   702→    musicResult: null
+   703→  };
+   704→
+   705→  // Add to queue with higher priority than regular jobs
+   706→  await queue.add('generate-variations', data, {
+   707→    jobId,
+   708→    priority: 1  // Higher priority than regular jobs
+   709→  });
+   710→
+   711→  return {
+   712→    jobId,
+   713→    status: JOB_STATUS.PENDING,
+   714→    isVariations: true,
+   715→    estimatedTime: '5-8 minutes'  // Longer due to 3 parallel generations
+   716→  };
+   717→}
+   718→
+   719→/**
+   720→ * Get variations job status with detailed progress
+   721→ * @param {string} jobId - Job ID
+   722→ * @returns {Promise<Object|null>} Job status with variations info
+   723→ */
+   724→async function getVariationsJobStatus(jobId) {
+   725→  const queue = getMusicQueue();
+   726→
+   727→  const job = await queue.getJob(jobId);
+   728→
+   729→  if (!job) {
+   730→    return null;
+   731→  }
+   732→
+   733→  const state = await job.getState();
+   734→
+   735→  return {
+   736→    jobId: job.id,
+   737→    isVariations: true,
+   738→    status: job.data.step || state,
+   739→    progress: job.progress || 0,
+   740→    variationProgress: job.data.variationProgress || [0, 0, 0],
+   741→    variations: (job.data.variations || []).map(v => ({
+   742→      variationIndex: v.variationIndex,
+   743→      variationName: v.variationName,
+   744→      promptDescription: v.promptDescription,
+   745→      status: v.failed ? 'failed' : 'completed',
+   746→      error: v.error || null,
+   747→      previewUrl: v.previewUrl || null,
+   748→      duration: v.duration || null
+   749→    })),
+   750→    selectedVariation: job.data.selectedVariation,
+   751→    data: {
+   752→      customerId: job.data.customerId,
+   753→      prompt: job.data.prompt,
+   754→      duration: job.data.duration,
+   755→      mood: job.data.mood,
+   756→      instruments: job.data.instruments,
+   757→      musicResult: job.data.musicResult
+   758→    },
+   759→    createdAt: job.data.createdAt,
+   760→    processedAt: job.processedOn ? new Date(job.processedOn).toISOString() : null,
+   761→    completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+   762→    failedReason: job.failedReason || null,
+   763→    attemptsMade: job.attemptsMade || 0
+   764→  };
+   765→}
+   766→
+   767→/**
+   768→ * Select a variation from a completed variations job
+   769→ * @param {string} jobId - Job ID
+   770→ * @param {number} variationIndex - Index of variation to select (0-2)
+   771→ * @param {string} customerId - Customer ID for ownership verification
+   772→ * @returns {Promise<Object>} Selected variation info
+   773→ */
+   774→async function selectVariation(jobId, variationIndex, customerId) {
+   775→  const queue = getMusicQueue();
+   776→
+   777→  const job = await queue.getJob(jobId);
+   778→
+   779→  if (!job) {
+   780→    throw new Error(`Job ${jobId} not found`);
+   781→  }
+   782→
+   783→  // Verify ownership
+   784→  if (job.data.customerId !== customerId) {
+   785→    throw new Error('Not authorized to access this job');
+   786→  }
+   787→
+   788→  // Check if variations are ready
+   789→  if (!job.data.variations || job.data.variations.length === 0) {
+   790→    throw new Error('Variations not yet generated');
+   791→  }
+   792→
+   793→  // Validate variation index
+   794→  if (variationIndex < 0 || variationIndex >= job.data.variations.length) {
+   795→    throw new Error(`Invalid variation index: ${variationIndex}`);
+   796→  }
+   797→
+   798→  // Check if selected variation failed
+   799→  const selectedVar = job.data.variations[variationIndex];
+   800→  if (selectedVar.failed) {
+   801→    throw new Error(`Selected variation failed: ${selectedVar.error}`);
+   802→  }
+   803→
+   804→  // Update job with selection
+   805→  await job.updateData({
+   806→    ...job.data,
+   807→    selectedVariation: variationIndex,
+   808→    step: JOB_STATUS.COMPLETED,
+   809→    musicResult: {
+   810→      title: selectedVar.title,
+   811→      taskId: selectedVar.taskId,
+   812→      duration: selectedVar.duration,
+   813→      audioUrl: selectedVar.audioUrl,
+   814→      previewUrl: selectedVar.previewUrl,
+   815→      variationName: selectedVar.variationName,
+   816→      variationIndex: selectedVar.variationIndex
+   817→    }
+   818→  });
+   819→
+   820→  return {
+   821→    success: true,
+   822→    selectedVariation: variationIndex,
+   823→    variationName: selectedVar.variationName,
+   824→    musicResult: {
+   825→      title: selectedVar.title,
+   826→      duration: selectedVar.duration,
+   827→      audioUrl: selectedVar.audioUrl,
+   828→      previewUrl: selectedVar.previewUrl
+   829→    }
+   830→  };
+   831→}
+   832→
+   833→/**
+   834→ * Update variation progress (used internally during generation)
+   835→ * @param {string} jobId - Job ID
+   836→ * @param {number} variationIndex - Variation index (0-2)
+   837→ * @param {number} progress - Progress percentage (0-100)
+   838→ * @param {string} status - Current status
+   839→ */
+   840→async function updateVariationProgress(jobId, variationIndex, progress, status) {
+   841→  const queue = getMusicQueue();
+   842→
+   843→  const job = await queue.getJob(jobId);
+   844→
+   845→  if (!job) {
+   846→    throw new Error(`Job ${jobId} not found`);
+   847→  }
+   848→
+   849→  const variationProgress = job.data.variationProgress || [0, 0, 0];
+   850→  variationProgress[variationIndex] = progress;
+   851→
+   852→  // Calculate overall progress (average of all variations)
+   853→  const overallProgress = Math.floor(
+   854→    variationProgress.reduce((a, b) => a + b, 0) / 3
+   855→  );
+   856→
+   857→  await job.updateData({
+   858→    ...job.data,
+   859→    variationProgress,
+   860→    step: status === 'completed' ? JOB_STATUS.SELECTING : JOB_STATUS.GENERATING_VARIATIONS
+   861→  });
+   862→
+   863→  await job.updateProgress(overallProgress);
+   864→}
+   865→
+   866→/**
+   867→ * Store generated variations in job data
+   868→ * @param {string} jobId - Job ID
+   869→ * @param {Object[]} variations - Array of variation results
+   870→ */
+   871→async function storeVariations(jobId, variations) {
+   872→  const queue = getMusicQueue();
+   873→
+   874→  const job = await queue.getJob(jobId);
+   875→
+   876→  if (!job) {
+   877→    throw new Error(`Job ${jobId} not found`);
+   878→  }
+   879→
+   880→  const successCount = variations.filter(v => !v.failed).length;
+   881→
+   882→  await job.updateData({
+   883→    ...job.data,
+   884→    variations,
+   885→    step: successCount > 0 ? JOB_STATUS.SELECTING : JOB_STATUS.FAILED
+   886→  });
+   887→
+   888→  await job.updateProgress(successCount > 0 ? 95 : 100);
+   889→}
+   890→
+   891→module.exports = {
+   892→  JOB_STATUS,
+   893→  PROGRESS_MAP,
+   894→  getMusicQueue,
+   895→  getRedisConnection,
+   896→  generateJobId,
+   897→  addMusicJob,
+   898→  getJobStatus,
+   899→  getCustomerJobs,
+   900→  cancelJob,
+   901→  retryJob,
+   902→  updateJobData,
+   903→  getQueueStats,
+   904→  closeQueue,
+   905→  // Variations-specific exports
+   906→  addVariationsJob,
+   907→  getVariationsJobStatus,
+   908→  selectVariation,
+   909→  updateVariationProgress,
+   910→  storeVariations,
+   911→  // HIGH-006: Dead Letter Queue exports
+   912→  getDeadLetterQueue,
+   913→  moveToDeadLetterQueue,
+   914→  getDeadLetterJobs,
+   915→  recoverFromDeadLetterQueue,
+   916→  getDeadLetterQueueStats,
+   917→  isUnrecoverableError,
+   918→  DLQ_CONFIG
+   919→};
+   920→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

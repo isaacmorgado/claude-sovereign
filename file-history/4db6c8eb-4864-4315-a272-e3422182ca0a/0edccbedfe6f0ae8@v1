@@ -1,0 +1,201 @@
+/**
+ * Slice 8: Silence Detection & Removal
+ *
+ * Detects silent gaps in audio and removes them from the timeline.
+ */
+
+// Store detected silences
+let currentSilences = [];
+
+/**
+ * Get current silences
+ */
+function getCurrentSilences() {
+  return currentSilences;
+}
+
+/**
+ * Initialize the silence threshold slider
+ */
+function initSilenceSlider() {
+  const slider = document.getElementById('silenceThreshold');
+  const valueDisplay = document.getElementById('thresholdValue');
+
+  slider.addEventListener('input', () => {
+    valueDisplay.textContent = `${slider.value}s`;
+  });
+}
+
+/**
+ * Initialize the Detect Silences button
+ */
+function initDetectSilences() {
+  document.getElementById('detectSilencesBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('detectSilencesBtn');
+    const threshold = parseFloat(document.getElementById('silenceThreshold').value);
+
+    btn.disabled = true;
+    setStatus('Detecting silences...');
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/silences`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wavPath: WAV_PATH, threshold })
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Failed to detect silences');
+      }
+
+      const data = await response.json();
+      currentSilences = data.silences;
+
+      // Display results
+      const resultsDiv = document.getElementById('silenceResults');
+      resultsDiv.style.display = 'block';
+
+      if (data.count === 0) {
+        resultsDiv.innerHTML = '<p style="color: #888;">No silences detected above threshold.</p>';
+        document.getElementById('removeSilencesBtn').style.display = 'none';
+      } else {
+        resultsDiv.innerHTML = `
+          <p><strong>${data.count}</strong> silence(s) found</p>
+          <p style="color: #888;">Total: ${data.totalSilenceDuration}s of silence</p>
+        `;
+        document.getElementById('removeSilencesBtn').style.display = 'block';
+      }
+
+      setStatus(`Found ${data.count} silence(s)`);
+
+    } catch (err) {
+      setStatus(`Error: ${err.message}`);
+      console.error('SPLICE silence detection error:', err);
+    }
+
+    btn.disabled = false;
+  });
+}
+
+/**
+ * Initialize the Remove Silences button
+ */
+function initRemoveSilences() {
+  document.getElementById('removeSilencesBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('removeSilencesBtn');
+
+    if (!currentSilences || currentSilences.length === 0) {
+      setStatus('No silences to remove');
+      return;
+    }
+
+    btn.disabled = true;
+    setStatus('Removing silences from timeline...');
+
+    try {
+      const context = await getActiveSequence();
+      if (!context) {
+        setStatus('No project or sequence open');
+        btn.disabled = false;
+        return;
+      }
+
+      const { sequence } = context;
+
+      // Sort silences by start time DESCENDING (work from end to avoid time shifts)
+      const sortedSilences = [...currentSilences].sort((a, b) => b.start - a.start);
+
+      let removedCount = 0;
+      const videoTrackCount = await sequence.getVideoTrackCount();
+      const audioTrackCount = await sequence.getAudioTrackCount();
+
+      for (const silence of sortedSilences) {
+        const startTicks = Math.floor(silence.start * TICKS_PER_SECOND);
+        const endTicks = Math.floor(silence.end * TICKS_PER_SECOND);
+
+        // Process video tracks
+        for (let i = 0; i < videoTrackCount; i++) {
+          const track = await sequence.getVideoTrack(i);
+          if (!track) continue;
+
+          const clips = await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false);
+          if (!clips) continue;
+
+          for (let j = clips.length - 1; j >= 0; j--) {
+            const clip = clips[j];
+            if (!clip) continue;
+
+            const clipStartObj = await clip.getStartTime();
+            const clipEndObj = await clip.getEndTime();
+            const clipStart = clipStartObj.ticks !== undefined ? clipStartObj.ticks : clipStartObj;
+            const clipEnd = clipEndObj.ticks !== undefined ? clipEndObj.ticks : clipEndObj;
+
+            // Check if clip overlaps with silence region
+            if (clipStart < endTicks && clipEnd > startTicks) {
+              // Disable clips that overlap silence (no remove API in UXP)
+              const project = await ppro.Project.getActiveProject();
+              const clipRef = clip;
+
+              project.lockedAccess(() => {
+                project.executeTransaction((compoundAction) => {
+                  const disableAction = clipRef.createSetDisabledAction(true);
+                  compoundAction.addAction(disableAction);
+                }, 'SPLICE: Remove Silence');
+              });
+              removedCount++;
+            }
+          }
+        }
+
+        // Process audio tracks
+        for (let i = 0; i < audioTrackCount; i++) {
+          const track = await sequence.getAudioTrack(i);
+          if (!track) continue;
+
+          const clips = await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false);
+          if (!clips) continue;
+
+          for (let j = clips.length - 1; j >= 0; j--) {
+            const clip = clips[j];
+            if (!clip) continue;
+
+            const clipStartObj = await clip.getStartTime();
+            const clipEndObj = await clip.getEndTime();
+            const clipStart = clipStartObj.ticks !== undefined ? clipStartObj.ticks : clipStartObj;
+            const clipEnd = clipEndObj.ticks !== undefined ? clipEndObj.ticks : clipEndObj;
+
+            // Check if clip overlaps with silence region
+            if (clipStart < endTicks && clipEnd > startTicks) {
+              const project = await ppro.Project.getActiveProject();
+              const clipRef = clip;
+
+              project.lockedAccess(() => {
+                project.executeTransaction((compoundAction) => {
+                  const disableAction = clipRef.createSetDisabledAction(true);
+                  compoundAction.addAction(disableAction);
+                }, 'SPLICE: Remove Silence');
+              });
+              removedCount++;
+            }
+          }
+        }
+      }
+
+      setStatus(`Disabled ${removedCount} clip(s) in silence regions`);
+
+    } catch (err) {
+      setStatus(`Remove error: ${err.message}`);
+      console.error('SPLICE remove silences error:', err);
+    }
+
+    btn.disabled = false;
+  });
+}
+
+/**
+ * Show the silence section (called after audio export)
+ */
+function showSilenceSection() {
+  document.getElementById('silenceSection').style.display = 'block';
+}

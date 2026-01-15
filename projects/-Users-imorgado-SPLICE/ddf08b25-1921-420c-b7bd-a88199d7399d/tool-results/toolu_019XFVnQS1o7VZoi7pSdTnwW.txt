@@ -1,0 +1,448 @@
+     1→/**
+     2→ * Music Generation Background Worker
+     3→ * Processes music generation jobs from the BullMQ queue
+     4→ *
+     5→ * HIGH-006: Integrated with Dead Letter Queue for permanently failed jobs
+     6→ */
+     7→
+     8→const { Worker, UnrecoverableError } = require('bullmq');
+     9→const {
+    10→  getRedisConnection,
+    11→  JOB_STATUS,
+    12→  PROGRESS_MAP,
+    13→  moveToDeadLetterQueue // HIGH-006: Import DLQ function
+    14→} = require('../services/musicQueue');
+    15→
+    16→// Lazy import services (will be implemented in later phases)
+    17→let songIdentification = null;
+    18→let musicGeneration = null;
+    19→let r2Storage = null;
+    20→let sceneAnalysis = null;
+    21→
+    22→/**
+    23→ * Initialize worker dependencies
+    24→ */
+    25→async function initDependencies() {
+    26→  try {
+    27→    r2Storage = require('../services/r2Storage');
+    28→  } catch (e) {
+    29→    console.warn('r2Storage not available:', e.message);
+    30→  }
+    31→
+    32→  try {
+    33→    songIdentification = require('../services/songIdentification');
+    34→  } catch (e) {
+    35→    console.warn('songIdentification not available:', e.message);
+    36→  }
+    37→
+    38→  try {
+    39→    musicGeneration = require('../services/musicGeneration');
+    40→  } catch (e) {
+    41→    console.warn('musicGeneration not available:', e.message);
+    42→  }
+    43→
+    44→  try {
+    45→    sceneAnalysis = require('../services/sceneAnalysis');
+    46→  } catch (e) {
+    47→    console.warn('sceneAnalysis not available:', e.message);
+    48→  }
+    49→}
+    50→
+    51→/**
+    52→ * Update job step and progress
+    53→ */
+    54→async function updateJobStep(job, step) {
+    55→  await job.updateData({
+    56→    ...job.data,
+    57→    step
+    58→  });
+    59→  await job.updateProgress(PROGRESS_MAP[step] || 0);
+    60→  console.log(`[Job ${job.id}] Step: ${step} (${PROGRESS_MAP[step]}%)`);
+    61→}
+    62→
+    63→/**
+    64→ * Update database record
+    65→ */
+    66→async function updateDatabaseRecord(jobId, updates) {
+    67→  // This will be connected to the actual database in Phase 4
+    68→  console.log(`[DB Update] Job ${jobId}:`, JSON.stringify(updates).substring(0, 100));
+    69→}
+    70→
+    71→/**
+    72→ * Process a music generation job
+    73→ * @param {Object} job - BullMQ job
+    74→ * @returns {Promise<Object>} Job result
+    75→ */
+    76→async function processJob(job) {
+    77→  const startTime = Date.now();
+    78→  console.log(`[Job ${job.id}] Starting music generation`);
+    79→  console.log(`[Job ${job.id}] Data:`, JSON.stringify({
+    80→    customerId: job.data.customerId,
+    81→    youtubeUrl: job.data.youtubeUrl?.substring(0, 50),
+    82→    prompt: job.data.prompt?.substring(0, 50),
+    83→    duration: job.data.duration,
+    84→    mood: job.data.mood
+    85→  }));
+    86→
+    87→  try {
+    88→    // Scene-aware path: Analyze transcript first
+    89→    let sceneContext = null;
+    90→    if (job.data.isSceneAware && job.data.segments) {
+    91→      await updateJobStep(job, JOB_STATUS.ANALYZING);
+    92→
+    93→      if (!sceneAnalysis) {
+    94→        console.log(`[Job ${job.id}] Skipping scene analysis (service not available)`);
+    95→      } else {
+    96→        console.log(`[Job ${job.id}] Analyzing ${job.data.segments.length} transcript segments...`);
+    97→        sceneContext = await sceneAnalysis.analyzeScenes(job.data.segments);
+    98→        await job.updateData({
+    99→          ...job.data,
+   100→          sceneContext: {
+   101→            dominantMood: sceneContext.dominantMood,
+   102→            averageEnergy: sceneContext.averageEnergy,
+   103→            sceneCount: sceneContext.scenes.length,
+   104→            summary: sceneAnalysis.getSceneContextSummary(sceneContext)
+   105→          }
+   106→        });
+   107→
+   108→        console.log(`[Job ${job.id}] Scene analysis: ${sceneContext.dominantMood} mood, ${sceneContext.averageEnergy}% energy`);
+   109→      }
+   110→    }
+   111→
+   112→    // Step 1: Extract audio fingerprint (if YouTube URL provided)
+   113→    if (job.data.youtubeUrl) {
+   114→      await updateJobStep(job, JOB_STATUS.EXTRACTING);
+   115→
+   116→      if (!songIdentification) {
+   117→        console.log(`[Job ${job.id}] Skipping extraction (service not available)`);
+   118→      } else {
+   119→        // Extract 15-second audio fingerprint
+   120→        const audioPath = await songIdentification.extractAudioFingerprint(job.data.youtubeUrl);
+   121→        await job.updateData({
+   122→          ...job.data,
+   123→          audioPath
+   124→        });
+   125→      }
+   126→    }
+   127→
+   128→    // Step 2: Identify reference song
+   129→    if (job.data.youtubeUrl) {
+   130→      await updateJobStep(job, JOB_STATUS.IDENTIFYING);
+   131→
+   132→      if (!songIdentification) {
+   133→        console.log(`[Job ${job.id}] Skipping identification (service not available)`);
+   134→      } else {
+   135→        const identification = await songIdentification.identifySong(job.data.audioPath);
+   136→        await job.updateData({
+   137→          ...job.data,
+   138→          referenceSong: identification
+   139→        });
+   140→
+   141→        // Update database with reference info
+   142→        await updateDatabaseRecord(job.id, {
+   143→          reference_song_title: identification?.title,
+   144→          reference_artist: identification?.artist,
+   145→          reference_bpm: identification?.bpm,
+   146→          reference_key: identification?.key,
+   147→          reference_mood: identification?.mood,
+   148→          reference_confidence: identification?.confidence
+   149→        });
+   150→      }
+   151→    }
+   152→
+   153→    // Step 3: Generate music via Mureka API
+   154→    await updateJobStep(job, JOB_STATUS.GENERATING);
+   155→
+   156→    let musicResult;
+   157→    if (!musicGeneration) {
+   158→      console.log(`[Job ${job.id}] Skipping generation (service not available)`);
+   159→      // Placeholder result for testing
+   160→      musicResult = {
+   161→        title: `Generated ${job.data.mood} Music`,
+   162→        duration: job.data.duration,
+   163→        audioBuffer: Buffer.from('placeholder'),
+   164→        previewBuffer: Buffer.from('placeholder')
+   165→      };
+   166→    } else if (job.data.isSceneAware && sceneContext) {
+   167→      // Use scene-aware generation
+   168→      console.log(`[Job ${job.id}] Using scene-aware generation`);
+   169→      musicResult = await musicGeneration.generateSceneAwareMusic(
+   170→        job.data.segments,
+   171→        {
+   172→          prompt: job.data.prompt,
+   173→          duration: job.data.duration,
+   174→          mood: job.data.mood,
+   175→          instruments: job.data.instruments,
+   176→          referenceSong: job.data.referenceSong
+   177→        }
+   178→      );
+   179→    } else {
+   180→      // Build generation prompt from reference + user input
+   181→      const prompt = buildGenerationPrompt(job.data);
+   182→      musicResult = await musicGeneration.generateMusic({
+   183→        prompt,
+   184→        duration: job.data.duration,
+   185→        mood: job.data.mood,
+   186→        instruments: job.data.instruments,
+   187→        referenceSong: job.data.referenceSong
+   188→      });
+   189→    }
+   190→
+   191→    await job.updateData({
+   192→      ...job.data,
+   193→      musicResult: {
+   194→        title: musicResult.title,
+   195→        duration: musicResult.duration
+   196→      }
+   197→    });
+   198→
+   199→    // Step 4: Upload to R2
+   200→    await updateJobStep(job, JOB_STATUS.UPLOADING);
+   201→
+   202→    if (!r2Storage) {
+   203→      console.log(`[Job ${job.id}] Skipping upload (service not available)`);
+   204→    } else {
+   205→      // Upload master WAV
+   206→      const masterKey = r2Storage.generateStorageKey(
+   207→        job.data.customerId,
+   208→        job.id,
+   209→        'master.wav'
+   210→      );
+   211→      await r2Storage.uploadMusic(musicResult.audioBuffer, masterKey);
+   212→
+   213→      // Upload preview MP3
+   214→      const previewKey = r2Storage.generateStorageKey(
+   215→        job.data.customerId,
+   216→        job.id,
+   217→        'preview.mp3'
+   218→      );
+   219→      await r2Storage.uploadMusic(musicResult.previewBuffer, previewKey);
+   220→
+   221→      // Upload metadata
+   222→      const metadataKey = r2Storage.generateStorageKey(
+   223→        job.data.customerId,
+   224→        job.id,
+   225→        'metadata.json'
+   226→      );
+   227→      await r2Storage.uploadMetadata(metadataKey, {
+   228→        title: musicResult.title,
+   229→        duration: musicResult.duration,
+   230→        mood: job.data.mood,
+   231→        instruments: job.data.instruments,
+   232→        referenceSong: job.data.referenceSong,
+   233→        isSceneAware: job.data.isSceneAware || false,
+   234→        sceneContext: job.data.sceneContext || null,
+   235→        createdAt: new Date().toISOString()
+   236→      });
+   237→
+   238→      // Update database with storage info
+   239→      await updateDatabaseRecord(job.id, {
+   240→        r2_key: masterKey,
+   241→        r2_preview_key: previewKey,
+   242→        file_size_bytes: musicResult.audioBuffer.length,
+   243→        audio_duration_seconds: musicResult.duration,
+   244→        title: musicResult.title
+   245→      });
+   246→    }
+   247→
+   248→    // Step 5: Complete
+   249→    await updateJobStep(job, JOB_STATUS.COMPLETED);
+   250→
+   251→    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+   252→    console.log(`[Job ${job.id}] Completed in ${elapsed}s`);
+   253→
+   254→    // Update database with completion
+   255→    await updateDatabaseRecord(job.id, {
+   256→      status: 'completed',
+   257→      completed_at: new Date().toISOString()
+   258→    });
+   259→
+   260→    return {
+   261→      success: true,
+   262→      jobId: job.id,
+   263→      title: musicResult.title,
+   264→      duration: musicResult.duration,
+   265→      elapsed: parseFloat(elapsed)
+   266→    };
+   267→
+   268→  } catch (error) {
+   269→    console.error(`[Job ${job.id}] Error:`, error.message);
+   270→
+   271→    // Check for unrecoverable errors
+   272→    if (isUnrecoverableError(error)) {
+   273→      // Update database with failure
+   274→      await updateDatabaseRecord(job.id, {
+   275→        status: 'failed',
+   276→        error_message: error.message
+   277→      });
+   278→
+   279→      throw new UnrecoverableError(error.message);
+   280→    }
+   281→
+   282→    // Update step to indicate failure point
+   283→    await job.updateData({
+   284→      ...job.data,
+   285→      lastError: error.message,
+   286→      lastErrorStep: job.data.step
+   287→    });
+   288→
+   289→    throw error; // Will trigger retry
+   290→  }
+   291→}
+   292→
+   293→/**
+   294→ * Build generation prompt from job data
+   295→ */
+   296→function buildGenerationPrompt(data) {
+   297→  const parts = [];
+   298→
+   299→  // Add user prompt if provided
+   300→  if (data.prompt) {
+   301→    parts.push(data.prompt);
+   302→  }
+   303→
+   304→  // Add reference song style
+   305→  if (data.referenceSong) {
+   306→    parts.push(`Style similar to "${data.referenceSong.title}" by ${data.referenceSong.artist}`);
+   307→    if (data.referenceSong.bpm) {
+   308→      parts.push(`Tempo: around ${data.referenceSong.bpm} BPM`);
+   309→    }
+   310→    if (data.referenceSong.key) {
+   311→      parts.push(`Key: ${data.referenceSong.key}`);
+   312→    }
+   313→  }
+   314→
+   315→  // Add mood
+   316→  if (data.mood) {
+   317→    parts.push(`Mood: ${data.mood}`);
+   318→  }
+   319→
+   320→  // Add instruments
+   321→  if (data.instruments && data.instruments.length > 0) {
+   322→    parts.push(`Instruments: ${data.instruments.join(', ')}`);
+   323→  }
+   324→
+   325→  // Add duration
+   326→  parts.push(`Duration: ${data.duration} seconds`);
+   327→
+   328→  // Add generic quality markers
+   329→  parts.push('Instrumental only, no vocals');
+   330→  parts.push('Suitable for video background music');
+   331→
+   332→  return parts.join('. ');
+   333→}
+   334→
+   335→/**
+   336→ * Check if error is unrecoverable
+   337→ */
+   338→function isUnrecoverableError(error) {
+   339→  const unrecoverablePatterns = [
+   340→    /quota exceeded/i,
+   341→    /invalid api key/i,
+   342→    /authentication failed/i,
+   343→    /insufficient credits/i,
+   344→    /account suspended/i,
+   345→    /content policy violation/i
+   346→  ];
+   347→
+   348→  return unrecoverablePatterns.some(pattern => pattern.test(error.message));
+   349→}
+   350→
+   351→/**
+   352→ * Create and start the music worker
+   353→ */
+   354→function createMusicWorker(options = {}) {
+   355→  const worker = new Worker(
+   356→    'music-generation',
+   357→    async (job) => {
+   358→      await initDependencies();
+   359→      return processJob(job);
+   360→    },
+   361→    {
+   362→      connection: getRedisConnection(),
+   363→      concurrency: options.concurrency || 3,
+   364→      settings: {
+   365→        backoffStrategy: (attemptsMade) => {
+   366→          // Exponential backoff: 5s, 10s, 20s
+   367→          return Math.min(5000 * Math.pow(2, attemptsMade - 1), 300000);
+   368→        }
+   369→      }
+   370→    }
+   371→  );
+   372→
+   373→  // Event handlers
+   374→  worker.on('completed', (job, result) => {
+   375→    console.log(`[Worker] Job ${job.id} completed:`, result?.title || 'Unknown');
+   376→  });
+   377→
+   378→  // HIGH-006: Move permanently failed jobs to Dead Letter Queue
+   379→  worker.on('failed', async (job, error) => {
+   380→    console.error(`[Worker] Job ${job?.id} failed after ${job?.attemptsMade} attempts:`, error.message);
+   381→    
+   382→    // Check if this job has exhausted all retries
+   383→    if (job && job.attemptsMade >= (job.opts?.attempts || 3)) {
+   384→      try {
+   385→        // Move to dead letter queue for inspection and potential recovery
+   386→        const { dlqJobId } = await moveToDeadLetterQueue(job, error);
+   387→        console.log(`[Worker] Job ${job.id} moved to DLQ as ${dlqJobId}`);
+   388→      } catch (dlqError) {
+   389→        console.error(`[Worker] Failed to move job ${job.id} to DLQ:`, dlqError.message);
+   390→      }
+   391→    }
+   392→  });
+   393→
+   394→  worker.on('progress', (job, progress) => {
+   395→    console.log(`[Worker] Job ${job.id} progress: ${progress}%`);
+   396→  });
+   397→
+   398→  worker.on('error', (error) => {
+   399→    console.error('[Worker] Error:', error.message);
+   400→  });
+   401→
+   402→  worker.on('stalled', (jobId) => {
+   403→    console.warn(`[Worker] Job ${jobId} stalled`);
+   404→  });
+   405→
+   406→  console.log('[Worker] Music generation worker started');
+   407→  console.log(`[Worker] Concurrency: ${options.concurrency || 3}`);
+   408→
+   409→  return worker;
+   410→}
+   411→
+   412→/**
+   413→ * Graceful shutdown
+   414→ */
+   415→async function shutdownWorker(worker) {
+   416→  console.log('[Worker] Shutting down...');
+   417→  await worker.close();
+   418→  console.log('[Worker] Shutdown complete');
+   419→}
+   420→
+   421→// Export for use in server.js or standalone
+   422→module.exports = {
+   423→  createMusicWorker,
+   424→  shutdownWorker,
+   425→  processJob,
+   426→  buildGenerationPrompt,
+   427→  isUnrecoverableError
+   428→};
+   429→
+   430→// Run standalone if executed directly
+   431→if (require.main === module) {
+   432→  const worker = createMusicWorker();
+   433→
+   434→  process.on('SIGTERM', async () => {
+   435→    await shutdownWorker(worker);
+   436→    process.exit(0);
+   437→  });
+   438→
+   439→  process.on('SIGINT', async () => {
+   440→    await shutdownWorker(worker);
+   441→    process.exit(0);
+   442→  });
+   443→}
+   444→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,120 @@
+#!/bin/bash
+# Reinforcement Learning Tracker - Learn from outcomes
+# Based on: DB-GPT retry patterns, swarms RL patterns
+# Tracks success/failure patterns and adjusts strategies
+
+set -eo pipefail
+
+CLAUDE_DIR="${HOME}/.claude"
+MEMORY_MANAGER="${CLAUDE_DIR}/hooks/memory-manager.sh"
+RL_DATA="${CLAUDE_DIR}/.rl/outcomes.jsonl"
+LOG_FILE="${CLAUDE_DIR}/rl-tracker.log"
+
+mkdir -p "$(dirname "$RL_DATA")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Record outcome
+record_outcome() {
+    local action_type="$1"
+    local context="$2"
+    local outcome="$3"  # success/failure
+    local reward="${4:-0}"  # -1 to 1
+
+    log "Recording outcome: $action_type -> $outcome (reward: $reward)"
+
+    local record
+    record=$(jq -n \
+        --arg type "$action_type" \
+        --arg context "$context" \
+        --arg outcome "$outcome" \
+        --arg reward "$reward" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{
+            timestamp: $ts,
+            action_type: $type,
+            context: $context,
+            outcome: $outcome,
+            reward: ($reward | tonumber)
+        }')
+
+    echo "$record" >> "$RL_DATA"
+
+    # Update memory with pattern
+    if [[ -x "$MEMORY_MANAGER" && "$outcome" == "success" ]]; then
+        "$MEMORY_MANAGER" add-pattern "successful_action" "$action_type in $context" "led to success" "$(echo "scale=2; ($reward + 1) / 2" | bc)" 2>/dev/null || true
+    fi
+}
+
+# Get success rate for action type
+get_success_rate() {
+    local action_type="$1"
+    local window="${2:-20}"
+
+    if [[ ! -f "$RL_DATA" ]]; then
+        echo '{"success_rate":0.5,"confidence":"low","sample_size":0}'
+        return
+    fi
+
+    local stats
+    stats=$(tail -n 100 "$RL_DATA" | jq -s --arg type "$action_type" --argjson window "$window" '
+        map(select(.action_type == $type)) | .[-$window:] | {
+            total: length,
+            successes: (map(select(.outcome == "success")) | length),
+            avg_reward: (map(.reward) | add / length)
+        } | . + {
+            success_rate: (if .total > 0 then .successes / .total else 0.5 end),
+            confidence: (if .total >= 10 then "high" elif .total >= 5 then "medium" else "low" end),
+            sample_size: .total
+        }
+    ')
+
+    echo "$stats"
+}
+
+# Recommend action based on learned patterns
+recommend_action() {
+    local context="$1"
+    local options="$2"  # JSON array of action options
+
+    log "Recommending action for context: $context"
+
+    if [[ ! -f "$RL_DATA" ]]; then
+        echo '{"recommendation":"insufficient_data","confidence":0}'
+        return
+    fi
+
+    # Score each option
+    local recommendations
+    recommendations=$(echo "$options" | jq -r '.[]' | while read -r action; do
+        local stats
+        stats=$(get_success_rate "$action")
+        echo "$stats" | jq --arg action "$action" '. + {action: $action}'
+    done | jq -s 'sort_by(-.success_rate)')
+
+    local best
+    best=$(echo "$recommendations" | jq '.[0]')
+
+    echo "$best"
+}
+
+case "${1:-help}" in
+    record)
+        record_outcome "${2:-action}" "${3:-context}" "${4:-success}" "${5:-0}"
+        ;;
+    success-rate)
+        get_success_rate "${2:-action}" "${3:-20}"
+        ;;
+    recommend)
+        recommend_action "${2:-context}" "${3:-[]}"
+        ;;
+    help|*)
+        echo "Reinforcement Learning Tracker"
+        echo "Usage: $0 <command> [args]"
+        echo "  record <action> <context> <outcome> [reward]"
+        echo "  success-rate <action> [window]"
+        echo "  recommend <context> <options_json>"
+        ;;
+esac

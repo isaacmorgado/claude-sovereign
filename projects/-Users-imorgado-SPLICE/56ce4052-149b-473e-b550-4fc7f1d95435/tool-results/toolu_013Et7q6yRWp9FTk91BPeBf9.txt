@@ -1,0 +1,732 @@
+     1→/**
+     2→ * SPLICE Backend Server
+     3→ *
+     4→ * Main entry point for the SPLICE backend API.
+     5→ * Orchestrates the audio analysis pipeline.
+     6→ *
+     7→ * Slices:
+     8→ * - Slice 4: Transcription (services/transcription.js)
+     9→ * - Slice 5: Take Detection (services/takeDetection.js)
+    10→ *
+    11→ * Architecture: Modular routes (see routes/ directory)
+    12→ */
+    13→
+    14→
+    15→require('dotenv').config();
+    16→
+    17→const express = require('express');
+    18→const cors = require('cors');
+    19→const helmet = require('helmet');
+    20→const fs = require('fs');
+    21→const https = require('https');
+    22→const http = require('http');
+    23→const path = require('path');
+    24→const crypto = require('crypto');
+    25→
+    26→// Check if running in production (Railway injects RAILWAY_ENVIRONMENT)
+    27→const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+    28→
+    29→// Import services
+    30→const usageTracking = require('./services/usageTracking');
+    31→const { requireCredits, ipRateLimit } = require('./middleware/rateLimiter');
+    32→const { generateToken, generateRefreshToken, verifyToken, authenticateToken, maskSensitiveData } = require('./middleware/auth');
+    33→const referralService = require('./services/referralService');
+    34→const licenseService = require('./services/licenseService');
+    35→const emailService = require('./services/emailService');
+    36→const { getSupportedLanguages, getAvailableBleepSounds } = require('./services/profanityDetection');
+    37→const { getSupportedFormats } = require('./services/captionExporter');
+    38→
+    39→// Import route modules
+    40→const healthRoutes = require('./routes/health');
+    41→const analyzeRoutes = require('./routes/analyze');
+    42→const silencesRoutes = require('./routes/silences');
+    43→const detectionRoutes = require('./routes/detection');
+    44→const exportRoutes = require('./routes/export');
+    45→const multitrackRoutes = require('./routes/multitrack');
+    46→const cutListRoutes = require('./routes/cutList');
+    47→const zoomRoutes = require('./routes/zoom');
+    48→const chaptersRoutes = require('./routes/chapters');
+    49→const youtubeRoutes = require('./routes/youtube');
+    50→const captionsRoutes = require('./routes/captions');
+    51→const textEditRoutes = require('./routes/textEdit');
+    52→const reframeRoutes = require('./routes/reframe');
+    53→const batchRoutes = require('./routes/batch');
+    54→const authRoutes = require('./routes/auth');
+    55→const billingRoutes = require('./routes/billing');
+    56→const referralRoutes = require('./routes/referral');
+    57→const licenseRoutes = require('./routes/license');
+    58→const musicRoutes = require('./routes/music');
+    59→
+    60→// Stripe for webhooks
+    61→const Stripe = require('stripe');
+    62→
+    63→// Validate STRIPE_SECRET_KEY in production - exit if missing
+    64→if (isProduction && !process.env.STRIPE_SECRET_KEY) {
+    65→  console.error('[SPLICE] CRITICAL: STRIPE_SECRET_KEY is required in production');
+    66→  process.exit(1);
+    67→}
+    68→
+    69→// Validate JWT_SECRET in production - exit if using default
+    70→if (isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'splice-dev-secret-change-in-production')) {
+    71→  console.error('[SPLICE] CRITICAL: JWT_SECRET must be set to a secure value in production');
+    72→  process.exit(1);
+    73→}
+    74→
+    75→// Validate DATABASE_URL in production
+    76→if (isProduction && !process.env.DATABASE_URL) {
+    77→  console.error('[SPLICE] CRITICAL: DATABASE_URL is required in production');
+    78→  process.exit(1);
+    79→}
+    80→
+    81→// Validate OPENAI_API_KEY in production
+    82→if (isProduction && !process.env.OPENAI_API_KEY) {
+    83→  console.error('[SPLICE] CRITICAL: OPENAI_API_KEY is required in production');
+    84→  process.exit(1);
+    85→}
+    86→
+    87→const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    88→
+    89→// =============================================================================
+    90→// PERF-FIX: Static Response Cache
+    91→// Cache static endpoint responses at startup to avoid repeated computation
+    92→// =============================================================================
+    93→
+    94→// Generate ETag from content
+    95→function generateETag(content) {
+    96→  return `"${crypto.createHash('md5').update(JSON.stringify(content)).digest('hex')}"`;
+    97→}
+    98→
+    99→// Static response cache - populated at startup
+   100→const STATIC_RESPONSE_CACHE = {
+   101→  profanityLanguages: null,
+   102→  profanityBleeps: null,
+   103→  exportFormats: null
+   104→};
+   105→
+   106→// Initialize cache at startup (called after server starts)
+   107→function initializeStaticCache() {
+   108→  // Cache profanity languages
+   109→  const languages = getSupportedLanguages();
+   110→  STATIC_RESPONSE_CACHE.profanityLanguages = {
+   111→    body: { success: true, languages },
+   112→    etag: generateETag({ languages })
+   113→  };
+   114→
+   115→  // Cache profanity bleeps
+   116→  const sounds = getAvailableBleepSounds();
+   117→  STATIC_RESPONSE_CACHE.profanityBleeps = {
+   118→    body: { success: true, sounds },
+   119→    etag: generateETag({ sounds })
+   120→  };
+   121→
+   122→  // Cache export formats
+   123→  const formats = getSupportedFormats();
+   124→  STATIC_RESPONSE_CACHE.exportFormats = {
+   125→    body: { success: true, formats },
+   126→    etag: generateETag({ formats })
+   127→  };
+   128→
+   129→  console.log('[SPLICE] Static response cache initialized');
+   130→}
+   131→
+   132→// Helper to send cached response with ETag
+   133→function sendCachedResponse(req, res, cacheKey) {
+   134→  const cached = STATIC_RESPONSE_CACHE[cacheKey];
+   135→  if (!cached) {
+   136→    return res.status(500).json({ error: 'Cache not initialized' });
+   137→  }
+   138→
+   139→  // Check If-None-Match header for conditional GET
+   140→  const clientETag = req.headers['if-none-match'];
+   141→  if (clientETag === cached.etag) {
+   142→    return res.status(304).end(); // Not Modified
+   143→  }
+   144→
+   145→  // Send cached response with ETag and cache headers
+   146→  res.set('ETag', cached.etag);
+   147→  res.set('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
+   148→  res.json(cached.body);
+   149→}
+   150→
+   151→// =============================================================================
+   152→// Server Configuration
+   153→// =============================================================================
+   154→
+   155→const app = express();
+   156→const PORT = process.env.PORT || 3847;
+   157→
+   158→// HTTPS certificates (generated by mkcert) - only for local development
+   159→let httpsOptions = null;
+   160→if (!isProduction) {
+   161→  const keyPath = path.join(__dirname, 'localhost+1-key.pem');
+   162→  const certPath = path.join(__dirname, 'localhost+1.pem');
+   163→  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+   164→    httpsOptions = {
+   165→      key: fs.readFileSync(keyPath),
+   166→      cert: fs.readFileSync(certPath)
+   167→    };
+   168→  }
+   169→}
+   170→
+   171→// =============================================================================
+   172→// Security Configuration
+   173→// =============================================================================
+   174→
+   175→// CORS whitelist - restrict origins in production
+   176→const CORS_WHITELIST = [
+   177→  'http://localhost:3000',
+   178→  'http://localhost:3847',
+   179→  'https://localhost:3847',
+   180→  'http://127.0.0.1:3000',
+   181→  'http://127.0.0.1:3847',
+   182→  'https://127.0.0.1:3847',
+   183→  'https://splice.app',
+   184→  'https://www.splice.app',
+   185→  'https://splice-api-production.up.railway.app',
+   186→  'https://splice-website.vercel.app',
+   187→  // Adobe CEP/UXP panels run from file:// or bolt://
+   188→  'file://',
+   189→  'bolt://'
+   190→];
+   191→
+   192→const corsOptions = {
+   193→  origin: function (origin, callback) {
+   194→    // Allow requests with no origin (like mobile apps, Postman, or Adobe plugins)
+   195→    if (!origin) {
+   196→      return callback(null, true);
+   197→    }
+   198→    // Check if origin is in whitelist
+   199→    if (CORS_WHITELIST.some(allowed => origin.startsWith(allowed) || origin === allowed)) {
+   200→      return callback(null, true);
+   201→    }
+   202→    // In development, allow all origins with warning
+   203→    if (!isProduction) {
+   204→      console.warn(`[CORS] Non-whitelisted origin in dev: ${origin}`);
+   205→      return callback(null, true);
+   206→    }
+   207→    // In production, reject non-whitelisted origins
+   208→    console.error(`[CORS] Blocked request from: ${origin}`);
+   209→    return callback(new Error('Not allowed by CORS'));
+   210→  },
+   211→  credentials: true,
+   212→  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+   213→  allowedHeaders: ['Content-Type', 'Authorization', 'x-stripe-customer-id', 'stripe-signature']
+   214→};
+   215→
+   216→app.use(cors(corsOptions));
+   217→
+   218→// IP-based rate limiting (100 requests/minute per IP)
+   219→app.use(ipRateLimit);
+   220→
+   221→// Security headers via helmet
+   222→app.use(helmet({
+   223→  contentSecurityPolicy: {
+   224→    directives: {
+   225→      defaultSrc: ["'self'"],
+   226→      scriptSrc: ["'self'"],
+   227→      styleSrc: ["'self'", "'unsafe-inline'"],
+   228→      imgSrc: ["'self'", 'data:', 'https:'],
+   229→      connectSrc: ["'self'", 'https://api.stripe.com', 'https://api.openai.com', 'https://api.replicate.com'],
+   230→      fontSrc: ["'self'"],
+   231→      objectSrc: ["'none'"],
+   232→      mediaSrc: ["'self'"],
+   233→      frameSrc: ["'none'"]
+   234→    }
+   235→  },
+   236→  hsts: {
+   237→    maxAge: 31536000,
+   238→    includeSubDomains: true,
+   239→    preload: true
+   240→  },
+   241→  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+   242→  noSniff: true,
+   243→  xssFilter: true,
+   244→  hidePoweredBy: true
+   245→}));
+   246→
+   247→// Helper to determine tier from price ID with logging
+   248→// Supports both monthly and annual pricing
+   249→function getTierFromPriceId(priceId) {
+   250→  // Monthly prices
+   251→  if (priceId === process.env.STRIPE_PRICE_STARTER) return 'starter';
+   252→  if (priceId === process.env.STRIPE_PRICE_PRO) return 'pro';
+   253→  if (priceId === process.env.STRIPE_PRICE_TEAM) return 'team';
+   254→
+   255→  // Annual prices (same tier, just different billing period)
+   256→  if (priceId === process.env.STRIPE_PRICE_STARTER_ANNUAL) return 'starter';
+   257→  if (priceId === process.env.STRIPE_PRICE_PRO_ANNUAL) return 'pro';
+   258→  if (priceId === process.env.STRIPE_PRICE_TEAM_ANNUAL) return 'team';
+   259→
+   260→  // Log unknown price ID for debugging
+   261→  console.warn(`[SPLICE] Unknown price ID: ${priceId} - defaulting to starter tier`);
+   262→  return 'starter';
+   263→}
+   264→
+   265→// =============================================================================
+   266→// Stripe Webhook (must be before express.json())
+   267→// =============================================================================
+   268→
+   269→app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+   270→  const sig = req.headers['stripe-signature'];
+   271→  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+   272→
+   273→  let event;
+   274→
+   275→  try {
+   276→    if (webhookSecret) {
+   277→      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+   278→    } else if (isProduction) {
+   279→      // SECURITY: Reject unsigned webhooks in production
+   280→      console.error('[SPLICE] CRITICAL: STRIPE_WEBHOOK_SECRET not set in production');
+   281→      return res.status(500).json({ error: 'Webhook configuration error: secret not configured' });
+   282→    } else {
+   283→      // For local development testing only
+   284→      // req.body is a Buffer from express.raw(), convert to string for JSON.parse
+   285→      const bodyString = typeof req.body === 'string' ? req.body : req.body.toString('utf8');
+   286→      event = JSON.parse(bodyString);
+   287→      console.warn('[SPLICE] Warning: Processing webhook without signature verification (dev only)');
+   288→    }
+   289→  } catch (err) {
+   290→    console.error('[SPLICE] Webhook signature verification failed:', err.message);
+   291→    return res.status(400).json({ error: 'Webhook signature verification failed' });
+   292→  }
+   293→
+   294→  console.log(`[SPLICE] Webhook received: ${event.type} (${event.id})`);
+   295→
+   296→  // Idempotency check - skip if already processed
+   297→  if (await usageTracking.isEventProcessed(event.id)) {
+   298→    console.log(`[SPLICE] Event ${event.id} already processed, skipping`);
+   299→    return res.json({ received: true, skipped: true });
+   300→  }
+   301→
+   302→  try {
+   303→    switch (event.type) {
+   304→      case 'customer.subscription.created':
+   305→      case 'customer.subscription.updated': {
+   306→        const subscription = event.data.object;
+   307→        const customerId = subscription.customer;
+   308→
+   309→        // Validate customerId
+   310→        if (!customerId) {
+   311→          console.error('[SPLICE] Missing customer ID in subscription event');
+   312→          return res.status(400).json({ error: 'Missing customer ID' });
+   313→        }
+   314→
+   315→        // Get tier from price ID
+   316→        const priceId = subscription.items?.data?.[0]?.price?.id;
+   317→        const tier = getTierFromPriceId(priceId);
+   318→
+   319→        // Update user tier and reset hours
+   320→        await usageTracking.updateTier(customerId, tier);
+   321→        console.log(`[SPLICE] Updated customer ${customerId} to tier: ${tier}`);
+   322→
+   323→        // Update trial end date if present
+   324→        if (subscription.trial_end) {
+   325→          await usageTracking.updateTrialEnd(customerId, subscription.trial_end);
+   326→        }
+   327→
+   328→        // Generate license key for new subscriptions with retry and delivery
+   329→        if (event.type === 'customer.subscription.created') {
+   330→          let licenseResult = null;
+   331→          let retryCount = 0;
+   332→          const maxRetries = 3;
+   333→
+   334→          // Retry mechanism for license key generation
+   335→          while (retryCount < maxRetries) {
+   336→            licenseResult = await licenseService.generateLicenseKey(customerId);
+   337→            if (licenseResult.success) {
+   338→              break;
+   339→            }
+   340→            retryCount++;
+   341→            console.warn(`[SPLICE] License key generation attempt ${retryCount}/${maxRetries} failed: ${licenseResult.error}`);
+   342→            // Wait before retry (exponential backoff)
+   343→            if (retryCount < maxRetries) {
+   344→              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+   345→            }
+   346→          }
+   347→
+   348→          if (licenseResult && licenseResult.success) {
+   349→            // SECURITY: Mask license key in logs
+   350→            console.log(`[SPLICE] Generated license key for ${maskSensitiveData(customerId)}: ${maskSensitiveData(licenseResult.key)}`);
+   351→
+   352→            // Store license key in Stripe subscription metadata as backup
+   353→            try {
+   354→              await stripe.subscriptions.update(subscription.id, {
+   355→                metadata: {
+   356→                  license_key: licenseResult.key,
+   357→                  license_generated_at: new Date().toISOString()
+   358→                }
+   359→              });
+   360→              console.log(`[SPLICE] Stored license key in Stripe metadata for subscription ${subscription.id}`);
+   361→            } catch (stripeErr) {
+   362→              console.error(`[SPLICE] Failed to store license key in Stripe metadata:`, stripeErr.message);
+   363→            }
+   364→
+   365→            // Get customer email and send license key
+   366→            try {
+   367→              const customer = await stripe.customers.retrieve(customerId);
+   368→              if (customer.email) {
+   369→                // SECURITY: Mask sensitive data in logs
+   370→                console.log(`[SPLICE] License key ready for delivery to ${maskSensitiveData(customer.email)}: ${maskSensitiveData(licenseResult.key)}`);
+   371→
+   372→                // Send license key email
+   373→                try {
+   374→                  await emailService.sendLicenseKeyEmail(customer.email, licenseResult.key, tier);
+   375→                  console.log(`[SPLICE] License key email sent to ${maskSensitiveData(customer.email)}`);
+   376→                } catch (sendErr) {
+   377→                  // Log but don't fail - license is stored in Stripe metadata as backup
+   378→                  console.error(`[SPLICE] Failed to send license email:`, sendErr.message);
+   379→                }
+   380→
+   381→                // Store email in database for reference
+   382→                await usageTracking.updateTier(customerId, tier, customer.email);
+   383→              } else {
+   384→                console.warn(`[SPLICE] No email found for customer ${customerId}`);
+   385→              }
+   386→            } catch (emailErr) {
+   387→              console.error(`[SPLICE] Error getting customer email:`, emailErr.message);
+   388→            }
+   389→          } else {
+   390→            // CRITICAL: License generation failed - return 500 to trigger Stripe retry
+   391→            const errorMsg = `Failed to generate license key after ${maxRetries} attempts: ${licenseResult?.error || 'Unknown error'}`;
+   392→            console.error(`[SPLICE] ${errorMsg}`);
+   393→            return res.status(500).json({ error: errorMsg });
+   394→          }
+   395→        }
+   396→        break;
+   397→      }
+   398→
+   399→      case 'customer.subscription.deleted': {
+   400→        const subscription = event.data.object;
+   401→        const customerId = subscription.customer;
+   402→
+   403→        // Validate customerId
+   404→        if (!customerId) {
+   405→          console.error('[SPLICE] Missing customer ID in subscription.deleted event');
+   406→          return res.status(400).json({ error: 'Missing customer ID' });
+   407→        }
+   408→
+   409→        // Downgrade to cancelled (0 hours)
+   410→        await usageTracking.updateTier(customerId, 'cancelled');
+   411→        console.log(`[SPLICE] Subscription cancelled for customer ${customerId}`);
+   412→        break;
+   413→      }
+   414→
+   415→      case 'invoice.payment_succeeded': {
+   416→        const invoice = event.data.object;
+   417→        const customerId = invoice.customer;
+   418→        const subscriptionId = invoice.subscription;
+   419→
+   420→        // Validate customerId
+   421→        if (!customerId) {
+   422→          console.error('[SPLICE] Missing customer ID in invoice event');
+   423→          return res.status(400).json({ error: 'Missing customer ID' });
+   424→        }
+   425→
+   426→        // Reset hours on successful payment (new billing period)
+   427→        let tier = 'starter';
+   428→        if (subscriptionId) {
+   429→          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+   430→          const priceId = subscription.items?.data?.[0]?.price?.id;
+   431→          tier = getTierFromPriceId(priceId);
+   432→
+   433→          await usageTracking.resetHours(customerId, tier);
+   434→          console.log(`[SPLICE] Reset hours for customer ${customerId} (tier: ${tier})`);
+   435→        }
+   436→
+   437→        // Check for affiliate coupon and record commission
+   438→        const discount = invoice.discount;
+   439→        if (discount && discount.coupon) {
+   440→          const couponId = discount.coupon.id;
+   441→          // Check if this is an affiliate code (like JIMMYN)
+   442→          if (referralService.AFFILIATE_CODES[couponId]) {
+   443→            const amountPaid = invoice.amount_paid / 100; // Convert cents to dollars
+   444→            await referralService.recordAffiliateCommission(
+   445→              couponId,
+   446→              customerId,
+   447→              amountPaid,
+   448→              tier
+   449→            );
+   450→            console.log(`[SPLICE] Recorded affiliate commission for ${couponId}`);
+   451→          }
+   452→        }
+   453→        break;
+   454→      }
+   455→
+   456→      case 'invoice.payment_failed': {
+   457→        const invoice = event.data.object;
+   458→        const customerId = invoice.customer;
+   459→        const attemptCount = invoice.attempt_count || 1;
+   460→
+   461→        // Validate customerId
+   462→        if (!customerId) {
+   463→          console.error('[SPLICE] Missing customer ID in payment_failed event');
+   464→          return res.status(400).json({ error: 'Missing customer ID' });
+   465→        }
+   466→
+   467→        console.warn(`[SPLICE] Payment failed for customer ${customerId} (attempt ${attemptCount})`);
+   468→
+   469→        // Stripe will retry automatically per retry settings
+   470→        // On final failure, Stripe will cancel subscription which triggers customer.subscription.deleted
+   471→        // Send warning email on final attempt
+   472→        if (attemptCount >= 3) {
+   473→          console.error(`[SPLICE] Final payment attempt failed for customer ${customerId}`);
+   474→          // Send warning email to customer about impending cancellation
+   475→          try {
+   476→            const customer = await stripe.customers.retrieve(customerId);
+   477→            if (customer.email) {
+   478→              await emailService.sendPaymentWarningEmail(customer.email, attemptCount);
+   479→              console.log(`[SPLICE] Payment warning email sent to ${maskSensitiveData(customer.email)}`);
+   480→            }
+   481→          } catch (emailErr) {
+   482→            console.error(`[SPLICE] Failed to send payment warning email:`, emailErr.message);
+   483→          }
+   484→        }
+   485→        break;
+   486→      }
+   487→
+   488→      case 'customer.deleted': {
+   489→        const customer = event.data.object;
+   490→        const customerId = customer.id;
+   491→
+   492→        // Validate customerId
+   493→        if (!customerId) {
+   494→          console.error('[SPLICE] Missing customer ID in customer.deleted event');
+   495→          return res.status(400).json({ error: 'Missing customer ID' });
+   496→        }
+   497→
+   498→        // Clean up user data - downgrade to cancelled
+   499→        await usageTracking.updateTier(customerId, 'cancelled');
+   500→        console.log(`[SPLICE] Customer deleted: ${customerId}`);
+   501→        break;
+   502→      }
+   503→
+   504→      default:
+   505→        console.log(`[SPLICE] Unhandled event type: ${event.type}`);
+   506→    }
+   507→
+   508→    // Record event as processed (idempotency)
+   509→    await usageTracking.recordWebhookEvent(event.id, event.type);
+   510→
+   511→    res.json({ received: true });
+   512→  } catch (err) {
+   513→    console.error('[SPLICE] Webhook handler error:', err);
+   514→    res.status(500).json({ error: err.message });
+   515→  }
+   516→});
+   517→
+   518→// Parse JSON body for all other routes
+   519→// SECURITY: Limit JSON body size to prevent DoS attacks
+   520→app.use(express.json({ limit: '10mb' }));
+   521→
+   522→// =============================================================================
+   523→// Route Configuration Options
+   524→// =============================================================================
+   525→
+   526→const routeOptions = {
+   527→  middleware: {
+   528→    requireCredits,
+   529→    authenticateToken
+   530→  },
+   531→  services: {
+   532→    usageTracking,
+   533→    referralService,
+   534→    licenseService,
+   535→    emailService,
+   536→    stripe
+   537→  },
+   538→  authHelpers: {
+   539→    generateToken,
+   540→    generateRefreshToken,
+   541→    verifyToken,
+   542→    maskSensitiveData
+   543→  },
+   544→  staticCache: STATIC_RESPONSE_CACHE,
+   545→  sendCachedResponse
+   546→};
+   547→
+   548→// =============================================================================
+   549→// Mount Routes
+   550→// =============================================================================
+   551→
+   552→// Health check and system endpoints (no prefix)
+   553→app.use('/', healthRoutes(routeOptions));
+   554→
+   555→// Core analysis endpoints
+   556→app.use('/', analyzeRoutes(routeOptions));
+   557→app.use('/', silencesRoutes(routeOptions));
+   558→app.use('/', detectionRoutes(routeOptions));
+   559→
+   560→// Export endpoints
+   561→app.use('/export', exportRoutes(routeOptions));
+   562→
+   563→// Multitrack/Multicam endpoints
+   564→app.use('/multitrack', multitrackRoutes(routeOptions));
+   565→
+   566→// Cut list generation
+   567→app.use('/cut-list', cutListRoutes(routeOptions));
+   568→
+   569→// Legacy XML processing endpoint (backwards compatibility)
+   570→const { processXMLFile } = require('./services/xmlProcessor');
+   571→app.post('/process-xml', requireCredits({ endpoint: 'process-xml' }), async (req, res) => {
+   572→  const {
+   573→    xmlPath,
+   574→    silences,
+   575→    removeGaps = true,
+   576→    outputPath = null
+   577→  } = req.body;
+   578→
+   579→  if (!xmlPath) {
+   580→    return res.status(400).json({ error: 'xmlPath is required' });
+   581→  }
+   582→
+   583→  if (!silences || !Array.isArray(silences)) {
+   584→    return res.status(400).json({ error: 'silences array is required' });
+   585→  }
+   586→
+   587→  if (!fs.existsSync(xmlPath)) {
+   588→    return res.status(404).json({ error: `XML file not found: ${xmlPath}` });
+   589→  }
+   590→
+   591→  console.log(`[SPLICE] Processing XML: ${xmlPath} with ${silences.length} silence(s)`);
+   592→
+   593→  try {
+   594→    const result = await processXMLFile(xmlPath, silences, {
+   595→      outputPath,
+   596→      removeGaps
+   597→    });
+   598→
+   599→    res.json({
+   600→      success: true,
+   601→      inputPath: xmlPath,
+   602→      outputPath: result.outputPath,
+   603→      stats: result.stats
+   604→    });
+   605→  } catch (err) {
+   606→    console.error('[SPLICE] XML processing error:', err);
+   607→    res.status(500).json({ error: err.message });
+   608→  }
+   609→});
+   610→
+   611→// Auto zoom endpoints
+   612→app.use('/zoom', zoomRoutes(routeOptions));
+   613→
+   614→// Chapter detection endpoints
+   615→app.use('/chapters', chaptersRoutes(routeOptions));
+   616→
+   617→// YouTube content generation
+   618→app.use('/youtube', youtubeRoutes(routeOptions));
+   619→
+   620→// Animated captions endpoints
+   621→app.use('/captions', captionsRoutes(routeOptions));
+   622→
+   623→// Text-based editing endpoints
+   624→app.use('/text-edit', textEditRoutes(routeOptions));
+   625→
+   626→// Social reframe endpoints
+   627→app.use('/reframe', reframeRoutes(routeOptions));
+   628→app.use('/faces', reframeRoutes.facesRouter(routeOptions));
+   629→
+   630→// Batch processing endpoints
+   631→app.use('/batch', batchRoutes(routeOptions));
+   632→
+   633→// Authentication endpoints
+   634→app.use('/auth', authRoutes(routeOptions));
+   635→
+   636→// Billing and credits endpoints
+   637→app.use('/', billingRoutes(routeOptions));
+   638→
+   639→// Referral system endpoints
+   640→app.use('/referral', referralRoutes(routeOptions));
+   641→
+   642→// License key endpoints
+   643→app.use('/license', licenseRoutes(routeOptions));
+   644→
+   645→// AI Music generation endpoints
+   646→app.use('/music', musicRoutes(routeOptions));
+   647→
+   648→// =============================================================================
+   649→// Start Server
+   650→// =============================================================================
+   651→
+   652→// Track active server for graceful shutdown
+   653→let server = null;
+   654→
+   655→// Initialize database and start server
+   656→async function startServer() {
+   657→  try {
+   658→    await usageTracking.initDatabase();
+   659→    await referralService.initReferralTables();
+   660→    await licenseService.initLicenseTables();
+   661→    console.log('[SPLICE] Database initialized');
+   662→
+   663→    // PERF-FIX: Initialize static response cache at startup
+   664→    initializeStaticCache();
+   665→
+   666→    if (isProduction || !httpsOptions) {
+   667→      // Production: Railway provides TLS termination, use HTTP
+   668→      server = http.createServer(app).listen(PORT, () => {
+   669→        console.log(`[SPLICE] Backend running at http://0.0.0.0:${PORT} (production)`);
+   670→      });
+   671→    } else {
+   672→      // Development: Use HTTPS with local certificates
+   673→      server = https.createServer(httpsOptions, app).listen(PORT, () => {
+   674→        console.log(`[SPLICE] Backend running at https://127.0.0.1:${PORT} (development)`);
+   675→        console.log(`[SPLICE] POST /analyze with { "wavPath": "/path/to/audio.wav" }`);
+   676→      });
+   677→    }
+   678→  } catch (err) {
+   679→    console.error('[SPLICE] Failed to start server:', err);
+   680→    process.exit(1);
+   681→  }
+   682→}
+   683→
+   684→// =============================================================================
+   685→// Graceful Shutdown
+   686→// =============================================================================
+   687→
+   688→async function gracefulShutdown(signal) {
+   689→  console.log(`[SPLICE] Received ${signal}, starting graceful shutdown...`);
+   690→
+   691→  // Stop accepting new connections
+   692→  if (server) {
+   693→    server.close(() => {
+   694→      console.log('[SPLICE] HTTP server closed');
+   695→    });
+   696→  }
+   697→
+   698→  // Close database pool
+   699→  try {
+   700→    await usageTracking.closePool();
+   701→    console.log('[SPLICE] Database pool closed');
+   702→  } catch (err) {
+   703→    console.error('[SPLICE] Error closing database pool:', err.message);
+   704→  }
+   705→
+   706→  // Give ongoing requests time to complete (max 10 seconds)
+   707→  setTimeout(() => {
+   708→    console.log('[SPLICE] Graceful shutdown complete');
+   709→    process.exit(0);
+   710→  }, 10000);
+   711→}
+   712→
+   713→// Handle termination signals
+   714→process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+   715→process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+   716→
+   717→// Handle uncaught exceptions
+   718→process.on('uncaughtException', (err) => {
+   719→  console.error('[SPLICE] Uncaught exception:', err);
+   720→  gracefulShutdown('uncaughtException');
+   721→});
+   722→
+   723→process.on('unhandledRejection', (reason, promise) => {
+   724→  console.error('[SPLICE] Unhandled rejection at:', promise, 'reason:', reason);
+   725→});
+   726→
+   727→startServer();
+   728→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

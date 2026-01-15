@@ -1,0 +1,100 @@
+/**
+ * Rate Limiter Middleware
+ *
+ * Checks if user has sufficient credits before processing.
+ * Returns 402 Payment Required if insufficient credits.
+ */
+
+const { hasCredits, deductUsage, getBalance } = require('../services/usageTracking');
+
+/**
+ * Middleware to check credits before processing
+ *
+ * Expects req.stripeCustomerId to be set by auth middleware
+ * Optionally uses req.estimatedDuration (in seconds) for pre-check
+ */
+function requireCredits(options = {}) {
+  const { endpoint = 'unknown' } = options;
+
+  return async (req, res, next) => {
+    const stripeCustomerId = req.stripeCustomerId || req.headers['x-stripe-customer-id'];
+
+    if (!stripeCustomerId) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Missing Stripe customer ID'
+      });
+    }
+
+    // Store for later use
+    req.stripeCustomerId = stripeCustomerId;
+
+    try {
+      // Check if user has any credits
+      const hasCreds = await hasCredits(stripeCustomerId, req.estimatedDuration || 0);
+
+      if (!hasCreds) {
+        const balance = await getBalance(stripeCustomerId);
+        return res.status(402).json({
+          error: 'Insufficient credits',
+          message: 'Please upgrade your plan or wait for your next billing cycle',
+          balance: {
+            hoursRemaining: balance.hoursRemaining,
+            tier: balance.tier
+          }
+        });
+      }
+
+      // Attach helper function to deduct after processing
+      req.deductUsage = async (audioDurationSeconds) => {
+        return await deductUsage(stripeCustomerId, audioDurationSeconds, endpoint);
+      };
+
+      next();
+    } catch (err) {
+      console.error('[RateLimiter] Error checking credits:', err);
+      return res.status(500).json({
+        error: 'Credit check failed',
+        message: err.message
+      });
+    }
+  };
+}
+
+/**
+ * Middleware to track usage after successful response
+ *
+ * Call this after processing to deduct actual usage
+ */
+function trackUsage(endpoint = 'unknown') {
+  return async (req, res, next) => {
+    // Store original json method
+    const originalJson = res.json.bind(res);
+
+    // Override json to track usage on success
+    res.json = async (data) => {
+      // Only deduct on successful responses
+      if (res.statusCode >= 200 && res.statusCode < 300 && req.audioDuration) {
+        try {
+          const balance = await deductUsage(
+            req.stripeCustomerId,
+            req.audioDuration,
+            endpoint
+          );
+          // Attach updated balance to response
+          data.balance = balance;
+        } catch (err) {
+          console.error('[RateLimiter] Error deducting usage:', err);
+        }
+      }
+      return originalJson(data);
+    };
+
+    next();
+  };
+}
+
+module.exports = {
+  requireCredits,
+  trackUsage
+};

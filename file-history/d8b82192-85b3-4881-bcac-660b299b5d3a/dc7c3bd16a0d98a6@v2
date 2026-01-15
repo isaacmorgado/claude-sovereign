@@ -1,0 +1,335 @@
+"""
+PSL (Pretty Scale Level) Router
+
+Endpoints for PSL calculation and height management.
+"""
+
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models.user import User
+from app.services.auth import get_current_user
+from app.services.psl_service import psl_service
+
+
+router = APIRouter(prefix="/psl", tags=["psl"])
+
+
+# ============================================
+# SCHEMAS
+# ============================================
+
+class HeightUpdate(BaseModel):
+    """Request to update user height"""
+    height_cm: int = Field(..., ge=100, le=250, description="Height in centimeters")
+
+
+class HeightResponse(BaseModel):
+    """Response with height info"""
+    height_cm: int
+    height_rating: float
+    height_display: str  # e.g., "5'10\" (178cm)"
+
+
+class WeightUpdate(BaseModel):
+    """Request to update user weight"""
+    weight_kg: float = Field(..., ge=30, le=300, description="Weight in kilograms")
+
+
+class WeightResponse(BaseModel):
+    """Response with weight info"""
+    weight_kg: float
+    weight_display: str  # e.g., "180 lbs (81.6 kg)"
+    bmi: Optional[float] = None  # Requires height to calculate
+
+
+class PSLCalculateRequest(BaseModel):
+    """Request to calculate PSL score"""
+    face_score: float = Field(..., ge=0, le=10, description="Face harmony score")
+    height_cm: int = Field(..., ge=100, le=250, description="Height in cm")
+    gender: str = Field(..., pattern="^(male|female)$")
+    body_fat_percent: Optional[float] = Field(None, ge=0, le=60)
+    muscle_level: Optional[str] = None
+    failos: Optional[List[str]] = None
+
+
+class PSLComponentScore(BaseModel):
+    """Component score breakdown"""
+    raw: float
+    weighted: float
+
+
+class PSLBonusBreakdown(BaseModel):
+    """Bonus breakdown"""
+    threshold: float
+    synergy: float
+    total: float
+
+
+class PSLBreakdown(BaseModel):
+    """Full PSL breakdown"""
+    face: PSLComponentScore
+    height: PSLComponentScore
+    body: PSLComponentScore
+    bonuses: PSLBonusBreakdown
+    penalties: float
+
+
+class PSLResponse(BaseModel):
+    """Full PSL calculation response"""
+    score: float
+    tier: str
+    percentile: float
+    breakdown: PSLBreakdown
+    potential: float
+
+
+class QuickPSLRequest(BaseModel):
+    """Quick PSL calculation using stored height"""
+    face_score: float = Field(..., ge=0, le=10)
+
+
+# ============================================
+# ENDPOINTS
+# ============================================
+
+@router.post("/calculate", response_model=PSLResponse)
+async def calculate_psl(request: PSLCalculateRequest):
+    """
+    Calculate PSL score based on face, height, and optionally body.
+
+    Formula: PSL = (Face × 0.75) + (Height × 0.20) + (Body × 0.05) + Bonuses
+
+    No authentication required - this is a public calculation endpoint.
+    """
+    result = psl_service.calculate_psl(
+        face_score=request.face_score,
+        height_cm=request.height_cm,
+        gender=request.gender,
+        body_fat_percent=request.body_fat_percent,
+        muscle_level=request.muscle_level,
+        failos=request.failos,
+    )
+    return result
+
+
+@router.get("/height-rating", response_model=HeightResponse)
+async def get_height_rating(height_cm: int, gender: str):
+    """
+    Get height rating for a given height and gender.
+
+    Returns the height rating (0-10) and display string.
+    """
+    if gender not in ('male', 'female'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Gender must be 'male' or 'female'"
+        )
+
+    if height_cm < 100 or height_cm > 250:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Height must be between 100 and 250 cm"
+        )
+
+    rating = psl_service.get_height_rating(height_cm, gender)
+
+    # Convert to feet/inches for display
+    total_inches = height_cm / 2.54
+    feet = int(total_inches // 12)
+    inches = int(round(total_inches % 12))
+    if inches == 12:
+        feet += 1
+        inches = 0
+    display = f'{feet}\'{inches}" ({height_cm}cm)'
+
+    return {
+        'height_cm': height_cm,
+        'height_rating': round(rating, 2),
+        'height_display': display,
+    }
+
+
+@router.put("/height", response_model=HeightResponse)
+async def update_user_height(
+    request: HeightUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update the current user's height.
+
+    Requires authentication.
+    """
+    # Get gender from user's most recent analysis or default to male
+    # For now, default to male - can be enhanced later
+    gender = 'male'
+
+    # Update height
+    current_user.height_cm = request.height_cm
+    await db.commit()
+    await db.refresh(current_user)
+
+    # Calculate rating
+    rating = psl_service.get_height_rating(request.height_cm, gender)
+
+    # Format display
+    total_inches = request.height_cm / 2.54
+    feet = int(total_inches // 12)
+    inches = int(round(total_inches % 12))
+    if inches == 12:
+        feet += 1
+        inches = 0
+    display = f'{feet}\'{inches}" ({request.height_cm}cm)'
+
+    return {
+        'height_cm': request.height_cm,
+        'height_rating': round(rating, 2),
+        'height_display': display,
+    }
+
+
+@router.get("/my-height", response_model=Optional[HeightResponse])
+async def get_my_height(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get the current user's stored height.
+
+    Returns null if height not set.
+    """
+    if current_user.height_cm is None:
+        return None
+
+    # Default to male for rating calculation
+    gender = 'male'
+    rating = psl_service.get_height_rating(current_user.height_cm, gender)
+
+    total_inches = current_user.height_cm / 2.54
+    feet = int(total_inches // 12)
+    inches = int(round(total_inches % 12))
+    if inches == 12:
+        feet += 1
+        inches = 0
+    display = f'{feet}\'{inches}" ({current_user.height_cm}cm)'
+
+    return {
+        'height_cm': current_user.height_cm,
+        'height_rating': round(rating, 2),
+        'height_display': display,
+    }
+
+
+@router.put("/weight", response_model=WeightResponse)
+async def update_user_weight(
+    request: WeightUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update the current user's weight.
+
+    Requires authentication.
+    """
+    # Update weight
+    current_user.weight_kg = request.weight_kg
+    await db.commit()
+    await db.refresh(current_user)
+
+    # Convert to lbs for display
+    weight_lbs = request.weight_kg * 2.20462
+    display = f'{weight_lbs:.0f} lbs ({request.weight_kg:.1f} kg)'
+
+    # Calculate BMI if height is available
+    bmi = None
+    if current_user.height_cm:
+        height_m = current_user.height_cm / 100
+        bmi = round(request.weight_kg / (height_m ** 2), 1)
+
+    return {
+        'weight_kg': request.weight_kg,
+        'weight_display': display,
+        'bmi': bmi,
+    }
+
+
+@router.get("/my-weight", response_model=Optional[WeightResponse])
+async def get_my_weight(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get the current user's stored weight.
+
+    Returns null if weight not set.
+    """
+    if current_user.weight_kg is None:
+        return None
+
+    # Convert to lbs for display
+    weight_lbs = current_user.weight_kg * 2.20462
+    display = f'{weight_lbs:.0f} lbs ({current_user.weight_kg:.1f} kg)'
+
+    # Calculate BMI if height is available
+    bmi = None
+    if current_user.height_cm:
+        height_m = current_user.height_cm / 100
+        bmi = round(current_user.weight_kg / (height_m ** 2), 1)
+
+    return {
+        'weight_kg': current_user.weight_kg,
+        'weight_display': display,
+        'bmi': bmi,
+    }
+
+
+@router.post("/quick-calculate", response_model=PSLResponse)
+async def quick_calculate_psl(
+    request: QuickPSLRequest,
+    gender: str,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Quick PSL calculation using the user's stored height.
+
+    Requires authentication and stored height.
+    """
+    if gender not in ('male', 'female'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Gender must be 'male' or 'female'"
+        )
+
+    if current_user.height_cm is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Height not set. Please update your height first."
+        )
+
+    result = psl_service.calculate_psl(
+        face_score=request.face_score,
+        height_cm=current_user.height_cm,
+        gender=gender,
+    )
+    return result
+
+
+@router.get("/tiers")
+async def get_tier_definitions():
+    """
+    Get all PSL tier definitions.
+
+    Returns the tier names, score ranges, and percentiles.
+    """
+    from app.services.psl_service import TIER_DEFINITIONS
+    return {
+        'tiers': TIER_DEFINITIONS,
+        'weights': {
+            'face': 0.75,
+            'height': 0.20,
+            'body': 0.05,
+        }
+    }

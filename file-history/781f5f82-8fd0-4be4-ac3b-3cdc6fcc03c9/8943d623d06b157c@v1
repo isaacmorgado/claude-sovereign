@@ -1,0 +1,727 @@
+/**
+ * Usage Tracking Service
+ *
+ * Tracks user credit balances and usage for billing.
+ * Uses PostgreSQL for persistence.
+ */
+
+const { Pool } = require('pg');
+
+// PostgreSQL connection pool with proper limits
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  // PERFORMANCE: Set connection pool limits
+  max: 20,                    // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000,   // Close idle connections after 30 seconds
+  connectionTimeoutMillis: 5000  // Timeout after 5 seconds when getting connection
+});
+
+// Hours per tier (regular processing)
+const TIER_HOURS = {
+  starter: 15,
+  pro: 50,
+  team: 150,
+  cancelled: 0
+};
+
+// Isolation minutes per tier (sized to maintain 80% margins)
+const TIER_ISOLATION_MINUTES = {
+  starter: 0,     // No isolation access
+  pro: 45,        // 45 minutes included
+  team: 180,      // 3 hours included
+  cancelled: 0
+};
+
+// Convert to hours for database storage
+const TIER_ISOLATION_HOURS = {
+  starter: 0,
+  pro: TIER_ISOLATION_MINUTES.pro / 60,      // 0.75 hours
+  team: TIER_ISOLATION_MINUTES.team / 60,    // 3 hours
+  cancelled: 0
+};
+
+// Overage rate for isolation beyond included minutes
+const ISOLATION_OVERAGE_RATE = 0.10; // $0.10 per minute (85% margin)
+
+/**
+ * Initialize database tables
+ */
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        stripe_customer_id VARCHAR(255) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        tier VARCHAR(50) DEFAULT 'starter',
+        hours_remaining DECIMAL(10,4) DEFAULT 15,
+        hours_total DECIMAL(10,4) DEFAULT 15,
+        isolation_hours_remaining DECIMAL(10,4) DEFAULT 0,
+        isolation_hours_total DECIMAL(10,4) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add isolation columns if they don't exist (for existing databases)
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'isolation_hours_remaining') THEN
+          ALTER TABLE users ADD COLUMN isolation_hours_remaining DECIMAL(10,4) DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'isolation_hours_total') THEN
+          ALTER TABLE users ADD COLUMN isolation_hours_total DECIMAL(10,4) DEFAULT 0;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS usage_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        stripe_customer_id VARCHAR(255),
+        audio_duration_seconds DECIMAL(10,2),
+        hours_used DECIMAL(10,6),
+        endpoint VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_stripe_customer_id ON users(stripe_customer_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_log_user_id ON usage_log(user_id)
+    `);
+
+    // PERFORMANCE: Add composite index for efficient customer usage history queries
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_log_customer_created
+      ON usage_log(stripe_customer_id, created_at DESC)
+    `);
+
+    // Webhook events table for idempotency
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS webhook_events (
+        id SERIAL PRIMARY KEY,
+        event_id VARCHAR(255) UNIQUE NOT NULL,
+        event_type VARCHAR(100),
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_webhook_events_event_id ON webhook_events(event_id)
+    `);
+
+    console.log('[UsageTracking] Database initialized');
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get or create a user by Stripe customer ID
+ */
+async function getOrCreateUser(stripeCustomerId, email = null) {
+  const client = await pool.connect();
+  try {
+    // Try to find existing user
+    let result = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length > 0) {
+      return result.rows[0];
+    }
+
+    // Create new user with starter tier (no isolation hours)
+    result = await client.query(
+      `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total)
+       VALUES ($1, $2, 'starter', $3, $3, $4, $4)
+       RETURNING *`,
+      [stripeCustomerId, email, TIER_HOURS.starter, TIER_ISOLATION_HOURS.starter]
+    );
+
+    return result.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get user's current credit balance
+ */
+async function getBalance(stripeCustomerId) {
+  const user = await getOrCreateUser(stripeCustomerId);
+  const hoursTotal = parseFloat(user.hours_total);
+  const hoursRemaining = parseFloat(user.hours_remaining);
+  const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+  const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+
+  // Tier display names
+  const tierNames = {
+    starter: 'Starter',
+    pro: 'Pro',
+    team: 'Team',
+    cancelled: 'Cancelled'
+  };
+
+  return {
+    hoursRemaining,
+    hoursTotal,
+    isolationHoursRemaining,
+    isolationHoursTotal,
+    tier: user.tier,
+    tierName: tierNames[user.tier] || user.tier,
+    percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+    isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+    hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+    isolationOverageRate: ISOLATION_OVERAGE_RATE
+  };
+}
+
+/**
+ * Check if user has enough credits for estimated duration
+ */
+async function hasCredits(stripeCustomerId, estimatedSeconds = 0) {
+  const balance = await getBalance(stripeCustomerId);
+  const estimatedHours = estimatedSeconds / 3600;
+  return balance.hoursRemaining >= estimatedHours;
+}
+
+/**
+ * Reserve credits atomically using SELECT ... FOR UPDATE
+ * This prevents race conditions where multiple requests pass credit check
+ * before any deduction occurs.
+ *
+ * @param {string} stripeCustomerId - Customer ID
+ * @param {number} estimatedSeconds - Estimated processing time in seconds
+ * @param {string} endpoint - Endpoint name for tracking
+ * @returns {Promise<{success: boolean, reservationId?: string, error?: string}>}
+ */
+async function reserveCredits(stripeCustomerId, estimatedSeconds = 0, endpoint = 'unknown') {
+  const estimatedHours = estimatedSeconds / 3600;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Lock the row for this customer - prevents concurrent modifications
+    const result = await client.query(
+      `SELECT id, hours_remaining FROM users
+       WHERE stripe_customer_id = $1
+       FOR UPDATE`,
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length === 0) {
+      // Create user if doesn't exist (within transaction)
+      const newUser = await client.query(
+        `INSERT INTO users (stripe_customer_id, tier, hours_remaining, hours_total)
+         VALUES ($1, 'starter', $2, $2)
+         RETURNING id, hours_remaining`,
+        [stripeCustomerId, TIER_HOURS.starter]
+      );
+      result.rows = newUser.rows;
+    }
+
+    const user = result.rows[0];
+    const hoursRemaining = parseFloat(user.hours_remaining);
+
+    // Check if enough credits
+    if (hoursRemaining < estimatedHours) {
+      await client.query('ROLLBACK');
+      return {
+        success: false,
+        error: 'Insufficient credits',
+        hoursRemaining,
+        hoursRequired: estimatedHours
+      };
+    }
+
+    // Generate unique reservation ID
+    const reservationId = `res_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Reserve credits by deducting the estimated amount
+    await client.query(
+      `UPDATE users
+       SET hours_remaining = hours_remaining - $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_customer_id = $2`,
+      [estimatedHours, stripeCustomerId]
+    );
+
+    // Log the reservation
+    await client.query(
+      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [user.id, stripeCustomerId, estimatedSeconds, estimatedHours, `${endpoint}:reserved`]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`[UsageTracking] Reserved ${estimatedHours.toFixed(4)}hrs for ${stripeCustomerId} (${reservationId})`);
+
+    return {
+      success: true,
+      reservationId,
+      hoursReserved: estimatedHours,
+      hoursRemaining: hoursRemaining - estimatedHours
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[UsageTracking] Reservation error:', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Confirm a reservation (finalize usage) or adjust for actual duration
+ *
+ * @param {string} stripeCustomerId - Customer ID
+ * @param {number} actualSeconds - Actual processing time in seconds
+ * @param {number} reservedSeconds - Originally reserved seconds
+ * @param {string} endpoint - Endpoint name
+ * @returns {Promise<object>} Updated balance
+ */
+async function confirmReservation(stripeCustomerId, actualSeconds, reservedSeconds, endpoint = 'unknown') {
+  const actualHours = actualSeconds / 3600;
+  const reservedHours = reservedSeconds / 3600;
+  const difference = reservedHours - actualHours;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock the row
+    const result = await client.query(
+      `SELECT id, hours_remaining FROM users
+       WHERE stripe_customer_id = $1
+       FOR UPDATE`,
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      throw new Error('User not found');
+    }
+
+    const user = result.rows[0];
+
+    // If actual usage was less than reserved, refund the difference
+    if (difference > 0) {
+      await client.query(
+        `UPDATE users
+         SET hours_remaining = hours_remaining + $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_customer_id = $2`,
+        [difference, stripeCustomerId]
+      );
+
+      // Log the adjustment
+      await client.query(
+        `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [user.id, stripeCustomerId, -(reservedSeconds - actualSeconds), -difference, `${endpoint}:adjusted`]
+      );
+    } else if (difference < 0) {
+      // Actual usage was more than reserved - deduct the extra
+      await client.query(
+        `UPDATE users
+         SET hours_remaining = GREATEST(0, hours_remaining - $1),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_customer_id = $2`,
+        [-difference, stripeCustomerId]
+      );
+
+      // Log the additional usage
+      await client.query(
+        `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [user.id, stripeCustomerId, actualSeconds - reservedSeconds, -difference, `${endpoint}:additional`]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    console.log(`[UsageTracking] Confirmed ${actualHours.toFixed(4)}hrs (reserved: ${reservedHours.toFixed(4)}) for ${stripeCustomerId}`);
+
+    return await getBalance(stripeCustomerId);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Release a reservation (refund credits on processing failure)
+ *
+ * @param {string} stripeCustomerId - Customer ID
+ * @param {number} reservedSeconds - Originally reserved seconds
+ * @param {string} endpoint - Endpoint name
+ * @param {string} reason - Reason for release
+ * @returns {Promise<object>} Updated balance
+ */
+async function releaseReservation(stripeCustomerId, reservedSeconds, endpoint = 'unknown', reason = 'failed') {
+  const reservedHours = reservedSeconds / 3600;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock the row
+    const result = await client.query(
+      `SELECT id FROM users
+       WHERE stripe_customer_id = $1
+       FOR UPDATE`,
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      throw new Error('User not found');
+    }
+
+    const user = result.rows[0];
+
+    // Refund the reserved amount
+    await client.query(
+      `UPDATE users
+       SET hours_remaining = hours_remaining + $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_customer_id = $2`,
+      [reservedHours, stripeCustomerId]
+    );
+
+    // Log the refund
+    await client.query(
+      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [user.id, stripeCustomerId, -reservedSeconds, -reservedHours, `${endpoint}:released:${reason}`]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`[UsageTracking] Released ${reservedHours.toFixed(4)}hrs for ${stripeCustomerId} (${reason})`);
+
+    return await getBalance(stripeCustomerId);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Check if user can use vocal isolation
+ * Returns: { allowed, hasIncludedHours, overageRequired, overageCost }
+ */
+async function checkIsolationAccess(stripeCustomerId, estimatedMinutes = 0) {
+  const balance = await getBalance(stripeCustomerId);
+
+  // Starter tier has no isolation access
+  if (!balance.hasIsolationAccess) {
+    return {
+      allowed: false,
+      reason: 'upgrade_required',
+      message: 'Vocal isolation requires Pro or Team tier',
+      hasIncludedHours: false,
+      overageRequired: false,
+      overageCost: 0
+    };
+  }
+
+  const estimatedHours = estimatedMinutes / 60;
+  const remainingIncluded = balance.isolationHoursRemaining;
+
+  // Check if within included hours
+  if (remainingIncluded >= estimatedHours) {
+    return {
+      allowed: true,
+      reason: 'included',
+      message: `Using ${estimatedMinutes.toFixed(1)} min of included isolation time`,
+      hasIncludedHours: true,
+      overageRequired: false,
+      overageCost: 0,
+      isolationHoursRemaining: remainingIncluded - estimatedHours
+    };
+  }
+
+  // Calculate overage
+  const overageMinutes = estimatedMinutes - (remainingIncluded * 60);
+  const overageCost = overageMinutes * ISOLATION_OVERAGE_RATE;
+
+  return {
+    allowed: true,
+    reason: 'overage',
+    message: `${remainingIncluded > 0 ? `Using ${(remainingIncluded * 60).toFixed(1)} included min + ` : ''}${overageMinutes.toFixed(1)} min overage ($${overageCost.toFixed(2)})`,
+    hasIncludedHours: remainingIncluded > 0,
+    overageRequired: true,
+    overageMinutes,
+    overageCost,
+    isolationHoursRemaining: 0
+  };
+}
+
+/**
+ * Deduct isolation usage from user's balance
+ * Returns overage cost if beyond included hours
+ */
+async function deductIsolationUsage(stripeCustomerId, audioDurationSeconds, endpoint = 'isolate-vocals') {
+  const durationMinutes = audioDurationSeconds / 60;
+  const durationHours = audioDurationSeconds / 3600;
+
+  const client = await pool.connect();
+  try {
+    // Get user
+    const userResult = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (userResult.rows.length === 0) {
+      throw new Error('User not found');
+    }
+
+    const user = userResult.rows[0];
+    const remainingIncluded = parseFloat(user.isolation_hours_remaining || 0);
+
+    let overageCost = 0;
+    let hoursFromIncluded = 0;
+    let overageMinutes = 0;
+
+    if (remainingIncluded >= durationHours) {
+      // Fully covered by included hours
+      hoursFromIncluded = durationHours;
+    } else {
+      // Partial or full overage
+      hoursFromIncluded = remainingIncluded;
+      overageMinutes = durationMinutes - (remainingIncluded * 60);
+      overageCost = overageMinutes * ISOLATION_OVERAGE_RATE;
+    }
+
+    // Update isolation balance
+    await client.query(
+      `UPDATE users
+       SET isolation_hours_remaining = GREATEST(0, isolation_hours_remaining - $1),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_customer_id = $2`,
+      [durationHours, stripeCustomerId]
+    );
+
+    // Log usage (mark as isolation)
+    await client.query(
+      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [user.id, stripeCustomerId, audioDurationSeconds, durationHours, endpoint]
+    );
+
+    // Return updated balance and overage info
+    const newBalance = await getBalance(stripeCustomerId);
+    return {
+      ...newBalance,
+      isolationUsed: {
+        durationMinutes,
+        hoursFromIncluded,
+        overageMinutes,
+        overageCost
+      }
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Deduct usage from user's balance
+ * Optimized: uses RETURNING to avoid extra SELECT after UPDATE
+ */
+async function deductUsage(stripeCustomerId, audioDurationSeconds, endpoint = 'unknown') {
+  const hoursUsed = audioDurationSeconds / 3600;
+
+  const client = await pool.connect();
+  try {
+    // Combined UPDATE with RETURNING - single query for update + get new values
+    const updateResult = await client.query(
+      `UPDATE users
+       SET hours_remaining = GREATEST(0, hours_remaining - $1),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_customer_id = $2
+       RETURNING id, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total, tier`,
+      [hoursUsed, stripeCustomerId]
+    );
+
+    if (updateResult.rows.length === 0) {
+      throw new Error('User not found');
+    }
+
+    const user = updateResult.rows[0];
+
+    // Log usage
+    await client.query(
+      `INSERT INTO usage_log (user_id, stripe_customer_id, audio_duration_seconds, hours_used, endpoint)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [user.id, stripeCustomerId, audioDurationSeconds, hoursUsed, endpoint]
+    );
+
+    // Build balance from RETURNING data (no extra SELECT needed)
+    const hoursTotal = parseFloat(user.hours_total);
+    const hoursRemaining = parseFloat(user.hours_remaining);
+    const isolationHoursTotal = parseFloat(user.isolation_hours_total || 0);
+    const isolationHoursRemaining = parseFloat(user.isolation_hours_remaining || 0);
+
+    const tierNames = {
+      starter: 'Starter',
+      pro: 'Pro',
+      team: 'Team',
+      cancelled: 'Cancelled'
+    };
+
+    return {
+      hoursRemaining,
+      hoursTotal,
+      isolationHoursRemaining,
+      isolationHoursTotal,
+      tier: user.tier,
+      tierName: tierNames[user.tier] || user.tier,
+      percentUsed: hoursTotal > 0 ? ((hoursTotal - hoursRemaining) / hoursTotal * 100).toFixed(1) : '0.0',
+      isolationPercentUsed: isolationHoursTotal > 0 ? ((isolationHoursTotal - isolationHoursRemaining) / isolationHoursTotal * 100).toFixed(1) : '0.0',
+      hasIsolationAccess: TIER_ISOLATION_HOURS[user.tier] > 0,
+      isolationOverageRate: ISOLATION_OVERAGE_RATE
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Reset user's hours for new billing period
+ */
+async function resetHours(stripeCustomerId, tier) {
+  const hours = tier in TIER_HOURS ? TIER_HOURS[tier] : TIER_HOURS.starter;
+  const isolationHours = tier in TIER_ISOLATION_HOURS ? TIER_ISOLATION_HOURS[tier] : 0;
+
+  await pool.query(
+    `UPDATE users
+     SET hours_remaining = $1, hours_total = $1,
+         isolation_hours_remaining = $2, isolation_hours_total = $2,
+         tier = $3, updated_at = CURRENT_TIMESTAMP
+     WHERE stripe_customer_id = $4`,
+    [hours, isolationHours, tier, stripeCustomerId]
+  );
+
+  return await getBalance(stripeCustomerId);
+}
+
+/**
+ * Update user's tier (from Stripe webhook)
+ */
+async function updateTier(stripeCustomerId, tier, email = null) {
+  const hours = tier in TIER_HOURS ? TIER_HOURS[tier] : TIER_HOURS.starter;
+  const isolationHours = tier in TIER_ISOLATION_HOURS ? TIER_ISOLATION_HOURS[tier] : 0;
+
+  const client = await pool.connect();
+  try {
+    // Check if user exists
+    const result = await client.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
+
+    if (result.rows.length === 0) {
+      // Create new user with this tier
+      await client.query(
+        `INSERT INTO users (stripe_customer_id, email, tier, hours_remaining, hours_total, isolation_hours_remaining, isolation_hours_total)
+         VALUES ($1, $2, $3, $4, $4, $5, $5)`,
+        [stripeCustomerId, email, tier, hours, isolationHours]
+      );
+    } else {
+      // Update existing user
+      await client.query(
+        `UPDATE users
+         SET tier = $1, hours_remaining = $2, hours_total = $2,
+             isolation_hours_remaining = $3, isolation_hours_total = $3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_customer_id = $4`,
+        [tier, hours, isolationHours, stripeCustomerId]
+      );
+    }
+
+    return await getBalance(stripeCustomerId);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get usage history for a user
+ */
+async function getUsageHistory(stripeCustomerId, limit = 50) {
+  const result = await pool.query(
+    `SELECT * FROM usage_log
+     WHERE stripe_customer_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [stripeCustomerId, limit]
+  );
+  return result.rows;
+}
+
+/**
+ * Check if webhook event has already been processed (idempotency)
+ */
+async function isEventProcessed(eventId) {
+  const result = await pool.query(
+    'SELECT id FROM webhook_events WHERE event_id = $1',
+    [eventId]
+  );
+  return result.rows.length > 0;
+}
+
+/**
+ * Record a processed webhook event
+ */
+async function recordWebhookEvent(eventId, eventType) {
+  try {
+    await pool.query(
+      'INSERT INTO webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING',
+      [eventId, eventType]
+    );
+  } catch (err) {
+    // Ignore duplicate key errors (race condition safety)
+    if (err.code !== '23505') throw err;
+  }
+}
+
+module.exports = {
+  initDatabase,
+  getOrCreateUser,
+  getBalance,
+  hasCredits,
+  reserveCredits,
+  confirmReservation,
+  releaseReservation,
+  checkIsolationAccess,
+  deductUsage,
+  deductIsolationUsage,
+  resetHours,
+  updateTier,
+  getUsageHistory,
+  isEventProcessed,
+  recordWebhookEvent,
+  TIER_HOURS,
+  TIER_ISOLATION_MINUTES,
+  TIER_ISOLATION_HOURS,
+  ISOLATION_OVERAGE_RATE
+};

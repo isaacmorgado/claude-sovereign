@@ -1,0 +1,499 @@
+/**
+ * Profanity Detection Service
+ *
+ * Detects profanity in transcripts and returns segments for muting/bleeping.
+ * Based on Fireside's proven approach with enhancements.
+ *
+ * Features:
+ * - Word-level profanity detection from transcript
+ * - Custom blocklist (add words)
+ * - Custom allowlist (exclude words)
+ * - Contiguous segment grouping
+ * - Frame-rate aligned boundaries
+ * - Multiple language support
+ */
+
+const path = require('path');
+const fs = require('fs');
+
+// =============================================================================
+// Default Profanity Lists
+// =============================================================================
+
+/**
+ * Default English profanity list
+ * This is a comprehensive list that can be extended via custom blocklist
+ */
+const DEFAULT_PROFANITY_EN = [
+  // Common expletives
+  'fuck', 'fucking', 'fucked', 'fucker', 'fuckers', 'fucks', 'motherfucker', 'motherfucking',
+  'shit', 'shitty', 'shitting', 'bullshit', 'horseshit', 'dipshit', 'shits',
+  'damn', 'damned', 'goddamn', 'goddamned',
+  'ass', 'asshole', 'assholes', 'asses', 'dumbass', 'jackass', 'badass',
+  'bitch', 'bitches', 'bitchy', 'bitching', 'son of a bitch',
+  'bastard', 'bastards',
+  'crap', 'crappy',
+  'hell', 'hellish',
+  'piss', 'pissed', 'pissing',
+
+  // Slurs and offensive terms (heavily censored in most media)
+  'cunt', 'cunts',
+  'cock', 'cocks', 'cocksucker',
+  'dick', 'dicks', 'dickhead',
+  'pussy', 'pussies',
+  'whore', 'whores',
+  'slut', 'sluts',
+  'fag', 'faggot', 'faggots',
+  'retard', 'retarded', 'retards',
+
+  // Religious profanity
+  'jesus christ', 'christ', 'god damn', 'oh my god',
+
+  // Racial slurs (abbreviated - these should always be censored)
+  // Note: Full list would include more but keeping brief for code
+
+  // Sexual terms
+  'dildo', 'dildos',
+  'blowjob', 'handjob',
+  'jerk off', 'jerking off',
+  'wanker', 'wanking',
+
+  // Drug references (optional, uncomment if needed)
+  // 'meth', 'cocaine', 'heroin',
+
+  // Common misspellings/slang variants
+  'fck', 'fuk', 'phuck', 'fxck',
+  'sht', 'sh1t', 's**t',
+  'btch', 'b1tch',
+  'azz', 'a$$',
+  'cnt',
+  'dck',
+
+  // Common euphemisms that sound like profanity
+  'frickin', 'freakin', 'friggin', 'effing',
+];
+
+/**
+ * Default Spanish profanity list
+ */
+const DEFAULT_PROFANITY_ES = [
+  'mierda', 'puta', 'puto', 'joder', 'coño', 'cojones', 'cabron', 'cabrón',
+  'pendejo', 'pendeja', 'chingar', 'chingada', 'verga', 'culo', 'carajo',
+  'marica', 'maricón', 'hostia', 'gilipollas', 'capullo', 'hijo de puta'
+];
+
+/**
+ * Default French profanity list
+ */
+const DEFAULT_PROFANITY_FR = [
+  'merde', 'putain', 'bordel', 'salaud', 'salope', 'connard', 'connasse',
+  'enculé', 'nique', 'bite', 'couille', 'foutre', 'baiser', 'chier', 'con'
+];
+
+/**
+ * Default German profanity list
+ */
+const DEFAULT_PROFANITY_DE = [
+  'scheiße', 'scheisse', 'arschloch', 'hurensohn', 'wichser', 'fotze',
+  'fick', 'ficken', 'verdammt', 'schlampe', 'hure', 'mistkerl'
+];
+
+// Language mapping
+const PROFANITY_LISTS = {
+  'en': DEFAULT_PROFANITY_EN,
+  'es': DEFAULT_PROFANITY_ES,
+  'fr': DEFAULT_PROFANITY_FR,
+  'de': DEFAULT_PROFANITY_DE
+};
+
+// =============================================================================
+// Core Detection
+// =============================================================================
+
+/**
+ * Detect profanity in transcript words
+ *
+ * @param {Object} transcript - Transcript with words array
+ * @param {Object} options - Detection options
+ * @returns {Object} Detection results with marked words and segments
+ */
+function detectProfanity(transcript, options = {}) {
+  const {
+    language = 'en',
+    customBlocklist = [],
+    customAllowlist = [],
+    caseSensitive = false,
+    includePartialMatches = true,
+    frameRate = 30  // For frame alignment
+  } = options;
+
+  // Get base profanity list for language
+  const baseProfanity = PROFANITY_LISTS[language] || PROFANITY_LISTS['en'];
+
+  // Build final profanity set
+  const profanitySet = new Set([
+    ...baseProfanity,
+    ...customBlocklist.map(w => caseSensitive ? w : w.toLowerCase())
+  ]);
+
+  // Remove allowlist items
+  const allowlistSet = new Set(customAllowlist.map(w => caseSensitive ? w : w.toLowerCase()));
+  for (const allowed of allowlistSet) {
+    profanitySet.delete(allowed);
+  }
+
+  // Also add common variants (e.g., "fucking" -> "fuckin'")
+  const variants = new Set();
+  for (const word of profanitySet) {
+    if (word.endsWith('ing')) {
+      variants.add(word.slice(0, -1)); // fuckin
+      variants.add(word.slice(0, -3) + "in'"); // fuckin'
+    }
+    if (word.endsWith('ed')) {
+      variants.add(word.slice(0, -2) + "'d"); // fuck'd
+    }
+  }
+  for (const v of variants) {
+    profanitySet.add(v);
+  }
+
+  // Check each word in transcript
+  const words = transcript.words || [];
+  const markedWords = [];
+
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    const wordText = word.word || word.text || '';
+    const normalizedWord = caseSensitive ? wordText : wordText.toLowerCase();
+
+    // Remove punctuation for matching
+    const cleanWord = normalizedWord.replace(/[^\w\s'-]/g, '').trim();
+
+    // Check for exact match
+    let isProfanity = profanitySet.has(cleanWord);
+
+    // Check for partial matches (word contains profanity)
+    if (!isProfanity && includePartialMatches) {
+      for (const profane of profanitySet) {
+        if (cleanWord.includes(profane) && profane.length >= 4) {
+          isProfanity = true;
+          break;
+        }
+      }
+    }
+
+    markedWords.push({
+      text: wordText,
+      start: word.start,
+      end: word.end,
+      index: i,
+      isProfanity,
+      // Can be toggled by user in UI
+      shouldCensor: isProfanity
+    });
+  }
+
+  // Group contiguous profanity into segments
+  const segments = groupProfanitySegments(markedWords, { frameRate });
+
+  // Calculate statistics
+  const profanityCount = markedWords.filter(w => w.isProfanity).length;
+  const totalDuration = segments.reduce((sum, s) => sum + s.duration, 0);
+
+  console.log(`[SPLICE Profanity] Detected ${profanityCount} profane word(s) in ${segments.length} segment(s)`);
+
+  return {
+    words: markedWords,
+    segments,
+    metadata: {
+      totalWords: words.length,
+      profanityCount,
+      segmentCount: segments.length,
+      totalCensorDuration: parseFloat(totalDuration.toFixed(3)),
+      language,
+      customBlocklistCount: customBlocklist.length,
+      customAllowlistCount: customAllowlist.length
+    }
+  };
+}
+
+/**
+ * Group contiguous profanity words into segments
+ *
+ * @param {Array} markedWords - Array of words with isProfanity flag
+ * @param {Object} options - Grouping options
+ * @returns {Array} Array of profanity segments
+ */
+function groupProfanitySegments(markedWords, options = {}) {
+  const { frameRate = 30, maxGap = 0.3 } = options;
+
+  const segments = [];
+  let currentSegment = null;
+
+  for (const word of markedWords) {
+    if (!word.isProfanity) {
+      // End current segment if exists
+      if (currentSegment) {
+        segments.push(finalizeSeg(currentSegment, frameRate));
+        currentSegment = null;
+      }
+      continue;
+    }
+
+    if (!currentSegment) {
+      // Start new segment
+      currentSegment = {
+        start: word.start,
+        end: word.end,
+        words: [word.text],
+        wordIndices: [word.index]
+      };
+    } else if (word.start - currentSegment.end <= maxGap) {
+      // Extend current segment (words are close together)
+      currentSegment.end = word.end;
+      currentSegment.words.push(word.text);
+      currentSegment.wordIndices.push(word.index);
+    } else {
+      // Gap too large - finalize current and start new
+      segments.push(finalizeSeg(currentSegment, frameRate));
+      currentSegment = {
+        start: word.start,
+        end: word.end,
+        words: [word.text],
+        wordIndices: [word.index]
+      };
+    }
+  }
+
+  // Finalize last segment
+  if (currentSegment) {
+    segments.push(finalizeSeg(currentSegment, frameRate));
+  }
+
+  return segments;
+}
+
+/**
+ * Finalize a segment with frame-aligned boundaries
+ */
+function finalizeSeg(segment, frameRate) {
+  // Add small padding around profanity (50ms before, 100ms after)
+  const paddedStart = Math.max(0, segment.start - 0.05);
+  const paddedEnd = segment.end + 0.1;
+
+  // Align to frame boundaries
+  const alignedStart = alignToFrame(paddedStart, frameRate, 'floor');
+  const alignedEnd = alignToFrame(paddedEnd, frameRate, 'ceil');
+
+  return {
+    start: parseFloat(alignedStart.toFixed(4)),
+    end: parseFloat(alignedEnd.toFixed(4)),
+    duration: parseFloat((alignedEnd - alignedStart).toFixed(4)),
+    words: segment.words,
+    wordCount: segment.words.length,
+    text: segment.words.join(' ')
+  };
+}
+
+/**
+ * Align time to frame boundary
+ */
+function alignToFrame(time, frameRate, mode = 'round') {
+  const frameDuration = 1 / frameRate;
+  switch (mode) {
+    case 'floor':
+      return Math.floor(time / frameDuration) * frameDuration;
+    case 'ceil':
+      return Math.ceil(time / frameDuration) * frameDuration;
+    default:
+      return Math.round(time / frameDuration) * frameDuration;
+  }
+}
+
+// =============================================================================
+// Bleep Sound Management
+// =============================================================================
+
+/**
+ * Available bleep sounds
+ */
+const BLEEP_SOUNDS = {
+  'standard': {
+    name: 'Standard Censor Beep',
+    frequency: 1000,
+    description: 'Classic 1kHz censor beep'
+  },
+  'tv': {
+    name: 'TV Bleep',
+    frequency: 1000,
+    description: 'Television-style censor beep'
+  },
+  'radio': {
+    name: 'Radio Bleep',
+    frequency: 880,
+    description: 'Radio broadcast censor tone'
+  },
+  'duck': {
+    name: 'Audio Duck',
+    frequency: 0,
+    description: 'Volume reduction (no beep)'
+  },
+  'mute': {
+    name: 'Complete Mute',
+    frequency: 0,
+    description: 'Complete silence'
+  }
+};
+
+/**
+ * Get list of available bleep sounds
+ */
+function getAvailableBleepSounds() {
+  return Object.entries(BLEEP_SOUNDS).map(([id, info]) => ({
+    id,
+    ...info
+  }));
+}
+
+// =============================================================================
+// Profanity List Management
+// =============================================================================
+
+/**
+ * Get the default profanity list for a language
+ *
+ * @param {string} language - Language code (en, es, fr, de)
+ * @returns {Array<string>} Profanity word list
+ */
+function getProfanityList(language = 'en') {
+  return PROFANITY_LISTS[language] || PROFANITY_LISTS['en'];
+}
+
+/**
+ * Get all supported languages
+ */
+function getSupportedLanguages() {
+  return [
+    { code: 'en', name: 'English' },
+    { code: 'es', name: 'Spanish' },
+    { code: 'fr', name: 'French' },
+    { code: 'de', name: 'German' }
+  ];
+}
+
+/**
+ * Validate and clean a custom word list
+ *
+ * @param {string|Array} input - Comma-separated string or array
+ * @returns {Array<string>} Cleaned word list
+ */
+function parseWordList(input) {
+  if (!input) return [];
+
+  if (Array.isArray(input)) {
+    return input.map(w => w.trim().toLowerCase()).filter(w => w.length > 0);
+  }
+
+  if (typeof input === 'string') {
+    return input
+      .split(',')
+      .map(w => w.trim().toLowerCase())
+      .filter(w => w.length > 0);
+  }
+
+  return [];
+}
+
+// =============================================================================
+// Segment Operations
+// =============================================================================
+
+/**
+ * Merge profanity segments that are close together
+ *
+ * @param {Array} segments - Array of profanity segments
+ * @param {number} maxGap - Maximum gap to merge (seconds)
+ * @returns {Array} Merged segments
+ */
+function mergeAdjacentSegments(segments, maxGap = 0.5) {
+  if (segments.length <= 1) return segments;
+
+  const sorted = [...segments].sort((a, b) => a.start - b.start);
+  const merged = [];
+  let current = { ...sorted[0] };
+
+  for (let i = 1; i < sorted.length; i++) {
+    const next = sorted[i];
+
+    if (next.start - current.end <= maxGap) {
+      // Merge
+      current.end = next.end;
+      current.duration = current.end - current.start;
+      current.words = [...current.words, ...next.words];
+      current.wordCount = current.words.length;
+      current.text = current.words.join(' ');
+    } else {
+      merged.push(current);
+      current = { ...next };
+    }
+  }
+
+  merged.push(current);
+  return merged;
+}
+
+/**
+ * Filter segments by user selection (for UI toggle)
+ *
+ * @param {Array} segments - All profanity segments
+ * @param {Array<number>} selectedIndices - Indices of segments to keep
+ * @returns {Array} Filtered segments
+ */
+function filterSelectedSegments(segments, selectedIndices) {
+  const indexSet = new Set(selectedIndices);
+  return segments.filter((_, i) => indexSet.has(i));
+}
+
+/**
+ * Convert segments to timeline format for cut list generator
+ *
+ * @param {Array} segments - Profanity segments
+ * @returns {Array<{start: number, end: number, type: string}>} Timeline-ready segments
+ */
+function segmentsToTimeline(segments) {
+  return segments.map(seg => ({
+    start: seg.start,
+    end: seg.end,
+    duration: seg.duration,
+    type: 'profanity',
+    label: `Profanity: ${seg.text.substring(0, 30)}${seg.text.length > 30 ? '...' : ''}`
+  }));
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
+module.exports = {
+  // Core detection
+  detectProfanity,
+  groupProfanitySegments,
+
+  // Profanity lists
+  getProfanityList,
+  getSupportedLanguages,
+  parseWordList,
+  PROFANITY_LISTS,
+
+  // Bleep sounds
+  getAvailableBleepSounds,
+  BLEEP_SOUNDS,
+
+  // Segment operations
+  mergeAdjacentSegments,
+  filterSelectedSegments,
+  segmentsToTimeline,
+
+  // Utilities
+  alignToFrame
+};

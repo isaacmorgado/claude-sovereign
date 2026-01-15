@@ -1,0 +1,257 @@
+#!/bin/bash
+# Memory Manager Bug Fixes
+# Adds: file locking, input sanitization, symlink protection, UTF-8 support
+# Fixes bugs #1-#7 from MEMORY-SYSTEM-BUG-REPORT.md
+
+# =============================================================================
+# UTILITY FUNCTIONS FOR BUG FIXES
+# =============================================================================
+
+# Bug #1 & #7 Fix: Cross-platform file locking (mkdir-based, works on macOS)
+# Replaces flock which doesn't exist on macOS
+acquire_lock() {
+    local lockfile="$1"
+    local lockdir="${lockfile}.lock"
+    local max_attempts=100
+    local attempt=0
+    local pid_file="$lockdir/pid"
+
+    while true; do
+        # Try to create lock directory atomically
+        if mkdir "$lockdir" 2>/dev/null; then
+            # Successfully acquired lock
+            echo $$ > "$pid_file"
+            trap "release_lock '$lockfile'" EXIT INT TERM
+            return 0
+        fi
+
+        # Lock exists, check if it's stale
+        if [[ -f "$pid_file" ]]; then
+            local lock_pid
+            lock_pid=$(cat "$pid_file" 2>/dev/null)
+
+            # Check if process still exists
+            if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                # Stale lock, remove it
+                rm -rf "$lockdir" 2>/dev/null
+                continue
+            fi
+        fi
+
+        # Increment attempt counter
+        attempt=$((attempt + 1))
+        if [[ $attempt -ge $max_attempts ]]; then
+            echo "Error: Could not acquire lock after $max_attempts attempts" >&2
+            return 1
+        fi
+
+        # Wait before retry (exponential backoff)
+        local wait_time=$(awk "BEGIN {print 0.01 * (1.5 ^ $attempt)}" 2>/dev/null || echo "0.1")
+        sleep "$wait_time" 2>/dev/null || sleep 1
+    done
+}
+
+release_lock() {
+    local lockfile="$1"
+    local lockdir="${lockfile}.lock"
+    rm -rf "$lockdir" 2>/dev/null
+    trap - EXIT INT TERM
+}
+
+# Bug #2 Fix: Symlink protection
+# Prevents TOCTOU attacks by resolving symlinks and validating file type
+safe_file_path() {
+    local file="$1"
+
+    # Check if file exists and is not a symlink
+    if [[ -e "$file" ]] && [[ -L "$file" ]]; then
+        echo "Error: $file is a symbolic link (security risk)" >&2
+        return 1
+    fi
+
+    # Resolve to real path
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$file" 2>/dev/null
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$file" 2>/dev/null || echo "$file"
+    else
+        echo "$file"
+    fi
+}
+
+# Bug #3, #4, #5 Fix: Input sanitization for JSON safety
+# Removes null bytes, handles special characters, preserves UTF-8
+sanitize_input() {
+    local input="$1"
+
+    # Remove null bytes (Bug #3)
+    input=$(echo "$input" | tr -d '\000')
+
+    # Note: We don't need to escape special characters here
+    # because jq's --arg flag handles escaping automatically
+    # This is the correct way to handle Bug #4
+
+    echo "$input"
+}
+
+# Bug #5 Fix: Ensure UTF-8 locale for Unicode/emoji support
+ensure_utf8() {
+    export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+    export LANG="${LANG:-en_US.UTF-8}"
+}
+
+# Bug #6 Fix: Atomic write with proper error handling
+# Wraps existing temp file + mv pattern with additional safety
+safe_atomic_write() {
+    local target_file="$1"
+    local content="$2"
+    local use_jq="${3:-false}"
+
+    # Ensure parent directory exists
+    local parent_dir
+    parent_dir=$(dirname "$target_file")
+    mkdir -p "$parent_dir" 2>/dev/null
+
+    # Validate target is not a symlink (Bug #2)
+    if [[ -e "$target_file" ]] && [[ -L "$target_file" ]]; then
+        echo "Error: $target_file is a symbolic link" >&2
+        return 1
+    fi
+
+    # Create temp file in same directory (ensures same filesystem)
+    local temp_file
+    temp_file=$(mktemp "${target_file}.XXXXXX") || return 1
+
+    # Write content
+    if [[ "$use_jq" == "true" ]]; then
+        echo "$content" | jq '.' > "$temp_file" 2>/dev/null || {
+            rm -f "$temp_file"
+            return 1
+        }
+    else
+        echo "$content" > "$temp_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+    fi
+
+    # Atomic move
+    mv -f "$temp_file" "$target_file" || {
+        rm -f "$temp_file"
+        return 1
+    }
+
+    return 0
+}
+
+# =============================================================================
+# INTEGRATION HELPER
+# =============================================================================
+
+# Helper to wrap existing write operations with locking
+locked_write_operation() {
+    local memory_file="$1"
+    local operation_func="$2"
+    shift 2
+    local args=("$@")
+
+    # Acquire lock
+    if ! acquire_lock "$memory_file"; then
+        echo "Error: Failed to acquire lock for $memory_file" >&2
+        return 1
+    fi
+
+    # Execute operation
+    "$operation_func" "${args[@]}"
+    local result=$?
+
+    # Release lock
+    release_lock "$memory_file"
+
+    return $result
+}
+
+# Test function to verify all fixes work
+test_fixes() {
+    echo "Testing memory manager bug fixes..."
+
+    # Test 1: Lock acquisition
+    local test_lock="/tmp/test-lock-$$"
+    if acquire_lock "$test_lock"; then
+        echo "✓ Lock acquisition works"
+        release_lock "$test_lock"
+    else
+        echo "✗ Lock acquisition failed"
+        return 1
+    fi
+
+    # Test 2: Symlink protection
+    local test_file="/tmp/test-file-$$"
+    local test_symlink="/tmp/test-symlink-$$"
+    touch "$test_file"
+    ln -s "$test_file" "$test_symlink"
+
+    if safe_file_path "$test_symlink" 2>/dev/null; then
+        echo "✗ Symlink protection failed"
+        rm -f "$test_file" "$test_symlink"
+        return 1
+    else
+        echo "✓ Symlink protection works"
+    fi
+    rm -f "$test_file" "$test_symlink"
+
+    # Test 3: Null byte sanitization
+    local test_input="test$(printf '\x00')data"
+    local sanitized
+    sanitized=$(sanitize_input "$test_input")
+    if echo "$sanitized" | grep -q $'\x00'; then
+        echo "✗ Null byte removal failed"
+        return 1
+    else
+        echo "✓ Null byte sanitization works"
+    fi
+
+    # Test 4: UTF-8 handling
+    ensure_utf8
+    local unicode_text="Test 中文 🔥"
+    if echo "$unicode_text" | jq -Rs . >/dev/null 2>&1; then
+        echo "✓ UTF-8 handling works"
+    else
+        echo "✗ UTF-8 handling failed"
+        return 1
+    fi
+
+    # Test 5: Atomic write
+    local test_atomic="/tmp/test-atomic-$$"
+    if safe_atomic_write "$test_atomic" '{"test": "data"}' true; then
+        if jq empty "$test_atomic" 2>/dev/null; then
+            echo "✓ Atomic write works"
+        else
+            echo "✗ Atomic write produced invalid JSON"
+            rm -f "$test_atomic"
+            return 1
+        fi
+    else
+        echo "✗ Atomic write failed"
+        return 1
+    fi
+    rm -f "$test_atomic"
+
+    echo ""
+    echo "All bug fixes verified successfully!"
+    return 0
+}
+
+# Export functions for use in memory-manager.sh
+export -f acquire_lock
+export -f release_lock
+export -f safe_file_path
+export -f sanitize_input
+export -f ensure_utf8
+export -f safe_atomic_write
+export -f locked_write_operation
+
+# Run tests if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    test_fixes
+fi

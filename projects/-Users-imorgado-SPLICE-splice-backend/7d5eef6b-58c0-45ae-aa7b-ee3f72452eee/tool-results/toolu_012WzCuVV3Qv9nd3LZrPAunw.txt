@@ -1,0 +1,319 @@
+     1→/**
+     2→ * Silences Routes
+     3→ *
+     4→ * Silence detection endpoints (Whisper gaps, FFprobe, RMS)
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const fsPromises = require('fs').promises;
+     9→const fs = require('fs');
+    10→const { transcribeAudio } = require('../services/transcription');
+    11→const { detectSilences } = require('../services/silenceDetection');
+    12→const { detectAudioSilences, isFFprobeInstalled, getAudioDuration } = require('../services/ffprobeSilence');
+    13→const { detectSilencesRMS, sensitivityToParams, getWaveformData } = require('../services/rmsSilenceDetection');
+    14→
+    15→// Maximum file size for audio processing (500MB)
+    16→const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+    17→
+    18→// Async file existence check (non-blocking)
+    19→async function fileExists(filePath) {
+    20→  try {
+    21→    await fsPromises.access(filePath, fs.constants.R_OK);
+    22→    return true;
+    23→  } catch {
+    24→    return false;
+    25→  }
+    26→}
+    27→
+    28→/**
+    29→ * Validate file size to prevent OOM crashes
+    30→ * @param {string} filePath - Path to file
+    31→ * @returns {Promise<{valid: boolean, size?: number, error?: string}>}
+    32→ */
+    33→async function validateFileSize(filePath) {
+    34→  try {
+    35→    const stats = await fsPromises.stat(filePath);
+    36→    if (stats.size > MAX_FILE_SIZE_BYTES) {
+    37→      return {
+    38→        valid: false,
+    39→        size: stats.size,
+    40→        error: `File too large (${(stats.size / 1024 / 1024).toFixed(1)}MB). Maximum allowed: ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB`
+    41→      };
+    42→    }
+    43→    return { valid: true, size: stats.size };
+    44→  } catch (err) {
+    45→    return { valid: false, error: `Cannot access file: ${err.message}` };
+    46→  }
+    47→}
+    48→
+    49→/**
+    50→ * Create silences routes
+    51→ * @param {Object} options - Route configuration options
+    52→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    53→ * @returns {express.Router}
+    54→ */
+    55→function createSilencesRoutes(options = {}) {
+    56→  const router = express.Router();
+    57→  const { requireCredits } = options.middleware || {};
+    58→
+    59→  /**
+    60→   * POST /silences - Detect silent gaps in audio
+    61→   *
+    62→   * Pipeline:
+    63→   * 1. Transcribe audio with Whisper (cached)
+    64→   * 2. Analyze gaps between segments
+    65→   * 3. Return silence regions
+    66→   */
+    67→  router.post('/silences', requireCredits({ endpoint: 'silences' }), async (req, res) => {
+    68→    const { wavPath, threshold = 0.5 } = req.body;
+    69→
+    70→    if (!wavPath) {
+    71→      return res.status(400).json({ error: 'wavPath is required' });
+    72→    }
+    73→
+    74→    if (!(await fileExists(wavPath))) {
+    75→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+    76→    }
+    77→
+    78→    console.log(`[SPLICE] Detecting silences: ${wavPath} (threshold: ${threshold}s)`);
+    79→
+    80→    try {
+    81→      const transcript = await transcribeAudio(wavPath);
+    82→      const silences = detectSilences(transcript.segments, threshold);
+    83→
+    84→      // Deduct usage based on audio duration
+    85→      const audioDuration = transcript.duration || 0;
+    86→      let balance = null;
+    87→      if (audioDuration > 0 && req.deductUsage) {
+    88→        balance = await req.deductUsage(audioDuration);
+    89→      }
+    90→
+    91→      res.json({
+    92→        success: true,
+    93→        wavPath,
+    94→        threshold,
+    95→        silences,
+    96→        count: silences.length,
+    97→        totalSilenceDuration: silences.reduce((sum, s) => sum + s.duration, 0).toFixed(2),
+    98→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+    99→      });
+   100→    } catch (err) {
+   101→      console.error('[SPLICE] Silence detection error:', err);
+   102→      res.status(500).json({ error: err.message });
+   103→    }
+   104→  });
+   105→
+   106→  /**
+   107→   * POST /silences-audio - Detect silences using FFprobe audio analysis
+   108→   *
+   109→   * Uses actual audio levels (dB threshold) instead of transcript gaps.
+   110→   * More accurate for detecting silence vs background noise.
+   111→   */
+   112→  router.post('/silences-audio', requireCredits({ endpoint: 'silences-audio' }), async (req, res) => {
+   113→    const {
+   114→      wavPath,
+   115→      threshold = -30,
+   116→      minDuration = 0.5,
+   117→      padding = 0.1
+   118→    } = req.body;
+   119→
+   120→    if (!wavPath) {
+   121→      return res.status(400).json({ error: 'wavPath is required' });
+   122→    }
+   123→
+   124→    if (!(await fileExists(wavPath))) {
+   125→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   126→    }
+   127→
+   128→    // Check FFprobe availability
+   129→    const ffprobeAvailable = await isFFprobeInstalled();
+   130→    if (!ffprobeAvailable) {
+   131→      return res.status(500).json({
+   132→        error: 'FFprobe not installed. Run: brew install ffmpeg'
+   133→      });
+   134→    }
+   135→
+   136→    console.log(`[SPLICE] FFprobe silence detection: ${wavPath} (threshold: ${threshold}dB, min: ${minDuration}s)`);
+   137→
+   138→    try {
+   139→      const silences = await detectAudioSilences(wavPath, {
+   140→        threshold,
+   141→        minDuration,
+   142→        padding
+   143→      });
+   144→
+   145→      const totalDuration = silences.reduce((sum, s) => sum + s.duration, 0);
+   146→
+   147→      // Deduct usage based on audio duration
+   148→      let balance = null;
+   149→      try {
+   150→        const audioDuration = await getAudioDuration(wavPath);
+   151→        if (audioDuration > 0 && req.deductUsage) {
+   152→          balance = await req.deductUsage(audioDuration);
+   153→        }
+   154→      } catch (durErr) {
+   155→        console.warn('[SPLICE] Could not get audio duration for billing:', durErr.message);
+   156→      }
+   157→
+   158→      res.json({
+   159→        success: true,
+   160→        wavPath,
+   161→        threshold,
+   162→        minDuration,
+   163→        padding,
+   164→        silences,
+   165→        count: silences.length,
+   166→        totalSilenceDuration: totalDuration.toFixed(2),
+   167→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   168→      });
+   169→    } catch (err) {
+   170→      console.error('[SPLICE] FFprobe silence detection error:', err);
+   171→      res.status(500).json({ error: err.message });
+   172→    }
+   173→  });
+   174→
+   175→  /**
+   176→   * POST /silences-rms - Detect silences using RMS audio analysis
+   177→   *
+   178→   * Advanced silence detection with:
+   179→   * - RMS (Root Mean Square) audio level analysis
+   180→   * - Auto-threshold detection from audio histogram
+   181→   * - Configurable padding (before/after cuts)
+   182→   * - Sensitivity slider mapping (0-100)
+   183→   *
+   184→   * Options:
+   185→   * - threshold: dBFS threshold (-60 to -20, default: -30)
+   186→   * - minSilenceLength: Minimum silence duration in seconds (default: 0.5)
+   187→   * - seekStep: Analysis window step in seconds (default: 0.05)
+   188→   * - paddingStart: Buffer before silence in seconds (default: 0.1)
+   189→   * - paddingEnd: Buffer after silence in seconds (default: 0.05)
+   190→   * - autoThreshold: Auto-detect optimal threshold (default: false)
+   191→   * - sensitivity: UI sensitivity 0-100 (overrides other params if provided)
+   192→   */
+   193→  router.post('/silences-rms', requireCredits({ endpoint: 'silences-rms' }), async (req, res) => {
+   194→    const { wavPath, sensitivity, ...manualOptions } = req.body;
+   195→
+   196→    if (!wavPath) {
+   197→      return res.status(400).json({ error: 'wavPath is required' });
+   198→    }
+   199→
+   200→    if (!(await fileExists(wavPath))) {
+   201→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   202→    }
+   203→
+   204→    // Validate file size to prevent OOM
+   205→    const sizeCheck = await validateFileSize(wavPath);
+   206→    if (!sizeCheck.valid) {
+   207→      return res.status(413).json({ error: sizeCheck.error });
+   208→    }
+   209→
+   210→    // Check FFprobe availability (needed for audio extraction)
+   211→    const ffprobeAvailable = await isFFprobeInstalled();
+   212→    if (!ffprobeAvailable) {
+   213→      return res.status(500).json({
+   214→        error: 'FFprobe not installed. Run: brew install ffmpeg'
+   215→      });
+   216→    }
+   217→
+   218→    // Build options - use sensitivity if provided, otherwise use manual options
+   219→    let options = {};
+   220→    if (typeof sensitivity === 'number') {
+   221→      options = sensitivityToParams(sensitivity);
+   222→      console.log(`[SPLICE] RMS detection with sensitivity ${sensitivity}`);
+   223→    } else {
+   224→      options = {
+   225→        threshold: manualOptions.threshold ?? -30,
+   226→        minSilenceLength: manualOptions.minSilenceLength ?? 0.5,
+   227→        seekStep: manualOptions.seekStep ?? 0.05,
+   228→        paddingStart: manualOptions.paddingStart ?? 0.1,
+   229→        paddingEnd: manualOptions.paddingEnd ?? 0.05,
+   230→        autoThreshold: manualOptions.autoThreshold ?? false,
+   231→        mergeDistance: manualOptions.mergeDistance ?? 0.2
+   232→      };
+   233→    }
+   234→
+   235→    console.log(`[SPLICE] RMS silence detection: ${wavPath}`);
+   236→
+   237→    try {
+   238→      const result = await detectSilencesRMS(wavPath, options);
+   239→
+   240→      // Deduct usage based on audio duration
+   241→      const audioDuration = result.metadata?.audioDuration || 0;
+   242→      let balance = null;
+   243→      if (audioDuration > 0 && req.deductUsage) {
+   244→        balance = await req.deductUsage(audioDuration);
+   245→      }
+   246→
+   247→      res.json({
+   248→        success: true,
+   249→        wavPath,
+   250→        ...result,
+   251→        count: result.silences.length,
+   252→        totalSilenceDuration: result.metadata.totalSilenceDuration.toFixed(2),
+   253→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   254→      });
+   255→    } catch (err) {
+   256→      console.error('[SPLICE] RMS silence detection error:', err);
+   257→      res.status(500).json({ error: err.message });
+   258→    }
+   259→  });
+   260→
+   261→  /**
+   262→   * POST /waveform - Get waveform data for visualization
+   263→   *
+   264→   * Extracts RMS waveform data from audio file for canvas visualization.
+   265→   * Returns normalized amplitude values (0-1) for drawing waveform display.
+   266→   *
+   267→   * Options:
+   268→   * - wavPath: Path to audio file (required)
+   269→   * - targetPoints: Number of data points to return (default: 400)
+   270→   * - windowMs: Window size in milliseconds for RMS calculation (default: 50)
+   271→   *
+   272→   * Response:
+   273→   * - waveform: Array of normalized RMS values (0-1)
+   274→   * - duration: Audio duration in seconds
+   275→   * - pointCount: Number of points in waveform array
+   276→   * - sampleRate: Audio sample rate
+   277→   */
+   278→  router.post('/waveform', requireCredits({ endpoint: 'waveform' }), async (req, res) => {
+   279→    const { wavPath, targetPoints = 400, windowMs = 50 } = req.body;
+   280→
+   281→    if (!wavPath) {
+   282→      return res.status(400).json({ error: 'wavPath is required' });
+   283→    }
+   284→
+   285→    if (!(await fileExists(wavPath))) {
+   286→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   287→    }
+   288→
+   289→    // Validate file size to prevent OOM
+   290→    const sizeCheck = await validateFileSize(wavPath);
+   291→    if (!sizeCheck.valid) {
+   292→      return res.status(413).json({ error: sizeCheck.error });
+   293→    }
+   294→
+   295→    console.log(`[SPLICE] Waveform extraction: ${wavPath} (${targetPoints} points)`);
+   296→
+   297→    try {
+   298→      const result = await getWaveformData(wavPath, { targetPoints, windowMs });
+   299→
+   300→      res.json({
+   301→        success: true,
+   302→        wavPath,
+   303→        ...result
+   304→      });
+   305→    } catch (err) {
+   306→      console.error('[SPLICE] Waveform extraction error:', err);
+   307→      res.status(500).json({ error: err.message });
+   308→    }
+   309→  });
+   310→
+   311→  return router;
+   312→}
+   313→
+   314→module.exports = createSilencesRoutes;
+   315→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

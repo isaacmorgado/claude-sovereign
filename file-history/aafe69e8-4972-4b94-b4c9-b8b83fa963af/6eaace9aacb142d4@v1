@@ -1,0 +1,555 @@
+#!/bin/bash
+# token-budgeter.sh - Context Token Budgeting for LLM interactions
+# Dynamic budget allocation with overflow prevention
+# Based on tiktoken patterns from langchain-ai, openinterpreter, and production systems
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_HELPER="${SCRIPT_DIR}/../lib/token_counter.py"
+BUDGET_CONFIG="${HOME}/.claude/config/token-budget.json"
+
+# Default budgets for Claude Sonnet 4.5 (200k context)
+DEFAULT_MAX_CONTEXT=200000
+DEFAULT_WARNING_THRESHOLD=160000  # 80% of max
+DEFAULT_CRITICAL_THRESHOLD=180000  # 90% of max
+
+# Ensure config directory exists
+mkdir -p "$(dirname "$BUDGET_CONFIG")"
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+usage() {
+    cat << EOF
+Usage: token-budgeter.sh <command> [options]
+
+Commands:
+    count <text|file>                Count tokens in text or file
+    budget <current_tokens>          Check if within budget, suggest actions
+    allocate <components_json>       Allocate tokens across conversation components
+    prune <messages_json> <target>   Prune messages to target token count
+    configure <max> <warn> <crit>    Configure budget thresholds
+    status                           Show current token usage status
+
+Options:
+    text|file:         Text string or file path to count tokens
+    current_tokens:    Current conversation token count
+    components_json:   JSON with component priorities and sizes
+    messages_json:     JSON array of messages with tokens
+    target:            Target token count after pruning
+    max:               Maximum context tokens (default: 200000)
+    warn:              Warning threshold (default: 80% of max)
+    crit:              Critical threshold (default: 90% of max)
+
+Examples:
+    token-budgeter.sh count "Hello world"
+    token-budgeter.sh count /path/to/file.py
+    token-budgeter.sh budget 150000
+    token-budgeter.sh configure 200000 160000 180000
+    token-budgeter.sh status
+
+Expected Impact: Prevents context overflow, maintains quality
+EOF
+}
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+init_config() {
+    if [[ ! -f "$BUDGET_CONFIG" ]]; then
+        cat > "$BUDGET_CONFIG" << JSON
+{
+  "max_context_tokens": $DEFAULT_MAX_CONTEXT,
+  "warning_threshold": $DEFAULT_WARNING_THRESHOLD,
+  "critical_threshold": $DEFAULT_CRITICAL_THRESHOLD,
+  "model": "claude-sonnet-4-5",
+  "priorities": {
+    "system_message": 100,
+    "user_query": 100,
+    "recent_messages": 80,
+    "tool_results": 60,
+    "historical_context": 40
+  }
+}
+JSON
+    fi
+}
+
+get_config() {
+    local key="$1"
+    init_config
+    jq -r ".${key}" "$BUDGET_CONFIG" 2>/dev/null || echo ""
+}
+
+set_config() {
+    local key="$1"
+    local value="$2"
+    init_config
+    jq ".${key} = ${value}" "$BUDGET_CONFIG" > "${BUDGET_CONFIG}.tmp"
+    mv "${BUDGET_CONFIG}.tmp" "$BUDGET_CONFIG"
+}
+
+# ============================================================================
+# PYTHON HELPER INTEGRATION
+# ============================================================================
+
+ensure_python_helper() {
+    if [[ ! -f "$PYTHON_HELPER" ]]; then
+        echo "Installing token counter Python helper..." >&2
+        cat > "$PYTHON_HELPER" << 'PYTHON_EOF'
+#!/usr/bin/env python3
+"""
+Token Counter using tiktoken
+Based on production patterns from langchain, openinterpreter, and LLM frameworks
+"""
+
+import sys
+import json
+from pathlib import Path
+
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+    print("Warning: tiktoken not installed. Install: pip install tiktoken", file=sys.stderr)
+
+def get_encoder(model: str = "gpt-4"):
+    """Get tiktoken encoder with fallback handling."""
+    if not TIKTOKEN_AVAILABLE:
+        return None
+
+    try:
+        # Try model-specific encoder (works for gpt-4, gpt-3.5-turbo, etc.)
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        # Fallback to cl100k_base (used by gpt-4, gpt-3.5-turbo-1106, etc.)
+        try:
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return None
+
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """Count tokens in text using tiktoken."""
+    if not TIKTOKEN_AVAILABLE:
+        # Fallback estimation: ~1.33 tokens per word
+        words = len(text.split())
+        return int(words * 1.33)
+
+    encoder = get_encoder(model)
+    if encoder is None:
+        # Fallback estimation
+        words = len(text.split())
+        return int(words * 1.33)
+
+    try:
+        return len(encoder.encode(text))
+    except Exception as e:
+        print(f"Error counting tokens: {e}", file=sys.stderr)
+        # Fallback estimation
+        words = len(text.split())
+        return int(words * 1.33)
+
+def count_tokens_from_file(file_path: str, model: str = "gpt-4") -> int:
+    """Count tokens in a file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return count_tokens(content, model)
+    except Exception as e:
+        print(f"Error reading file: {e}", file=sys.stderr)
+        return 0
+
+def count_messages_tokens(messages: list, model: str = "gpt-4") -> dict:
+    """
+    Count tokens for message array (OpenAI format).
+    Based on https://community.openai.com/t/how-to-calculate-the-tokens-when-using-function-call/266573
+    """
+    if not TIKTOKEN_AVAILABLE:
+        # Fallback: count all message content
+        total = 0
+        for msg in messages:
+            content = msg.get('content', '')
+            total += count_tokens(content, model)
+        return {
+            'total_tokens': total,
+            'messages': [{'tokens': count_tokens(m.get('content', ''), model)} for m in messages]
+        }
+
+    encoder = get_encoder(model)
+    if encoder is None:
+        return {'total_tokens': 0, 'messages': []}
+
+    # Message overhead (ChatML format)
+    # Every message has 3 tokens overhead
+    # If message has 'name', it's -1 token
+    tokens_per_message = 3
+    tokens_per_name = -1 if model in ["gpt-3.5-turbo-0301", "gpt-4-0314"] else 1
+
+    total_tokens = 0
+    message_tokens = []
+
+    for message in messages:
+        msg_tokens = tokens_per_message
+
+        # Count role
+        role = message.get('role', 'user')
+        msg_tokens += len(encoder.encode(role))
+
+        # Count content
+        content = message.get('content', '')
+        if content:
+            msg_tokens += len(encoder.encode(content))
+
+        # Count name if present
+        if 'name' in message:
+            msg_tokens += tokens_per_name
+
+        message_tokens.append({'tokens': msg_tokens, 'role': role})
+        total_tokens += msg_tokens
+
+    # Add 3 tokens for assistant reply priming
+    total_tokens += 3
+
+    return {
+        'total_tokens': total_tokens,
+        'messages': message_tokens,
+        'overhead_per_message': tokens_per_message
+    }
+
+def prune_messages(messages: list, target_tokens: int, model: str = "gpt-4", preserve_recent: int = 2) -> dict:
+    """
+    Prune messages to fit within target token budget.
+    Strategy: Preserve system message, user query, and last N messages. Remove oldest in middle.
+    """
+    if not messages:
+        return {'messages': [], 'removed_count': 0, 'tokens_saved': 0}
+
+    # Count tokens for all messages
+    token_info = count_messages_tokens(messages, model)
+    current_tokens = token_info['total_tokens']
+
+    if current_tokens <= target_tokens:
+        return {
+            'messages': messages,
+            'removed_count': 0,
+            'tokens_saved': 0,
+            'current_tokens': current_tokens
+        }
+
+    # Identify system message (always preserve)
+    system_indices = [i for i, m in enumerate(messages) if m.get('role') == 'system']
+
+    # Preserve system, first user message, and last N messages
+    preserve_indices = set()
+    if system_indices:
+        preserve_indices.update(system_indices)
+
+    # Preserve first user message
+    for i, m in enumerate(messages):
+        if m.get('role') == 'user':
+            preserve_indices.add(i)
+            break
+
+    # Preserve last N messages
+    preserve_indices.update(range(max(0, len(messages) - preserve_recent), len(messages)))
+
+    # Remove messages from middle until under budget
+    pruned_messages = []
+    removed_count = 0
+    tokens_saved = 0
+
+    for i, msg in enumerate(messages):
+        if i in preserve_indices:
+            pruned_messages.append(msg)
+        else:
+            removed_count += 1
+            tokens_saved += token_info['messages'][i]['tokens']
+
+        # Check if we're under budget
+        if current_tokens - tokens_saved <= target_tokens:
+            # Add remaining preserved messages
+            for j in range(i + 1, len(messages)):
+                if j in preserve_indices:
+                    pruned_messages.append(messages[j])
+            break
+
+    # Recount tokens
+    final_tokens = count_messages_tokens(pruned_messages, model)['total_tokens']
+
+    return {
+        'messages': pruned_messages,
+        'removed_count': removed_count,
+        'tokens_saved': tokens_saved,
+        'current_tokens': final_tokens,
+        'target_tokens': target_tokens,
+        'under_budget': final_tokens <= target_tokens
+    }
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: token_counter.py <command> [args...]", file=sys.stderr)
+        print("Commands: count, count_file, count_messages, prune_messages", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "count":
+        if len(sys.argv) < 3:
+            print("Usage: token_counter.py count <text> [model]", file=sys.stderr)
+            sys.exit(1)
+        text = sys.argv[2]
+        model = sys.argv[3] if len(sys.argv) > 3 else "gpt-4"
+        tokens = count_tokens(text, model)
+        print(json.dumps({'tokens': tokens, 'text_length': len(text)}))
+
+    elif command == "count_file":
+        if len(sys.argv) < 3:
+            print("Usage: token_counter.py count_file <file_path> [model]", file=sys.stderr)
+            sys.exit(1)
+        file_path = sys.argv[2]
+        model = sys.argv[3] if len(sys.argv) > 3 else "gpt-4"
+        tokens = count_tokens_from_file(file_path, model)
+        print(json.dumps({'tokens': tokens, 'file': file_path}))
+
+    elif command == "count_messages":
+        if len(sys.argv) < 3:
+            print("Usage: token_counter.py count_messages <messages_json> [model]", file=sys.stderr)
+            sys.exit(1)
+        messages_json = sys.argv[2]
+        model = sys.argv[3] if len(sys.argv) > 3 else "gpt-4"
+        messages = json.loads(messages_json)
+        result = count_messages_tokens(messages, model)
+        print(json.dumps(result))
+
+    elif command == "prune_messages":
+        if len(sys.argv) < 4:
+            print("Usage: token_counter.py prune_messages <messages_json> <target_tokens> [model] [preserve_recent]", file=sys.stderr)
+            sys.exit(1)
+        messages_json = sys.argv[2]
+        target_tokens = int(sys.argv[3])
+        model = sys.argv[4] if len(sys.argv) > 4 else "gpt-4"
+        preserve_recent = int(sys.argv[5]) if len(sys.argv) > 5 else 2
+        messages = json.loads(messages_json)
+        result = prune_messages(messages, target_tokens, model, preserve_recent)
+        print(json.dumps(result))
+
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+PYTHON_EOF
+        chmod +x "$PYTHON_HELPER"
+    fi
+}
+
+# ============================================================================
+# COUNT COMMAND
+# ============================================================================
+
+count_tokens() {
+    local input="$1"
+    local model="${2:-gpt-4}"
+
+    ensure_python_helper
+
+    # Check if input is a file
+    if [[ -f "$input" ]]; then
+        python3 "$PYTHON_HELPER" count_file "$input" "$model"
+    else
+        python3 "$PYTHON_HELPER" count "$(echo "$input")" "$model"
+    fi
+}
+
+# ============================================================================
+# BUDGET COMMAND
+# ============================================================================
+
+check_budget() {
+    local current_tokens="$1"
+
+    init_config
+
+    local max_context=$(get_config "max_context_tokens")
+    local warning_threshold=$(get_config "warning_threshold")
+    local critical_threshold=$(get_config "critical_threshold")
+
+    local remaining=$((max_context - current_tokens))
+    local usage_pct=$(echo "scale=2; $current_tokens * 100.0 / $max_context" | bc)
+
+    local status="OK"
+    local action="none"
+    local message=""
+
+    if [[ $current_tokens -ge $critical_threshold ]]; then
+        status="CRITICAL"
+        action="prune_now"
+        message="⚠️  CRITICAL: ${usage_pct}% of context used. Prune immediately to prevent overflow."
+    elif [[ $current_tokens -ge $warning_threshold ]]; then
+        status="WARNING"
+        action="prune_soon"
+        message="⚠️  WARNING: ${usage_pct}% of context used. Consider pruning soon."
+    else
+        status="OK"
+        action="none"
+        message="✅ OK: ${usage_pct}% of context used. ${remaining} tokens remaining."
+    fi
+
+    cat << JSON
+{
+  "status": "$status",
+  "action": "$action",
+  "current_tokens": $current_tokens,
+  "max_tokens": $max_context,
+  "remaining_tokens": $remaining,
+  "usage_percent": $usage_pct,
+  "thresholds": {
+    "warning": $warning_threshold,
+    "critical": $critical_threshold
+  },
+  "message": "$message"
+}
+JSON
+}
+
+# ============================================================================
+# ALLOCATE COMMAND
+# ============================================================================
+
+allocate_budget() {
+    local components_json="$1"
+
+    init_config
+
+    local max_context=$(get_config "max_context_tokens")
+    local priorities=$(get_config "priorities")
+
+    # Calculate total priority weight
+    local total_weight=$(echo "$priorities" | jq '[.[] | tonumber] | add')
+
+    # Allocate tokens proportionally
+    local allocations=$(echo "$components_json" | jq --argjson max "$max_context" --argjson priorities "$priorities" --argjson total_weight "$total_weight" '
+        . as $components |
+        $priorities | to_entries | map({
+            key: .key,
+            priority: .value,
+            allocated: ($max * .value / $total_weight | floor),
+            current: ($components[.key] // 0)
+        }) | from_entries
+    ')
+
+    echo "$allocations" | jq .
+}
+
+# ============================================================================
+# PRUNE COMMAND
+# ============================================================================
+
+prune_messages() {
+    local messages_json="$1"
+    local target_tokens="$2"
+    local model="${3:-gpt-4}"
+    local preserve_recent="${4:-2}"
+
+    ensure_python_helper
+
+    python3 "$PYTHON_HELPER" prune_messages "$messages_json" "$target_tokens" "$model" "$preserve_recent"
+}
+
+# ============================================================================
+# CONFIGURE COMMAND
+# ============================================================================
+
+configure_budget() {
+    local max_context="$1"
+    local warning_threshold="$2"
+    local critical_threshold="$3"
+
+    set_config "max_context_tokens" "$max_context"
+    set_config "warning_threshold" "$warning_threshold"
+    set_config "critical_threshold" "$critical_threshold"
+
+    echo "Token budget configured:"
+    echo "  Max context: $max_context"
+    echo "  Warning:     $warning_threshold ($(echo "scale=0; $warning_threshold * 100 / $max_context" | bc)%)"
+    echo "  Critical:    $critical_threshold ($(echo "scale=0; $critical_threshold * 100 / $max_context" | bc)%)"
+}
+
+# ============================================================================
+# STATUS COMMAND
+# ============================================================================
+
+show_status() {
+    init_config
+
+    local max_context=$(get_config "max_context_tokens")
+    local warning_threshold=$(get_config "warning_threshold")
+    local critical_threshold=$(get_config "critical_threshold")
+    local model=$(get_config "model")
+
+    cat << STATUS
+Token Budget Status
+===================
+Model:              $model
+Max context:        $max_context tokens
+Warning threshold:  $warning_threshold tokens ($(echo "scale=0; $warning_threshold * 100 / $max_context" | bc)%)
+Critical threshold: $critical_threshold tokens ($(echo "scale=0; $critical_threshold * 100 / $max_context" | bc)%)
+
+Priority Allocation:
+$(get_config "priorities" | jq -r 'to_entries | .[] | "  \(.key): \(.value)"')
+
+Configuration: $BUDGET_CONFIG
+STATUS
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        count)
+            shift
+            count_tokens "$@"
+            ;;
+        budget)
+            shift
+            check_budget "$@"
+            ;;
+        allocate)
+            shift
+            allocate_budget "$@"
+            ;;
+        prune)
+            shift
+            prune_messages "$@"
+            ;;
+        configure)
+            shift
+            configure_budget "$@"
+            ;;
+        status)
+            show_status
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "Error: Unknown command: $command" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,1065 @@
+     1→#!/bin/bash
+     2→# Agent Loop - Autonomous execution with tool calling
+     3→# Based on patterns from: Roo-Code AgentLoopState, UI-TARS AgentComposer, PraisonAI, TanStack
+     4→
+     5→set -uo pipefail
+     6→
+     7→AGENT_DIR="${HOME}/.claude/agent"
+     8→AGENT_STATE="$AGENT_DIR/state.json"
+     9→TOOL_REGISTRY="$AGENT_DIR/tools.json"
+    10→EXECUTION_LOG="$AGENT_DIR/execution.log"
+    11→LOG_FILE="${HOME}/.claude/agent-loop.log"
+    12→
+    13→# Memory integration
+    14→MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
+    15→MEMORY_AVAILABLE="false"
+    16→MEMORY_WARNING_SHOWN="false"
+    17→
+    18→# Loop control
+    19→MAX_ITERATIONS="${MAX_ITERATIONS:-50}"
+    20→MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-3}"
+    21→
+    22→log() {
+    23→    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    24→}
+    25→
+    26→show_memory_advisory() {
+    27→    if [[ "$MEMORY_WARNING_SHOWN" == "false" ]]; then
+    28→        echo "⚠️  Running stateless - memory disabled" >&2
+    29→        log "Memory manager unavailable - running stateless"
+    30→        MEMORY_WARNING_SHOWN="true"
+    31→    fi
+    32→}
+    33→
+    34→init_agent() {
+    35→    mkdir -p "$AGENT_DIR"
+    36→
+    37→    # Initialize tool registry if not exists
+    38→    if [[ ! -f "$TOOL_REGISTRY" ]]; then
+    39→        cat > "$TOOL_REGISTRY" << 'EOF'
+    40→{
+    41→    "tools": {
+    42→        "read_file": {
+    43→            "description": "Read file contents",
+    44→            "command": "cat",
+    45→            "requiresPath": true
+    46→        },
+    47→        "write_file": {
+    48→            "description": "Write to file",
+    49→            "command": "tee",
+    50→            "requiresPath": true
+    51→        },
+    52→        "search_code": {
+    53→            "description": "Search in codebase",
+    54→            "command": "grep -r",
+    55→            "requiresPattern": true
+    56→        },
+    57→        "run_tests": {
+    58→            "description": "Run test suite",
+    59→            "command": "npm test || pytest || go test ./...",
+    60→            "requiresPath": false
+    61→        },
+    62→        "lint_code": {
+    63→            "description": "Run linter",
+    64→            "command": "npm run lint || ruff check . || go vet ./...",
+    65→            "requiresPath": false
+    66→        },
+    67→        "typecheck": {
+    68→            "description": "Run type checker",
+    69→            "command": "npm run typecheck || mypy . || go build ./...",
+    70→            "requiresPath": false
+    71→        },
+    72→        "shell": {
+    73→            "description": "Execute shell command",
+    74→            "command": "bash -c",
+    75→            "requiresCommand": true
+    76→        }
+    77→    }
+    78→}
+    79→EOF
+    80→    fi
+    81→}
+    82→
+    83→# =============================================================================
+    84→# MEMORY INTEGRATION (from Generative Agents, MemGPT patterns)
+    85→# =============================================================================
+    86→
+    87→# Initialize memory for agent session
+    88→memory_init() {
+    89→    if [[ -x "$MEMORY_MANAGER" ]]; then
+    90→        if "$MEMORY_MANAGER" init 2>/dev/null; then
+    91→            MEMORY_AVAILABLE="true"
+    92→            log "Memory system initialized"
+    93→        else
+    94→            show_memory_advisory
+    95→        fi
+    96→    else
+    97→        show_memory_advisory
+    98→    fi
+    99→}
+   100→
+   101→# Set current task in working memory
+   102→memory_set_task() {
+   103→    local goal="$1"
+   104→    local context="${2:-}"
+   105→
+   106→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   107→        if "$MEMORY_MANAGER" set-task "$goal" "$context" 2>/dev/null; then
+   108→            log "Memory: Set task - $goal"
+   109→        else
+   110→            show_memory_advisory
+   111→        fi
+   112→    else
+   113→        show_memory_advisory
+   114→    fi
+   115→}
+   116→
+   117→# Retrieve relevant context from memory before execution
+   118→memory_retrieve_context() {
+   119→    local query="$1"
+   120→    local limit="${2:-5}"
+   121→
+   122→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   123→        # PHASE 2 INTEGRATION: Use hybrid search (BM25 + semantic)
+   124→        local memories
+   125→        memories=$("$MEMORY_MANAGER" remember-hybrid "$query" "$limit" 2>/dev/null)
+   126→
+   127→        if [[ -n "$memories" && "$memories" != "[]" ]]; then
+   128→            echo "$memories"
+   129→            log "Memory: Retrieved $(echo "$memories" | jq 'length') relevant memories"
+   130→        elif [[ -z "$memories" ]]; then
+   131→            show_memory_advisory
+   132→        fi
+   133→    else
+   134→        show_memory_advisory
+   135→    fi
+   136→}
+   137→
+   138→# Record a successful action to memory
+   139→memory_record_success() {
+   140→    local action_type="$1"
+   141→    local description="$2"
+   142→    local details="${3:-}"
+   143→
+   144→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   145→        # Record episode
+   146→        if ! "$MEMORY_MANAGER" record "$action_type" "$description" "success" "$details" 2>/dev/null; then
+   147→            show_memory_advisory
+   148→            return
+   149→        fi
+   150→
+   151→        # Log action
+   152→        if ! "$MEMORY_MANAGER" log-action "$action_type" "$description" "success" '{"outcome":"success"}' 2>/dev/null; then
+   153→            show_memory_advisory
+   154→            return
+   155→        fi
+   156→
+   157→        log "Memory: Recorded success - $description"
+   158→    else
+   159→        show_memory_advisory
+   160→    fi
+   161→}
+   162→
+   163→# Record a failure to memory for learning
+   164→memory_record_failure() {
+   165→    local action_type="$1"
+   166→    local description="$2"
+   167→    local error="${3:-}"
+   168→
+   169→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   170→        # Record episode
+   171→        if ! "$MEMORY_MANAGER" record "failure" "$description" "failure" "$error" 2>/dev/null; then
+   172→            show_memory_advisory
+   173→            return
+   174→        fi
+   175→
+   176→        # Log action
+   177→        if ! "$MEMORY_MANAGER" log-action "$action_type" "$description" "$error" '{"outcome":"failure"}' 2>/dev/null; then
+   178→            show_memory_advisory
+   179→            return
+   180→        fi
+   181→
+   182→        log "Memory: Recorded failure - $description"
+   183→    else
+   184→        show_memory_advisory
+   185→    fi
+   186→}
+   187→
+   188→# Learn a pattern from experience
+   189→memory_learn_pattern() {
+   190→    local pattern_type="$1"    # error_fix, optimization, workflow
+   191→    local trigger="$2"          # What triggers this pattern
+   192→    local solution="$3"         # The solution/action
+   193→    local success_rate="${4:-1.0}"
+   194→
+   195→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   196→        local pattern_id
+   197→        pattern_id=$("$MEMORY_MANAGER" add-pattern "$pattern_type" "$trigger" "$solution" "$success_rate" 2>/dev/null)
+   198→
+   199→        log "Memory: Learned pattern $pattern_id - $trigger -> $solution"
+   200→        echo "$pattern_id"
+   201→    fi
+   202→}
+   203→
+   204→# Search for known patterns that might help
+   205→memory_find_patterns() {
+   206→    local query="$1"
+   207→    local limit="${2:-3}"
+   208→
+   209→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   210→        local patterns
+   211→        patterns=$("$MEMORY_MANAGER" find-patterns "$query" "$limit" 2>/dev/null)
+   212→
+   213→        if [[ -n "$patterns" && "$patterns" != "[]" ]]; then
+   214→            echo "$patterns"
+   215→            log "Memory: Found $(echo "$patterns" | jq 'length') matching patterns"
+   216→        fi
+   217→    fi
+   218→}
+   219→
+   220→# Create a reflection after significant work
+   221→memory_reflect() {
+   222→    local focus="$1"
+   223→    local content="$2"
+   224→    local insights="${3:-}"
+   225→
+   226→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   227→        if ! "$MEMORY_MANAGER" reflect "$focus" "$content" "$insights" 2>/dev/null; then
+   228→            show_memory_advisory
+   229→            return
+   230→        fi
+   231→        log "Memory: Created reflection - $focus"
+   232→    else
+   233→        show_memory_advisory
+   234→    fi
+   235→}
+   236→
+   237→# Store a fact learned during execution
+   238→memory_store_fact() {
+   239→    local category="$1"
+   240→    local key="$2"
+   241→    local value="$3"
+   242→
+   243→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   244→        "$MEMORY_MANAGER" add-fact "$category" "$key" "$value" 2>/dev/null
+   245→        log "Memory: Stored fact - $category/$key"
+   246→    fi
+   247→}
+   248→
+   249→# Get memory statistics
+   250→memory_stats() {
+   251→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   252→        "$MEMORY_MANAGER" stats 2>/dev/null
+   253→    fi
+   254→}
+   255→
+   256→# =============================================================================
+   257→# AGENT STATE MACHINE (from Roo-Code patterns)
+   258→# =============================================================================
+   259→
+   260→# Agent states: idle, planning, executing, validating, reflecting, paused, completed, failed
+   261→
+   262→start_agent() {
+   263→    local goal="$1"
+   264→    local context="${2:-}"
+   265→
+   266→    init_agent
+   267→
+   268→    # PHASE 4 INTEGRATION: Check context budget before starting
+   269→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   270→        log "Checking context budget..."
+   271→        local budget_status
+   272→        budget_status=$("$MEMORY_MANAGER" context-check 2>/dev/null || echo "")
+   273→
+   274→        if [[ -n "$budget_status" ]]; then
+   275→            log "$budget_status"
+   276→
+   277→            # Auto-compact if needed
+   278→            "$MEMORY_MANAGER" auto-compact-if-needed 2>/dev/null || true
+   279→        fi
+   280→    fi
+   281→
+   282→    # Initialize memory system
+   283→    memory_init
+   284→
+   285→    local agent_id
+   286→    agent_id="agent_$(date +%s)"
+   287→
+   288→    local timestamp
+   289→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   290→
+   291→    # Retrieve relevant memories for this goal
+   292→    local relevant_memories=""
+   293→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   294→        relevant_memories=$(memory_retrieve_context "$goal" 5 2>/dev/null | jq -c '.' 2>/dev/null || echo "[]")
+   295→    fi
+   296→
+   297→    # ============================================================================
+   298→    # PLANNING PHASE: Thinking Framework + Plan-Execute + Task Queue
+   299→    # ============================================================================
+   300→    local THINKING_FRAMEWORK="${HOME}/.claude/hooks/thinking-framework.sh"
+   301→    local PLAN_EXECUTE="${HOME}/.claude/hooks/plan-execute.sh"
+   302→    local TASK_QUEUE="${HOME}/.claude/hooks/task-queue.sh"
+   303→
+   304→    # 1. Thinking Framework: Generate reasoning chain
+   305→    local reasoning_chain="[]"
+   306→    if [[ -x "$THINKING_FRAMEWORK" ]]; then
+   307→        log "Generating reasoning chain with thinking-framework..."
+   308→        reasoning_chain=$("$THINKING_FRAMEWORK" reason "$goal" "$context" 2>/dev/null | jq -c '.' 2>/dev/null || echo '[]')
+   309→        log "Reasoning chain generated: $(echo "$reasoning_chain" | jq 'length') steps"
+   310→    fi
+   311→
+   312→    # 2. Plan-Execute: Create execution plan
+   313→    local execution_plan="[]"
+   314→    if [[ -x "$PLAN_EXECUTE" ]]; then
+   315→        log "Creating execution plan with plan-execute..."
+   316→        execution_plan=$("$PLAN_EXECUTE" plan "$goal" "$context" 2>/dev/null | jq -c '.steps // []' 2>/dev/null || echo '[]')
+   317→        log "Execution plan created: $(echo "$execution_plan" | jq 'length') steps"
+   318→    fi
+   319→
+   320→    # 3. Task Queue: Prioritize tasks
+   321→    local prioritized_plan="[]"
+   322→    if [[ -x "$TASK_QUEUE" && $(echo "$execution_plan" | jq 'length') -gt 0 ]]; then
+   323→        log "Prioritizing tasks with task-queue..."
+   324→        # Add tasks to queue (using process substitution to avoid subshell)
+   325→        while IFS= read -r step; do
+   326→            local task_name priority_str priority_num
+   327→            task_name=$(echo "$step" | jq -r '.task // .description')
+   328→            priority_str=$(echo "$step" | jq -r '.priority // "medium"')
+   329→            # Convert string priority to numeric (high=1, medium=3, low=5)
+   330→            case "$priority_str" in
+   331→                high|urgent|critical) priority_num=1 ;;
+   332→                low|minor) priority_num=5 ;;
+   333→                *) priority_num=3 ;;  # medium is default
+   334→            esac
+   335→            "$TASK_QUEUE" add "$task_name" "$priority_num" 2>/dev/null || true
+   336→        done < <(echo "$execution_plan" | jq -c '.[]')
+   337→        # Get prioritized list
+   338→        prioritized_plan=$("$TASK_QUEUE" list 2>/dev/null | jq -c '.' 2>/dev/null || echo "$execution_plan")
+   339→        log "Tasks prioritized: $(echo "$prioritized_plan" | jq 'length') tasks"
+   340→    else
+   341→        prioritized_plan="$execution_plan"
+   342→    fi
+   343→    # ============================================================================
+   344→
+   345→    # Extract autoResearch from context if provided (format: autoResearch:BASE64_ENCODED_JSON)
+   346→    # Or check if a temp file exists with the research data
+   347→    local auto_research="{}"
+   348→    if [[ -f "${AGENT_DIR}/.pending-research.json" ]]; then
+   349→        # Research data passed via temp file
+   350→        auto_research=$(cat "${AGENT_DIR}/.pending-research.json" 2>/dev/null || echo '{}')
+   351→        rm -f "${AGENT_DIR}/.pending-research.json"
+   352→    elif [[ "$context" == *"autoResearch:"* ]]; then
+   353→        # Extract JSON after autoResearch: prefix (try to parse carefully)
+   354→        local research_part=$(echo "$context" | sed -n 's/.*autoResearch:\({.*}\).*/\1/p')
+   355→        if [[ -n "$research_part" ]] && echo "$research_part" | jq empty 2>/dev/null; then
+   356→            auto_research="$research_part"
+   357→        fi
+   358→    fi
+   359→
+   360→    cat > "$AGENT_STATE" << EOF
+   361→{
+   362→    "id": "$agent_id",
+   363→    "goal": "$goal",
+   364→    "context": "$context",
+   365→    "state": "planning",
+   366→    "iteration": 0,
+   367→    "maxIterations": $MAX_ITERATIONS,
+   368→    "consecutiveFailures": 0,
+   369→    "startedAt": "$timestamp",
+   370→    "plan": $prioritized_plan,
+   371→    "reasoningChain": $reasoning_chain,
+   372→    "currentStep": null,
+   373→    "executionHistory": [],
+   374→    "toolCalls": [],
+   375→    "pauseRequested": false,
+   376→    "stopRequested": false,
+   377→    "relevantMemories": $relevant_memories,
+   378→    "autoResearch": $auto_research
+   379→}
+   380→EOF
+   381→
+   382→    # Set task in working memory
+   383→    memory_set_task "$goal" "$context"
+   384→
+   385→    # Execute auto-research if recommendations are present
+   386→    if [[ "$auto_research" != "[]" ]]; then
+   387→        local research_executor="${HOME}/.claude/hooks/github-research-executor.sh"
+   388→        if [[ -x "$research_executor" ]]; then
+   389→            log "Executing auto-research recommendations"
+   390→            "$research_executor" execute "$auto_research" 2>/dev/null || true
+   391→        fi
+   392→    fi
+   393→
+   394→    log "Started agent: $agent_id with goal: $goal"
+   395→    echo "$agent_id"
+   396→}
+   397→
+   398→# Transition agent state
+   399→transition_state() {
+   400→    local new_state="$1"
+   401→    local reason="${2:-}"
+   402→
+   403→    if [[ ! -f "$AGENT_STATE" ]]; then
+   404→        return 1
+   405→    fi
+   406→
+   407→    local temp_file
+   408→    temp_file=$(mktemp)
+   409→
+   410→    local timestamp
+   411→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   412→
+   413→    local old_state
+   414→    old_state=$(jq -r '.state' "$AGENT_STATE")
+   415→
+   416→    jq --arg state "$new_state" \
+   417→       --arg reason "$reason" \
+   418→       --arg ts "$timestamp" \
+   419→       --arg old "$old_state" \
+   420→       '
+   421→       .state = $state |
+   422→       .lastTransition = {
+   423→           from: $old,
+   424→           to: $state,
+   425→           reason: $reason,
+   426→           timestamp: $ts
+   427→       }
+   428→       ' "$AGENT_STATE" > "$temp_file"
+   429→
+   430→    mv "$temp_file" "$AGENT_STATE"
+   431→
+   432→    log "State transition: $old_state -> $new_state (reason: $reason)"
+   433→}
+   434→
+   435→# =============================================================================
+   436→# LOOP CONTROL (from TanStack patterns)
+   437→# =============================================================================
+   438→
+   439→# Check if loop should continue
+   440→should_continue() {
+   441→    if [[ ! -f "$AGENT_STATE" ]]; then
+   442→        echo "false:no_agent"
+   443→        return 1
+   444→    fi
+   445→
+   446→    local result
+   447→    result=$(jq -r '
+   448→        if .stopRequested then
+   449→            "false:stop_requested"
+   450→        elif .pauseRequested then
+   451→            "false:paused"
+   452→        elif .state == "completed" then
+   453→            "false:completed"
+   454→        elif .state == "failed" then
+   455→            "false:failed"
+   456→        elif .iteration >= .maxIterations then
+   457→            "false:max_iterations"
+   458→        elif .consecutiveFailures >= '"$MAX_CONSECUTIVE_FAILURES"' then
+   459→            "false:consecutive_failures"
+   460→        else
+   461→            "true:continue"
+   462→        end
+   463→    ' "$AGENT_STATE")
+   464→
+   465→    echo "$result"
+   466→}
+   467→
+   468→# Increment iteration
+   469→increment_iteration() {
+   470→    if [[ ! -f "$AGENT_STATE" ]]; then
+   471→        return 1
+   472→    fi
+   473→
+   474→    local temp_file
+   475→    temp_file=$(mktemp)
+   476→
+   477→    jq '.iteration += 1' "$AGENT_STATE" > "$temp_file"
+   478→    mv "$temp_file" "$AGENT_STATE"
+   479→}
+   480→
+   481→# Record failure
+   482→record_failure() {
+   483→    local error="${1:-unknown}"
+   484→
+   485→    if [[ ! -f "$AGENT_STATE" ]]; then
+   486→        return 1
+   487→    fi
+   488→
+   489→    local temp_file
+   490→    temp_file=$(mktemp)
+   491→
+   492→    local timestamp
+   493→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   494→
+   495→    local goal
+   496→    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+   497→
+   498→    # ============================================================================
+   499→    # ERROR HANDLER INTEGRATION: Classify error and get retry strategy
+   500→    # ============================================================================
+   501→    local ERROR_HANDLER="${HOME}/.claude/hooks/error-handler.sh"
+   502→    local error_classification="UNKNOWN"
+   503→    local should_retry="false"
+   504→    local backoff_ms=1000
+   505→    local attempt
+   506→    attempt=$(jq -r '.consecutiveFailures // 0' "$AGENT_STATE" 2>/dev/null || echo "0")
+   507→
+   508→    if [[ -x "$ERROR_HANDLER" ]]; then
+   509→        log "Analyzing error with error-handler..."
+   510→        local handler_response
+   511→        handler_response=$("$ERROR_HANDLER" handle "$error" "$attempt" 3 "agent-loop:$goal" 2>/dev/null || echo '{}')
+   512→
+   513→        error_classification=$(echo "$handler_response" | jq -r '.classification // "UNKNOWN"')
+   514→        should_retry=$(echo "$handler_response" | jq -r '.shouldRetry // false')
+   515→        backoff_ms=$(echo "$handler_response" | jq -r '.backoffMs // 1000')
+   516→
+   517→        log "Error classified as: $error_classification (retry: $should_retry, backoff: ${backoff_ms}ms)"
+   518→    fi
+   519→    # ============================================================================
+   520→
+   521→    jq --arg error "$error" \
+   522→       --arg ts "$timestamp" \
+   523→       --arg classification "$error_classification" \
+   524→       --arg retry "$should_retry" \
+   525→       --argjson backoff "$backoff_ms" \
+   526→       '
+   527→       .consecutiveFailures += 1 |
+   528→       .lastError = {
+   529→           message: $error,
+   530→           timestamp: $ts,
+   531→           iteration: .iteration,
+   532→           classification: $classification,
+   533→           shouldRetry: ($retry == "true"),
+   534→           backoffMs: $backoff
+   535→       }
+   536→       ' "$AGENT_STATE" > "$temp_file"
+   537→
+   538→    mv "$temp_file" "$AGENT_STATE"
+   539→
+   540→    log "Recorded failure: $error"
+   541→
+   542→    # Record failure to memory for learning
+   543→    memory_record_failure "execution" "$goal" "$error"
+   544→}
+   545→
+   546→# Record success (resets consecutive failures)
+   547→record_success() {
+   548→    local result="${1:-success}"
+   549→
+   550→    if [[ ! -f "$AGENT_STATE" ]]; then
+   551→        return 1
+   552→    fi
+   553→
+   554→    local temp_file
+   555→    temp_file=$(mktemp)
+   556→
+   557→    local timestamp
+   558→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   559→
+   560→    jq --arg result "$result" \
+   561→       --arg ts "$timestamp" \
+   562→       '
+   563→       .consecutiveFailures = 0 |
+   564→       .lastSuccess = {
+   565→           result: $result,
+   566→           timestamp: $ts,
+   567→           iteration: .iteration
+   568→       }
+   569→       ' "$AGENT_STATE" > "$temp_file"
+   570→
+   571→    mv "$temp_file" "$AGENT_STATE"
+   572→}
+   573→
+   574→# =============================================================================
+   575→# TOOL EXECUTION (from UI-TARS patterns)
+   576→# =============================================================================
+   577→
+   578→# Execute a tool call
+   579→execute_tool() {
+   580→    local tool_name="$1"
+   581→    shift
+   582→    local args=("$@")
+   583→
+   584→    if [[ ! -f "$AGENT_STATE" ]]; then
+   585→        echo '{"success":false,"error":"no_active_agent"}'
+   586→        return 1
+   587→    fi
+   588→
+   589→    local temp_file
+   590→    temp_file=$(mktemp)
+   591→
+   592→    local timestamp
+   593→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   594→
+   595→    local tool_call_id
+   596→    tool_call_id="tool_$(date +%s%N | cut -c1-13)"
+   597→
+   598→    # Record tool call start
+   599→    jq --arg id "$tool_call_id" \
+   600→       --arg name "$tool_name" \
+   601→       --arg args "${args[*]}" \
+   602→       --arg ts "$timestamp" \
+   603→       '
+   604→       .toolCalls += [{
+   605→           id: $id,
+   606→           name: $name,
+   607→           args: $args,
+   608→           startedAt: $ts,
+   609→           status: "running"
+   610→       }]
+   611→       ' "$AGENT_STATE" > "$temp_file"
+   612→
+   613→    mv "$temp_file" "$AGENT_STATE"
+   614→
+   615→    log "Executing tool: $tool_name (id: $tool_call_id)"
+   616→
+   617→    # ============================================================================
+   618→    # VALIDATION GATE: Check if command is safe before execution
+   619→    # ============================================================================
+   620→    local VALIDATION_GATE="${HOME}/.claude/hooks/validation-gate.sh"
+   621→    if [[ -x "$VALIDATION_GATE" && "$tool_name" == "shell" ]]; then
+   622→        local validation_result
+   623→        validation_result=$("$VALIDATION_GATE" command "${args[*]}" 2>/dev/null || echo "PASS")
+   624→
+   625→        local validation_status
+   626→        validation_status=$(echo "$validation_result" | head -n1)
+   627→
+   628→        if [[ "$validation_status" == "BLOCKED" ]]; then
+   629→            local reason
+   630→            reason=$(echo "$validation_result" | tail -n +2)
+   631→            log "⚠️  Validation gate blocked command: ${args[*]} - $reason"
+   632→
+   633→            # Return validation error
+   634→            jq -n \
+   635→                --arg id "$tool_call_id" \
+   636→                --arg name "$tool_name" \
+   637→                --arg reason "$reason" \
+   638→                '{
+   639→                    id: $id,
+   640→                    name: $name,
+   641→                    success: false,
+   642→                    result: ("BLOCKED: " + $reason),
+   643→                    exitCode: 126,
+   644→                    durationMs: 0
+   645→                }'
+   646→            return 126
+   647→        elif [[ "$validation_status" == "WARNING" ]]; then
+   648→            local warnings
+   649→            warnings=$(echo "$validation_result" | tail -n +2)
+   650→            log "⚠️  Validation gate warnings for command: ${args[*]} - $warnings"
+   651→        fi
+   652→        log "✓ Validation gate: Command approved ($validation_status)"
+   653→    fi
+   654→    # ============================================================================
+   655→
+   656→    # Execute the tool
+   657→    local result
+   658→    local exit_code
+   659→    local start_time
+   660→    start_time=$(date +%s%N)
+   661→
+   662→    case "$tool_name" in
+   663→        read_file)
+   664→            result=$(cat "${args[0]}" 2>&1)
+   665→            exit_code=$?
+   666→            ;;
+   667→        search_code)
+   668→            result=$(grep -r "${args[0]}" "${args[1]:-.}" 2>&1 | head -50)
+   669→            exit_code=$?
+   670→            ;;
+   671→        run_tests)
+   672→            result=$(npm test 2>&1 || pytest 2>&1 || go test ./... 2>&1)
+   673→            exit_code=$?
+   674→            ;;
+   675→        lint_code)
+   676→            result=$(npm run lint 2>&1 || ruff check . 2>&1 || go vet ./... 2>&1)
+   677→            exit_code=$?
+   678→            ;;
+   679→        typecheck)
+   680→            result=$(npm run typecheck 2>&1 || npx tsc --noEmit 2>&1 || mypy . 2>&1)
+   681→            exit_code=$?
+   682→            ;;
+   683→        shell)
+   684→            result=$(bash -c "${args[*]}" 2>&1)
+   685→            exit_code=$?
+   686→            ;;
+   687→        *)
+   688→            result="Unknown tool: $tool_name"
+   689→            exit_code=1
+   690→            ;;
+   691→    esac
+   692→
+   693→    local end_time
+   694→    end_time=$(date +%s%N)
+   695→    local duration=$(( (end_time - start_time) / 1000000 ))  # ms
+   696→
+   697→    # Update tool call with result
+   698→    temp_file=$(mktemp)
+   699→    local end_timestamp
+   700→    end_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   701→
+   702→    # Truncate result if too long
+   703→    if [[ ${#result} -gt 10000 ]]; then
+   704→        result="${result:0:10000}... (truncated)"
+   705→    fi
+   706→
+   707→    jq --arg id "$tool_call_id" \
+   708→       --arg result "$result" \
+   709→       --argjson code "$exit_code" \
+   710→       --argjson duration "$duration" \
+   711→       --arg ts "$end_timestamp" \
+   712→       '
+   713→       .toolCalls = [.toolCalls[] |
+   714→           if .id == $id then
+   715→               . + {
+   716→                   result: $result,
+   717→                   exitCode: $code,
+   718→                   duration: $duration,
+   719→                   completedAt: $ts,
+   720→                   status: (if $code == 0 then "success" else "failed" end)
+   721→               }
+   722→           else . end
+   723→       ]
+   724→       ' "$AGENT_STATE" > "$temp_file"
+   725→
+   726→    mv "$temp_file" "$AGENT_STATE"
+   727→
+   728→    log "Tool completed: $tool_name (exit: $exit_code, duration: ${duration}ms)"
+   729→
+   730→    # Return result as JSON
+   731→    jq -n \
+   732→        --arg id "$tool_call_id" \
+   733→        --arg name "$tool_name" \
+   734→        --argjson success "$([ $exit_code -eq 0 ] && echo true || echo false)" \
+   735→        --arg result "$result" \
+   736→        --argjson exitCode "$exit_code" \
+   737→        --argjson duration "$duration" \
+   738→        '{
+   739→            id: $id,
+   740→            name: $name,
+   741→            success: $success,
+   742→            result: $result,
+   743→            exitCode: $exitCode,
+   744→            durationMs: $duration
+   745→        }'
+   746→}
+   747→
+   748→# =============================================================================
+   749→# LOOP LIFECYCLE HOOKS (from UI-TARS AgentComposer patterns)
+   750→# =============================================================================
+   751→
+   752→# Called at start of each iteration
+   753→on_loop_start() {
+   754→    local iteration
+   755→    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+   756→
+   757→    log "Loop iteration $iteration starting"
+   758→
+   759→    # Log to execution log
+   760→    echo "=== Iteration $iteration ===" >> "$EXECUTION_LOG"
+   761→    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$EXECUTION_LOG"
+   762→
+   763→    # Check health
+   764→    if [[ -x "${HOME}/.claude/hooks/self-healing.sh" ]]; then
+   765→        local health
+   766→        health=$("${HOME}/.claude/hooks/self-healing.sh" health 2>/dev/null)
+   767→        if [[ "$health" != "healthy" ]]; then
+   768→            log "Health check: $health - attempting recovery"
+   769→            "${HOME}/.claude/hooks/self-healing.sh" recover 2>/dev/null
+   770→        fi
+   771→    fi
+   772→}
+   773→
+   774→# Called at end of each iteration
+   775→on_loop_end() {
+   776→    local iteration
+   777→    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+   778→
+   779→    local state
+   780→    state=$(jq -r '.state' "$AGENT_STATE" 2>/dev/null || echo "unknown")
+   781→
+   782→    local goal
+   783→    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+   784→
+   785→    log "Loop iteration $iteration ended (state: $state)"
+   786→
+   787→    # Update metrics
+   788→    if [[ -x "${HOME}/.claude/hooks/metrics-collector.sh" ]]; then
+   789→        "${HOME}/.claude/hooks/metrics-collector.sh" tool "agent_loop" 0 2>/dev/null
+   790→    fi
+   791→
+   792→    # Update progress
+   793→    if [[ -x "${HOME}/.claude/hooks/progress-tracker.sh" ]]; then
+   794→        "${HOME}/.claude/hooks/progress-tracker.sh" update "$iteration" "Iteration $iteration" "Processing..." 2>/dev/null
+   795→    fi
+   796→
+   797→    # Record iteration to memory (every 5 iterations to avoid noise)
+   798→    if [[ $((iteration % 5)) -eq 0 && -x "$MEMORY_MANAGER" ]]; then
+   799→        local tool_count
+   800→        tool_count=$(jq '.toolCalls | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+   801→
+   802→        "$MEMORY_MANAGER" add-context "Iteration $iteration: state=$state, tools=$tool_count" 3 2>/dev/null
+   803→    fi
+   804→}
+   805→
+   806→# =============================================================================
+   807→# CONTROL COMMANDS
+   808→# =============================================================================
+   809→
+   810→# Request pause
+   811→request_pause() {
+   812→    if [[ ! -f "$AGENT_STATE" ]]; then
+   813→        return 1
+   814→    fi
+   815→
+   816→    local temp_file
+   817→    temp_file=$(mktemp)
+   818→
+   819→    jq '.pauseRequested = true' "$AGENT_STATE" > "$temp_file"
+   820→    mv "$temp_file" "$AGENT_STATE"
+   821→
+   822→    log "Pause requested"
+   823→}
+   824→
+   825→# Resume from pause
+   826→resume() {
+   827→    if [[ ! -f "$AGENT_STATE" ]]; then
+   828→        return 1
+   829→    fi
+   830→
+   831→    local temp_file
+   832→    temp_file=$(mktemp)
+   833→
+   834→    jq '.pauseRequested = false | .state = "executing"' "$AGENT_STATE" > "$temp_file"
+   835→    mv "$temp_file" "$AGENT_STATE"
+   836→
+   837→    log "Resumed from pause"
+   838→}
+   839→
+   840→# Request stop
+   841→request_stop() {
+   842→    if [[ ! -f "$AGENT_STATE" ]]; then
+   843→        return 1
+   844→    fi
+   845→
+   846→    local temp_file
+   847→    temp_file=$(mktemp)
+   848→
+   849→    jq '.stopRequested = true' "$AGENT_STATE" > "$temp_file"
+   850→    mv "$temp_file" "$AGENT_STATE"
+   851→
+   852→    log "Stop requested"
+   853→}
+   854→
+   855→# Complete agent
+   856→complete_agent() {
+   857→    local result="${1:-success}"
+   858→    local summary="${2:-}"
+   859→
+   860→    if [[ ! -f "$AGENT_STATE" ]]; then
+   861→        return 1
+   862→    fi
+   863→
+   864→    local temp_file
+   865→    temp_file=$(mktemp)
+   866→
+   867→    local timestamp
+   868→    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   869→
+   870→    local goal
+   871→    goal=$(jq -r '.goal' "$AGENT_STATE" 2>/dev/null || echo "")
+   872→
+   873→    local iteration
+   874→    iteration=$(jq -r '.iteration' "$AGENT_STATE" 2>/dev/null || echo "0")
+   875→
+   876→    local tool_count
+   877→    tool_count=$(jq '.toolCalls | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+   878→
+   879→    local success_count
+   880→    success_count=$(jq '[.toolCalls[] | select(.status == "success")] | length' "$AGENT_STATE" 2>/dev/null || echo "0")
+   881→
+   882→    jq --arg result "$result" \
+   883→       --arg summary "$summary" \
+   884→       --arg ts "$timestamp" \
+   885→       '
+   886→       .state = "completed" |
+   887→       .result = $result |
+   888→       .summary = $summary |
+   889→       .completedAt = $ts |
+   890→       .totalDuration = (
+   891→           (($ts | fromdate) - (.startedAt | fromdate)) | floor
+   892→       )
+   893→       ' "$AGENT_STATE" > "$temp_file"
+   894→
+   895→    mv "$temp_file" "$AGENT_STATE"
+   896→
+   897→    log "Agent completed: $result"
+   898→
+   899→    # Record to memory
+   900→    if [[ -x "$MEMORY_MANAGER" ]]; then
+   901→        # Record episode
+   902→        local details="iterations=$iteration, tools=$tool_count, success=$success_count"
+   903→        memory_record_success "task_complete" "$goal" "$details"
+   904→
+   905→        # Create reflection
+   906→        local reflection_content="Completed: $goal. Used $tool_count tools across $iteration iterations. Result: $result"
+   907→        memory_reflect "progress" "$reflection_content" "$summary"
+   908→
+   909→        # Clear working memory for next task
+   910→        "$MEMORY_MANAGER" clear-working 2>/dev/null
+   911→    fi
+   912→}
+   913→
+   914→# Get agent status
+   915→get_status() {
+   916→    if [[ -f "$AGENT_STATE" ]]; then
+   917→        jq '.' "$AGENT_STATE"
+   918→    else
+   919→        echo '{"state":"no_agent"}'
+   920→    fi
+   921→}
+   922→
+   923→# Get execution summary
+   924→get_summary() {
+   925→    if [[ ! -f "$AGENT_STATE" ]]; then
+   926→        echo "No active agent"
+   927→        return
+   928→    fi
+   929→
+   930→    jq -r '
+   931→        "=== Agent Status ===\n" +
+   932→        "Goal: \(.goal)\n" +
+   933→        "State: \(.state)\n" +
+   934→        "Iteration: \(.iteration)/\(.maxIterations)\n" +
+   935→        "Failures: \(.consecutiveFailures)\n" +
+   936→        "Tool Calls: \(.toolCalls | length)\n" +
+   937→        "Successful Tools: \([.toolCalls[] | select(.status == "success")] | length)\n" +
+   938→        "Duration: \(if .completedAt then .totalDuration else "running" end)\n"
+   939→    ' "$AGENT_STATE"
+   940→}
+   941→
+   942→# =============================================================================
+   943→# COMMAND INTERFACE
+   944→# =============================================================================
+   945→
+   946→case "${1:-help}" in
+   947→    start)
+   948→        start_agent "${2:-goal}" "${3:-}"
+   949→        ;;
+   950→    transition)
+   951→        transition_state "${2:-executing}" "${3:-}"
+   952→        ;;
+   953→    should-continue)
+   954→        should_continue
+   955→        ;;
+   956→    iterate)
+   957→        increment_iteration
+   958→        ;;
+   959→    failure)
+   960→        record_failure "${2:-unknown}"
+   961→        ;;
+   962→    success)
+   963→        record_success "${2:-success}"
+   964→        ;;
+   965→    execute)
+   966→        tool_name="${2:-shell}"
+   967→        shift 2 2>/dev/null || shift 1
+   968→        execute_tool "$tool_name" "$@"
+   969→        ;;
+   970→    on-start)
+   971→        on_loop_start
+   972→        ;;
+   973→    on-end)
+   974→        on_loop_end
+   975→        ;;
+   976→    pause)
+   977→        request_pause
+   978→        ;;
+   979→    resume)
+   980→        resume
+   981→        ;;
+   982→    stop)
+   983→        request_stop
+   984→        ;;
+   985→    complete)
+   986→        complete_agent "${2:-success}" "${3:-}"
+   987→        ;;
+   988→    status)
+   989→        get_status
+   990→        ;;
+   991→    summary)
+   992→        get_summary
+   993→        ;;
+   994→
+   995→    # Memory commands
+   996→    memory-init)
+   997→        memory_init
+   998→        ;;
+   999→    memory-context)
+  1000→        memory_retrieve_context "${2:-}" "${3:-5}"
+  1001→        ;;
+  1002→    memory-patterns)
+  1003→        memory_find_patterns "${2:-}" "${3:-3}"
+  1004→        ;;
+  1005→    memory-learn)
+  1006→        memory_learn_pattern "${2:-workflow}" "${3:-}" "${4:-}" "${5:-1.0}"
+  1007→        ;;
+  1008→    memory-record)
+  1009→        memory_record_success "${2:-task}" "${3:-}" "${4:-}"
+  1010→        ;;
+  1011→    memory-reflect)
+  1012→        memory_reflect "${2:-progress}" "${3:-}" "${4:-}"
+  1013→        ;;
+  1014→    memory-stats)
+  1015→        memory_stats
+  1016→        ;;
+  1017→
+  1018→    help|*)
+  1019→        echo "Agent Loop - Autonomous Execution System"
+  1020→        echo ""
+  1021→        echo "Usage: $0 <command> [args]"
+  1022→        echo ""
+  1023→        echo "Lifecycle Commands:"
+  1024→        echo "  start <goal> [context]      - Start new agent"
+  1025→        echo "  transition <state> [reason] - Change agent state"
+  1026→        echo "  complete <result> [summary] - Complete agent"
+  1027→        echo ""
+  1028→        echo "Loop Control:"
+  1029→        echo "  should-continue             - Check if loop should continue"
+  1030→        echo "  iterate                     - Increment iteration counter"
+  1031→        echo "  failure <error>             - Record a failure"
+  1032→        echo "  success <result>            - Record a success"
+  1033→        echo "  pause                       - Request pause"
+  1034→        echo "  resume                      - Resume from pause"
+  1035→        echo "  stop                        - Request stop"
+  1036→        echo ""
+  1037→        echo "Tool Execution:"
+  1038→        echo "  execute <tool> [args...]    - Execute a tool"
+  1039→        echo "    Tools: read_file, search_code, run_tests, lint_code, typecheck, shell"
+  1040→        echo ""
+  1041→        echo "Hooks:"
+  1042→        echo "  on-start                    - Call at loop start"
+  1043→        echo "  on-end                      - Call at loop end"
+  1044→        echo ""
+  1045→        echo "Status:"
+  1046→        echo "  status                      - Get full status JSON"
+  1047→        echo "  summary                     - Get human-readable summary"
+  1048→        echo ""
+  1049→        echo "Memory Integration:"
+  1050→        echo "  memory-init                 - Initialize memory system"
+  1051→        echo "  memory-context <query>      - Retrieve relevant memories"
+  1052→        echo "  memory-patterns <query>     - Find known patterns"
+  1053→        echo "  memory-learn <type> <trigger> <solution>"
+  1054→        echo "                              - Learn a new pattern"
+  1055→        echo "  memory-record <type> <desc> - Record to memory"
+  1056→        echo "  memory-reflect <focus> <content>"
+  1057→        echo "                              - Create reflection"
+  1058→        echo "  memory-stats                - Get memory statistics"
+  1059→        ;;
+  1060→esac
+  1061→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

@@ -1,0 +1,483 @@
+/**
+ * Workflow API Routes
+ *
+ * REST API for workflow CRUD operations and execution
+ * Based on FireCut's workflow system
+ *
+ * Date: 2026-01-12
+ */
+
+const express = require('express');
+const { Pool } = require('pg');
+const { executeWorkflowAsync, getExecutionStatus } = require('../services/workflowExecutor');
+const logger = require('../services/logger');
+
+// PostgreSQL connection pool
+const sslConfig = process.env.NODE_ENV === 'production' ? {
+  rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === 'true',
+  ca: process.env.DATABASE_SSL_CA || undefined
+} : false;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: sslConfig,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  statement_timeout: 30000,
+  query_timeout: 30000
+});
+
+/**
+ * Create workflow routes
+ * @param {Object} options - Route configuration options
+ * @param {Object} options.middleware - Shared middleware (authenticateToken, csrfMiddleware, requireCredits)
+ * @returns {express.Router}
+ */
+function createWorkflowRoutes(options = {}) {
+  const router = express.Router();
+  const { authenticateToken, validateCsrfToken } = options.middleware || {};
+
+  // Apply authentication to all routes
+  if (authenticateToken) {
+    router.use(authenticateToken);
+  }
+
+  // Optional CSRF validation middleware
+  const csrfMiddleware = validateCsrfToken || ((req, res, next) => next());
+
+/**
+ * GET /api/workflows
+ * List all workflows for authenticated user
+ */
+router.get('/', async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `SELECT id, name, description, scope, steps, created_at, updated_at
+       FROM workflows
+       WHERE user_id = $1
+       ORDER BY updated_at DESC`,
+      [userId]
+    );
+
+    // Parse steps JSON if stored as string
+    const workflows = result.rows.map(workflow => ({
+      ...workflow,
+      steps: typeof workflow.steps === 'string' ? JSON.parse(workflow.steps) : workflow.steps
+    }));
+
+    res.json({
+      success: true,
+      workflows
+    });
+
+  } catch (error) {
+    logger.error('List workflows error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to list workflows'
+    });
+  }
+});
+
+/**
+ * GET /api/workflows/:id
+ * Get single workflow by ID
+ */
+router.get('/:id', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT * FROM workflows WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Workflow not found'
+      });
+    }
+
+    const workflow = result.rows[0];
+
+    // Parse steps JSON if stored as string
+    if (typeof workflow.steps === 'string') {
+      workflow.steps = JSON.parse(workflow.steps);
+    }
+
+    res.json({
+      success: true,
+      workflow
+    });
+
+  } catch (error) {
+    logger.error('Get workflow error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get workflow'
+    });
+  }
+});
+
+/**
+ * POST /api/workflows
+ * Create new workflow
+ */
+router.post('/', csrfMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name, description, scope, steps } = req.body;
+
+    // Validation
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Workflow name is required'
+      });
+    }
+
+    if (!scope || !['entire_sequence', 'selection', 'in_out'].includes(scope)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid workflow scope'
+      });
+    }
+
+    if (!Array.isArray(steps)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Steps must be an array'
+      });
+    }
+
+    // Validate step structure
+    for (const step of steps) {
+      if (!step.type || typeof step.type !== 'string') {
+        return res.status(400).json({
+          success: false,
+          error: 'Each step must have a type'
+        });
+      }
+    }
+
+    // Create workflow
+    const result = await pool.query(
+      `INSERT INTO workflows (user_id, name, description, scope, steps)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [userId, name.trim(), description || '', scope, JSON.stringify(steps)]
+    );
+
+    const workflow = result.rows[0];
+    workflow.steps = JSON.parse(workflow.steps);
+
+    logger.info(`Workflow created: ${workflow.id} by user ${userId}`);
+
+    res.status(201).json({
+      success: true,
+      workflow
+    });
+
+  } catch (error) {
+    logger.error('Create workflow error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create workflow'
+    });
+  }
+});
+
+/**
+ * PUT /api/workflows/:id
+ * Update existing workflow
+ */
+router.put('/:id', csrfMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { name, description, scope, steps } = req.body;
+
+    // Validation
+    if (name !== undefined && (!name || !name.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'Workflow name cannot be empty'
+      });
+    }
+
+    if (scope !== undefined && !['entire_sequence', 'selection', 'in_out'].includes(scope)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid workflow scope'
+      });
+    }
+
+    if (steps !== undefined && !Array.isArray(steps)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Steps must be an array'
+      });
+    }
+
+    // Build update query dynamically
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramIndex++}`);
+      values.push(name.trim());
+    }
+
+    if (description !== undefined) {
+      updates.push(`description = $${paramIndex++}`);
+      values.push(description);
+    }
+
+    if (scope !== undefined) {
+      updates.push(`scope = $${paramIndex++}`);
+      values.push(scope);
+    }
+
+    if (steps !== undefined) {
+      updates.push(`steps = $${paramIndex++}`);
+      values.push(JSON.stringify(steps));
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fields to update'
+      });
+    }
+
+    // Add WHERE clause parameters
+    values.push(id, userId);
+
+    const result = await pool.query(
+      `UPDATE workflows
+       SET ${updates.join(', ')}
+       WHERE id = $${paramIndex} AND user_id = $${paramIndex + 1}
+       RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Workflow not found'
+      });
+    }
+
+    const workflow = result.rows[0];
+    workflow.steps = JSON.parse(workflow.steps);
+
+    logger.info(`Workflow updated: ${workflow.id} by user ${userId}`);
+
+    res.json({
+      success: true,
+      workflow
+    });
+
+  } catch (error) {
+    logger.error('Update workflow error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update workflow'
+    });
+  }
+});
+
+/**
+ * DELETE /api/workflows/:id
+ * Delete workflow
+ */
+router.delete('/:id', csrfMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `DELETE FROM workflows WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Workflow not found'
+      });
+    }
+
+    logger.info(`Workflow deleted: ${id} by user ${userId}`);
+
+    res.json({
+      success: true,
+      message: 'Workflow deleted successfully'
+    });
+
+  } catch (error) {
+    logger.error('Delete workflow error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to delete workflow'
+    });
+  }
+});
+
+/**
+ * POST /api/workflows/:id/execute
+ * Execute workflow
+ */
+router.post('/:id/execute', csrfMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { sequenceId, scope: overrideScope } = req.body;
+
+    // Get workflow
+    const workflowResult = await pool.query(
+      `SELECT * FROM workflows WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (workflowResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Workflow not found'
+      });
+    }
+
+    const workflow = workflowResult.rows[0];
+
+    // Use override scope if provided, otherwise use workflow's default scope
+    const _effectiveScope = overrideScope || workflow.scope;
+
+    // Parse steps if stored as string
+    if (typeof workflow.steps === 'string') {
+      workflow.steps = JSON.parse(workflow.steps);
+    }
+
+    // Create execution record
+    const executionResult = await pool.query(
+      `INSERT INTO workflow_executions (workflow_id, user_id, sequence_id, status)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [id, userId, sequenceId || null, 'pending']
+    );
+
+    const execution = executionResult.rows[0];
+
+    logger.info(`Workflow execution started: ${execution.id} for workflow ${id}`);
+
+    // Execute workflow asynchronously (non-blocking)
+    executeWorkflowAsync(workflow, execution.id, userId, sequenceId)
+      .catch(error => {
+        logger.error('Workflow execution error:', error);
+      });
+
+    res.json({
+      success: true,
+      executionId: execution.id,
+      status: 'pending',
+      message: 'Workflow execution started'
+    });
+
+  } catch (error) {
+    logger.error('Execute workflow error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to execute workflow'
+    });
+  }
+});
+
+/**
+ * GET /api/workflows/executions/:executionId
+ * Get execution status and results
+ */
+router.get('/executions/:executionId', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { executionId } = req.params;
+
+    const execution = await getExecutionStatus(executionId, userId);
+
+    res.json({
+      success: true,
+      execution
+    });
+
+  } catch (error) {
+    if (error.message === 'Execution not found') {
+      return res.status(404).json({
+        success: false,
+        error: 'Execution not found'
+      });
+    }
+
+    logger.error('Get execution status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get execution status'
+    });
+  }
+});
+
+/**
+ * GET /api/workflows/:id/executions
+ * Get execution history for a workflow
+ */
+router.get('/:id/executions', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { limit = 10, offset = 0 } = req.query;
+
+    // Verify workflow belongs to user
+    const workflowResult = await pool.query(
+      `SELECT id FROM workflows WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (workflowResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Workflow not found'
+      });
+    }
+
+    // Get executions
+    const result = await pool.query(
+      `SELECT id, status, progress, current_step, total_steps, started_at, completed_at, error_message
+       FROM workflow_executions
+       WHERE workflow_id = $1 AND user_id = $2
+       ORDER BY started_at DESC
+       LIMIT $3 OFFSET $4`,
+      [id, userId, parseInt(limit), parseInt(offset)]
+    );
+
+    res.json({
+      success: true,
+      executions: result.rows,
+      total: result.rowCount
+    });
+
+  } catch (error) {
+    logger.error('Get execution history error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get execution history'
+    });
+  }
+});
+
+  return router;
+}
+
+module.exports = createWorkflowRoutes;

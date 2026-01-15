@@ -1,0 +1,124 @@
+/**
+ * ReAct + Reflexion Pattern Implementation
+ * Source: /auto hooks/react-reflexion.sh
+ *
+ * Pattern: Think → Act → Observe → Reflect
+ */
+
+export interface ReflexionCycle {
+  thought: string;
+  action: string;
+  observation: string;
+  reflection: string;
+  success: boolean;
+}
+
+export interface Context {
+  goal: string;
+  history: ReflexionCycle[];
+  metadata: Record<string, any>;
+}
+
+/**
+ * ReAct + Reflexion Agent
+ * Implements the Think-Act-Observe-Reflect loop
+ */
+export class ReflexionAgent {
+  private context: Context;
+
+  constructor(goal: string) {
+    this.context = {
+      goal,
+      history: [],
+      metadata: {}
+    };
+  }
+
+  /**
+   * Execute a complete ReAct + Reflexion cycle
+   */
+  async cycle(input: string): Promise<ReflexionCycle> {
+    // THINK: Generate reasoning
+    const thought = await this.think(input);
+
+    // ACT: Execute action
+    const action = await this.act(thought);
+
+    // OBSERVE: Record outcome
+    const observation = await this.observe(action);
+
+    // REFLECT: Learn from outcome
+    const reflection = await this.reflect(thought, action, observation);
+
+    const cycle: ReflexionCycle = {
+      thought,
+      action,
+      observation,
+      reflection,
+      success: this.evaluateSuccess(observation)
+    };
+
+    this.context.history.push(cycle);
+
+    return cycle;
+  }
+
+  /**
+   * THINK: Generate explicit reasoning about what to do
+   */
+  private async think(input: string): Promise<string> {
+    // Consider context, history, and goal
+    // Generate reasoning about the best approach
+    // Check for similar patterns in memory
+
+    return `Reasoning about: ${input} with goal: ${this.context.goal}`;
+  }
+
+  /**
+   * ACT: Execute the action based on reasoning
+   */
+  private async act(thought: string): Promise<string> {
+    // Execute the actual action
+    // Log decision to audit trail
+    return `Action based on: ${thought}`;
+  }
+
+  /**
+   * OBSERVE: Record the result of the action
+   */
+  private async observe(action: string): Promise<string> {
+    // Capture the outcome
+    // Record to reinforcement learning
+    return `Observed result of: ${action}`;
+  }
+
+  /**
+   * REFLECT: Self-critique and extract lessons
+   */
+  private async reflect(
+    thought: string,
+    action: string,
+    observation: string
+  ): Promise<string> {
+    // Self-critique: What went well/poorly?
+    // Extract lessons and patterns
+    // Store in memory for future use
+
+    return `Reflection on thought: ${thought}, action: ${action}, observation: ${observation}`;
+  }
+
+  /**
+   * Evaluate if the cycle was successful
+   */
+  private evaluateSuccess(observation: string): boolean {
+    // TODO: Implement success evaluation logic
+    return true;
+  }
+
+  /**
+   * Get the full history of cycles
+   */
+  getHistory(): ReflexionCycle[] {
+    return this.context.history;
+  }
+}

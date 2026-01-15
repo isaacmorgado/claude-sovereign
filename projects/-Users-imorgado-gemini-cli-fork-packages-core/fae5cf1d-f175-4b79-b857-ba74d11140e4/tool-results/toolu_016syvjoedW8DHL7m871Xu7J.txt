@@ -1,0 +1,502 @@
+     1→# Implementation Plan: Claude Code-Style Agent Architecture for Gemini CLI
+     2→
+     3→## Overview
+     4→
+     5→Enhance Gemini CLI with Claude Code-inspired agent spawning features while leveraging Gemini's existing robust agent infrastructure.
+     6→
+     7→**Current State**: Gemini CLI already has a sophisticated agent system in `@google/gemini-cli-core/src/agents/`:
+     8→- `AgentRegistry` - discovers and manages agents
+     9→- `AgentExecutor` - runs agent loops with tool execution
+    10→- `SubagentInvocation` - executes subagents
+    11→- `delegate_to_agent` tool - spawns subagents from parent agents
+    12→- `CodebaseInvestigatorAgent` - built-in example agent
+    13→
+    14→**Goal**: Add user-friendly features from Claude Code:
+    15→1. File-based agent definitions (`.gemini/agents/*.md`)
+    16→2. CLI agent injection (`--agents` flag)
+    17→3. Background execution with task management
+    18→4. `/agents` slash command for management
+    19→
+    20→---
+    21→
+    22→## Phase 1: File-Based Agent Definitions
+    23→
+    24→### 1.1 Create FileAgentLoader
+    25→
+    26→**File**: `packages/cli/src/services/FileAgentLoader.ts`
+    27→
+    28→```typescript
+    29→import { AgentDefinition } from '@google/gemini-cli-core';
+    30→import { z } from 'zod';
+    31→
+    32→interface FileAgentLoaderConfig {
+    33→  projectPath: string;    // .gemini/agents/
+    34→  userPath: string;       // ~/.gemini/agents/
+    35→}
+    36→
+    37→export class FileAgentLoader {
+    38→  async loadAgents(signal: AbortSignal): Promise<AgentDefinition[]>;
+    39→  private parseMarkdownAgent(filePath: string): AgentDefinition;
+    40→  private parseFrontmatter(content: string): { meta: AgentMeta, body: string };
+    41→}
+    42→```
+    43→
+    44→**Agent File Format** (`.gemini/agents/code-reviewer.md`):
+    45→
+    46→```markdown
+    47→---
+    48→name: code-reviewer
+    49→description: Expert code reviewer for quality and security analysis
+    50→tools: read_file, glob, grep, shell
+    51→model: gemini-2.5-pro
+    52→temperature: 0.2
+    53→max_turns: 20
+    54→max_time_minutes: 10
+    55→---
+    56→
+    57→You are a senior code reviewer specializing in security and best practices.
+    58→
+    59→When reviewing code:
+    60→1. Check for security vulnerabilities
+    61→2. Verify error handling
+    62→3. Assess code clarity
+    63→4. Suggest improvements
+    64→
+    65→Be thorough but concise in feedback.
+    66→```
+    67→
+    68→**Frontmatter Schema**:
+    69→```typescript
+    70→const AgentMetaSchema = z.object({
+    71→  name: z.string().regex(/^[a-z0-9-]+$/),
+    72→  description: z.string(),
+    73→  tools: z.string().optional(),           // comma-separated tool names
+    74→  model: z.string().optional(),           // defaults to current model
+    75→  temperature: z.number().min(0).max(2).optional(),
+    76→  max_turns: z.number().optional(),
+    77→  max_time_minutes: z.number().optional(),
+    78→  inputs: z.record(z.object({             // optional typed inputs
+    79→    type: z.enum(['string', 'number', 'boolean']),
+    80→    description: z.string(),
+    81→    required: z.boolean().optional()
+    82→  })).optional()
+    83→});
+    84→```
+    85→
+    86→### 1.2 Integrate with AgentRegistry
+    87→
+    88→**Modify**: `packages/core/src/agents/registry.ts`
+    89→
+    90→```typescript
+    91→export class AgentRegistry {
+    92→  private readonly fileLoader: FileAgentLoader;
+    93→
+    94→  async initialize(): Promise<void> {
+    95→    await this.loadBuiltInAgents();
+    96→    await this.loadFileAgents();  // NEW: Load from filesystem
+    97→  }
+    98→
+    99→  private async loadFileAgents(): Promise<void> {
+   100→    const agents = await this.fileLoader.loadAgents(this.signal);
+   101→    for (const agent of agents) {
+   102→      this.registerAgent(agent);  // Later sources override earlier
+   103→    }
+   104→  }
+   105→}
+   106→```
+   107→
+   108→**Priority Order** (later overrides earlier):
+   109→1. Built-in agents (codebase_investigator)
+   110→2. User agents (`~/.gemini/agents/`)
+   111→3. Project agents (`./.gemini/agents/`)
+   112→4. CLI-injected agents (`--agents` flag)
+   113→
+   114→### 1.3 Files to Create/Modify
+   115→
+   116→| File | Action | Purpose |
+   117→|------|--------|---------|
+   118→| `packages/cli/src/services/FileAgentLoader.ts` | CREATE | Load agents from markdown files |
+   119→| `packages/core/src/agents/registry.ts` | MODIFY | Add file loading to initialize() |
+   120→| `packages/core/src/agents/types.ts` | MODIFY | Add `source` field to AgentDefinition |
+   121→
+   122→---
+   123→
+   124→## Phase 2: CLI Agent Injection
+   125→
+   126→### 2.1 Add `--agents` Flag
+   127→
+   128→**Modify**: `packages/cli/src/config/config.ts`
+   129→
+   130→```typescript
+   131→// In parseArguments(), add option:
+   132→.option('agents', {
+   133→  type: 'string',
+   134→  description: 'JSON object defining runtime agents',
+   135→  coerce: (val: string) => {
+   136→    try {
+   137→      return JSON.parse(val);
+   138→    } catch {
+   139→      throw new Error('--agents must be valid JSON');
+   140→    }
+   141→  }
+   142→})
+   143→```
+   144→
+   145→**Usage**:
+   146→```bash
+   147→gemini --agents '{
+   148→  "debugger": {
+   149→    "description": "Debug specialist",
+   150→    "prompt": "You are an expert debugger...",
+   151→    "tools": ["read_file", "shell", "grep"]
+   152→  }
+   153→}'
+   154→```
+   155→
+   156→### 2.2 Process CLI Agents in Config
+   157→
+   158→**Modify**: `packages/cli/src/config/config.ts`
+   159→
+   160→```typescript
+   161→export async function loadCliConfig(...) {
+   162→  // After settings load, before config creation:
+   163→  const cliAgents = argv.agents ? parseCliAgents(argv.agents) : [];
+   164→
+   165→  return new Config({
+   166→    ...existingProps,
+   167→    cliAgents,  // Pass to config for registry injection
+   168→  });
+   169→}
+   170→```
+   171→
+   172→### 2.3 Files to Modify
+   173→
+   174→| File | Action | Purpose |
+   175→|------|--------|---------|
+   176→| `packages/cli/src/config/config.ts` | MODIFY | Add --agents yargs option |
+   177→| `packages/cli/src/config/config.d.ts` | MODIFY | Add CliAgents type |
+   178→| `packages/core/src/config/config.ts` | MODIFY | Accept cliAgents in constructor |
+   179→
+   180→---
+   181→
+   182→## Phase 3: Background Agent Execution
+   183→
+   184→### 3.1 Create AgentTaskManager
+   185→
+   186→**File**: `packages/core/src/agents/task-manager.ts`
+   187→
+   188→```typescript
+   189→export interface AgentTask {
+   190→  id: string;
+   191→  agentName: string;
+   192→  status: 'pending' | 'running' | 'completed' | 'error';
+   193→  startedAt: Date;
+   194→  completedAt?: Date;
+   195→  result?: OutputObject;
+   196→  error?: Error;
+   197→}
+   198→
+   199→export class AgentTaskManager {
+   200→  private tasks: Map<string, AgentTask> = new Map();
+   201→  private executors: Map<string, AgentExecutor> = new Map();
+   202→
+   203→  async spawnBackground(
+   204→    definition: AgentDefinition,
+   205→    inputs: AgentInputs,
+   206→    config: Config
+   207→  ): Promise<string> {
+   208→    const taskId = crypto.randomUUID();
+   209→    const task: AgentTask = {
+   210→      id: taskId,
+   211→      agentName: definition.name,
+   212→      status: 'pending',
+   213→      startedAt: new Date()
+   214→    };
+   215→
+   216→    this.tasks.set(taskId, task);
+   217→
+   218→    // Run in background (don't await)
+   219→    this.executeInBackground(taskId, definition, inputs, config);
+   220→
+   221→    return taskId;
+   222→  }
+   223→
+   224→  private async executeInBackground(...): Promise<void> {
+   225→    const task = this.tasks.get(taskId)!;
+   226→    task.status = 'running';
+   227→
+   228→    try {
+   229→      const executor = await AgentExecutor.create(definition, config);
+   230→      this.executors.set(taskId, executor);
+   231→
+   232→      const result = await executor.run(inputs, this.createSignal(taskId));
+   233→
+   234→      task.status = 'completed';
+   235→      task.result = result;
+   236→      task.completedAt = new Date();
+   237→    } catch (error) {
+   238→      task.status = 'error';
+   239→      task.error = error;
+   240→      task.completedAt = new Date();
+   241→    }
+   242→  }
+   243→
+   244→  async getOutput(taskId: string, options: {
+   245→    block?: boolean;
+   246→    timeout?: number;
+   247→  }): Promise<AgentTask> {
+   248→    const task = this.tasks.get(taskId);
+   249→    if (!task) throw new Error(`Task ${taskId} not found`);
+   250→
+   251→    if (options.block && task.status === 'running') {
+   252→      await this.waitForCompletion(taskId, options.timeout);
+   253→    }
+   254→
+   255→    return task;
+   256→  }
+   257→
+   258→  cancelTask(taskId: string): void {
+   259→    // Abort the executor's signal
+   260→  }
+   261→
+   262→  listTasks(): AgentTask[] {
+   263→    return Array.from(this.tasks.values());
+   264→  }
+   265→}
+   266→```
+   267→
+   268→### 3.2 Integrate with delegate_to_agent Tool
+   269→
+   270→**Modify**: `packages/core/src/agents/delegate-to-agent-tool.ts`
+   271→
+   272→Add `run_in_background` parameter:
+   273→
+   274→```typescript
+   275→type DelegateParams = {
+   276→  agent_name: string;
+   277→  run_in_background?: boolean;  // NEW
+   278→} & Record<string, unknown>;
+   279→
+   280→// In createInvocation():
+   281→if (params.run_in_background) {
+   282→  const taskId = await this.taskManager.spawnBackground(
+   283→    definition,
+   284→    params,
+   285→    this.config
+   286→  );
+   287→  return { taskId, status: 'spawned' };
+   288→}
+   289→```
+   290→
+   291→### 3.3 Create TaskOutput Tool
+   292→
+   293→**File**: `packages/core/src/agents/task-output-tool.ts`
+   294→
+   295→```typescript
+   296→export class TaskOutputTool extends BaseDeclarativeTool {
+   297→  schema = z.object({
+   298→    task_id: z.string(),
+   299→    block: z.boolean().optional().default(true),
+   300→    timeout: z.number().optional().default(30000)
+   301→  });
+   302→
+   303→  async execute(params): Promise<ToolResult> {
+   304→    const task = await this.taskManager.getOutput(params.task_id, {
+   305→      block: params.block,
+   306→      timeout: params.timeout
+   307→    });
+   308→
+   309→    return {
+   310→      llmContent: [{ text: JSON.stringify(task, null, 2) }]
+   311→    };
+   312→  }
+   313→}
+   314→```
+   315→
+   316→### 3.4 Files to Create/Modify
+   317→
+   318→| File | Action | Purpose |
+   319→|------|--------|---------|
+   320→| `packages/core/src/agents/task-manager.ts` | CREATE | Background task management |
+   321→| `packages/core/src/agents/task-output-tool.ts` | CREATE | Query task status |
+   322→| `packages/core/src/agents/delegate-to-agent-tool.ts` | MODIFY | Add background support |
+   323→| `packages/core/src/tools/tool-registry.ts` | MODIFY | Register TaskOutputTool |
+   324→
+   325→---
+   326→
+   327→## Phase 4: /agents Slash Command
+   328→
+   329→### 4.1 Create Agents Command
+   330→
+   331→**File**: `packages/cli/src/commands/extensions/agentsCommand.ts`
+   332→
+   333→```typescript
+   334→import { SlashCommand, CommandContext, CommandResult } from '../types.js';
+   335→
+   336→export function agentsCommand(registry: AgentRegistry): SlashCommand {
+   337→  return {
+   338→    command: 'agents',
+   339→    description: 'Manage available agents',
+   340→    subCommands: [
+   341→      {
+   342→        command: 'list',
+   343→        description: 'List all registered agents',
+   344→        action: async (ctx) => listAgents(registry, ctx)
+   345→      },
+   346→      {
+   347→        command: 'info',
+   348→        description: 'Show details about an agent',
+   349→        action: async (ctx) => showAgentInfo(registry, ctx)
+   350→      },
+   351→      {
+   352→        command: 'reload',
+   353→        description: 'Reload agents from filesystem',
+   354→        action: async (ctx) => reloadAgents(registry, ctx)
+   355→      }
+   356→    ],
+   357→    action: async (ctx) => listAgents(registry, ctx)  // Default: list
+   358→  };
+   359→}
+   360→
+   361→async function listAgents(registry: AgentRegistry, ctx: CommandContext): Promise<CommandResult> {
+   362→  const agents = registry.getAllDefinitions();
+   363→
+   364→  const output = agents.map(a =>
+   365→    `- **${a.name}**: ${a.description} [${a.source || 'builtin'}]`
+   366→  ).join('\n');
+   367→
+   368→  return {
+   369→    type: 'markdown',
+   370→    content: `## Available Agents\n\n${output}`
+   371→  };
+   372→}
+   373→
+   374→async function showAgentInfo(registry: AgentRegistry, ctx: CommandContext): Promise<CommandResult> {
+   375→  const agentName = ctx.args[0];
+   376→  const agent = registry.getDefinition(agentName);
+   377→
+   378→  if (!agent) {
+   379→    return { type: 'error', content: `Agent '${agentName}' not found` };
+   380→  }
+   381→
+   382→  return {
+   383→    type: 'markdown',
+   384→    content: `## ${agent.name}\n\n${agent.description}\n\n**Tools**: ${agent.toolConfig?.tools.join(', ')}\n**Model**: ${agent.modelConfig.model}`
+   385→  };
+   386→}
+   387→```
+   388→
+   389→### 4.2 Register Command
+   390→
+   391→**Modify**: `packages/cli/src/services/BuiltinCommandLoader.ts`
+   392→
+   393→```typescript
+   394→import { agentsCommand } from '../commands/extensions/agentsCommand.js';
+   395→
+   396→export class BuiltinCommandLoader implements ICommandLoader {
+   397→  async loadCommands(signal: AbortSignal): Promise<SlashCommand[]> {
+   398→    return [
+   399→      // ... existing commands
+   400→      agentsCommand(this.agentRegistry),  // NEW
+   401→    ];
+   402→  }
+   403→}
+   404→```
+   405→
+   406→### 4.3 Files to Create/Modify
+   407→
+   408→| File | Action | Purpose |
+   409→|------|--------|---------|
+   410→| `packages/cli/src/commands/extensions/agentsCommand.ts` | CREATE | /agents command |
+   411→| `packages/cli/src/services/BuiltinCommandLoader.ts` | MODIFY | Register command |
+   412→
+   413→---
+   414→
+   415→## Phase 5: Testing & Documentation
+   416→
+   417→### 5.1 Test Files to Create
+   418→
+   419→| Test File | Purpose |
+   420→|-----------|---------|
+   421→| `packages/cli/src/services/FileAgentLoader.test.ts` | Test markdown parsing |
+   422→| `packages/core/src/agents/task-manager.test.ts` | Test background execution |
+   423→| `packages/cli/src/commands/extensions/agentsCommand.test.ts` | Test slash command |
+   424→
+   425→### 5.2 Documentation Updates
+   426→
+   427→- Update `docs/cli/agents.md` with new agent definition format
+   428→- Add examples to `docs/tools/agents.md`
+   429→- Update README with agent features
+   430→
+   431→---
+   432→
+   433→## Implementation Order
+   434→
+   435→1. **Phase 1.1-1.2**: FileAgentLoader + Registry integration (foundation)
+   436→2. **Phase 4**: /agents command (user visibility)
+   437→3. **Phase 2**: CLI --agents flag (power users)
+   438→4. **Phase 3**: Background execution (advanced feature)
+   439→5. **Phase 5**: Tests and documentation
+   440→
+   441→---
+   442→
+   443→## Critical Files Summary
+   444→
+   445→### Files to Create
+   446→```
+   447→packages/cli/src/services/FileAgentLoader.ts
+   448→packages/core/src/agents/task-manager.ts
+   449→packages/core/src/agents/task-output-tool.ts
+   450→packages/cli/src/commands/extensions/agentsCommand.ts
+   451→```
+   452→
+   453→### Files to Modify
+   454→```
+   455→packages/core/src/agents/registry.ts
+   456→packages/core/src/agents/types.ts
+   457→packages/core/src/agents/delegate-to-agent-tool.ts
+   458→packages/cli/src/config/config.ts
+   459→packages/cli/src/services/BuiltinCommandLoader.ts
+   460→packages/core/src/tools/tool-registry.ts
+   461→```
+   462→
+   463→---
+   464→
+   465→## Design Decisions
+   466→
+   467→### File Format: Markdown (.md) - Recommended
+   468→- Agent prompts are long text, more readable in markdown
+   469→- YAML frontmatter is a common, well-supported pattern
+   470→- Claude Code proved this pattern works well for agent definitions
+   471→- Markdown allows syntax highlighting for the prompt body in editors
+   472→
+   473→### Implementation Location: Fork Gemini CLI - Recommended
+   474→- Gemini CLI is open source (Apache 2.0 license)
+   475→- Direct modification gives full control over all components
+   476→- Can potentially submit as PR to main repo if successful
+   477→- Extension system in Gemini CLI is less mature for this use case
+   478→
+   479→### Implementation: Full implementation in order
+   480→- Phase 1 (File-based agents) → Phase 4 (/agents command) → Phase 2 (CLI flag) → Phase 3 (Background execution) → Phase 5 (Tests/Docs)
+   481→
+   482→---
+   483→
+   484→## Getting Started
+   485→
+   486→```bash
+   487→# Clone Gemini CLI
+   488→git clone https://github.com/google-gemini/gemini-cli.git
+   489→cd gemini-cli
+   490→
+   491→# Install dependencies
+   492→npm install
+   493→
+   494→# Build
+   495→npm run build
+   496→
+   497→# Link for local testing
+   498→npm link
+   499→```
+   500→
+
+</system-reminder>

@@ -1,0 +1,448 @@
+/**
+ * Scene Analysis Service
+ * Analyzes transcript segments to extract mood, energy, and scene context
+ * for scene-aware music generation
+ */
+
+const OpenAI = require('openai');
+
+// Initialize OpenAI client
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Energy levels for mapping
+const ENERGY_LEVELS = {
+  calm: 20,
+  relaxed: 30,
+  neutral: 50,
+  engaged: 60,
+  excited: 75,
+  intense: 90,
+  peak: 100
+};
+
+// Mood to Mureka prompt mapping
+const MOOD_PROMPTS = {
+  happy: 'uplifting, joyful, bright melodies',
+  sad: 'melancholic, emotional, minor key, introspective',
+  angry: 'intense, aggressive, driving rhythm, powerful',
+  fearful: 'tense, suspenseful, dark atmosphere',
+  surprised: 'dynamic, unexpected changes, varied intensity',
+  neutral: 'balanced, versatile, steady',
+  excited: 'high energy, upbeat, building momentum',
+  calm: 'peaceful, ambient, gentle flow',
+  tense: 'suspenseful, building tension, dramatic',
+  inspirational: 'uplifting, motivational, soaring melodies',
+  humorous: 'playful, light-hearted, quirky'
+};
+
+/**
+ * Analyze transcript segments for scene context
+ * Uses GPT-4o-mini for sentiment analysis
+ * @param {Object[]} segments - Transcript segments with {id, start, end, text}
+ * @returns {Promise<Object>} Scene analysis with mood timeline and energy curve
+ */
+async function analyzeScenes(segments) {
+  if (!segments || segments.length === 0) {
+    return {
+      scenes: [],
+      dominantMood: 'neutral',
+      averageEnergy: 50,
+      energyTimeline: [],
+      moodTimeline: []
+    };
+  }
+
+  // Group segments into chunks of ~30 seconds for analysis
+  const sceneChunks = groupSegmentsIntoScenes(segments, 30);
+
+  // Analyze each scene chunk
+  const sceneAnalyses = await Promise.all(
+    sceneChunks.map((chunk, index) => analyzeSceneChunk(chunk, index))
+  );
+
+  // Build timelines
+  const energyTimeline = sceneAnalyses.map(s => ({
+    start: s.startTime,
+    end: s.endTime,
+    energy: s.energy
+  }));
+
+  const moodTimeline = sceneAnalyses.map(s => ({
+    start: s.startTime,
+    end: s.endTime,
+    mood: s.mood,
+    confidence: s.confidence
+  }));
+
+  // Calculate dominant mood (most frequent)
+  const moodCounts = {};
+  sceneAnalyses.forEach(s => {
+    moodCounts[s.mood] = (moodCounts[s.mood] || 0) + 1;
+  });
+  const dominantMood = Object.entries(moodCounts)
+    .sort((a, b) => b[1] - a[1])[0]?.[0] || 'neutral';
+
+  // Calculate average energy
+  const averageEnergy = Math.round(
+    sceneAnalyses.reduce((sum, s) => sum + s.energy, 0) / sceneAnalyses.length
+  );
+
+  return {
+    scenes: sceneAnalyses,
+    dominantMood,
+    averageEnergy,
+    energyTimeline,
+    moodTimeline,
+    totalDuration: segments[segments.length - 1]?.end || 0
+  };
+}
+
+/**
+ * Group segments into scene chunks based on time window
+ * @param {Object[]} segments - Transcript segments
+ * @param {number} windowSeconds - Target window size in seconds
+ * @returns {Object[]} Array of scene chunks
+ */
+function groupSegmentsIntoScenes(segments, windowSeconds) {
+  const scenes = [];
+  let currentScene = { segments: [], startTime: 0, endTime: 0 };
+
+  for (const segment of segments) {
+    if (currentScene.segments.length === 0) {
+      currentScene.startTime = segment.start;
+    }
+
+    currentScene.segments.push(segment);
+    currentScene.endTime = segment.end;
+
+    // Check if scene duration exceeds window
+    const sceneDuration = currentScene.endTime - currentScene.startTime;
+    if (sceneDuration >= windowSeconds) {
+      scenes.push({ ...currentScene });
+      currentScene = { segments: [], startTime: segment.end, endTime: 0 };
+    }
+  }
+
+  // Don't forget the last scene
+  if (currentScene.segments.length > 0) {
+    scenes.push(currentScene);
+  }
+
+  return scenes;
+}
+
+/**
+ * Analyze a single scene chunk using GPT-4o-mini
+ * @param {Object} sceneChunk - Scene chunk with segments
+ * @param {number} sceneIndex - Scene index for context
+ * @returns {Promise<Object>} Scene analysis
+ */
+async function analyzeSceneChunk(sceneChunk, sceneIndex) {
+  const text = sceneChunk.segments.map(s => s.text).join(' ').trim();
+
+  // Skip empty scenes
+  if (!text) {
+    return {
+      sceneIndex,
+      startTime: sceneChunk.startTime,
+      endTime: sceneChunk.endTime,
+      mood: 'neutral',
+      energy: 50,
+      keywords: [],
+      confidence: 0.5
+    };
+  }
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a video content analyzer. Analyze the transcript text and determine:
+1. Primary mood (one of: happy, sad, angry, fearful, surprised, neutral, excited, calm, tense, inspirational, humorous)
+2. Energy level (one of: calm, relaxed, neutral, engaged, excited, intense, peak)
+3. Key topic/keywords (2-3 words max)
+4. Confidence score (0.0-1.0)
+
+Respond in JSON format only:
+{"mood": "...", "energy": "...", "keywords": ["...", "..."], "confidence": 0.0}`
+        },
+        {
+          role: 'user',
+          content: `Analyze this video transcript segment:\n\n"${text.substring(0, 500)}"`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 100
+    });
+
+    const content = response.choices[0]?.message?.content || '{}';
+    const parsed = JSON.parse(content);
+
+    return {
+      sceneIndex,
+      startTime: sceneChunk.startTime,
+      endTime: sceneChunk.endTime,
+      mood: parsed.mood || 'neutral',
+      energy: ENERGY_LEVELS[parsed.energy] || 50,
+      keywords: parsed.keywords || [],
+      confidence: parsed.confidence || 0.7,
+      text: text.substring(0, 100) // Store snippet for debugging
+    };
+  } catch (error) {
+    console.error(`[SPLICE] Scene analysis error for chunk ${sceneIndex}:`, error.message);
+
+    // Fallback to basic sentiment
+    return {
+      sceneIndex,
+      startTime: sceneChunk.startTime,
+      endTime: sceneChunk.endTime,
+      mood: estimateMoodFromText(text),
+      energy: estimateEnergyFromText(text),
+      keywords: extractKeywords(text),
+      confidence: 0.3
+    };
+  }
+}
+
+/**
+ * Fallback mood estimation from text
+ * @param {string} text - Text to analyze
+ * @returns {string} Estimated mood
+ */
+function estimateMoodFromText(text) {
+  const lowerText = text.toLowerCase();
+
+  // Simple keyword-based fallback
+  if (/\b(amazing|awesome|great|love|happy|excited|wonderful)\b/.test(lowerText)) {
+    return 'happy';
+  }
+  if (/\b(sad|unfortunately|disappointed|sorry|miss)\b/.test(lowerText)) {
+    return 'sad';
+  }
+  if (/\b(angry|frustrated|hate|annoying|terrible)\b/.test(lowerText)) {
+    return 'angry';
+  }
+  if (/\b(scared|worried|afraid|nervous|anxious)\b/.test(lowerText)) {
+    return 'fearful';
+  }
+  if (/\b(wow|unbelievable|incredible|shocking|surprised)\b/.test(lowerText)) {
+    return 'surprised';
+  }
+  if (/\b(calm|peaceful|relaxed|quiet|gentle)\b/.test(lowerText)) {
+    return 'calm';
+  }
+  if (/\b(let's go|action|hurry|quick|fast|energy)\b/.test(lowerText)) {
+    return 'excited';
+  }
+  if (/\b(funny|hilarious|joke|laugh|lol)\b/.test(lowerText)) {
+    return 'humorous';
+  }
+
+  return 'neutral';
+}
+
+/**
+ * Fallback energy estimation from text
+ * @param {string} text - Text to analyze
+ * @returns {number} Energy level (0-100)
+ */
+function estimateEnergyFromText(text) {
+  const lowerText = text.toLowerCase();
+
+  // Check for high energy indicators
+  const highEnergyWords = ['excited', 'amazing', 'incredible', 'action', 'fast', 'hurry', 'lets go', 'wow'];
+  const lowEnergyWords = ['calm', 'quiet', 'peaceful', 'slow', 'gentle', 'relaxed', 'subtle'];
+
+  let energy = 50;
+
+  highEnergyWords.forEach(word => {
+    if (lowerText.includes(word)) energy += 10;
+  });
+
+  lowEnergyWords.forEach(word => {
+    if (lowerText.includes(word)) energy -= 10;
+  });
+
+  // Check for exclamation marks (high energy indicator)
+  const exclamations = (text.match(/!/g) || []).length;
+  energy += Math.min(exclamations * 5, 20);
+
+  // Check for question marks (engagement)
+  const questions = (text.match(/\?/g) || []).length;
+  energy += Math.min(questions * 2, 10);
+
+  return Math.max(0, Math.min(100, energy));
+}
+
+/**
+ * Extract keywords from text
+ * @param {string} text - Text to analyze
+ * @returns {string[]} Extracted keywords
+ */
+function extractKeywords(text) {
+  // Simple keyword extraction - filter out common words
+  const stopWords = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+    'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this',
+    'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+    'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'how', 'so',
+    'just', 'also', 'very', 'really', 'actually', 'um', 'uh', 'like'
+  ]);
+
+  const words = text.toLowerCase()
+    .replace(/[^\w\s]/g, '')
+    .split(/\s+/)
+    .filter(word => word.length > 3 && !stopWords.has(word));
+
+  // Count word frequency
+  const wordCounts = {};
+  words.forEach(word => {
+    wordCounts[word] = (wordCounts[word] || 0) + 1;
+  });
+
+  // Return top 3 most frequent
+  return Object.entries(wordCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([word]) => word);
+}
+
+/**
+ * Build scene-aware music prompt from analysis
+ * @param {Object} sceneAnalysis - Result from analyzeScenes
+ * @param {Object} options - User options (mood, instruments, etc.)
+ * @returns {string} Enhanced prompt for music generation
+ */
+function buildSceneAwarePrompt(sceneAnalysis, options = {}) {
+  const parts = [];
+
+  // Add user's custom prompt if provided
+  if (options.prompt) {
+    parts.push(options.prompt);
+  }
+
+  // Add dominant mood description
+  const moodDescription = MOOD_PROMPTS[sceneAnalysis.dominantMood] || MOOD_PROMPTS.neutral;
+  parts.push(`Overall mood: ${moodDescription}`);
+
+  // Add energy guidance
+  const energy = sceneAnalysis.averageEnergy;
+  if (energy < 30) {
+    parts.push('Energy: Low and calm, ambient feel');
+  } else if (energy < 50) {
+    parts.push('Energy: Moderate, steady pace');
+  } else if (energy < 70) {
+    parts.push('Energy: Engaged, building momentum');
+  } else if (energy < 85) {
+    parts.push('Energy: High, dynamic and driving');
+  } else {
+    parts.push('Energy: Peak intensity, powerful climax');
+  }
+
+  // Add energy arc description if timeline has variation
+  if (sceneAnalysis.energyTimeline && sceneAnalysis.energyTimeline.length > 1) {
+    const arc = describeEnergyArc(sceneAnalysis.energyTimeline);
+    if (arc) {
+      parts.push(`Energy arc: ${arc}`);
+    }
+  }
+
+  // Add scene keywords if available
+  const allKeywords = sceneAnalysis.scenes
+    .flatMap(s => s.keywords || [])
+    .filter((v, i, a) => a.indexOf(v) === i) // Unique
+    .slice(0, 5);
+
+  if (allKeywords.length > 0) {
+    parts.push(`Content themes: ${allKeywords.join(', ')}`);
+  }
+
+  // Add reference song style if available
+  if (options.referenceSong && options.referenceSong.identified) {
+    parts.push(`Style inspired by "${options.referenceSong.title}" by ${options.referenceSong.artist}`);
+  }
+
+  // Add user-selected mood override if different from detected
+  if (options.mood && options.mood !== sceneAnalysis.dominantMood) {
+    const userMoodDesc = MOOD_PROMPTS[options.mood] || options.mood;
+    parts.push(`User preference: ${userMoodDesc}`);
+  }
+
+  // Add instruments
+  if (options.instruments?.length > 0) {
+    parts.push(`Instruments: ${options.instruments.join(', ')}`);
+  }
+
+  // Add duration
+  const duration = options.duration || 60;
+  parts.push(`Duration: approximately ${duration} seconds`);
+
+  // Add quality markers
+  parts.push('Instrumental only, no vocals');
+  parts.push('Suitable as background music for video');
+  parts.push('Professional quality, well-mixed');
+
+  return parts.join('. ');
+}
+
+/**
+ * Describe energy arc from timeline
+ * @param {Object[]} timeline - Energy timeline
+ * @returns {string|null} Arc description
+ */
+function describeEnergyArc(timeline) {
+  if (timeline.length < 2) return null;
+
+  const energies = timeline.map(t => t.energy);
+  const first = energies[0];
+  const last = energies[energies.length - 1];
+  const peak = Math.max(...energies);
+  const low = Math.min(...energies);
+  const peakIndex = energies.indexOf(peak);
+  const range = peak - low;
+
+  // Not enough variation
+  if (range < 20) return null;
+
+  // Determine arc type
+  if (last > first + 20) {
+    return 'Building from calm to energetic';
+  }
+  if (first > last + 20) {
+    return 'Starting strong, winding down';
+  }
+  if (peakIndex > 0 && peakIndex < energies.length - 1) {
+    return 'Building to climax, then resolving';
+  }
+
+  return 'Dynamic with energy shifts';
+}
+
+/**
+ * Get scene context summary for debugging/logging
+ * @param {Object} sceneAnalysis - Scene analysis result
+ * @returns {string} Summary string
+ */
+function getSceneContextSummary(sceneAnalysis) {
+  return `${sceneAnalysis.scenes.length} scenes, ` +
+    `dominant mood: ${sceneAnalysis.dominantMood}, ` +
+    `avg energy: ${sceneAnalysis.averageEnergy}%`;
+}
+
+module.exports = {
+  analyzeScenes,
+  groupSegmentsIntoScenes,
+  analyzeSceneChunk,
+  buildSceneAwarePrompt,
+  describeEnergyArc,
+  getSceneContextSummary,
+  estimateMoodFromText,
+  estimateEnergyFromText,
+  extractKeywords,
+  ENERGY_LEVELS,
+  MOOD_PROMPTS
+};

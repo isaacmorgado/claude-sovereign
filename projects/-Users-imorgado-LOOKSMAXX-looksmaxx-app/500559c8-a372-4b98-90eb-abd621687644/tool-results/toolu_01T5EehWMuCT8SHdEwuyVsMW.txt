@@ -1,0 +1,1306 @@
+     1→"""
+     2→Forum router - Categories, Sub-Forums, Posts, Comments, Votes, Reports
+     3→
+     4→Rate Limits:
+     5→- Posts: 5 per minute per user
+     6→- Comments: 20 per minute per user
+     7→- Votes: 30 per minute per user
+     8→- Reports: 10 per hour per user
+     9→"""
+    10→
+    11→from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+    12→from sqlalchemy.ext.asyncio import AsyncSession
+    13→from sqlalchemy import select, func, and_, or_, desc
+    14→from sqlalchemy.orm import selectinload
+    15→from uuid import UUID
+    16→from typing import Optional, List
+    17→from datetime import datetime, timezone
+    18→
+    19→from app.database import get_db
+    20→from app.core.rate_limit import limiter, ForumRateLimits
+    21→from app.models.user import User, UserRole
+    22→from app.models.forum import (
+    23→    ForumIssueCategory, ForumSubForum, ForumPost, ForumComment,
+    24→    ForumVote, ForumReport, FlawToForumMapping, ArchetypeForumMapping,
+    25→    VoteType, TargetType, ReportStatus, ReportReason
+    26→)
+    27→from app.services.auth import get_current_user, get_current_user_optional
+    28→from app.schemas.forum import (
+    29→    CategoryResponse, CategoryListResponse, SubForumResponse,
+    30→    PostCreate, PostUpdate, PostResponse, PostListItem,
+    31→    PostListResponse, CommentCreate, CommentUpdate, CommentResponse,
+    32→    VoteRequest, VoteResponse, ReportCreate, ReportResponse,
+    33→    GuideSectionResponse, SortOrder, PostAuthor, RecommendedForumResponse,
+    34→    ArchetypeForumRecommendation
+    35→)
+    36→
+    37→router = APIRouter(prefix="/forum", tags=["forum"])
+    38→
+    39→PAGE_SIZE = 20
+    40→MAX_COMMENT_DEPTH = 5
+    41→
+    42→
+    43→# === CATEGORIES ===
+    44→
+    45→@router.get("/categories", response_model=List[CategoryResponse])
+    46→async def list_categories(db: AsyncSession = Depends(get_db)):
+    47→    """List all active forum categories with sub-forums and post counts.
+    48→
+    49→    Optimized to use only 2 queries instead of N+1 pattern.
+    50→    """
+    51→    # Query 1: Get all categories with sub-forums
+    52→    query = (
+    53→        select(ForumIssueCategory)
+    54→        .options(selectinload(ForumIssueCategory.sub_forums))
+    55→        .where(ForumIssueCategory.is_active == True)
+    56→        .order_by(ForumIssueCategory.display_order)
+    57→    )
+    58→    result = await db.execute(query)
+    59→    categories = result.scalars().all()
+    60→
+    61→    # Query 2: Get ALL sub-forum post counts in ONE query (batched)
+    62→    sf_counts_query = (
+    63→        select(
+    64→            ForumPost.sub_forum_id,
+    65→            func.count(ForumPost.id).label('post_count')
+    66→        )
+    67→        .where(
+    68→            ForumPost.is_deleted == False,
+    69→            ForumPost.is_approved == True
+    70→        )
+    71→        .group_by(ForumPost.sub_forum_id)
+    72→    )
+    73→    sf_counts_result = await db.execute(sf_counts_query)
+    74→    sf_counts = {row[0]: row[1] for row in sf_counts_result}
+    75→
+    76→    # Build response using pre-fetched counts (no additional queries)
+    77→    response = []
+    78→    for cat in categories:
+    79→        cat_post_count = 0
+    80→        sub_forums = []
+    81→
+    82→        for sf in sorted(cat.sub_forums, key=lambda x: x.display_order):
+    83→            if sf.is_active:
+    84→                sf_post_count = sf_counts.get(sf.id, 0)
+    85→                cat_post_count += sf_post_count
+    86→
+    87→                sub_forums.append(SubForumResponse(
+    88→                    id=sf.id,
+    89→                    name=sf.name,
+    90→                    slug=sf.slug,
+    91→                    description=sf.description,
+    92→                    icon=sf.icon,
+    93→                    display_order=sf.display_order,
+    94→                    post_count=sf_post_count
+    95→                ))
+    96→
+    97→        response.append(CategoryResponse(
+    98→            id=cat.id,
+    99→            name=cat.name,
+   100→            slug=cat.slug,
+   101→            description=cat.description,
+   102→            icon=cat.icon,
+   103→            display_order=cat.display_order,
+   104→            post_count=cat_post_count,
+   105→            sub_forums=sub_forums
+   106→        ))
+   107→
+   108→    return response
+   109→
+   110→
+   111→@router.get("/categories/{slug}", response_model=CategoryResponse)
+   112→async def get_category(
+   113→    slug: str,
+   114→    db: AsyncSession = Depends(get_db)
+   115→):
+   116→    """Get a single category by slug with its sub-forums.
+   117→
+   118→    Optimized to use only 2 queries instead of N+1 pattern.
+   119→    """
+   120→    # Query 1: Get category with sub-forums
+   121→    query = (
+   122→        select(ForumIssueCategory)
+   123→        .options(selectinload(ForumIssueCategory.sub_forums))
+   124→        .where(ForumIssueCategory.slug == slug, ForumIssueCategory.is_active == True)
+   125→    )
+   126→    result = await db.execute(query)
+   127→    cat = result.scalar_one_or_none()
+   128→
+   129→    if not cat:
+   130→        raise HTTPException(status_code=404, detail="Category not found")
+   131→
+   132→    # Get sub-forum IDs for this category
+   133→    sf_ids = [sf.id for sf in cat.sub_forums if sf.is_active]
+   134→
+   135→    # Query 2: Get post counts for all sub-forums in this category (batched)
+   136→    sf_counts = {}
+   137→    if sf_ids:
+   138→        sf_counts_query = (
+   139→            select(
+   140→                ForumPost.sub_forum_id,
+   141→                func.count(ForumPost.id).label('post_count')
+   142→            )
+   143→            .where(
+   144→                ForumPost.sub_forum_id.in_(sf_ids),
+   145→                ForumPost.is_deleted == False,
+   146→                ForumPost.is_approved == True
+   147→            )
+   148→            .group_by(ForumPost.sub_forum_id)
+   149→        )
+   150→        sf_counts_result = await db.execute(sf_counts_query)
+   151→        sf_counts = {row[0]: row[1] for row in sf_counts_result}
+   152→
+   153→    # Build sub-forums list using pre-fetched counts
+   154→    cat_post_count = 0
+   155→    sub_forums = []
+   156→    for sf in sorted(cat.sub_forums, key=lambda x: x.display_order):
+   157→        if sf.is_active:
+   158→            sf_post_count = sf_counts.get(sf.id, 0)
+   159→            cat_post_count += sf_post_count
+   160→
+   161→            sub_forums.append(SubForumResponse(
+   162→                id=sf.id,
+   163→                name=sf.name,
+   164→                slug=sf.slug,
+   165→                description=sf.description,
+   166→                icon=sf.icon,
+   167→                display_order=sf.display_order,
+   168→                post_count=sf_post_count
+   169→            ))
+   170→
+   171→    return CategoryResponse(
+   172→        id=cat.id,
+   173→        name=cat.name,
+   174→        slug=cat.slug,
+   175→        description=cat.description,
+   176→        icon=cat.icon,
+   177→        display_order=cat.display_order,
+   178→        post_count=cat_post_count,
+   179→        sub_forums=sub_forums
+   180→    )
+   181→
+   182→
+   183→@router.get("/recommended", response_model=List[RecommendedForumResponse])
+   184→async def get_recommended_forums(
+   185→    flaws: str = Query(..., description="Comma-separated list of flaw IDs"),
+   186→    db: AsyncSession = Depends(get_db)
+   187→):
+   188→    """Get recommended forums based on detected flaws."""
+   189→    flaw_list = [f.strip() for f in flaws.split(",") if f.strip()]
+   190→
+   191→    if not flaw_list:
+   192→        return []
+   193→
+   194→    # Find mappings for these flaws
+   195→    query = (
+   196→        select(FlawToForumMapping)
+   197→        .options(selectinload(FlawToForumMapping.issue_category))
+   198→        .where(FlawToForumMapping.flaw_id.in_(flaw_list))
+   199→        .order_by(FlawToForumMapping.priority)
+   200→    )
+   201→
+   202→    result = await db.execute(query)
+   203→    mappings = result.scalars().all()
+   204→
+   205→    # Group by category
+   206→    category_flaws = {}
+   207→    for mapping in mappings:
+   208→        cat_id = mapping.issue_category_id
+   209→        if cat_id not in category_flaws:
+   210→            category_flaws[cat_id] = {
+   211→                "category": mapping.issue_category,
+   212→                "flaws": [],
+   213→                "priority": mapping.priority
+   214→            }
+   215→        category_flaws[cat_id]["flaws"].append(mapping.flaw_id)
+   216→        # Use lowest priority (1 = primary)
+   217→        if mapping.priority < category_flaws[cat_id]["priority"]:
+   218→            category_flaws[cat_id]["priority"] = mapping.priority
+   219→
+   220→    # Build response sorted by priority
+   221→    response = []
+   222→    for cat_data in sorted(category_flaws.values(), key=lambda x: x["priority"]):
+   223→        cat = cat_data["category"]
+   224→        response.append(RecommendedForumResponse(
+   225→            category=CategoryListResponse(
+   226→                id=cat.id,
+   227→                name=cat.name,
+   228→                slug=cat.slug,
+   229→                description=cat.description,
+   230→                icon=cat.icon,
+   231→                display_order=cat.display_order,
+   232→                post_count=0
+   233→            ),
+   234→            matched_flaws=cat_data["flaws"],
+   235→            priority=cat_data["priority"]
+   236→        ))
+   237→
+   238→    return response
+   239→
+   240→
+   241→@router.get("/archetype-recommendations", response_model=List[ArchetypeForumRecommendation])
+   242→async def get_archetype_forum_recommendations(
+   243→    archetype: str = Query(..., description="Archetype category (Softboy, Prettyboy, RobustPrettyboy, Chad, Hypermasculine, Exotic)"),
+   244→    db: AsyncSession = Depends(get_db)
+   245→):
+   246→    """Get recommended forums based on user's archetype classification."""
+   247→    # Normalize archetype name (handle case variations)
+   248→    archetype = archetype.strip()
+   249→
+   250→    # Valid archetypes
+   251→    valid_archetypes = ["Softboy", "Prettyboy", "RobustPrettyboy", "Chad", "Hypermasculine", "Exotic"]
+   252→
+   253→    # Case-insensitive match
+   254→    matched_archetype = None
+   255→    for valid in valid_archetypes:
+   256→        if archetype.lower() == valid.lower():
+   257→            matched_archetype = valid
+   258→            break
+   259→
+   260→    if not matched_archetype:
+   261→        # Return empty list for invalid archetype (not an error)
+   262→        return []
+   263→
+   264→    # Find mappings for this archetype, ordered by priority (highest first)
+   265→    query = (
+   266→        select(ArchetypeForumMapping)
+   267→        .options(selectinload(ArchetypeForumMapping.issue_category))
+   268→        .where(ArchetypeForumMapping.archetype_category == matched_archetype)
+   269→        .order_by(ArchetypeForumMapping.priority.desc())
+   270→    )
+   271→
+   272→    result = await db.execute(query)
+   273→    mappings = result.scalars().all()
+   274→
+   275→    # Build response
+   276→    response = []
+   277→    for mapping in mappings:
+   278→        cat = mapping.issue_category
+   279→        if cat and cat.is_active:
+   280→            response.append(ArchetypeForumRecommendation(
+   281→                category=CategoryListResponse(
+   282→                    id=cat.id,
+   283→                    name=cat.name,
+   284→                    slug=cat.slug,
+   285→                    description=cat.description,
+   286→                    icon=cat.icon,
+   287→                    display_order=cat.display_order,
+   288→                    post_count=0  # Could be optimized with a count query if needed
+   289→                ),
+   290→                archetype=matched_archetype,
+   291→                reason=mapping.reason,
+   292→                priority=mapping.priority
+   293→            ))
+   294→
+   295→    return response
+   296→
+   297→
+   298→@router.get("/guides", response_model=List[GuideSectionResponse])
+   299→async def get_guides_section(db: AsyncSession = Depends(get_db)):
+   300→    """Get pinned guides grouped by category for the top section."""
+   301→    # Get categories
+   302→    cat_query = (
+   303→        select(ForumIssueCategory)
+   304→        .where(ForumIssueCategory.is_active == True)
+   305→        .order_by(ForumIssueCategory.display_order)
+   306→    )
+   307→    cat_result = await db.execute(cat_query)
+   308→    categories = cat_result.scalars().all()
+   309→
+   310→    response = []
+   311→    for cat in categories:
+   312→        # Get top 5 guides (pinned or marked as guide) per category
+   313→        guide_query = (
+   314→            select(ForumPost)
+   315→            .options(
+   316→                selectinload(ForumPost.author),
+   317→                selectinload(ForumPost.sub_forum)
+   318→            )
+   319→            .join(ForumSubForum, ForumPost.sub_forum_id == ForumSubForum.id)
+   320→            .where(
+   321→                ForumSubForum.issue_category_id == cat.id,
+   322→                ForumPost.is_deleted == False,
+   323→                ForumPost.is_approved == True,
+   324→                or_(ForumPost.is_pinned == True, ForumPost.is_guide == True)
+   325→            )
+   326→            .order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc())
+   327→            .limit(5)
+   328→        )
+   329→        guide_result = await db.execute(guide_query)
+   330→        guides = guide_result.scalars().all()
+   331→
+   332→        if guides:  # Only include categories that have guides
+   333→            response.append(GuideSectionResponse(
+   334→                category=CategoryListResponse(
+   335→                    id=cat.id,
+   336→                    name=cat.name,
+   337→                    slug=cat.slug,
+   338→                    description=cat.description,
+   339→                    icon=cat.icon,
+   340→                    display_order=cat.display_order,
+   341→                    post_count=0
+   342→                ),
+   343→                guides=[_post_to_list_item(g, cat.slug, None) for g in guides]
+   344→            ))
+   345→
+   346→    return response
+   347→
+   348→
+   349→# === POSTS ===
+   350→
+   351→@router.get("/sub-forums/{sub_forum_id}/posts", response_model=PostListResponse)
+   352→async def list_sub_forum_posts(
+   353→    sub_forum_id: UUID,
+   354→    sort: SortOrder = Query(SortOrder.HOT),
+   355→    limit: int = Query(PAGE_SIZE, ge=1, le=50),
+   356→    offset: int = Query(0, ge=0),
+   357→    current_user: Optional[User] = Depends(get_current_user_optional),
+   358→    db: AsyncSession = Depends(get_db),
+   359→):
+   360→    """List posts in a sub-forum with sorting and pagination."""
+   361→    # Verify sub-forum exists and get category
+   362→    sf_result = await db.execute(
+   363→        select(ForumSubForum)
+   364→        .options(selectinload(ForumSubForum.issue_category))
+   365→        .where(ForumSubForum.id == sub_forum_id)
+   366→    )
+   367→    sub_forum = sf_result.scalar_one_or_none()
+   368→    if not sub_forum:
+   369→        raise HTTPException(status_code=404, detail="Sub-forum not found")
+   370→
+   371→    category_slug = sub_forum.issue_category.slug
+   372→
+   373→    # Base query
+   374→    query = (
+   375→        select(ForumPost)
+   376→        .options(selectinload(ForumPost.author))
+   377→        .where(
+   378→            ForumPost.sub_forum_id == sub_forum_id,
+   379→            ForumPost.is_deleted == False,
+   380→            ForumPost.is_approved == True
+   381→        )
+   382→    )
+   383→
+   384→    # Sorting - pinned always first
+   385→    if sort == SortOrder.NEW:
+   386→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.created_at.desc())
+   387→    elif sort == SortOrder.TOP:
+   388→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc())
+   389→    else:  # HOT - combination of votes and recency
+   390→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc(), ForumPost.created_at.desc())
+   391→
+   392→    # Get total count
+   393→    count_query = (
+   394→        select(func.count(ForumPost.id))
+   395→        .where(
+   396→            ForumPost.sub_forum_id == sub_forum_id,
+   397→            ForumPost.is_deleted == False,
+   398→            ForumPost.is_approved == True
+   399→        )
+   400→    )
+   401→    total_result = await db.execute(count_query)
+   402→    total_count = total_result.scalar() or 0
+   403→
+   404→    # Paginate
+   405→    query = query.offset(offset).limit(limit)
+   406→    result = await db.execute(query)
+   407→    posts = result.scalars().all()
+   408→
+   409→    # Get user votes if authenticated
+   410→    user_votes = {}
+   411→    if current_user:
+   412→        post_ids = [p.id for p in posts]
+   413→        if post_ids:
+   414→            votes_query = select(ForumVote).where(
+   415→                ForumVote.user_id == current_user.id,
+   416→                ForumVote.target_type == TargetType.POST,
+   417→                ForumVote.target_id.in_(post_ids)
+   418→            )
+   419→            votes_result = await db.execute(votes_query)
+   420→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   421→
+   422→    return PostListResponse(
+   423→        posts=[_post_to_list_item(p, category_slug, user_votes.get(p.id)) for p in posts],
+   424→        total_count=total_count,
+   425→        has_more=offset + limit < total_count
+   426→    )
+   427→
+   428→
+   429→@router.get("/categories/{slug}/posts", response_model=PostListResponse)
+   430→async def list_category_posts(
+   431→    slug: str,
+   432→    sort: SortOrder = Query(SortOrder.HOT),
+   433→    limit: int = Query(PAGE_SIZE, ge=1, le=50),
+   434→    offset: int = Query(0, ge=0),
+   435→    current_user: Optional[User] = Depends(get_current_user_optional),
+   436→    db: AsyncSession = Depends(get_db),
+   437→):
+   438→    """List all posts in a category (across all sub-forums) with sorting and pagination."""
+   439→    # Verify category exists
+   440→    cat_result = await db.execute(
+   441→        select(ForumIssueCategory).where(ForumIssueCategory.slug == slug)
+   442→    )
+   443→    category = cat_result.scalar_one_or_none()
+   444→    if not category:
+   445→        raise HTTPException(status_code=404, detail="Category not found")
+   446→
+   447→    # Base query - join with sub-forums to filter by category
+   448→    query = (
+   449→        select(ForumPost)
+   450→        .options(selectinload(ForumPost.author), selectinload(ForumPost.sub_forum))
+   451→        .join(ForumSubForum, ForumPost.sub_forum_id == ForumSubForum.id)
+   452→        .where(
+   453→            ForumSubForum.issue_category_id == category.id,
+   454→            ForumPost.is_deleted == False,
+   455→            ForumPost.is_approved == True
+   456→        )
+   457→    )
+   458→
+   459→    # Sorting
+   460→    if sort == SortOrder.NEW:
+   461→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.created_at.desc())
+   462→    elif sort == SortOrder.TOP:
+   463→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc())
+   464→    else:
+   465→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc(), ForumPost.created_at.desc())
+   466→
+   467→    # Get total count
+   468→    count_query = (
+   469→        select(func.count(ForumPost.id))
+   470→        .join(ForumSubForum, ForumPost.sub_forum_id == ForumSubForum.id)
+   471→        .where(
+   472→            ForumSubForum.issue_category_id == category.id,
+   473→            ForumPost.is_deleted == False,
+   474→            ForumPost.is_approved == True
+   475→        )
+   476→    )
+   477→    total_result = await db.execute(count_query)
+   478→    total_count = total_result.scalar() or 0
+   479→
+   480→    # Paginate
+   481→    query = query.offset(offset).limit(limit)
+   482→    result = await db.execute(query)
+   483→    posts = result.scalars().all()
+   484→
+   485→    # Get user votes
+   486→    user_votes = {}
+   487→    if current_user:
+   488→        post_ids = [p.id for p in posts]
+   489→        if post_ids:
+   490→            votes_query = select(ForumVote).where(
+   491→                ForumVote.user_id == current_user.id,
+   492→                ForumVote.target_type == TargetType.POST,
+   493→                ForumVote.target_id.in_(post_ids)
+   494→            )
+   495→            votes_result = await db.execute(votes_query)
+   496→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   497→
+   498→    return PostListResponse(
+   499→        posts=[_post_to_list_item(p, slug, user_votes.get(p.id)) for p in posts],
+   500→        total_count=total_count,
+   501→        has_more=offset + limit < total_count
+   502→    )
+   503→
+   504→
+   505→@router.get("/categories/{slug}/{sub_forum_slug}/posts", response_model=PostListResponse)
+   506→async def list_sub_forum_posts(
+   507→    slug: str,
+   508→    sub_forum_slug: str,
+   509→    sort: SortOrder = Query(SortOrder.HOT),
+   510→    limit: int = Query(PAGE_SIZE, ge=1, le=50),
+   511→    offset: int = Query(0, ge=0),
+   512→    current_user: Optional[User] = Depends(get_current_user_optional),
+   513→    db: AsyncSession = Depends(get_db),
+   514→):
+   515→    """List all posts in a specific sub-forum with sorting and pagination."""
+   516→    # Verify category and sub-forum exist
+   517→    cat_result = await db.execute(
+   518→        select(ForumIssueCategory).where(ForumIssueCategory.slug == slug)
+   519→    )
+   520→    category = cat_result.scalar_one_or_none()
+   521→    if not category:
+   522→        raise HTTPException(status_code=404, detail="Category not found")
+   523→
+   524→    sf_result = await db.execute(
+   525→        select(ForumSubForum).where(
+   526→            ForumSubForum.slug == sub_forum_slug,
+   527→            ForumSubForum.issue_category_id == category.id
+   528→        )
+   529→    )
+   530→    sub_forum = sf_result.scalar_one_or_none()
+   531→    if not sub_forum:
+   532→        raise HTTPException(status_code=404, detail="Sub-forum not found")
+   533→
+   534→    # Base query
+   535→    query = (
+   536→        select(ForumPost)
+   537→        .options(selectinload(ForumPost.author), selectinload(ForumPost.sub_forum))
+   538→        .where(
+   539→            ForumPost.sub_forum_id == sub_forum.id,
+   540→            ForumPost.is_deleted == False,
+   541→            ForumPost.is_approved == True
+   542→        )
+   543→    )
+   544→
+   545→    # Sorting
+   546→    if sort == SortOrder.NEW:
+   547→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.created_at.desc())
+   548→    elif sort == SortOrder.TOP:
+   549→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc())
+   550→    else:
+   551→        query = query.order_by(ForumPost.is_pinned.desc(), ForumPost.vote_count.desc(), ForumPost.created_at.desc())
+   552→
+   553→    # Get total count
+   554→    count_query = (
+   555→        select(func.count(ForumPost.id))
+   556→        .where(
+   557→            ForumPost.sub_forum_id == sub_forum.id,
+   558→            ForumPost.is_deleted == False,
+   559→            ForumPost.is_approved == True
+   560→        )
+   561→    )
+   562→    total_result = await db.execute(count_query)
+   563→    total_count = total_result.scalar() or 0
+   564→
+   565→    # Paginate
+   566→    query = query.offset(offset).limit(limit)
+   567→    result = await db.execute(query)
+   568→    posts = result.scalars().all()
+   569→
+   570→    # Get user votes
+   571→    user_votes = {}
+   572→    if current_user:
+   573→        post_ids = [p.id for p in posts]
+   574→        if post_ids:
+   575→            votes_query = select(ForumVote).where(
+   576→                ForumVote.user_id == current_user.id,
+   577→                ForumVote.target_type == TargetType.POST,
+   578→                ForumVote.target_id.in_(post_ids)
+   579→            )
+   580→            votes_result = await db.execute(votes_query)
+   581→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   582→
+   583→    return PostListResponse(
+   584→        posts=[_post_to_list_item(p, slug, user_votes.get(p.id)) for p in posts],
+   585→        total_count=total_count,
+   586→        has_more=offset + limit < total_count
+   587→    )
+   588→
+   589→
+   590→@router.post("/posts", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
+   591→@limiter.limit(ForumRateLimits.POSTS)
+   592→async def create_post(
+   593→    request: Request,
+   594→    data: PostCreate,
+   595→    current_user: User = Depends(get_current_user),
+   596→    db: AsyncSession = Depends(get_db),
+   597→):
+   598→    """Create a new post.
+   599→
+   600→    Rate limit: 5 posts per minute per user.
+   601→    """
+   602→    # Verify sub-forum exists
+   603→    sf_result = await db.execute(
+   604→        select(ForumSubForum)
+   605→        .options(selectinload(ForumSubForum.issue_category))
+   606→        .where(ForumSubForum.id == data.sub_forum_id)
+   607→    )
+   608→    sub_forum = sf_result.scalar_one_or_none()
+   609→    if not sub_forum:
+   610→        raise HTTPException(status_code=404, detail="Sub-forum not found")
+   611→
+   612→    post = ForumPost(
+   613→        title=data.title,
+   614→        content=data.content,
+   615→        sub_forum_id=data.sub_forum_id,
+   616→        author_id=current_user.id,
+   617→    )
+   618→
+   619→    db.add(post)
+   620→    await db.commit()
+   621→    await db.refresh(post)
+   622→
+   623→    return _post_to_response(post, sub_forum.slug, sub_forum.issue_category.slug, None)
+   624→
+   625→
+   626→@router.get("/posts/{post_id}", response_model=PostResponse)
+   627→async def get_post(
+   628→    post_id: UUID,
+   629→    current_user: Optional[User] = Depends(get_current_user_optional),
+   630→    db: AsyncSession = Depends(get_db),
+   631→):
+   632→    """Get a single post with full details."""
+   633→    query = (
+   634→        select(ForumPost)
+   635→        .options(
+   636→            selectinload(ForumPost.author),
+   637→            selectinload(ForumPost.sub_forum).selectinload(ForumSubForum.issue_category)
+   638→        )
+   639→        .where(ForumPost.id == post_id, ForumPost.is_deleted == False)
+   640→    )
+   641→    result = await db.execute(query)
+   642→    post = result.scalar_one_or_none()
+   643→
+   644→    if not post:
+   645→        raise HTTPException(status_code=404, detail="Post not found")
+   646→
+   647→    # Get user's vote
+   648→    user_vote = None
+   649→    if current_user:
+   650→        vote_result = await db.execute(
+   651→            select(ForumVote).where(
+   652→                ForumVote.user_id == current_user.id,
+   653→                ForumVote.target_type == TargetType.POST,
+   654→                ForumVote.target_id == post_id
+   655→            )
+   656→        )
+   657→        vote = vote_result.scalar_one_or_none()
+   658→        user_vote = vote.vote_type if vote else None
+   659→
+   660→    return _post_to_response(
+   661→        post,
+   662→        post.sub_forum.slug,
+   663→        post.sub_forum.issue_category.slug,
+   664→        user_vote
+   665→    )
+   666→
+   667→
+   668→@router.post("/posts/{post_id}/vote", response_model=VoteResponse)
+   669→@limiter.limit(ForumRateLimits.VOTES)
+   670→async def vote_on_post(
+   671→    request: Request,
+   672→    post_id: UUID,
+   673→    data: VoteRequest,
+   674→    current_user: User = Depends(get_current_user),
+   675→    db: AsyncSession = Depends(get_db),
+   676→):
+   677→    """Vote on a post (upvote/downvote). Voting again removes vote, changing vote type switches it.
+   678→
+   679→    Rate limit: 30 votes per minute per user.
+   680→    """
+   681→    # Verify post exists
+   682→    post_result = await db.execute(
+   683→        select(ForumPost).where(ForumPost.id == post_id, ForumPost.is_deleted == False)
+   684→    )
+   685→    post = post_result.scalar_one_or_none()
+   686→    if not post:
+   687→        raise HTTPException(status_code=404, detail="Post not found")
+   688→
+   689→    # Prevent self-voting
+   690→    if post.author_id == current_user.id:
+   691→        raise HTTPException(status_code=400, detail="You cannot vote on your own post")
+   692→
+   693→    # Check existing vote
+   694→    vote_result = await db.execute(
+   695→        select(ForumVote).where(
+   696→            ForumVote.user_id == current_user.id,
+   697→            ForumVote.target_type == TargetType.POST,
+   698→            ForumVote.target_id == post_id
+   699→        )
+   700→    )
+   701→    existing_vote = vote_result.scalar_one_or_none()
+   702→
+   703→    new_user_vote = None
+   704→    if existing_vote:
+   705→        # Robustly get value (handle if DB returns string or Enum)
+   706→        current_val = existing_vote.vote_type.value if hasattr(existing_vote.vote_type, 'value') else existing_vote.vote_type
+   707→        # Request is from Pydantic Schema Enum
+   708→        request_val = data.vote_type.value
+   709→
+   710→        if current_val == request_val:
+   711→            # Same vote - remove it
+   712→            await db.delete(existing_vote)
+   713→            post.vote_count += -1 if request_val == "up" else 1
+   714→        else:
+   715→            # Different vote - switch it
+   716→            # Ensure we assign the Model Enum (or string if that's what it wants, but Model Enum is safer if Typed)
+   717→            existing_vote.vote_type = VoteType(request_val)
+   718→            # Swing by 2 (remove old, add new)
+   719→            post.vote_count += 2 if request_val == "up" else -2
+   720→            new_user_vote = data.vote_type
+   721→    else:
+   722→        # New vote
+   723→        vote = ForumVote(
+   724→            user_id=current_user.id,
+   725→            target_type=TargetType.POST,
+   726→            target_id=post_id,
+   727→            # Explicitly cast to Model Enum
+   728→            vote_type=VoteType(data.vote_type.value)
+   729→        )
+   730→        db.add(vote)
+   731→        post.vote_count += 1 if data.vote_type.value == "up" else -1
+   732→        new_user_vote = data.vote_type
+   733→
+   734→    await db.commit()
+   735→
+   736→    return VoteResponse(success=True, new_vote_count=post.vote_count, user_vote=new_user_vote)
+   737→
+   738→
+   739→@router.delete("/posts/{post_id}")
+   740→async def delete_post(
+   741→    post_id: UUID,
+   742→    current_user: User = Depends(get_current_user),
+   743→    db: AsyncSession = Depends(get_db),
+   744→):
+   745→    """Delete a post (author or moderator)."""
+   746→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+   747→    post = post_result.scalar_one_or_none()
+   748→    if not post:
+   749→        raise HTTPException(status_code=404, detail="Post not found")
+   750→
+   751→    is_author = post.author_id == current_user.id
+   752→    is_mod = current_user.role in [UserRole.MODERATOR, UserRole.ADMIN]
+   753→
+   754→    if not is_author and not is_mod:
+   755→        raise HTTPException(status_code=403, detail="Not authorized")
+   756→
+   757→    post.is_deleted = True
+   758→    post.deleted_at = datetime.now(timezone.utc)
+   759→    post.deleted_by = current_user.id
+   760→    await db.commit()
+   761→
+   762→    return {"success": True}
+   763→
+   764→
+   765→@router.put("/posts/{post_id}", response_model=PostResponse)
+   766→async def update_post(
+   767→    post_id: UUID,
+   768→    data: PostUpdate,
+   769→    current_user: User = Depends(get_current_user),
+   770→    db: AsyncSession = Depends(get_db),
+   771→):
+   772→    """Update a post (author only)."""
+   773→    post_result = await db.execute(
+   774→        select(ForumPost)
+   775→        .options(selectinload(ForumPost.author), selectinload(ForumPost.sub_forum))
+   776→        .where(ForumPost.id == post_id)
+   777→    )
+   778→    post = post_result.scalar_one_or_none()
+   779→    if not post:
+   780→        raise HTTPException(status_code=404, detail="Post not found")
+   781→
+   782→    if post.author_id != current_user.id:
+   783→        raise HTTPException(status_code=403, detail="Not authorized to edit this post")
+   784→
+   785→    if data.title is not None:
+   786→        post.title = data.title
+   787→    if data.content is not None:
+   788→        post.content = data.content
+   789→    post.updated_at = datetime.utcnow()
+   790→
+   791→    await db.commit()
+   792→    await db.refresh(post)
+   793→
+   794→    # Get user vote
+   795→    vote_result = await db.execute(
+   796→        select(ForumVote).where(
+   797→            ForumVote.user_id == current_user.id,
+   798→            ForumVote.target_type == TargetType.POST,
+   799→            ForumVote.target_id == post_id
+   800→        )
+   801→    )
+   802→    user_vote = vote_result.scalar_one_or_none()
+   803→
+   804→    # Get category slug
+   805→    sf = post.sub_forum
+   806→    cat_result = await db.execute(
+   807→        select(ForumIssueCategory).where(ForumIssueCategory.id == sf.issue_category_id)
+   808→    )
+   809→    cat = cat_result.scalar_one()
+   810→
+   811→    return PostResponse(
+   812→        id=post.id,
+   813→        title=post.title,
+   814→        content=post.content,
+   815→        vote_count=post.vote_count,
+   816→        comment_count=post.comment_count,
+   817→        is_pinned=post.is_pinned,
+   818→        is_guide=post.is_guide,
+   819→        created_at=post.created_at,
+   820→        updated_at=post.updated_at,
+   821→        author=PostAuthor(
+   822→            id=post.author.id,
+   823→            username=post.author.username,
+   824→            avatar_url=None
+   825→        ),
+   826→        sub_forum=SubForumResponse(
+   827→            id=sf.id,
+   828→            name=sf.name,
+   829→            slug=sf.slug,
+   830→            description=sf.description,
+   831→            icon=sf.icon,
+   832→            display_order=sf.display_order,
+   833→            post_count=0
+   834→        ),
+   835→        category_slug=cat.slug,
+   836→        user_vote=user_vote.vote_type if user_vote else None
+   837→    )
+   838→
+   839→
+   840→# === COMMENTS ===
+   841→
+   842→@router.get("/posts/{post_id}/comments", response_model=List[CommentResponse])
+   843→async def get_post_comments(
+   844→    post_id: UUID,
+   845→    current_user: Optional[User] = Depends(get_current_user_optional),
+   846→    db: AsyncSession = Depends(get_db),
+   847→):
+   848→    """Get all comments for a post in a threaded structure."""
+   849→    # Verify post exists
+   850→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+   851→    if not post_result.scalar_one_or_none():
+   852→        raise HTTPException(status_code=404, detail="Post not found")
+   853→
+   854→    # Get all comments for post
+   855→    query = (
+   856→        select(ForumComment)
+   857→        .options(selectinload(ForumComment.author))
+   858→        .where(ForumComment.post_id == post_id, ForumComment.is_deleted == False)
+   859→        .order_by(ForumComment.created_at)
+   860→    )
+   861→    result = await db.execute(query)
+   862→    comments = result.scalars().all()
+   863→
+   864→    # Get user votes
+   865→    user_votes = {}
+   866→    if current_user:
+   867→        comment_ids = [c.id for c in comments]
+   868→        if comment_ids:
+   869→            votes_query = select(ForumVote).where(
+   870→                ForumVote.user_id == current_user.id,
+   871→                ForumVote.target_type == TargetType.COMMENT,
+   872→                ForumVote.target_id.in_(comment_ids)
+   873→            )
+   874→            votes_result = await db.execute(votes_query)
+   875→            user_votes = {v.target_id: v.vote_type for v in votes_result.scalars()}
+   876→
+   877→    # Build tree structure
+   878→    return _build_comment_tree(comments, user_votes)
+   879→
+   880→
+   881→@router.post("/posts/{post_id}/comments", response_model=CommentResponse, status_code=status.HTTP_201_CREATED)
+   882→@limiter.limit(ForumRateLimits.COMMENTS)
+   883→async def create_comment(
+   884→    request: Request,
+   885→    post_id: UUID,
+   886→    data: CommentCreate,
+   887→    current_user: User = Depends(get_current_user),
+   888→    db: AsyncSession = Depends(get_db),
+   889→):
+   890→    """Create a comment on a post.
+   891→
+   892→    Rate limit: 20 comments per minute per user.
+   893→    """
+   894→    # Verify post exists
+   895→    post_result = await db.execute(
+   896→        select(ForumPost).where(ForumPost.id == post_id, ForumPost.is_deleted == False)
+   897→    )
+   898→    post = post_result.scalar_one_or_none()
+   899→    if not post:
+   900→        raise HTTPException(status_code=404, detail="Post not found")
+   901→
+   902→    depth = 0
+   903→    if data.parent_id:
+   904→        # Verify parent comment exists
+   905→        parent_result = await db.execute(
+   906→            select(ForumComment).where(
+   907→                ForumComment.id == data.parent_id,
+   908→                ForumComment.post_id == post_id
+   909→            )
+   910→        )
+   911→        parent = parent_result.scalar_one_or_none()
+   912→        if not parent:
+   913→            raise HTTPException(status_code=404, detail="Parent comment not found")
+   914→        depth = min(parent.depth + 1, MAX_COMMENT_DEPTH)
+   915→
+   916→    comment = ForumComment(
+   917→        content=data.content,
+   918→        post_id=post_id,
+   919→        author_id=current_user.id,
+   920→        parent_id=data.parent_id,
+   921→        depth=depth,
+   922→    )
+   923→
+   924→    db.add(comment)
+   925→    await db.commit()
+   926→    await db.refresh(comment)
+   927→
+   928→    # Load author relationship
+   929→    await db.refresh(comment, ["author"])
+   930→
+   931→    return _comment_to_response(comment, None)
+   932→
+   933→
+   934→@router.post("/comments/{comment_id}/vote", response_model=VoteResponse)
+   935→@limiter.limit(ForumRateLimits.VOTES)
+   936→async def vote_on_comment(
+   937→    request: Request,
+   938→    comment_id: UUID,
+   939→    data: VoteRequest,
+   940→    current_user: User = Depends(get_current_user),
+   941→    db: AsyncSession = Depends(get_db),
+   942→):
+   943→    """Vote on a comment.
+   944→
+   945→    Rate limit: 30 votes per minute per user.
+   946→    """
+   947→    comment_result = await db.execute(
+   948→        select(ForumComment).where(ForumComment.id == comment_id, ForumComment.is_deleted == False)
+   949→    )
+   950→    comment = comment_result.scalar_one_or_none()
+   951→    if not comment:
+   952→        raise HTTPException(status_code=404, detail="Comment not found")
+   953→
+   954→    # Prevent self-voting
+   955→    if comment.author_id == current_user.id:
+   956→        raise HTTPException(status_code=400, detail="You cannot vote on your own comment")
+   957→
+   958→    vote_result = await db.execute(
+   959→        select(ForumVote).where(
+   960→            ForumVote.user_id == current_user.id,
+   961→            ForumVote.target_type == TargetType.COMMENT,
+   962→            ForumVote.target_id == comment_id
+   963→        )
+   964→    )
+   965→    existing_vote = vote_result.scalar_one_or_none()
+   966→
+   967→    new_user_vote = None
+   968→    if existing_vote:
+   969→        if existing_vote.vote_type == data.vote_type:
+   970→            await db.delete(existing_vote)
+   971→            comment.vote_count += -1 if data.vote_type == VoteType.UP else 1
+   972→        else:
+   973→            existing_vote.vote_type = data.vote_type
+   974→            comment.vote_count += 2 if data.vote_type == VoteType.UP else -2
+   975→            new_user_vote = data.vote_type
+   976→    else:
+   977→        vote = ForumVote(
+   978→            user_id=current_user.id,
+   979→            target_type=TargetType.COMMENT,
+   980→            target_id=comment_id,
+   981→            vote_type=data.vote_type
+   982→        )
+   983→        db.add(vote)
+   984→        comment.vote_count += 1 if data.vote_type == VoteType.UP else -1
+   985→        new_user_vote = data.vote_type
+   986→
+   987→    await db.commit()
+   988→
+   989→    return VoteResponse(success=True, new_vote_count=comment.vote_count, user_vote=new_user_vote)
+   990→
+   991→
+   992→@router.put("/comments/{comment_id}", response_model=CommentResponse)
+   993→async def update_comment(
+   994→    comment_id: UUID,
+   995→    data: CommentUpdate,
+   996→    current_user: User = Depends(get_current_user),
+   997→    db: AsyncSession = Depends(get_db),
+   998→):
+   999→    """Update a comment (author only)."""
+  1000→    comment_result = await db.execute(
+  1001→        select(ForumComment)
+  1002→        .options(selectinload(ForumComment.author))
+  1003→        .where(ForumComment.id == comment_id, ForumComment.is_deleted == False)
+  1004→    )
+  1005→    comment = comment_result.scalar_one_or_none()
+  1006→    if not comment:
+  1007→        raise HTTPException(status_code=404, detail="Comment not found")
+  1008→
+  1009→    if comment.author_id != current_user.id:
+  1010→        raise HTTPException(status_code=403, detail="Not authorized to edit this comment")
+  1011→
+  1012→    comment.content = data.content
+  1013→    comment.updated_at = datetime.utcnow()
+  1014→
+  1015→    await db.commit()
+  1016→    await db.refresh(comment)
+  1017→
+  1018→    # Get user vote
+  1019→    vote_result = await db.execute(
+  1020→        select(ForumVote).where(
+  1021→            ForumVote.user_id == current_user.id,
+  1022→            ForumVote.target_type == TargetType.COMMENT,
+  1023→            ForumVote.target_id == comment_id
+  1024→        )
+  1025→    )
+  1026→    user_vote = vote_result.scalar_one_or_none()
+  1027→
+  1028→    return _comment_to_response(comment, user_vote.vote_type if user_vote else None)
+  1029→
+  1030→
+  1031→@router.delete("/comments/{comment_id}")
+  1032→async def delete_comment(
+  1033→    comment_id: UUID,
+  1034→    current_user: User = Depends(get_current_user),
+  1035→    db: AsyncSession = Depends(get_db),
+  1036→):
+  1037→    """Delete a comment (author or moderator)."""
+  1038→    comment_result = await db.execute(select(ForumComment).where(ForumComment.id == comment_id))
+  1039→    comment = comment_result.scalar_one_or_none()
+  1040→    if not comment:
+  1041→        raise HTTPException(status_code=404, detail="Comment not found")
+  1042→
+  1043→    is_author = comment.author_id == current_user.id
+  1044→    is_mod = current_user.role in [UserRole.MODERATOR, UserRole.ADMIN]
+  1045→
+  1046→    if not is_author and not is_mod:
+  1047→        raise HTTPException(status_code=403, detail="Not authorized")
+  1048→
+  1049→    comment.is_deleted = True
+  1050→    comment.deleted_at = datetime.now(timezone.utc)
+  1051→    comment.deleted_by = current_user.id
+  1052→
+  1053→    # Decrement comment count on the parent post
+  1054→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == comment.post_id))
+  1055→    post = post_result.scalar_one_or_none()
+  1056→    if post and post.comment_count > 0:
+  1057→        post.comment_count -= 1
+  1058→
+  1059→    await db.commit()
+  1060→
+  1061→    return {"success": True}
+  1062→
+  1063→
+  1064→# === REPORTS ===
+  1065→
+  1066→@router.post("/reports", response_model=ReportResponse, status_code=status.HTTP_201_CREATED)
+  1067→@limiter.limit(ForumRateLimits.REPORTS)
+  1068→async def create_report(
+  1069→    request: Request,
+  1070→    data: ReportCreate,
+  1071→    current_user: User = Depends(get_current_user),
+  1072→    db: AsyncSession = Depends(get_db),
+  1073→):
+  1074→    """Report a post or comment.
+  1075→
+  1076→    Rate limit: 10 reports per hour per user.
+  1077→    """
+  1078→    # Verify target exists
+  1079→    if data.target_type == TargetType.POST:
+  1080→        target_result = await db.execute(select(ForumPost).where(ForumPost.id == data.target_id))
+  1081→    else:
+  1082→        target_result = await db.execute(select(ForumComment).where(ForumComment.id == data.target_id))
+  1083→
+  1084→    if not target_result.scalar_one_or_none():
+  1085→        raise HTTPException(status_code=404, detail="Target not found")
+  1086→
+  1087→    # Check for duplicate report
+  1088→    existing = await db.execute(
+  1089→        select(ForumReport).where(
+  1090→            ForumReport.reporter_id == current_user.id,
+  1091→            ForumReport.target_type == data.target_type,
+  1092→            ForumReport.target_id == data.target_id,
+  1093→            ForumReport.status == ReportStatus.PENDING
+  1094→        )
+  1095→    )
+  1096→    if existing.scalar_one_or_none():
+  1097→        raise HTTPException(status_code=400, detail="You have already reported this content")
+  1098→
+  1099→    report = ForumReport(
+  1100→        reporter_id=current_user.id,
+  1101→        target_type=data.target_type,
+  1102→        target_id=data.target_id,
+  1103→        reason=data.reason,
+  1104→        details=data.details,
+  1105→    )
+  1106→
+  1107→    db.add(report)
+  1108→    await db.commit()
+  1109→    await db.refresh(report)
+  1110→
+  1111→    return ReportResponse(
+  1112→        id=report.id,
+  1113→        target_type=report.target_type,
+  1114→        target_id=report.target_id,
+  1115→        reason=report.reason,
+  1116→        status=report.status.value,
+  1117→        created_at=report.created_at
+  1118→    )
+  1119→
+  1120→
+  1121→# === MODERATION (Admin/Moderator only) ===
+  1122→
+  1123→@router.post("/posts/{post_id}/pin")
+  1124→async def pin_post(
+  1125→    post_id: UUID,
+  1126→    current_user: User = Depends(get_current_user),
+  1127→    db: AsyncSession = Depends(get_db),
+  1128→):
+  1129→    """Pin/unpin a post (moderator only)."""
+  1130→    if current_user.role not in [UserRole.MODERATOR, UserRole.ADMIN]:
+  1131→        raise HTTPException(status_code=403, detail="Moderator access required")
+  1132→
+  1133→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+  1134→    post = post_result.scalar_one_or_none()
+  1135→    if not post:
+  1136→        raise HTTPException(status_code=404, detail="Post not found")
+  1137→
+  1138→    post.is_pinned = not post.is_pinned
+  1139→    await db.commit()
+  1140→
+  1141→    return {"success": True, "is_pinned": post.is_pinned}
+  1142→
+  1143→
+  1144→@router.post("/posts/{post_id}/mark-guide")
+  1145→async def mark_as_guide(
+  1146→    post_id: UUID,
+  1147→    current_user: User = Depends(get_current_user),
+  1148→    db: AsyncSession = Depends(get_db),
+  1149→):
+  1150→    """Mark/unmark a post as a guide (moderator only)."""
+  1151→    if current_user.role not in [UserRole.MODERATOR, UserRole.ADMIN]:
+  1152→        raise HTTPException(status_code=403, detail="Moderator access required")
+  1153→
+  1154→    post_result = await db.execute(select(ForumPost).where(ForumPost.id == post_id))
+  1155→    post = post_result.scalar_one_or_none()
+  1156→    if not post:
+  1157→        raise HTTPException(status_code=404, detail="Post not found")
+  1158→
+  1159→    post.is_guide = not post.is_guide
+  1160→    await db.commit()
+  1161→
+  1162→    return {"success": True, "is_guide": post.is_guide}
+  1163→
+  1164→
+  1165→@router.get("/reports", response_model=List[ReportResponse])
+  1166→async def list_reports(
+  1167→    status_filter: Optional[ReportStatus] = Query(None, alias="status"),
+  1168→    limit: int = Query(50, ge=1, le=100),
+  1169→    offset: int = Query(0, ge=0),
+  1170→    current_user: User = Depends(get_current_user),
+  1171→    db: AsyncSession = Depends(get_db),
+  1172→):
+  1173→    """List reports (moderator only)."""
+  1174→    if current_user.role not in [UserRole.MODERATOR, UserRole.ADMIN]:
+  1175→        raise HTTPException(status_code=403, detail="Moderator access required")
+  1176→
+  1177→    query = select(ForumReport).order_by(ForumReport.created_at.desc())
+  1178→
+  1179→    if status_filter:
+  1180→        query = query.where(ForumReport.status == status_filter)
+  1181→
+  1182→    query = query.offset(offset).limit(limit)
+  1183→    result = await db.execute(query)
+  1184→    reports = result.scalars().all()
+  1185→
+  1186→    return [
+  1187→        ReportResponse(
+  1188→            id=r.id,
+  1189→            target_type=r.target_type,
+  1190→            target_id=r.target_id,
+  1191→            reason=r.reason,
+  1192→            status=r.status.value,
+  1193→            created_at=r.created_at
+  1194→        )
+  1195→        for r in reports
+  1196→    ]
+  1197→
+  1198→
+  1199→@router.patch("/reports/{report_id}")
+  1200→async def update_report_status(
+  1201→    report_id: UUID,
+  1202→    new_status: ReportStatus,
+  1203→    current_user: User = Depends(get_current_user),
+  1204→    db: AsyncSession = Depends(get_db),
+  1205→):
+  1206→    """Update report status (moderator only)."""
+  1207→    if current_user.role not in [UserRole.MODERATOR, UserRole.ADMIN]:
+  1208→        raise HTTPException(status_code=403, detail="Moderator access required")
+  1209→
+  1210→    report_result = await db.execute(select(ForumReport).where(ForumReport.id == report_id))
+  1211→    report = report_result.scalar_one_or_none()
+  1212→    if not report:
+  1213→        raise HTTPException(status_code=404, detail="Report not found")
+  1214→
+  1215→    report.status = new_status
+  1216→    report.reviewed_by = current_user.id
+  1217→    report.reviewed_at = datetime.utcnow()
+  1218→
+  1219→    await db.commit()
+  1220→
+  1221→    return {"success": True, "status": new_status.value}
+  1222→
+  1223→
+  1224→# === HELPER FUNCTIONS ===
+  1225→
+  1226→def _post_to_list_item(post: ForumPost, category_slug: str, user_vote: Optional[VoteType]) -> PostListItem:
+  1227→    sub_forum_slug = post.sub_forum.slug if post.sub_forum else ""
+  1228→    return PostListItem(
+  1229→        id=post.id,
+  1230→        title=post.title,
+  1231→        content_preview=post.content[:200] + "..." if len(post.content) > 200 else post.content,
+  1232→        sub_forum_slug=sub_forum_slug,
+  1233→        category_slug=category_slug,
+  1234→        author=PostAuthor(id=post.author.id, username=post.author.username),
+  1235→        is_pinned=post.is_pinned,
+  1236→        is_guide=post.is_guide,
+  1237→        vote_count=post.vote_count,
+  1238→        comment_count=post.comment_count,
+  1239→        user_vote=user_vote,
+  1240→        created_at=post.created_at,
+  1241→    )
+  1242→
+  1243→
+  1244→def _post_to_response(
+  1245→    post: ForumPost,
+  1246→    sub_forum_slug: str,
+  1247→    category_slug: str,
+  1248→    user_vote: Optional[VoteType]
+  1249→) -> PostResponse:
+  1250→    return PostResponse(
+  1251→        id=post.id,
+  1252→        title=post.title,
+  1253→        content=post.content,
+  1254→        sub_forum_id=post.sub_forum_id,
+  1255→        sub_forum_slug=sub_forum_slug,
+  1256→        category_slug=category_slug,
+  1257→        author=PostAuthor(id=post.author.id, username=post.author.username),
+  1258→        is_pinned=post.is_pinned,
+  1259→        is_guide=post.is_guide,
+  1260→        vote_count=post.vote_count,
+  1261→        comment_count=post.comment_count,
+  1262→        user_vote=user_vote,
+  1263→        created_at=post.created_at,
+  1264→        updated_at=post.updated_at,
+  1265→    )
+  1266→
+  1267→
+  1268→def _comment_to_response(comment: ForumComment, user_vote: Optional[VoteType]) -> CommentResponse:
+  1269→    return CommentResponse(
+  1270→        id=comment.id,
+  1271→        content=comment.content,
+  1272→        post_id=comment.post_id,
+  1273→        author=PostAuthor(id=comment.author.id, username=comment.author.username),
+  1274→        parent_id=comment.parent_id,
+  1275→        vote_count=comment.vote_count,
+  1276→        user_vote=user_vote,
+  1277→        depth=comment.depth,
+  1278→        replies=[],
+  1279→        created_at=comment.created_at,
+  1280→        updated_at=comment.updated_at,
+  1281→    )
+  1282→
+  1283→
+  1284→def _build_comment_tree(comments: List[ForumComment], user_votes: dict) -> List[CommentResponse]:
+  1285→    """Build a tree structure from flat comment list."""
+  1286→    comment_map = {}
+  1287→    roots = []
+  1288→
+  1289→    # First pass: create all response objects
+  1290→    for c in comments:
+  1291→        comment_map[c.id] = _comment_to_response(c, user_votes.get(c.id))
+  1292→
+  1293→    # Second pass: build tree
+  1294→    for c in comments:
+  1295→        response = comment_map[c.id]
+  1296→        if c.parent_id and c.parent_id in comment_map:
+  1297→            comment_map[c.parent_id].replies.append(response)
+  1298→        else:
+  1299→            roots.append(response)
+  1300→
+  1301→    return roots
+  1302→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

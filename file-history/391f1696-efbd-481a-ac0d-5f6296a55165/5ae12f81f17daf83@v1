@@ -1,0 +1,360 @@
+import * as vscode from "vscode"
+import { BrowserSession } from "./BrowserSession"
+import { EventEmitter } from "events"
+
+/**
+ * Browser preview mode options
+ */
+export type BrowserPreviewMode = "simple-browser" | "puppeteer" | "external"
+
+/**
+ * Browser preview options
+ */
+export interface BrowserPreviewOptions {
+	url: string
+	mode?: BrowserPreviewMode
+	viewColumn?: vscode.ViewColumn
+	preserveFocus?: boolean
+	title?: string
+}
+
+/**
+ * Screenshot options for browser preview
+ */
+export interface ScreenshotOptions {
+	format?: "png" | "jpeg" | "webp"
+	quality?: number
+	fullPage?: boolean
+}
+
+/**
+ * Screenshot result
+ */
+export interface ScreenshotResult {
+	base64: string
+	mimeType: string
+	width?: number
+	height?: number
+	url?: string
+}
+
+/**
+ * Browser preview state
+ */
+export interface BrowserPreviewState {
+	isActive: boolean
+	mode: BrowserPreviewMode
+	currentUrl?: string
+	title?: string
+}
+
+/**
+ * Manages browser preview capabilities with multiple modes:
+ * - SimpleBrowser: VS Code's built-in browser panel
+ * - Puppeteer: Headless browser for automation and screenshots
+ * - External: System default browser
+ *
+ * Provides unified API for browser preview, navigation, and screenshot capture.
+ */
+export class BrowserPreviewManager extends EventEmitter implements vscode.Disposable {
+	private static instance: BrowserPreviewManager | null = null
+	private context: vscode.ExtensionContext
+	private browserSession: BrowserSession | null = null
+	private currentMode: BrowserPreviewMode = "simple-browser"
+	private currentUrl: string | null = null
+	private disposables: vscode.Disposable[] = []
+
+	private constructor(context: vscode.ExtensionContext) {
+		super()
+		this.context = context
+	}
+
+	/**
+	 * Get the singleton instance of BrowserPreviewManager
+	 */
+	static getInstance(context: vscode.ExtensionContext): BrowserPreviewManager {
+		if (!BrowserPreviewManager.instance) {
+			BrowserPreviewManager.instance = new BrowserPreviewManager(context)
+		}
+		return BrowserPreviewManager.instance
+	}
+
+	/**
+	 * Check if BrowserPreviewManager has been initialized
+	 */
+	static hasInstance(): boolean {
+		return BrowserPreviewManager.instance !== null
+	}
+
+	/**
+	 * Get the default preview mode from settings
+	 */
+	private getDefaultMode(): BrowserPreviewMode {
+		const config = vscode.workspace.getConfiguration("multi-agent")
+		return config.get<BrowserPreviewMode>("browser.previewMode", "simple-browser")
+	}
+
+	/**
+	 * Open a URL in the browser preview
+	 */
+	async open(options: BrowserPreviewOptions): Promise<void> {
+		const mode = options.mode ?? this.getDefaultMode()
+		const viewColumn = options.viewColumn ?? vscode.ViewColumn.Beside
+		const preserveFocus = options.preserveFocus ?? true
+
+		this.currentMode = mode
+		this.currentUrl = options.url
+
+		switch (mode) {
+			case "simple-browser":
+				await this.openSimpleBrowser(options.url, viewColumn, preserveFocus)
+				break
+
+			case "puppeteer":
+				await this.openPuppeteer(options.url)
+				break
+
+			case "external":
+				await this.openExternal(options.url)
+				break
+		}
+
+		this.emit("preview-opened", { url: options.url, mode })
+	}
+
+	/**
+	 * Open URL in VS Code's SimpleBrowser
+	 */
+	private async openSimpleBrowser(
+		url: string,
+		viewColumn: vscode.ViewColumn,
+		preserveFocus: boolean,
+	): Promise<void> {
+		try {
+			await vscode.commands.executeCommand("simpleBrowser.api.open", vscode.Uri.parse(url), {
+				viewColumn,
+				preserveFocus,
+			})
+		} catch (error) {
+			// Fallback to simpleBrowser.show if api.open is not available
+			try {
+				await vscode.commands.executeCommand("simpleBrowser.show", url)
+			} catch (fallbackError) {
+				console.error("Failed to open SimpleBrowser:", fallbackError)
+				// Last resort: open in external browser
+				await this.openExternal(url)
+			}
+		}
+	}
+
+	/**
+	 * Open URL in Puppeteer-controlled browser
+	 */
+	private async openPuppeteer(url: string): Promise<void> {
+		if (!this.browserSession) {
+			this.browserSession = new BrowserSession(this.context, (isActive) => {
+				this.emit("session-state-changed", { isActive })
+			})
+		}
+
+		await this.browserSession.launchBrowser()
+		await this.browserSession.navigateToUrl(url)
+	}
+
+	/**
+	 * Open URL in external system browser
+	 */
+	private async openExternal(url: string): Promise<void> {
+		await vscode.env.openExternal(vscode.Uri.parse(url))
+	}
+
+	/**
+	 * Navigate to a new URL in the current preview
+	 */
+	async navigate(url: string): Promise<void> {
+		this.currentUrl = url
+
+		switch (this.currentMode) {
+			case "simple-browser":
+				await this.openSimpleBrowser(url, vscode.ViewColumn.Active, false)
+				break
+
+			case "puppeteer":
+				if (this.browserSession) {
+					await this.browserSession.navigateToUrl(url)
+				} else {
+					await this.openPuppeteer(url)
+				}
+				break
+
+			case "external":
+				await this.openExternal(url)
+				break
+		}
+
+		this.emit("navigation", { url })
+	}
+
+	/**
+	 * Take a screenshot of the current browser view (Puppeteer mode only)
+	 */
+	async takeScreenshot(options?: ScreenshotOptions): Promise<ScreenshotResult | null> {
+		if (this.currentMode !== "puppeteer" || !this.browserSession) {
+			// Switch to puppeteer mode if not already
+			if (this.currentUrl) {
+				await this.open({ url: this.currentUrl, mode: "puppeteer" })
+			} else {
+				return null
+			}
+		}
+
+		if (!this.browserSession?.isSessionActive()) {
+			return null
+		}
+
+		try {
+			// Use the existing browser session's action mechanism
+			const result = await this.browserSession.doAction(async (page) => {
+				// Just wait for stability, screenshot is taken in doAction
+			})
+
+			if (result.screenshot) {
+				// Parse the data URL to extract base64 and mime type
+				const match = result.screenshot.match(/^data:([^;]+);base64,(.+)$/)
+				if (match) {
+					return {
+						base64: match[2],
+						mimeType: match[1],
+						width: result.viewportWidth,
+						height: result.viewportHeight,
+						url: result.currentUrl,
+					}
+				}
+			}
+
+			return null
+		} catch (error) {
+			console.error("Failed to take screenshot:", error)
+			return null
+		}
+	}
+
+	/**
+	 * Get the current preview state
+	 */
+	getState(): BrowserPreviewState {
+		return {
+			isActive: this.currentMode === "puppeteer" ? this.browserSession?.isSessionActive() ?? false : true,
+			mode: this.currentMode,
+			currentUrl: this.currentUrl ?? undefined,
+		}
+	}
+
+	/**
+	 * Get the current URL
+	 */
+	getCurrentUrl(): string | null {
+		return this.currentUrl
+	}
+
+	/**
+	 * Get the current preview mode
+	 */
+	getMode(): BrowserPreviewMode {
+		return this.currentMode
+	}
+
+	/**
+	 * Set the preview mode
+	 */
+	setMode(mode: BrowserPreviewMode): void {
+		this.currentMode = mode
+	}
+
+	/**
+	 * Check if a Puppeteer session is active
+	 */
+	isPuppeteerActive(): boolean {
+		return this.browserSession?.isSessionActive() ?? false
+	}
+
+	/**
+	 * Get the underlying BrowserSession (for advanced use)
+	 */
+	getBrowserSession(): BrowserSession | null {
+		return this.browserSession
+	}
+
+	/**
+	 * Close the current browser preview
+	 */
+	async close(): Promise<void> {
+		if (this.browserSession) {
+			await this.browserSession.closeBrowser()
+			this.browserSession = null
+		}
+
+		this.currentUrl = null
+		this.emit("preview-closed")
+	}
+
+	/**
+	 * Refresh the current page
+	 */
+	async refresh(): Promise<void> {
+		if (this.currentUrl) {
+			await this.navigate(this.currentUrl)
+		}
+	}
+
+	/**
+	 * Execute JavaScript in the current page (Puppeteer mode only)
+	 */
+	async executeScript<T>(script: string): Promise<T | null> {
+		if (this.currentMode !== "puppeteer" || !this.browserSession?.isSessionActive()) {
+			return null
+		}
+
+		let result: T | null = null
+
+		await this.browserSession.doAction(async (page) => {
+			result = await page.evaluate(script) as T
+		})
+
+		return result
+	}
+
+	/**
+	 * Get the viewport size
+	 */
+	getViewportSize(): { width?: number; height?: number } {
+		if (this.browserSession) {
+			return this.browserSession.getViewportSize()
+		}
+		return {}
+	}
+
+	/**
+	 * Cleanup the singleton instance
+	 */
+	static cleanup(): void {
+		if (BrowserPreviewManager.instance) {
+			BrowserPreviewManager.instance.dispose()
+			BrowserPreviewManager.instance = null
+		}
+	}
+
+	/**
+	 * Dispose of resources
+	 */
+	dispose(): void {
+		this.close().catch(console.error)
+
+		for (const disposable of this.disposables) {
+			disposable.dispose()
+		}
+		this.disposables = []
+
+		this.removeAllListeners()
+	}
+}

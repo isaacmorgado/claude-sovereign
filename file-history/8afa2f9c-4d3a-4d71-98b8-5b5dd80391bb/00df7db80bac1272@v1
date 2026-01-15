@@ -1,0 +1,176 @@
+// Test script for upload progress functionality
+import http from 'http';
+import { URL } from 'url';
+import fs from 'fs';
+
+const API_BASE = 'http://localhost:3001/api';
+
+async function login() {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ email: 'test2@example.com', password: 'TestPass123' });
+    const req = http.request(`${API_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': data.length }
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        const result = JSON.parse(body);
+        if (result.success) resolve(result.data.tokens.accessToken);
+        else reject(new Error(result.error));
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function getPresignedUrl(token, filename, contentType, fileSize) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ filename, contentType, fileSize });
+    const req = http.request(`${API_BASE}/audio/presigned-url`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+        'Authorization': `Bearer ${token}`
+      }
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        const result = JSON.parse(body);
+        if (result.success) resolve(result.data);
+        else reject(new Error(result.error));
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function uploadWithProgress(presignedUrl, filePath, contentType) {
+  return new Promise((resolve, reject) => {
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileSize = fileBuffer.length;
+    const url = new URL(presignedUrl);
+
+    const progressUpdates = [];
+    let bytesUploaded = 0;
+
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname + url.search,
+      method: 'PUT',
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': fileSize
+      }
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ progressUpdates, finalProgress: 100 });
+        } else {
+          reject(new Error(`Upload failed: ${res.statusCode} ${body}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+
+    // Simulate chunked upload for progress tracking
+    const chunkSize = Math.ceil(fileSize / 10);
+    let offset = 0;
+
+    const writeChunk = () => {
+      const end = Math.min(offset + chunkSize, fileSize);
+      const chunk = fileBuffer.slice(offset, end);
+      bytesUploaded += chunk.length;
+      const progress = Math.round((bytesUploaded / fileSize) * 100);
+      progressUpdates.push(progress);
+      console.log(`  Upload progress: ${progress}%`);
+
+      if (end < fileSize) {
+        req.write(chunk);
+        offset = end;
+        setImmediate(writeChunk);
+      } else {
+        req.write(chunk);
+        req.end();
+      }
+    };
+
+    writeChunk();
+  });
+}
+
+async function verifyUpload(publicUrl) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(publicUrl);
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname,
+      method: 'HEAD'
+    }, (res) => {
+      if (res.statusCode === 200) {
+        resolve(res.headers['content-length']);
+      } else {
+        reject(new Error(`Verification failed: ${res.statusCode}`));
+      }
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function runTest() {
+  console.log('=== Testing Upload Progress Functionality ===\n');
+
+  try {
+    // Create a larger test file for better progress visibility
+    console.log('1. Creating test file...');
+    const testFile = '/tmp/test-audio-large.wav';
+    const header = Buffer.from('RIFF....WAVEfmt ');
+    const randomData = Buffer.alloc(100 * 1024); // 100KB
+    for (let i = 0; i < randomData.length; i++) {
+      randomData[i] = Math.floor(Math.random() * 256);
+    }
+    fs.writeFileSync(testFile, Buffer.concat([header, randomData]));
+    const fileSize = fs.statSync(testFile).size;
+    console.log(`   Created ${(fileSize / 1024).toFixed(1)}KB test file\n`);
+
+    // Login
+    console.log('2. Logging in...');
+    const token = await login();
+    console.log('   Login successful\n');
+
+    // Get presigned URL
+    console.log('3. Getting presigned URL...');
+    const presigned = await getPresignedUrl(token, 'test-audio-large.wav', 'audio/wav', fileSize);
+    console.log(`   Got presigned URL for ${presigned.fileKey}\n`);
+
+    // Upload with progress
+    console.log('4. Uploading file with progress tracking...');
+    const result = await uploadWithProgress(presigned.uploadUrl, testFile, 'audio/wav');
+    console.log(`   Upload complete! Progress updates received: ${result.progressUpdates.length}\n`);
+
+    // Verify upload
+    console.log('5. Verifying upload...');
+    const uploadedSize = await verifyUpload(presigned.publicUrl);
+    console.log(`   File verified in S3! Size: ${uploadedSize} bytes\n`);
+
+    console.log('=== ALL TESTS PASSED ===');
+
+  } catch (error) {
+    console.error('Test failed:', error.message);
+    process.exit(1);
+  }
+}
+
+runTest();

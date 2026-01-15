@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""
+looksmax_engine.py - Reverse-engineered facial analysis algorithm
+Implements Frankfort plane standardization, geometric calculations, and Gaussian scoring.
+"""
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+# =============================================================================
+# LANDMARK MAPPINGS (MediaPipe 478-point indices)
+# =============================================================================
+
+LANDMARKS_SIDE = {
+    "porion": 226,
+    "orbitale": 33,
+    "glabella": 168,
+    "nasion": 6,
+    "pronasale": 1,
+    "subnasale": 164,
+    "labrale_sup": 0,
+    "labrale_inf": 17,
+    "pogonion": 152,
+    "menton": 152,
+    "gnathion": 175,
+    "gonion": 172,
+    "condyle": 234,
+    "cheilion": 61,
+}
+
+LANDMARKS_FRONT = {
+    "trichion": 10,
+    "menton": 152,
+    "cheekbone_l": 123,
+    "cheekbone_r": 352,
+    "gonion_l": 172,
+    "gonion_r": 397,
+    "pupil_l": 468,
+    "pupil_r": 473,
+    "canthus_in_l": 133,
+    "canthus_out_l": 33,
+    "canthus_in_r": 362,
+    "canthus_out_r": 263,
+    "ala_nasi_l": 102,
+    "ala_nasi_r": 331,
+    "cheilion_l": 61,
+    "cheilion_r": 291,
+    "glabella": 168,
+    "upper_lip": 0,
+}
+
+# =============================================================================
+# SCORING RANGES (Ideal ranges for each metric)
+# =============================================================================
+
+SCORING_RANGES = {
+    "Gonial Angle": (115.5, 124.2),          # Degrees
+    "Nasolabial Angle": (90.0, 110.0),       # Degrees
+    "Canthal Tilt": (4.0, 18.0),             # Degrees (Positive = hunter eyes)
+    "FWHR": (1.8, 2.2),                      # Ratio
+    "Ramus to Mandible Ratio": (0.7, 0.9),   # Ratio
+    "Mandibular Plane Angle": (20.0, 30.0),  # Degrees
+    "Midface Ratio": (0.38, 0.45),           # Ratio (pupil-mouth dist / face width)
+    "Eye Separation Ratio": (0.28, 0.35),    # Ratio
+}
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class MockLandmark:
+    """Represents a single facial landmark with x, y, z coordinates."""
+    x: float
+    y: float
+    z: float = 0.0
+
+
+@dataclass
+class Point2D:
+    """2D point for geometric calculations."""
+    x: float
+    y: float
+
+    def __sub__(self, other: 'Point2D') -> 'Point2D':
+        return Point2D(self.x - other.x, self.y - other.y)
+
+    def __add__(self, other: 'Point2D') -> 'Point2D':
+        return Point2D(self.x + other.x, self.y + other.y)
+
+
+# =============================================================================
+# GEOMETRIC UTILITIES
+# =============================================================================
+
+def distance(p1: Point2D, p2: Point2D) -> float:
+    """Calculate Euclidean distance between two points."""
+    return math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2)
+
+
+def angle_between_points(p1: Point2D, vertex: Point2D, p2: Point2D) -> float:
+    """
+    Calculate angle at vertex formed by p1-vertex-p2.
+    Returns angle in degrees.
+    """
+    v1 = Point2D(p1.x - vertex.x, p1.y - vertex.y)
+    v2 = Point2D(p2.x - vertex.x, p2.y - vertex.y)
+
+    dot = v1.x * v2.x + v1.y * v2.y
+    mag1 = math.sqrt(v1.x ** 2 + v1.y ** 2)
+    mag2 = math.sqrt(v2.x ** 2 + v2.y ** 2)
+
+    if mag1 == 0 or mag2 == 0:
+        return 0.0
+
+    cos_angle = max(-1.0, min(1.0, dot / (mag1 * mag2)))
+    return math.degrees(math.acos(cos_angle))
+
+
+def angle_to_horizontal(p1: Point2D, p2: Point2D) -> float:
+    """
+    Calculate angle of line p1->p2 relative to horizontal.
+    Returns angle in degrees (positive = upward tilt).
+    """
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+
+    if dx == 0:
+        return 90.0 if dy > 0 else -90.0
+
+    return math.degrees(math.atan2(dy, dx))
+
+
+def rotate_point(point: Point2D, center: Point2D, angle_rad: float) -> Point2D:
+    """Rotate a point around a center by angle (radians)."""
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+
+    # Translate to origin
+    px = point.x - center.x
+    py = point.y - center.y
+
+    # Rotate
+    new_x = px * cos_a - py * sin_a
+    new_y = px * sin_a + py * cos_a
+
+    # Translate back
+    return Point2D(new_x + center.x, new_y + center.y)
+
+
+# =============================================================================
+# FRANKFORT PLANE STANDARDIZATION
+# =============================================================================
+
+def apply_frankfort_correction(landmarks: List[MockLandmark]) -> Dict[str, Point2D]:
+    """
+    Apply Frankfort Plane correction to side profile landmarks.
+
+    The Frankfort Plane is defined by Porion (ear canal) and Orbitale (lowest point of orbit).
+    This function rotates all landmarks so this line becomes perfectly horizontal.
+
+    Returns: Dictionary of landmark names to corrected Point2D coordinates.
+    """
+    # Extract porion and orbitale
+    porion_idx = LANDMARKS_SIDE["porion"]
+    orbitale_idx = LANDMARKS_SIDE["orbitale"]
+
+    porion = Point2D(landmarks[porion_idx].x, landmarks[porion_idx].y)
+    orbitale = Point2D(landmarks[orbitale_idx].x, landmarks[orbitale_idx].y)
+
+    # Calculate angle to horizontal
+    current_angle = angle_to_horizontal(porion, orbitale)
+
+    # We want this line to be horizontal (0 degrees)
+    rotation_angle = -math.radians(current_angle)
+
+    # Rotate all landmarks around porion
+    corrected = {}
+    for name, idx in LANDMARKS_SIDE.items():
+        original = Point2D(landmarks[idx].x, landmarks[idx].y)
+        corrected[name] = rotate_point(original, porion, rotation_angle)
+
+    return corrected
+
+
+def get_front_landmarks(landmarks: List[MockLandmark]) -> Dict[str, Point2D]:
+    """Extract front profile landmarks as Point2D objects."""
+    result = {}
+    for name, idx in LANDMARKS_FRONT.items():
+        result[name] = Point2D(landmarks[idx].x, landmarks[idx].y)
+    return result
+
+
+# =============================================================================
+# SIDE PROFILE CALCULATIONS
+# =============================================================================
+
+def calculate_side_profile(landmarks: List[MockLandmark]) -> Dict[str, float]:
+    """
+    Calculate side profile metrics using Frankfort-corrected landmarks.
+
+    Returns dictionary with:
+    - Gonial Angle: Angle between Condyle -> Gonion -> Menton
+    - Nasolabial Angle: Angle of columella relative to upper lip
+    - Mandibular Plane Angle: Angle of mandibular plane to Frankfort horizontal
+    - Ramus to Mandible Ratio: Ramus height / Mandible length
+    """
+    # Apply Frankfort correction
+    lm = apply_frankfort_correction(landmarks)
+
+    results = {}
+
+    # 1. Gonial Angle: Condyle -> Gonion -> Menton
+    gonial_angle = angle_between_points(
+        lm["condyle"],
+        lm["gonion"],
+        lm["menton"]
+    )
+    results["Gonial Angle"] = gonial_angle
+
+    # 2. Nasolabial Angle: Columella -> Subnasale -> Labrale Superior
+    # Columella is approximated as a point between pronasale and subnasale
+    columella = Point2D(
+        (lm["pronasale"].x + lm["subnasale"].x) / 2,
+        (lm["pronasale"].y + lm["subnasale"].y) / 2
+    )
+    nasolabial_angle = angle_between_points(
+        columella,
+        lm["subnasale"],
+        lm["labrale_sup"]
+    )
+    results["Nasolabial Angle"] = nasolabial_angle
+
+    # 3. Mandibular Plane Angle: Angle of Gonion-Menton line to horizontal
+    # Since we've applied Frankfort correction, horizontal is the reference
+    mpa = abs(angle_to_horizontal(lm["gonion"], lm["menton"]))
+    results["Mandibular Plane Angle"] = mpa
+
+    # 4. Ramus to Mandible Ratio
+    ramus_length = distance(lm["condyle"], lm["gonion"])
+    mandible_length = distance(lm["gonion"], lm["menton"])
+
+    if mandible_length > 0:
+        results["Ramus to Mandible Ratio"] = ramus_length / mandible_length
+    else:
+        results["Ramus to Mandible Ratio"] = 0.0
+
+    return results
+
+
+# =============================================================================
+# FRONT PROFILE CALCULATIONS
+# =============================================================================
+
+def calculate_front_profile(landmarks: List[MockLandmark]) -> Dict[str, float]:
+    """
+    Calculate front profile metrics.
+
+    Returns dictionary with:
+    - Canthal Tilt: Angle of inner-to-outer canthus line relative to horizontal
+    - FWHR: Face Width-to-Height Ratio
+    - Midface Ratio: Vertical proportion of midface
+    - Eye Separation Ratio: Inter-canthal distance relative to face width
+    """
+    lm = get_front_landmarks(landmarks)
+
+    results = {}
+
+    # 1. Canthal Tilt (average of both eyes)
+    # Positive tilt = outer canthus higher than inner (hunter eyes)
+    # In screen coordinates: Y increases downward, so "higher" means lower Y value
+    # Canthal tilt = how many degrees the outer canthus is elevated above the inner
+
+    # Left eye: outer is to the LEFT of inner
+    left_dx = abs(lm["canthus_out_l"].x - lm["canthus_in_l"].x)
+    left_dy = lm["canthus_in_l"].y - lm["canthus_out_l"].y  # Positive if outer is higher
+    left_tilt = math.degrees(math.atan2(left_dy, left_dx))
+
+    # Right eye: outer is to the RIGHT of inner
+    right_dx = abs(lm["canthus_out_r"].x - lm["canthus_in_r"].x)
+    right_dy = lm["canthus_in_r"].y - lm["canthus_out_r"].y  # Positive if outer is higher
+    right_tilt = math.degrees(math.atan2(right_dy, right_dx))
+
+    results["Canthal Tilt"] = (left_tilt + right_tilt) / 2
+
+    # 2. FWHR (Facial Width-to-Height Ratio)
+    # Width: Bizygomatic (cheekbone to cheekbone)
+    # Height: Glabella to upper lip
+    face_width = distance(lm["cheekbone_l"], lm["cheekbone_r"])
+    face_height = distance(lm["glabella"], lm["upper_lip"])
+
+    if face_height > 0:
+        results["FWHR"] = face_width / face_height
+    else:
+        results["FWHR"] = 0.0
+
+    # 3. Midface Ratio
+    # Distance from pupils to mouth / cheekbone width
+    pupil_center = Point2D(
+        (lm["pupil_l"].x + lm["pupil_r"].x) / 2,
+        (lm["pupil_l"].y + lm["pupil_r"].y) / 2
+    )
+    mouth_center = Point2D(
+        (lm["cheilion_l"].x + lm["cheilion_r"].x) / 2,
+        (lm["cheilion_l"].y + lm["cheilion_r"].y) / 2
+    )
+    midface_height = distance(pupil_center, mouth_center)
+
+    if face_width > 0:
+        results["Midface Ratio"] = midface_height / face_width
+    else:
+        results["Midface Ratio"] = 0.0
+
+    # 4. Eye Separation Ratio
+    # Inter-canthal distance / face width
+    inter_canthal = distance(lm["canthus_in_l"], lm["canthus_in_r"])
+
+    if face_width > 0:
+        results["Eye Separation Ratio"] = inter_canthal / face_width
+    else:
+        results["Eye Separation Ratio"] = 0.0
+
+    return results
+
+
+# =============================================================================
+# GAUSSIAN SCORING SYSTEM
+# =============================================================================
+
+def calculate_score(value: float, min_range: float, max_range: float) -> float:
+    """
+    Calculate a score from 0-10 using Gaussian decay.
+
+    - If value is within [min_range, max_range], score is 10.0
+    - If outside, applies exponential decay based on distance from range
+
+    Formula: 10.0 * exp(-0.5 * (deviation / (target * 0.1))^2)
+    """
+    if min_range <= value <= max_range:
+        return 10.0
+
+    # Calculate deviation from nearest boundary
+    if value < min_range:
+        deviation = min_range - value
+        target = min_range
+    else:
+        deviation = value - max_range
+        target = max_range
+
+    # Avoid division by zero
+    if target == 0:
+        target = 1.0
+
+    # Gaussian decay
+    sigma = abs(target) * 0.1  # 10% of target as standard deviation
+    if sigma == 0:
+        sigma = 1.0
+
+    score = 10.0 * math.exp(-0.5 * (deviation / sigma) ** 2)
+
+    return max(0.0, min(10.0, score))
+
+
+def score_metrics(metrics: Dict[str, float]) -> Dict[str, Tuple[float, float]]:
+    """
+    Score all metrics and return (value, score) tuples.
+    """
+    results = {}
+    for name, value in metrics.items():
+        if name in SCORING_RANGES:
+            min_r, max_r = SCORING_RANGES[name]
+            score = calculate_score(value, min_r, max_r)
+            results[name] = (value, score)
+        else:
+            # No scoring range defined
+            results[name] = (value, None)
+    return results
+
+
+# =============================================================================
+# MOCK DATA GENERATOR
+# =============================================================================
+
+def generate_mock_landmarks() -> List[MockLandmark]:
+    """
+    Generate 478 mock landmarks roughly shaped like a human face.
+
+    Face is roughly centered at (0.5, 0.5) with normalized coordinates [0, 1].
+    This creates anatomically plausible positions for key landmarks.
+    """
+    landmarks = []
+
+    # Initialize all 478 landmarks with default positions (spread across face region)
+    for i in range(478):
+        # Default: spread points in a face-shaped region
+        # Use a simple ellipse pattern
+        t = i / 478.0 * 2 * math.pi
+        x = 0.5 + 0.3 * math.cos(t) * (1 + 0.1 * math.sin(3 * t))
+        y = 0.5 + 0.4 * math.sin(t) * (1 + 0.1 * math.cos(2 * t))
+        landmarks.append(MockLandmark(x, y, 0.0))
+
+    # Override specific landmarks with anatomically correct positions
+    # All coordinates are normalized [0, 1] where (0,0) is top-left
+
+    # === FRONT PROFILE LANDMARKS ===
+
+    # Top of head / hairline
+    landmarks[10] = MockLandmark(0.5, 0.08, 0.0)   # trichion
+
+    # Eyes - LEFT eye (viewer's right, screen coordinates where Y increases downward)
+    # Outer canthus is LEFT and slightly HIGHER (lower Y value) for hunter eyes
+    landmarks[468] = MockLandmark(0.38, 0.38, 0.0)  # pupil_l
+    landmarks[133] = MockLandmark(0.42, 0.385, 0.0) # canthus_in_l (inner)
+    landmarks[33] = MockLandmark(0.33, 0.375, 0.0)  # canthus_out_l (outer, ~6° tilt)
+
+    # Eyes - RIGHT eye (viewer's left)
+    # Outer canthus is RIGHT and slightly HIGHER (lower Y value) for hunter eyes
+    landmarks[473] = MockLandmark(0.62, 0.38, 0.0)  # pupil_r
+    landmarks[362] = MockLandmark(0.58, 0.385, 0.0) # canthus_in_r (inner)
+    landmarks[263] = MockLandmark(0.67, 0.375, 0.0) # canthus_out_r (outer, ~6° tilt)
+
+    # Cheekbones (bizygomatic width)
+    landmarks[123] = MockLandmark(0.22, 0.42, 0.0)  # cheekbone_l
+    landmarks[352] = MockLandmark(0.78, 0.42, 0.0)  # cheekbone_r
+
+    # Nose - For side profile, use X as anterior-posterior axis
+    # Nasolabial angle = angle at subnasale between columella direction and upper lip
+    # For ~100° angle: columella points down-forward, upper lip is below and slightly back
+    landmarks[168] = MockLandmark(0.50, 0.32, 0.0)   # glabella (between eyebrows)
+    landmarks[6] = MockLandmark(0.50, 0.40, 0.0)     # nasion (bridge of nose)
+    landmarks[1] = MockLandmark(0.56, 0.46, -0.08)   # pronasale (tip projects forward)
+    landmarks[164] = MockLandmark(0.54, 0.50, -0.02) # subnasale (base of nose, also forward)
+    landmarks[102] = MockLandmark(0.46, 0.49, 0.0)   # ala_nasi_l
+    landmarks[331] = MockLandmark(0.54, 0.49, 0.0)   # ala_nasi_r
+
+    # Mouth - positioned for ~100° nasolabial angle
+    # Upper lip positioned slightly behind and below subnasale
+    landmarks[0] = MockLandmark(0.50, 0.54, 0.0)     # labrale_sup (upper lip, recessed)
+    landmarks[17] = MockLandmark(0.49, 0.63, 0.0)    # labrale_inf (lower lip)
+    landmarks[61] = MockLandmark(0.42, 0.60, 0.0)    # cheilion_l (mouth corner L)
+    landmarks[291] = MockLandmark(0.58, 0.60, 0.0)   # cheilion_r (mouth corner R)
+
+    # Chin / Jaw - positioned for realistic gonial angle and mandible ratios
+    landmarks[152] = MockLandmark(0.50, 0.78, 0.0)   # menton (bottom of chin)
+    landmarks[175] = MockLandmark(0.50, 0.75, 0.0)   # gnathion
+    landmarks[172] = MockLandmark(0.28, 0.68, 0.0)   # gonion_l (jaw angle L)
+    landmarks[397] = MockLandmark(0.72, 0.68, 0.0)   # gonion_r (jaw angle R)
+
+    # === SIDE PROFILE LANDMARKS ===
+    # These are positioned for realistic side profile geometry
+    # Critical for Frankfort plane, gonial angle, and ramus/mandible ratio
+
+    # Ear region (for Frankfort plane) - porion is posterior
+    landmarks[226] = MockLandmark(0.12, 0.40, 0.0)  # porion (ear canal, posterior)
+    # Condyle positioned for realistic ramus length (should be ~0.8x mandible length)
+    # Mandible length (gonion to menton) ~ 0.28 (from 0.28 to 0.50 in X, plus Y component)
+    # So condyle should be positioned to give ramus ~0.22
+    landmarks[234] = MockLandmark(0.22, 0.52, 0.0)  # condyle (jaw joint)
+
+    return landmarks
+
+
+def generate_ideal_landmarks() -> List[MockLandmark]:
+    """
+    Generate landmarks representing an 'ideal' face that should score highly.
+    """
+    landmarks = generate_mock_landmarks()
+
+    # Adjust specific landmarks for ideal proportions
+    # Canthal tilt: ~8 degrees (outer canthus higher)
+    landmarks[33] = MockLandmark(0.32, 0.35, 0.0)   # canthus_out_l slightly higher
+    landmarks[263] = MockLandmark(0.68, 0.35, 0.0)  # canthus_out_r slightly higher
+
+    # Good jaw definition (gonial angle ~120 degrees)
+    landmarks[172] = MockLandmark(0.26, 0.65, 0.0)  # gonion_l
+    landmarks[397] = MockLandmark(0.74, 0.65, 0.0)  # gonion_r
+
+    return landmarks
+
+
+# =============================================================================
+# MAIN - TEST HARNESS
+# =============================================================================
+
+def print_report(title: str, scored_metrics: Dict[str, Tuple[float, Optional[float]]]) -> None:
+    """Print a formatted report of metrics and scores."""
+    print(f"\n{'=' * 60}")
+    print(f"  {title}")
+    print(f"{'=' * 60}")
+    print(f"{'Metric':<30} {'Value':>12} {'Score':>10}")
+    print(f"{'-' * 60}")
+
+    total_score = 0.0
+    scored_count = 0
+
+    for name, (value, score) in scored_metrics.items():
+        if score is not None:
+            score_str = f"{score:.2f} / 10"
+            total_score += score
+            scored_count += 1
+        else:
+            score_str = "N/A"
+
+        # Format value based on magnitude
+        if abs(value) >= 10:
+            value_str = f"{value:.1f}"
+        else:
+            value_str = f"{value:.3f}"
+
+        # Add unit hint
+        if "Angle" in name or "Tilt" in name:
+            value_str += "°"
+
+        print(f"{name:<30} {value_str:>12} {score_str:>10}")
+
+    if scored_count > 0:
+        avg_score = total_score / scored_count
+        print(f"{'-' * 60}")
+        print(f"{'AVERAGE SCORE':<30} {'':>12} {avg_score:.2f} / 10")
+
+    print(f"{'=' * 60}\n")
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
+
+def analyze_face(landmarks: List[MockLandmark], include_debug: bool = False) -> dict:
+    """
+    Analyze a face from MediaPipe 478-point landmarks.
+
+    Args:
+        landmarks: List of 478 MockLandmark objects (or any object with x, y, z attributes)
+        include_debug: If True, include intermediate calculation values
+
+    Returns:
+        Dictionary with:
+        - 'side_profile': dict of side profile metrics with scores
+        - 'front_profile': dict of front profile metrics with scores
+        - 'overall_score': float (0-100)
+        - 'debug': dict (only if include_debug=True)
+    """
+    # Calculate metrics
+    side_metrics = calculate_side_profile(landmarks)
+    front_metrics = calculate_front_profile(landmarks)
+
+    # Score metrics
+    side_scores = score_metrics(side_metrics)
+    front_scores = score_metrics(front_metrics)
+
+    # Calculate overall score
+    all_scores = {**side_scores, **front_scores}
+    total = sum(s for v, s in all_scores.values() if s is not None)
+    count = sum(1 for v, s in all_scores.values() if s is not None)
+    overall = (total / (count * 10) * 100) if count > 0 else 0
+
+    result = {
+        'side_profile': {
+            name: {'value': v, 'score': s, 'range': SCORING_RANGES.get(name)}
+            for name, (v, s) in side_scores.items()
+        },
+        'front_profile': {
+            name: {'value': v, 'score': s, 'range': SCORING_RANGES.get(name)}
+            for name, (v, s) in front_scores.items()
+        },
+        'overall_score': round(overall, 1)
+    }
+
+    if include_debug:
+        result['debug'] = {
+            'frankfort_corrected': apply_frankfort_correction(landmarks),
+            'landmark_indices': {
+                'side': LANDMARKS_SIDE,
+                'front': LANDMARKS_FRONT
+            }
+        }
+
+    return result
+
+
+# =============================================================================
+# RANGES LOADER
+# =============================================================================
+
+def load_ranges(filepath: str = None) -> dict:
+    """
+    Load scoring ranges from ranges.json file.
+
+    Args:
+        filepath: Path to ranges.json. If None, looks in same directory as script.
+
+    Returns:
+        Dictionary with structure: {gender: {ethnicity: {front: {...}, side: {...}}}}
+    """
+    if filepath is None:
+        # Look for ranges.json in the same directory as this script
+        script_dir = Path(__file__).parent
+        filepath = script_dir / "ranges.json"
+
+    with open(filepath, 'r') as f:
+        return json.load(f)
+
+
+def get_ranges_for_profile(ranges: dict, gender: str = "male", ethnicity: str = "caucasian") -> dict:
+    """
+    Get front and side ranges for a specific gender/ethnicity combination.
+
+    Returns:
+        Dictionary with 'front' and 'side' keys containing metric ranges.
+    """
+    return ranges.get(gender, {}).get(ethnicity, {"front": {}, "side": {}})
+
+
+# =============================================================================
+# FACIAL CALCULATOR CLASS
+# =============================================================================
+
+class FacialCalculator:
+    """
+    Unified facial metrics calculator that computes both front and side profile measurements.
+    """
+
+    def __init__(self, landmarks: List[MockLandmark]):
+        self.landmarks = landmarks
+        self.front_landmarks = get_front_landmarks(landmarks)
+        self.side_landmarks = apply_frankfort_correction(landmarks)
+
+    def calculate_all(self) -> Dict[str, Dict[str, float]]:
+        """
+        Calculate all front and side profile metrics.
+
+        Returns:
+            Dictionary with 'front' and 'side' keys containing metric dictionaries.
+        """
+        return {
+            'front': self._calculate_front_metrics(),
+            'side': self._calculate_side_metrics()
+        }
+
+    def _calculate_front_metrics(self) -> Dict[str, float]:
+        """Calculate front profile metrics matching ranges.json keys."""
+        lm = self.front_landmarks
+        results = {}
+
+        # Face Width to Height Ratio (FWHR)
+        face_width = distance(lm["cheekbone_l"], lm["cheekbone_r"])
+        face_height = distance(lm["glabella"], lm["upper_lip"])
+        if face_height > 0:
+            results["Face Width to Height Ratio"] = face_width / face_height
+
+        # Lateral Canthal Tilt
+        left_dx = abs(lm["canthus_out_l"].x - lm["canthus_in_l"].x)
+        left_dy = lm["canthus_in_l"].y - lm["canthus_out_l"].y
+        left_tilt = math.degrees(math.atan2(left_dy, left_dx))
+        right_dx = abs(lm["canthus_out_r"].x - lm["canthus_in_r"].x)
+        right_dy = lm["canthus_in_r"].y - lm["canthus_out_r"].y
+        right_tilt = math.degrees(math.atan2(right_dy, right_dx))
+        results["Lateral Canthal Tilt"] = (left_tilt + right_tilt) / 2
+
+        # Midface Ratio
+        pupil_center = Point2D(
+            (lm["pupil_l"].x + lm["pupil_r"].x) / 2,
+            (lm["pupil_l"].y + lm["pupil_r"].y) / 2
+        )
+        mouth_center = Point2D(
+            (lm["cheilion_l"].x + lm["cheilion_r"].x) / 2,
+            (lm["cheilion_l"].y + lm["cheilion_r"].y) / 2
+        )
+        midface_height = distance(pupil_center, mouth_center)
+        if face_width > 0:
+            results["Midface Ratio"] = midface_height / face_width
+
+        # Eye Separation Ratio (as percentage)
+        inter_canthal = distance(lm["canthus_in_l"], lm["canthus_in_r"])
+        if face_width > 0:
+            results["Eye Separation Ratio"] = (inter_canthal / face_width) * 100
+
+        # Bigonial Width (jaw width as percentage of face width)
+        jaw_width = distance(lm["gonion_l"], lm["gonion_r"])
+        if face_width > 0:
+            results["Bigonial Width"] = (jaw_width / face_width) * 100
+
+        # Mouth Width to Nose Width Ratio
+        mouth_width = distance(lm["cheilion_l"], lm["cheilion_r"])
+        nose_width = distance(lm["ala_nasi_l"], lm["ala_nasi_r"])
+        if nose_width > 0:
+            results["Mouth Width to Nose Width Ratio"] = mouth_width / nose_width
+
+        # Interpupillary-Mouth Width Ratio
+        ipd = distance(lm["pupil_l"], lm["pupil_r"])
+        if mouth_width > 0:
+            results["Interpupillary-Mouth Width Ratio"] = ipd / mouth_width
+
+        return results
+
+    def _calculate_side_metrics(self) -> Dict[str, float]:
+        """Calculate side profile metrics matching ranges.json keys."""
+        lm = self.side_landmarks
+        results = {}
+
+        # Gonial Angle: Condyle -> Gonion -> Menton
+        results["Gonial Angle"] = angle_between_points(
+            lm["condyle"], lm["gonion"], lm["menton"]
+        )
+
+        # Nasolabial Angle
+        columella = Point2D(
+            (lm["pronasale"].x + lm["subnasale"].x) / 2,
+            (lm["pronasale"].y + lm["subnasale"].y) / 2
+        )
+        results["Nasolabial Angle"] = angle_between_points(
+            columella, lm["subnasale"], lm["labrale_sup"]
+        )
+
+        # Mandibular Plane Angle
+        results["Mandibular Plane Angle"] = abs(
+            angle_to_horizontal(lm["gonion"], lm["menton"])
+        )
+
+        # Ramus to Mandible Ratio
+        ramus_length = distance(lm["condyle"], lm["gonion"])
+        mandible_length = distance(lm["gonion"], lm["menton"])
+        if mandible_length > 0:
+            results["Ramus to Mandible Ratio"] = ramus_length / mandible_length
+
+        # Nasofrontal Angle (approximated)
+        results["Nasofrontal Angle"] = angle_between_points(
+            lm["glabella"], lm["nasion"], lm["pronasale"]
+        )
+
+        # Nasomental Angle (nose tip to chin angle)
+        results["Nasomental Angle"] = angle_between_points(
+            lm["pronasale"], lm["subnasale"], lm["pogonion"]
+        )
+
+        return results
+
+
+# =============================================================================
+# TEST HARNESS
+# =============================================================================
+
+def print_profile_table(title: str, metrics: Dict[str, float], ranges: Dict[str, List[float]]) -> Tuple[float, int]:
+    """
+    Print a formatted table for a profile (front or side).
+
+    Args:
+        title: Table title
+        metrics: Calculated metric values
+        ranges: Ideal ranges from ranges.json
+
+    Returns:
+        Tuple of (total_score, scored_count)
+    """
+    print(f"\n{'=' * 70}")
+    print(f"  {title}")
+    print(f"{'=' * 70}")
+    print(f"{'Metric':<40} {'Value':>10} {'Range':>12} {'Score':>8}")
+    print(f"{'-' * 70}")
+
+    total_score = 0.0
+    scored_count = 0
+
+    # Iterate through ranges to ensure we show all expected metrics
+    for metric_name, (min_val, max_val) in sorted(ranges.items()):
+        if metric_name in metrics:
+            value = metrics[metric_name]
+            score = calculate_score(value, min_val, max_val)
+            total_score += score
+            scored_count += 1
+
+            # Format value
+            if abs(value) >= 10:
+                value_str = f"{value:.1f}"
+            else:
+                value_str = f"{value:.2f}"
+
+            # Add degree symbol for angles
+            if "Angle" in metric_name or "Tilt" in metric_name:
+                value_str += "°"
+
+            range_str = f"[{min_val:.1f}, {max_val:.1f}]"
+            score_str = f"{score:.1f}/10"
+
+            print(f"{metric_name:<40} {value_str:>10} {range_str:>12} {score_str:>8}")
+        else:
+            # Metric in ranges but not calculated
+            range_str = f"[{min_val:.1f}, {max_val:.1f}]"
+            print(f"{metric_name:<40} {'N/A':>10} {range_str:>12} {'--':>8}")
+
+    if scored_count > 0:
+        avg_score = total_score / scored_count
+        print(f"{'-' * 70}")
+        print(f"{'AVERAGE SCORE':<40} {'':>10} {'':>12} {avg_score:.2f}/10")
+
+    print(f"{'=' * 70}")
+
+    return total_score, scored_count
+
+
+def main():
+    """Main test harness for the looksmax engine."""
+    print("\n" + "=" * 70)
+    print("  LOOKSMAX ENGINE - Facial Analysis Algorithm")
+    print("  Using ranges.json for ethnicity-specific scoring")
+    print("=" * 70)
+
+    # Configuration
+    gender = "male"
+    ethnicity = "caucasian"
+
+    # [1] Load ranges.json
+    print(f"\n[1] Loading ranges.json...")
+    try:
+        ranges = load_ranges()
+        current_ranges = get_ranges_for_profile(ranges, gender, ethnicity)
+        print(f"    Loaded ranges for: {gender} / {ethnicity}")
+        print(f"    Front metrics: {len(current_ranges.get('front', {}))}")
+        print(f"    Side metrics: {len(current_ranges.get('side', {}))}")
+    except FileNotFoundError:
+        print("    ERROR: ranges.json not found!")
+        print("    Please ensure ranges.json is in the same directory as this script.")
+        return
+
+    # [2] Generate mock landmarks
+    print(f"\n[2] Generating mock facial landmarks (478 points)...")
+    landmarks = generate_mock_landmarks()
+    print(f"    Created {len(landmarks)} landmarks")
+
+    # [3] Calculate metrics using FacialCalculator
+    print(f"\n[3] Calculating facial metrics...")
+    calculator = FacialCalculator(landmarks)
+    all_metrics = calculator.calculate_all()
+    print(f"    Front metrics calculated: {len(all_metrics['front'])}")
+    print(f"    Side metrics calculated: {len(all_metrics['side'])}")
+
+    # [4] Print Front Profile Table
+    print(f"\n[4] Scoring against {gender}/{ethnicity} ranges...")
+    front_total, front_count = print_profile_table(
+        "FRONT PROFILE ANALYSIS",
+        all_metrics['front'],
+        current_ranges.get('front', {})
+    )
+
+    # [5] Print Side Profile Table
+    side_total, side_count = print_profile_table(
+        "SIDE PROFILE ANALYSIS",
+        all_metrics['side'],
+        current_ranges.get('side', {})
+    )
+
+    # [6] Overall Summary
+    total_count = front_count + side_count
+    total_score = front_total + side_total
+
+    print(f"\n{'=' * 70}")
+    print("  OVERALL SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  Profile: {gender.upper()} / {ethnicity.upper()}")
+    print(f"  Front metrics scored: {front_count}")
+    print(f"  Side metrics scored: {side_count}")
+    print(f"  Total metrics: {total_count}")
+    if total_count > 0:
+        overall_avg = total_score / total_count
+        overall_pct = (total_score / (total_count * 10)) * 100
+        print(f"  Average Score: {overall_avg:.2f} / 10")
+        print(f"  Overall Rating: {overall_pct:.1f}%")
+    print(f"{'=' * 70}\n")
+
+
+if __name__ == "__main__":
+    main()

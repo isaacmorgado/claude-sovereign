@@ -1,0 +1,206 @@
+"""
+Referral codes management router
+"""
+
+import stripe
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from pydantic import BaseModel
+from typing import Optional
+from uuid import uuid4
+
+from app.config import get_settings
+from app.database import get_db
+from app.models.user import User, ReferralCode
+from app.services.auth import get_current_user
+
+router = APIRouter(prefix="/referrals", tags=["referrals"])
+settings = get_settings()
+
+# Initialize Stripe
+stripe.api_key = settings.stripe_secret_key
+
+
+class CreateReferralCode(BaseModel):
+    code: str
+    influencer_name: str
+    discount_percent: Optional[int] = None  # Percentage discount (e.g., 10 for 10%)
+    discount_amount: Optional[int] = None   # Fixed amount in cents (e.g., 4000 for $40)
+    create_stripe_promo: bool = True
+
+
+class ReferralCodeResponse(BaseModel):
+    id: str
+    code: str
+    influencer_name: str
+    discount_percent: Optional[int]
+    discount_amount: Optional[int]  # In cents
+    stripe_promotion_code_id: Optional[str]
+    stripe_coupon_id: Optional[str]
+    is_active: bool
+    total_uses: int
+
+
+@router.post("/create", response_model=ReferralCodeResponse)
+async def create_referral_code(
+    data: CreateReferralCode,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a new referral code for an influencer.
+    Optionally creates a corresponding Stripe promotion code.
+
+    Note: In production, this should be admin-only.
+    """
+    # Check if code already exists
+    result = await db.execute(
+        select(ReferralCode).where(ReferralCode.code == data.code.upper())
+    )
+    existing = result.scalar_one_or_none()
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Referral code already exists"
+        )
+
+    stripe_coupon_id = None
+    stripe_promo_id = None
+
+    # Create Stripe coupon and promotion code if requested
+    if data.create_stripe_promo and settings.stripe_secret_key:
+        try:
+            # Create a coupon
+            coupon = stripe.Coupon.create(
+                percent_off=data.discount_percent,
+                duration="once",
+                name=f"Influencer: {data.influencer_name}",
+                metadata={
+                    "influencer": data.influencer_name,
+                    "referral_code": data.code.upper(),
+                }
+            )
+            stripe_coupon_id = coupon.id
+
+            # Create a promotion code using the coupon
+            promo = stripe.PromotionCode.create(
+                coupon=coupon.id,
+                code=data.code.upper(),
+                metadata={
+                    "influencer": data.influencer_name,
+                }
+            )
+            stripe_promo_id = promo.id
+
+        except stripe.error.StripeError as e:
+            # Log but don't fail - code can still work without Stripe integration
+            print(f"Failed to create Stripe promo: {e}")
+
+    # Create referral code in database
+    referral = ReferralCode(
+        id=uuid4(),
+        code=data.code.upper(),
+        influencer_name=data.influencer_name,
+        discount_percent=data.discount_percent,
+        stripe_coupon_id=stripe_coupon_id,
+        stripe_promotion_code_id=stripe_promo_id,
+        is_active=True,
+        total_uses=0,
+    )
+
+    db.add(referral)
+    await db.commit()
+    await db.refresh(referral)
+
+    return ReferralCodeResponse(
+        id=str(referral.id),
+        code=referral.code,
+        influencer_name=referral.influencer_name,
+        discount_percent=referral.discount_percent,
+        stripe_promotion_code_id=referral.stripe_promotion_code_id,
+        stripe_coupon_id=referral.stripe_coupon_id,
+        is_active=referral.is_active,
+        total_uses=referral.total_uses,
+    )
+
+
+@router.get("/stats/{code}")
+async def get_referral_stats(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get usage statistics for a referral code"""
+    result = await db.execute(
+        select(ReferralCode).where(ReferralCode.code == code.upper())
+    )
+    referral = result.scalar_one_or_none()
+
+    if not referral:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Referral code not found"
+        )
+
+    # Count users who signed up with this code
+    user_count = await db.execute(
+        select(User).where(User.referral_code == code.upper())
+    )
+    users = user_count.scalars().all()
+
+    return {
+        "code": referral.code,
+        "influencer_name": referral.influencer_name,
+        "total_signups": len(users),
+        "total_uses": referral.total_uses,
+        "discount_percent": referral.discount_percent,
+        "is_active": referral.is_active,
+    }
+
+
+@router.get("/list")
+async def list_referral_codes(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all referral codes (admin only in production)"""
+    result = await db.execute(select(ReferralCode).order_by(ReferralCode.created_at.desc()))
+    codes = result.scalars().all()
+
+    return [
+        {
+            "id": str(code.id),
+            "code": code.code,
+            "influencer_name": code.influencer_name,
+            "discount_percent": code.discount_percent,
+            "total_uses": code.total_uses,
+            "is_active": code.is_active,
+        }
+        for code in codes
+    ]
+
+
+@router.patch("/{code}/toggle")
+async def toggle_referral_code(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle a referral code active/inactive"""
+    result = await db.execute(
+        select(ReferralCode).where(ReferralCode.code == code.upper())
+    )
+    referral = result.scalar_one_or_none()
+
+    if not referral:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Referral code not found"
+        )
+
+    referral.is_active = not referral.is_active
+    await db.commit()
+
+    return {"code": referral.code, "is_active": referral.is_active}

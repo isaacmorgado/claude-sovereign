@@ -1,0 +1,509 @@
+/**
+ * Auth Routes
+ *
+ * Authentication endpoints (login, refresh, logout, csrf-token, email verification)
+ */
+
+const express = require('express');
+const crypto = require('crypto');
+const { csrfTokenHandler, validateCsrfToken } = require('../middleware/csrf');
+const authLogger = require('../utils/authLogger');
+
+// ============================================================================
+// Email Verification Code Storage
+// In-memory store for verification codes. Maps email -> { code, expires, attempts }
+// Can be upgraded to Redis for distributed deployments.
+// ============================================================================
+
+const verificationCodes = new Map();
+
+// Verification code expiry time (10 minutes)
+const VERIFICATION_CODE_EXPIRY_MS = 10 * 60 * 1000;
+
+// Maximum verification attempts before code is invalidated
+const MAX_VERIFICATION_ATTEMPTS = 5;
+
+// Rate limiting: minimum time between sending codes to same email (60 seconds)
+const SEND_CODE_COOLDOWN_MS = 60 * 1000;
+
+// Track last send time per email for rate limiting
+const lastSendTime = new Map();
+
+// Cleanup interval for expired codes (every 5 minutes)
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * Generate a 6-digit verification code
+ * @returns {string} 6-digit code
+ */
+function generateVerificationCode() {
+  // Generate cryptographically secure random 6-digit code
+  const code = crypto.randomInt(100000, 999999).toString();
+  return code;
+}
+
+/**
+ * Store a verification code for an email
+ * @param {string} email - Email address
+ * @param {string} code - Verification code
+ */
+function storeVerificationCode(email, code) {
+  const normalizedEmail = email.toLowerCase().trim();
+  verificationCodes.set(normalizedEmail, {
+    code,
+    expires: Date.now() + VERIFICATION_CODE_EXPIRY_MS,
+    attempts: 0,
+    createdAt: Date.now()
+  });
+  lastSendTime.set(normalizedEmail, Date.now());
+}
+
+/**
+ * Verify a code for an email
+ * @param {string} email - Email address
+ * @param {string} code - Code to verify
+ * @returns {{ valid: boolean, error?: string }}
+ */
+function verifyCode(email, code) {
+  const normalizedEmail = email.toLowerCase().trim();
+  const stored = verificationCodes.get(normalizedEmail);
+
+  if (!stored) {
+    return { valid: false, error: 'No verification code found. Please request a new one.' };
+  }
+
+  // Check if expired
+  if (Date.now() > stored.expires) {
+    verificationCodes.delete(normalizedEmail);
+    return { valid: false, error: 'Verification code has expired. Please request a new one.' };
+  }
+
+  // Increment attempt counter
+  stored.attempts++;
+
+  // Check if too many attempts
+  if (stored.attempts > MAX_VERIFICATION_ATTEMPTS) {
+    verificationCodes.delete(normalizedEmail);
+    return { valid: false, error: 'Too many failed attempts. Please request a new code.' };
+  }
+
+  // Check if code matches
+  if (stored.code !== code) {
+    verificationCodes.set(normalizedEmail, stored);
+    return { valid: false, error: `Invalid verification code. ${MAX_VERIFICATION_ATTEMPTS - stored.attempts} attempts remaining.` };
+  }
+
+  // Code is valid - remove it (single use)
+  verificationCodes.delete(normalizedEmail);
+  return { valid: true };
+}
+
+/**
+ * Check if we can send a new code to an email (rate limiting)
+ * @param {string} email - Email address
+ * @returns {{ allowed: boolean, waitSeconds?: number }}
+ */
+function canSendCode(email) {
+  const normalizedEmail = email.toLowerCase().trim();
+  const lastSent = lastSendTime.get(normalizedEmail);
+
+  if (!lastSent) {
+    return { allowed: true };
+  }
+
+  const elapsed = Date.now() - lastSent;
+  if (elapsed < SEND_CODE_COOLDOWN_MS) {
+    const waitSeconds = Math.ceil((SEND_CODE_COOLDOWN_MS - elapsed) / 1000);
+    return { allowed: false, waitSeconds };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Clean up expired verification codes
+ */
+function cleanupVerificationCodes() {
+  const now = Date.now();
+  let cleanedCount = 0;
+
+  for (const [email, data] of verificationCodes.entries()) {
+    if (data.expires <= now) {
+      verificationCodes.delete(email);
+      cleanedCount++;
+    }
+  }
+
+  // Also clean up old lastSendTime entries (older than 1 hour)
+  const oneHourAgo = now - (60 * 60 * 1000);
+  for (const [email, time] of lastSendTime.entries()) {
+    if (time < oneHourAgo) {
+      lastSendTime.delete(email);
+    }
+  }
+
+  if (cleanedCount > 0) {
+    console.log(`[Auth] Verification code cleanup: removed ${cleanedCount} expired codes`);
+  }
+}
+
+// Start periodic cleanup (unref to allow process exit)
+const cleanupTimer = setInterval(cleanupVerificationCodes, CLEANUP_INTERVAL_MS);
+if (cleanupTimer.unref) {
+  cleanupTimer.unref();
+}
+
+/**
+ * Validate email format
+ * @param {string} email - Email to validate
+ * @returns {boolean}
+ */
+function isValidEmail(email) {
+  if (!email || typeof email !== 'string') return false;
+  // Basic email validation regex
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email.trim());
+}
+
+/**
+ * Create auth routes
+ * @param {Object} options - Route configuration options
+ * @param {Object} options.middleware - Shared middleware (authenticateToken)
+ * @param {Object} options.services - Shared services (usageTracking, licenseService, emailService)
+ * @param {Object} options.authHelpers - Auth helper functions
+ * @returns {express.Router}
+ */
+function createAuthRoutes(options = {}) {
+  const router = express.Router();
+  const { authenticateToken } = options.middleware || {};
+  const { generateToken, generateRefreshToken, verifyToken, maskSensitiveData, blacklistToken } = options.authHelpers || {};
+  const { usageTracking, licenseService, emailService } = options.services || {};
+
+  /**
+   * GET /csrf-token - Generate and return a CSRF token
+   *
+   * SECURITY: This endpoint provides CSRF tokens for state-changing requests.
+   * The token is returned in both the response body and an HttpOnly cookie.
+   * Clients must include the token in the X-CSRF-Token header for POST/PUT/DELETE requests.
+   */
+  router.get('/csrf-token', csrfTokenHandler);
+
+  /**
+   * POST /login - Authenticate with license key and get JWT token
+   *
+   * SECURITY: This is the primary authentication endpoint.
+   * Validates license key and returns a JWT token for API access.
+   * CSRF protection applied to prevent cross-site login attacks.
+   */
+  router.post('/login', validateCsrfToken, async (req, res) => {
+    const { licenseKey } = req.body;
+
+    if (!licenseKey) {
+      authLogger.logLoginFailed(req, 'missing_license_key', { licenseKey: null });
+      return res.status(400).json({
+        error: 'License key required',
+        message: 'Please provide your license key to log in'
+      });
+    }
+
+    try {
+      // Validate and activate the license key
+      const licenseResult = await licenseService.activateLicenseKey(licenseKey);
+
+      if (!licenseResult.success) {
+        authLogger.logLoginFailed(req, licenseResult.error || 'invalid_license_key', { licenseKey });
+        return res.status(401).json({
+          error: 'Invalid license key',
+          message: licenseResult.error || 'The license key is invalid or expired'
+        });
+      }
+
+      // Get user's tier and balance
+      const balance = await usageTracking.getBalance(licenseResult.customerId);
+
+      // Generate JWT tokens
+      const tokenResult = generateToken(licenseResult.customerId, {
+        tier: balance.tier,
+        email: licenseResult.email
+      });
+      const refreshResult = generateRefreshToken(licenseResult.customerId);
+
+      // Log successful login with structured logging
+      authLogger.logLoginSuccess(req, licenseResult.customerId, {
+        email: licenseResult.email,
+        tier: balance.tier
+      });
+
+      res.json({
+        success: true,
+        token: tokenResult.token,
+        tokenType: tokenResult.tokenType,
+        expiresIn: tokenResult.expiresIn,
+        refreshToken: refreshResult.refreshToken,
+        customerId: licenseResult.customerId,
+        tier: balance.tier,
+        hoursRemaining: balance.hoursRemaining
+      });
+    } catch (err) {
+      authLogger.logLoginFailed(req, `server_error: ${err.message}`, { licenseKey });
+      res.status(500).json({ error: 'Authentication failed. Please try again.' });
+    }
+  });
+
+  /**
+   * POST /refresh - Refresh an expired JWT token
+   *
+   * Uses a refresh token to get a new access token.
+   * CSRF protection applied to prevent token theft via cross-site requests.
+   */
+  router.post('/refresh', validateCsrfToken, async (req, res) => {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      authLogger.logTokenRefreshFailed(req, 'missing_refresh_token');
+      return res.status(400).json({
+        error: 'Refresh token required'
+      });
+    }
+
+    try {
+      const decoded = await verifyToken(refreshToken, { req });
+
+      if (!decoded || decoded.type !== 'refresh') {
+        authLogger.logTokenRefreshFailed(req, 'invalid_or_wrong_token_type');
+        return res.status(401).json({
+          error: 'Invalid refresh token',
+          message: 'Please log in again'
+        });
+      }
+
+      // Get current user info
+      const balance = await usageTracking.getBalance(decoded.sub);
+
+      // Generate new access token
+      const tokenResult = generateToken(decoded.sub, {
+        tier: balance.tier
+      });
+
+      // Log successful token refresh
+      authLogger.logTokenRefreshSuccess(req, decoded.sub);
+
+      res.json({
+        success: true,
+        token: tokenResult.token,
+        tokenType: tokenResult.tokenType,
+        expiresIn: tokenResult.expiresIn
+      });
+    } catch (err) {
+      authLogger.logTokenRefreshFailed(req, `server_error: ${err.message}`);
+      res.status(401).json({
+        error: 'Failed to refresh token',
+        message: 'Please log in again'
+      });
+    }
+  });
+
+  /**
+   * POST /logout - Invalidate tokens by adding to blacklist
+   *
+   * Adds the current token's jti to the blacklist so it cannot be reused.
+   * Also accepts an optional refreshToken to revoke both tokens at once.
+   * CSRF protection applied to prevent forced logout attacks.
+   */
+  router.post('/logout', validateCsrfToken, authenticateToken, (req, res) => {
+    const { refreshToken } = req.body;
+    let refreshTokenRevoked = false;
+
+    // Blacklist the access token using the blacklistToken function from authHelpers
+    if (req.tokenData && req.tokenData.jti && req.tokenData.exp) {
+      if (blacklistToken) {
+        blacklistToken(req.tokenData.jti, req.tokenData.exp, {
+          userId: req.stripeCustomerId,
+          reason: 'logout'
+        });
+      } else {
+        console.warn('[Auth] Logout: blacklistToken function not available');
+      }
+    } else {
+      // Token doesn't have jti - log warning but continue
+      // This handles tokens generated before jti was added
+      console.warn('[Auth] Logout: token missing jti or exp, cannot blacklist access token');
+    }
+
+    // Optionally blacklist the refresh token too
+    if (refreshToken && blacklistToken) {
+      // Use checkBlacklist: false to allow decoding already-blacklisted refresh tokens
+      const decoded = verifyToken(refreshToken, { checkBlacklist: false });
+      if (decoded && decoded.jti && decoded.exp) {
+        blacklistToken(decoded.jti, decoded.exp, {
+          userId: req.stripeCustomerId,
+          reason: 'logout_refresh'
+        });
+        refreshTokenRevoked = true;
+      }
+    }
+
+    // Log successful logout with structured logging
+    authLogger.logLogoutSuccess(req, req.stripeCustomerId, {
+      jti: req.tokenData?.jti,
+      refreshTokenRevoked
+    });
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+  });
+
+  // ==========================================================================
+  // Email Verification Endpoints
+  // ==========================================================================
+
+  /**
+   * POST /send-verification - Send a verification code to an email address
+   *
+   * Request body: { email: string }
+   * Response: { success: boolean, message: string, expiresInMinutes?: number }
+   *
+   * SECURITY: Rate limited to prevent abuse. CSRF protection applied.
+   */
+  router.post('/send-verification', validateCsrfToken, async (req, res) => {
+    const { email } = req.body;
+
+    // Validate email
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email required',
+        message: 'Please provide an email address'
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        error: 'Invalid email',
+        message: 'Please provide a valid email address'
+      });
+    }
+
+    // Check rate limiting
+    const rateCheck = canSendCode(email);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        error: 'Too many requests',
+        message: `Please wait ${rateCheck.waitSeconds} seconds before requesting a new code`,
+        waitSeconds: rateCheck.waitSeconds
+      });
+    }
+
+    try {
+      // Generate and store verification code
+      const code = generateVerificationCode();
+      storeVerificationCode(email, code);
+
+      // Send verification email
+      if (emailService && emailService.sendEmailVerificationCode) {
+        await emailService.sendEmailVerificationCode(email, code, 10);
+        console.log(`[Auth] Verification code sent to ${maskSensitiveData(email)}`);
+      } else {
+        // Fallback for development - log to console
+        console.log(`[Auth] Verification code for ${email}: ${code} (emailService not configured)`);
+      }
+
+      res.json({
+        success: true,
+        message: 'Verification code sent. Please check your email.',
+        expiresInMinutes: 10
+      });
+    } catch (err) {
+      console.error('[Auth] Send verification error:', err.message);
+      res.status(500).json({
+        error: 'Failed to send verification code',
+        message: 'Please try again later'
+      });
+    }
+  });
+
+  /**
+   * POST /verify-email - Verify an email address with a code
+   *
+   * Request body: { email: string, code: string }
+   * Response: { success: boolean, verified: boolean, message?: string, error?: string }
+   *
+   * SECURITY: Limited attempts per code. CSRF protection applied.
+   */
+  router.post('/verify-email', validateCsrfToken, async (req, res) => {
+    const { email, code } = req.body;
+
+    // Validate inputs
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email required',
+        message: 'Please provide an email address'
+      });
+    }
+
+    if (!code) {
+      return res.status(400).json({
+        error: 'Code required',
+        message: 'Please provide the verification code'
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        error: 'Invalid email',
+        message: 'Please provide a valid email address'
+      });
+    }
+
+    // Validate code format (6 digits)
+    const codeStr = String(code).trim();
+    if (!/^\d{6}$/.test(codeStr)) {
+      return res.status(400).json({
+        error: 'Invalid code format',
+        message: 'Verification code must be 6 digits'
+      });
+    }
+
+    try {
+      // Verify the code
+      const result = verifyCode(email, codeStr);
+
+      if (!result.valid) {
+        return res.status(400).json({
+          success: false,
+          verified: false,
+          error: 'Verification failed',
+          message: result.error
+        });
+      }
+
+      // Mark email as verified in the database
+      if (usageTracking && usageTracking.markEmailVerified) {
+        const dbResult = await usageTracking.markEmailVerified(email);
+        if (!dbResult.success) {
+          console.warn(`[Auth] Failed to persist email verification: ${dbResult.error}`);
+        }
+      }
+
+      console.log(`[Auth] Email verified: ${maskSensitiveData(email)}`);
+
+      // Email verified successfully
+      res.json({
+        success: true,
+        verified: true,
+        message: 'Email verified successfully'
+      });
+    } catch (err) {
+      console.error('[Auth] Verify email error:', err.message);
+      res.status(500).json({
+        error: 'Verification failed',
+        message: 'Please try again later'
+      });
+    }
+  });
+
+  return router;
+}
+
+module.exports = createAuthRoutes;

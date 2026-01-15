@@ -1,0 +1,499 @@
+import * as vscode from "vscode"
+import * as path from "path"
+import * as fs from "fs/promises"
+import { parse as parseYaml } from "yaml"
+import type {
+	WorkspaceAgentConfig,
+	WorkspaceAgentState,
+	WorkspaceContext,
+	WorkspaceInfo,
+	WorkspaceSwitcherState,
+	MultiProjectConfig,
+	multiProjectConfigSchema,
+} from "@multi-agent/types"
+
+export interface WorkspaceManagerOptions {
+	extensionContext: vscode.ExtensionContext
+	outputChannel: vscode.OutputChannel
+}
+
+/**
+ * Manages multi-workspace support for MultiAgent.
+ * Tracks workspace folders, manages per-workspace configurations,
+ * and coordinates workspace switching.
+ */
+export class WorkspaceManager implements vscode.Disposable {
+	private static instance: WorkspaceManager | undefined
+	private readonly context: vscode.ExtensionContext
+	private readonly outputChannel: vscode.OutputChannel
+	private readonly disposables: vscode.Disposable[] = []
+
+	// Workspace state tracking
+	private workspaceStates: Map<string, WorkspaceAgentState> = new Map()
+	private activeWorkspacePath: string | undefined
+	private focusedWorkspacePath: string | undefined
+
+	// Configuration
+	private multiProjectConfig: MultiProjectConfig | undefined
+	private configWatcher: vscode.FileSystemWatcher | undefined
+
+	// Events
+	private readonly _onWorkspaceChanged = new vscode.EventEmitter<WorkspaceContext>()
+	private readonly _onWorkspacesUpdated = new vscode.EventEmitter<WorkspaceInfo[]>()
+	private readonly _onConfigChanged = new vscode.EventEmitter<MultiProjectConfig | undefined>()
+
+	public readonly onWorkspaceChanged = this._onWorkspaceChanged.event
+	public readonly onWorkspacesUpdated = this._onWorkspacesUpdated.event
+	public readonly onConfigChanged = this._onConfigChanged.event
+
+	private constructor(options: WorkspaceManagerOptions) {
+		this.context = options.extensionContext
+		this.outputChannel = options.outputChannel
+	}
+
+	/**
+	 * Get or create the singleton WorkspaceManager instance
+	 */
+	static getInstance(options?: WorkspaceManagerOptions): WorkspaceManager {
+		if (!WorkspaceManager.instance) {
+			if (!options) {
+				throw new Error("WorkspaceManager requires options for first initialization")
+			}
+			WorkspaceManager.instance = new WorkspaceManager(options)
+		}
+		return WorkspaceManager.instance
+	}
+
+	/**
+	 * Check if instance exists
+	 */
+	static hasInstance(): boolean {
+		return !!WorkspaceManager.instance
+	}
+
+	/**
+	 * Initialize the workspace manager
+	 */
+	async initialize(): Promise<void> {
+		this.log("Initializing WorkspaceManager")
+
+		// Initialize workspace folders
+		await this.initializeWorkspaceFolders()
+
+		// Load multi-project configuration
+		await this.loadMultiProjectConfig()
+
+		// Watch for configuration changes
+		this.setupConfigWatcher()
+
+		// Watch for workspace folder changes
+		this.disposables.push(
+			vscode.workspace.onDidChangeWorkspaceFolders((e) => {
+				this.handleWorkspaceFoldersChanged(e)
+			}),
+		)
+
+		this.log(`Initialized with ${this.workspaceStates.size} workspace(s)`)
+	}
+
+	/**
+	 * Initialize state for all workspace folders
+	 */
+	private async initializeWorkspaceFolders(): Promise<void> {
+		const folders = vscode.workspace.workspaceFolders
+
+		if (!folders || folders.length === 0) {
+			this.log("No workspace folders found")
+			return
+		}
+
+		for (const folder of folders) {
+			const workspacePath = folder.uri.fsPath
+			const state = this.createWorkspaceState(workspacePath, folder.index)
+			this.workspaceStates.set(workspacePath, state)
+		}
+
+		// Set initial active workspace to the first folder
+		const firstFolder = folders[0]
+		this.activeWorkspacePath = firstFolder.uri.fsPath
+		this.focusedWorkspacePath = firstFolder.uri.fsPath
+	}
+
+	/**
+	 * Create initial state for a workspace
+	 */
+	private createWorkspaceState(workspacePath: string, folderIndex: number): WorkspaceAgentState {
+		return {
+			workspacePath,
+			workspaceFolderIndex: folderIndex,
+			providerId: `provider-${folderIndex}-${Date.now()}`,
+			isActive: folderIndex === 0,
+			isFocused: folderIndex === 0,
+			taskQueue: [],
+			config: {
+				workspacePath,
+				enabled: true,
+				isolatedContext: true,
+				maxConcurrentTasks: 1,
+			},
+		}
+	}
+
+	/**
+	 * Load multi-project configuration from .multiagent/workspaces.yaml
+	 */
+	private async loadMultiProjectConfig(): Promise<void> {
+		const configPath = this.getConfigPath()
+		if (!configPath) {
+			return
+		}
+
+		try {
+			const content = await fs.readFile(configPath, "utf-8")
+			const parsed = parseYaml(content)
+			const validated = multiProjectConfigSchema.parse(parsed)
+			this.multiProjectConfig = validated
+
+			// Apply configuration to workspace states
+			this.applyConfiguration(validated)
+
+			this.log(`Loaded multi-project config: ${validated.workspaces.length} workspace(s) configured`)
+			this._onConfigChanged.fire(validated)
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				this.log(`Failed to load multi-project config: ${error}`)
+			}
+		}
+	}
+
+	/**
+	 * Get the path to the multi-project config file
+	 */
+	private getConfigPath(): string | undefined {
+		const folders = vscode.workspace.workspaceFolders
+		if (!folders || folders.length === 0) {
+			return undefined
+		}
+		return path.join(folders[0].uri.fsPath, ".multiagent", "workspaces.yaml")
+	}
+
+	/**
+	 * Apply loaded configuration to workspace states
+	 */
+	private applyConfiguration(config: MultiProjectConfig): void {
+		for (const workspaceConfig of config.workspaces) {
+			// Resolve workspace path (supports ${workspaceFolder} variable)
+			const resolvedPath = this.resolveWorkspacePath(workspaceConfig.workspacePath)
+			const state = this.workspaceStates.get(resolvedPath)
+
+			if (state) {
+				state.config = {
+					...state.config,
+					...workspaceConfig,
+					workspacePath: resolvedPath,
+				}
+			}
+		}
+	}
+
+	/**
+	 * Resolve workspace path variables
+	 */
+	private resolveWorkspacePath(workspacePath: string): string {
+		const folders = vscode.workspace.workspaceFolders
+		if (!folders || folders.length === 0) {
+			return workspacePath
+		}
+
+		// Replace ${workspaceFolder} with the first workspace folder
+		if (workspacePath.includes("${workspaceFolder}")) {
+			return workspacePath.replace("${workspaceFolder}", folders[0].uri.fsPath)
+		}
+
+		// Replace ${workspaceFolder:N} with the Nth workspace folder
+		const indexMatch = workspacePath.match(/\$\{workspaceFolder:(\d+)\}/)
+		if (indexMatch) {
+			const index = parseInt(indexMatch[1], 10)
+			if (folders[index]) {
+				return workspacePath.replace(indexMatch[0], folders[index].uri.fsPath)
+			}
+		}
+
+		return workspacePath
+	}
+
+	/**
+	 * Set up file watcher for configuration changes
+	 */
+	private setupConfigWatcher(): void {
+		const folders = vscode.workspace.workspaceFolders
+		if (!folders || folders.length === 0) {
+			return
+		}
+
+		const pattern = new vscode.RelativePattern(folders[0], ".multiagent/workspaces.yaml")
+		this.configWatcher = vscode.workspace.createFileSystemWatcher(pattern)
+
+		this.configWatcher.onDidChange(() => this.loadMultiProjectConfig())
+		this.configWatcher.onDidCreate(() => this.loadMultiProjectConfig())
+		this.configWatcher.onDidDelete(() => {
+			this.multiProjectConfig = undefined
+			this._onConfigChanged.fire(undefined)
+		})
+
+		this.disposables.push(this.configWatcher)
+	}
+
+	/**
+	 * Handle workspace folder changes
+	 */
+	private handleWorkspaceFoldersChanged(event: vscode.WorkspaceFoldersChangeEvent): void {
+		// Add new folders
+		for (const folder of event.added) {
+			const workspacePath = folder.uri.fsPath
+			if (!this.workspaceStates.has(workspacePath)) {
+				const state = this.createWorkspaceState(workspacePath, folder.index)
+				this.workspaceStates.set(workspacePath, state)
+				this.log(`Added workspace: ${workspacePath}`)
+			}
+		}
+
+		// Remove deleted folders
+		for (const folder of event.removed) {
+			const workspacePath = folder.uri.fsPath
+			if (this.workspaceStates.has(workspacePath)) {
+				this.workspaceStates.delete(workspacePath)
+				this.log(`Removed workspace: ${workspacePath}`)
+
+				// If active workspace was removed, switch to first available
+				if (this.activeWorkspacePath === workspacePath) {
+					const firstWorkspace = Array.from(this.workspaceStates.keys())[0]
+					if (firstWorkspace) {
+						this.switchWorkspace(firstWorkspace)
+					}
+				}
+			}
+		}
+
+		this._onWorkspacesUpdated.fire(this.getWorkspaceInfoList())
+	}
+
+	/**
+	 * Switch to a different workspace
+	 */
+	async switchWorkspace(workspacePath: string): Promise<void> {
+		const state = this.workspaceStates.get(workspacePath)
+		if (!state) {
+			this.log(`Cannot switch to unknown workspace: ${workspacePath}`)
+			return
+		}
+
+		// Update previous workspace state
+		if (this.focusedWorkspacePath) {
+			const previousState = this.workspaceStates.get(this.focusedWorkspacePath)
+			if (previousState) {
+				previousState.isFocused = false
+			}
+		}
+
+		// Update new workspace state
+		state.isFocused = true
+		this.focusedWorkspacePath = workspacePath
+
+		this.log(`Switched to workspace: ${workspacePath}`)
+
+		// Fire events
+		const context = this.getWorkspaceContext(workspacePath)
+		if (context) {
+			this._onWorkspaceChanged.fire(context)
+		}
+		this._onWorkspacesUpdated.fire(this.getWorkspaceInfoList())
+	}
+
+	/**
+	 * Get the current workspace context
+	 */
+	getCurrentWorkspaceContext(): WorkspaceContext | undefined {
+		if (!this.focusedWorkspacePath) {
+			return undefined
+		}
+		return this.getWorkspaceContext(this.focusedWorkspacePath)
+	}
+
+	/**
+	 * Get workspace context for a specific path
+	 */
+	getWorkspaceContext(workspacePath: string): WorkspaceContext | undefined {
+		const state = this.workspaceStates.get(workspacePath)
+		if (!state) {
+			return undefined
+		}
+
+		const folders = vscode.workspace.workspaceFolders
+		const folder = folders?.find((f) => f.uri.fsPath === workspacePath)
+
+		return {
+			workspacePath,
+			workspaceFolderIndex: state.workspaceFolderIndex,
+			workspaceName: folder?.name || path.basename(workspacePath),
+			isMultiRoot: (folders?.length || 0) > 1,
+			relatedWorkspaces: this.getRelatedWorkspaces(workspacePath),
+		}
+	}
+
+	/**
+	 * Get related workspaces based on configuration
+	 */
+	private getRelatedWorkspaces(workspacePath: string): string[] | undefined {
+		if (!this.multiProjectConfig?.orchestration?.projectDependencies) {
+			return undefined
+		}
+
+		const deps = this.multiProjectConfig.orchestration.projectDependencies[workspacePath]
+		return deps
+	}
+
+	/**
+	 * Get list of all workspace info for UI
+	 */
+	getWorkspaceInfoList(): WorkspaceInfo[] {
+		const infos: WorkspaceInfo[] = []
+
+		for (const [workspacePath, state] of this.workspaceStates) {
+			const folder = vscode.workspace.workspaceFolders?.find((f) => f.uri.fsPath === workspacePath)
+
+			infos.push({
+				path: workspacePath,
+				name: folder?.name || path.basename(workspacePath),
+				folderIndex: state.workspaceFolderIndex,
+				hasAgent: state.config.enabled,
+				isActive: state.isActive,
+				isFocused: state.isFocused,
+				currentTaskId: state.currentTaskId,
+				taskCount: state.taskQueue.length,
+			})
+		}
+
+		return infos.sort((a, b) => a.folderIndex - b.folderIndex)
+	}
+
+	/**
+	 * Get workspace switcher state for UI
+	 */
+	getWorkspaceSwitcherState(): WorkspaceSwitcherState {
+		const workspaces = this.getWorkspaceInfoList()
+		const activeIndex = workspaces.findIndex((w) => w.path === this.activeWorkspacePath)
+		const focusedIndex = workspaces.findIndex((w) => w.path === this.focusedWorkspacePath)
+
+		return {
+			availableWorkspaces: workspaces,
+			activeWorkspaceIndex: activeIndex >= 0 ? activeIndex : 0,
+			focusedWorkspaceIndex: focusedIndex >= 0 ? focusedIndex : 0,
+		}
+	}
+
+	/**
+	 * Set task for a workspace
+	 */
+	setWorkspaceTask(workspacePath: string, taskId: string | undefined): void {
+		const state = this.workspaceStates.get(workspacePath)
+		if (state) {
+			state.currentTaskId = taskId
+			if (taskId) {
+				state.isActive = true
+			}
+			this._onWorkspacesUpdated.fire(this.getWorkspaceInfoList())
+		}
+	}
+
+	/**
+	 * Add task to workspace queue
+	 */
+	queueTask(workspacePath: string, taskId: string): void {
+		const state = this.workspaceStates.get(workspacePath)
+		if (state) {
+			state.taskQueue.push(taskId)
+			this._onWorkspacesUpdated.fire(this.getWorkspaceInfoList())
+		}
+	}
+
+	/**
+	 * Remove task from workspace queue
+	 */
+	dequeueTask(workspacePath: string, taskId: string): void {
+		const state = this.workspaceStates.get(workspacePath)
+		if (state) {
+			state.taskQueue = state.taskQueue.filter((id) => id !== taskId)
+			this._onWorkspacesUpdated.fire(this.getWorkspaceInfoList())
+		}
+	}
+
+	/**
+	 * Check if workspace has capacity for more tasks
+	 */
+	hasTaskCapacity(workspacePath: string): boolean {
+		const state = this.workspaceStates.get(workspacePath)
+		if (!state) {
+			return false
+		}
+
+		const maxConcurrent = state.config.maxConcurrentTasks || 1
+		const currentCount = state.currentTaskId ? 1 : 0
+		return currentCount < maxConcurrent
+	}
+
+	/**
+	 * Get workspace configuration
+	 */
+	getWorkspaceConfig(workspacePath: string): WorkspaceAgentConfig | undefined {
+		return this.workspaceStates.get(workspacePath)?.config
+	}
+
+	/**
+	 * Check if multi-project mode is enabled
+	 */
+	isMultiProjectEnabled(): boolean {
+		const folders = vscode.workspace.workspaceFolders
+		return (folders?.length || 0) > 1 || !!this.multiProjectConfig
+	}
+
+	/**
+	 * Get the focused workspace path
+	 */
+	getFocusedWorkspacePath(): string | undefined {
+		return this.focusedWorkspacePath
+	}
+
+	/**
+	 * Get the active workspace path
+	 */
+	getActiveWorkspacePath(): string | undefined {
+		return this.activeWorkspacePath
+	}
+
+	/**
+	 * Log a message
+	 */
+	private log(message: string): void {
+		this.outputChannel.appendLine(`[WorkspaceManager] ${message}`)
+	}
+
+	/**
+	 * Dispose the workspace manager
+	 */
+	dispose(): void {
+		this.log("Disposing WorkspaceManager")
+
+		for (const disposable of this.disposables) {
+			disposable.dispose()
+		}
+		this.disposables.length = 0
+
+		this._onWorkspaceChanged.dispose()
+		this._onWorkspacesUpdated.dispose()
+		this._onConfigChanged.dispose()
+
+		this.workspaceStates.clear()
+		WorkspaceManager.instance = undefined
+	}
+}

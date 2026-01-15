@@ -1,0 +1,529 @@
+#!/usr/bin/env node
+
+/**
+ * Live Capture Server
+ *
+ * Runs a local server that receives captured data from the browser in real-time.
+ * When you're done browsing, press 'p' to process all captured data.
+ *
+ * Usage: node live-capture-server.js [output-dir]
+ */
+
+const http = require('http');
+const fs = require('fs').promises;
+const path = require('path');
+const Deobfuscator = require('./lib/deobfuscator');
+
+const PORT = 9999;
+const outputDir = process.argv[2] || './live-capture';
+
+// Store all captured data
+const captured = {
+  pages: {},
+  scripts: {},
+  styles: {},
+  api: {},
+  startTime: new Date().toISOString()
+};
+
+// Stats
+let stats = {
+  pages: 0,
+  scripts: 0,
+  styles: 0,
+  api: 0,
+  lastActivity: null
+};
+
+// CORS headers for browser requests
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Content-Type': 'application/json'
+};
+
+// Simple JS beautifier
+function beautifyJS(code) {
+  try {
+    let result = code;
+    result = result.replace(/;(?=\s*[^\s])/g, ';\n');
+    result = result.replace(/\{(?=\s*[^\s\}])/g, '{\n');
+    result = result.replace(/(?<=\S)\}/g, '\n}');
+    result = result.replace(/\}(?=\s*[a-zA-Z])/g, '}\n');
+
+    const lines = result.split('\n');
+    let indent = 0;
+    const indented = lines.map(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return '';
+      if (trimmed.startsWith('}') || trimmed.startsWith(']')) {
+        indent = Math.max(0, indent - 1);
+      }
+      const indentedLine = '  '.repeat(indent) + trimmed;
+      if (trimmed.endsWith('{') || trimmed.endsWith('[')) {
+        indent++;
+      }
+      return indentedLine;
+    });
+    return indented.join('\n');
+  } catch (e) {
+    return code;
+  }
+}
+
+// Simple CSS beautifier
+function beautifyCSS(code) {
+  try {
+    let result = code;
+    result = result.replace(/\{/g, '{\n');
+    result = result.replace(/\}/g, '\n}\n');
+    result = result.replace(/;/g, ';\n');
+    result = result.replace(/\n\s*\n/g, '\n');
+
+    const lines = result.split('\n');
+    let inBlock = false;
+    const indented = lines.map(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return '';
+      if (trimmed.includes('{')) { inBlock = true; return trimmed; }
+      if (trimmed.includes('}')) { inBlock = false; return trimmed; }
+      return inBlock ? '  ' + trimmed : trimmed;
+    });
+    return indented.join('\n');
+  } catch (e) {
+    return code;
+  }
+}
+
+// Print status
+function printStatus() {
+  console.clear();
+  console.log('\x1b[36m╔═══════════════════════════════════════════════════════════╗\x1b[0m');
+  console.log('\x1b[36m║            🔴 LIVE CAPTURE SERVER RUNNING                 ║\x1b[0m');
+  console.log('\x1b[36m╠═══════════════════════════════════════════════════════════╣\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Pages captured:     \x1b[33m' + String(stats.pages).padEnd(5) + '\x1b[0m                              \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Scripts captured:   \x1b[33m' + String(stats.scripts).padEnd(5) + '\x1b[0m                              \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Styles captured:    \x1b[33m' + String(stats.styles).padEnd(5) + '\x1b[0m                              \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  API calls captured: \x1b[33m' + String(stats.api).padEnd(5) + '\x1b[0m                              \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m╠═══════════════════════════════════════════════════════════╣\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Press \x1b[32mp\x1b[0m to process & save all captured data              \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Press \x1b[32ms\x1b[0m to show detailed status                          \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m║\x1b[0m  Press \x1b[32mq\x1b[0m to quit                                          \x1b[36m║\x1b[0m');
+  console.log('\x1b[36m╚═══════════════════════════════════════════════════════════╝\x1b[0m');
+
+  if (stats.lastActivity) {
+    console.log(`\n\x1b[90mLast activity: ${stats.lastActivity}\x1b[0m`);
+  }
+}
+
+// Show detailed status
+function showDetailedStatus() {
+  console.log('\n\x1b[33m=== Captured Pages ===\x1b[0m');
+  Object.keys(captured.pages).forEach(f => console.log(`  - ${f}`));
+
+  console.log('\n\x1b[33m=== Captured API Endpoints ===\x1b[0m');
+  Object.entries(captured.api).forEach(([f, data]) => {
+    console.log(`  - ${data.method} ${data.url}`);
+  });
+
+  console.log('\n\x1b[33m=== Captured Scripts ===\x1b[0m');
+  console.log(`  ${Object.keys(captured.scripts).length} files`);
+
+  console.log('\n\x1b[33m=== Captured Styles ===\x1b[0m');
+  console.log(`  ${Object.keys(captured.styles).length} files`);
+
+  console.log('\nPress any key to continue...');
+}
+
+// Process all captured data
+async function processCaptures() {
+  console.log('\n\x1b[36m[PROCESSING] Creating output directories...\x1b[0m');
+
+  const dirs = ['html', 'js', 'js-beautified', 'js-deobfuscated', 'css', 'css-beautified', 'api'];
+  for (const dir of dirs) {
+    await fs.mkdir(path.join(outputDir, dir), { recursive: true });
+  }
+
+  const processStats = {
+    pages: 0,
+    scripts: 0,
+    scriptsDeobfuscated: 0,
+    styles: 0,
+    api: 0
+  };
+
+  // Process HTML
+  console.log('\x1b[36m[PROCESSING] Saving HTML pages...\x1b[0m');
+  for (const [filename, page] of Object.entries(captured.pages)) {
+    await fs.writeFile(path.join(outputDir, 'html', filename), page.content);
+    console.log(`  ✓ ${filename}`);
+    processStats.pages++;
+  }
+
+  // Process JavaScript
+  console.log('\x1b[36m[PROCESSING] Processing JavaScript...\x1b[0m');
+  const deobfuscator = new Deobfuscator();
+
+  for (const [filename, script] of Object.entries(captured.scripts)) {
+    // Save original
+    await fs.writeFile(path.join(outputDir, 'js', filename), script.content);
+
+    // Beautify
+    const beautified = beautifyJS(script.content);
+    await fs.writeFile(path.join(outputDir, 'js-beautified', filename), beautified);
+
+    // Deobfuscate if needed
+    if (Deobfuscator.isObfuscated(script.content)) {
+      try {
+        const result = deobfuscator.deobfuscate(script.content);
+        await fs.writeFile(path.join(outputDir, 'js-deobfuscated', filename), result.code);
+        console.log(`  ✓ ${filename} \x1b[32m[DEOBFUSCATED]\x1b[0m`);
+        processStats.scriptsDeobfuscated++;
+      } catch (e) {
+        console.log(`  ✓ ${filename}`);
+      }
+    } else {
+      console.log(`  ✓ ${filename}`);
+    }
+    processStats.scripts++;
+  }
+
+  // Process CSS
+  console.log('\x1b[36m[PROCESSING] Processing CSS...\x1b[0m');
+  for (const [filename, style] of Object.entries(captured.styles)) {
+    await fs.writeFile(path.join(outputDir, 'css', filename), style.content);
+    const beautified = beautifyCSS(style.content);
+    await fs.writeFile(path.join(outputDir, 'css-beautified', filename), beautified);
+    console.log(`  ✓ ${filename}`);
+    processStats.styles++;
+  }
+
+  // Process API
+  console.log('\x1b[36m[PROCESSING] Saving API responses...\x1b[0m');
+  for (const [filename, api] of Object.entries(captured.api)) {
+    const content = JSON.stringify({
+      url: api.url,
+      method: api.method,
+      status: api.status,
+      timestamp: api.timestamp,
+      response: api.data
+    }, null, 2);
+    await fs.writeFile(path.join(outputDir, 'api', filename), content);
+    console.log(`  ✓ ${api.method} ${api.url}`);
+    processStats.api++;
+  }
+
+  // Generate summary
+  const summary = `# Live Capture Summary
+
+**Started:** ${captured.startTime}
+**Processed:** ${new Date().toISOString()}
+
+## Statistics
+- HTML Pages: ${processStats.pages}
+- JavaScript Files: ${processStats.scripts}
+  - Deobfuscated: ${processStats.scriptsDeobfuscated}
+- CSS Files: ${processStats.styles}
+- API Responses: ${processStats.api}
+
+## Pages Captured
+${Object.entries(captured.pages).map(([f, p]) => `- [${p.title}](html/${f}) - ${p.url}`).join('\n')}
+
+## API Endpoints
+${Object.entries(captured.api).map(([f, a]) => `- ${a.method} ${a.url}`).join('\n')}
+`;
+
+  await fs.writeFile(path.join(outputDir, 'SUMMARY.md'), summary);
+
+  console.log('\n\x1b[32m╔═══════════════════════════════════════════════════════════╗\x1b[0m');
+  console.log('\x1b[32m║              ✅ PROCESSING COMPLETE!                      ║\x1b[0m');
+  console.log('\x1b[32m╚═══════════════════════════════════════════════════════════╝\x1b[0m');
+  console.log(`
+  Pages:              ${processStats.pages}
+  Scripts:            ${processStats.scripts}
+  Scripts Deobfuscated: ${processStats.scriptsDeobfuscated}
+  Styles:             ${processStats.styles}
+  API Responses:      ${processStats.api}
+
+  \x1b[36mOutput saved to: ${path.resolve(outputDir)}\x1b[0m
+`);
+}
+
+// Handle incoming data
+function handleCapture(data) {
+  const { type, filename, content, url, method, status, title, size, timestamp } = data;
+
+  switch (type) {
+    case 'page':
+      captured.pages[filename] = { url, title, content, size, timestamp };
+      stats.pages = Object.keys(captured.pages).length;
+      stats.lastActivity = `Page: ${filename}`;
+      break;
+
+    case 'script':
+      captured.scripts[filename] = { url, content, size };
+      stats.scripts = Object.keys(captured.scripts).length;
+      stats.lastActivity = `Script: ${filename}`;
+      break;
+
+    case 'style':
+      captured.styles[filename] = { url, content, size };
+      stats.styles = Object.keys(captured.styles).length;
+      stats.lastActivity = `Style: ${filename}`;
+      break;
+
+    case 'api':
+      captured.api[filename] = { url, method, status, data: content, timestamp };
+      stats.api = Object.keys(captured.api).length;
+      stats.lastActivity = `API: ${method} ${url}`;
+      break;
+  }
+
+  printStatus();
+}
+
+// Create HTTP server
+const server = http.createServer((req, res) => {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/capture') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        handleCapture(data);
+        res.writeHead(200, corsHeaders);
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        res.writeHead(400, corsHeaders);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Serve the console script
+  if (req.url === '/script') {
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/javascript' });
+    res.end(generateConsoleScript());
+    return;
+  }
+
+  res.writeHead(404, corsHeaders);
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+// Generate the console script with server URL baked in
+function generateConsoleScript() {
+  return `/**
+ * Auto-Capture Script - Paste this in the browser console
+ * Automatically captures everything and sends to local server
+ */
+
+(function() {
+  const SERVER = 'http://localhost:${PORT}';
+  let originalFetch = window.fetch;
+  let capturedScripts = new Set();
+  let capturedStyles = new Set();
+
+  function safeFilename(url) {
+    try {
+      const u = new URL(url);
+      let name = u.pathname.replace(/^\\//, '').replace(/\\//g, '_') || 'index';
+      if (u.search) name += '_' + u.search.slice(1).replace(/[=&]/g, '-').replace(/[^a-zA-Z0-9_-]/g, '');
+      return name.slice(0, 100);
+    } catch { return 'file_' + Math.random().toString(36).slice(2, 10); }
+  }
+
+  async function sendToServer(data) {
+    try {
+      await originalFetch(SERVER + '/capture', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+    } catch (e) {
+      console.warn('[CAPTURE] Server not reachable:', e.message);
+    }
+  }
+
+  // Intercept fetch
+  window.fetch = async function(...args) {
+    const response = await originalFetch.apply(this, args);
+    try {
+      const url = typeof args[0] === 'string' ? args[0] : args[0].url;
+      const clone = response.clone();
+      const contentType = clone.headers.get('content-type') || '';
+
+      if (contentType.includes('application/json') || url.includes('/api/')) {
+        const json = await clone.json();
+        sendToServer({
+          type: 'api',
+          filename: safeFilename(url) + '.json',
+          url,
+          method: args[1]?.method || 'GET',
+          status: response.status,
+          content: json,
+          timestamp: new Date().toISOString()
+        });
+        console.log('%c[AUTO-CAPTURE] API: ' + url, 'color: #4CAF50');
+      }
+    } catch (e) {}
+    return response;
+  };
+
+  // Intercept XHR
+  const origXHR = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this._url = url;
+    this._method = method;
+    this.addEventListener('load', function() {
+      try {
+        const ct = this.getResponseHeader('content-type') || '';
+        if (ct.includes('application/json') || this._url.includes('/api/')) {
+          sendToServer({
+            type: 'api',
+            filename: safeFilename(this._url) + '.json',
+            url: this._url,
+            method: this._method,
+            status: this.status,
+            content: JSON.parse(this.responseText),
+            timestamp: new Date().toISOString()
+          });
+          console.log('%c[AUTO-CAPTURE] XHR: ' + this._url, 'color: #4CAF50');
+        }
+      } catch (e) {}
+    });
+    return origXHR.apply(this, [method, url, ...rest]);
+  };
+
+  // Capture page and assets
+  async function captureCurrentPage() {
+    const url = window.location.href;
+    const filename = safeFilename(url) + '.html';
+
+    // Capture HTML
+    sendToServer({
+      type: 'page',
+      filename,
+      url,
+      title: document.title,
+      content: document.documentElement.outerHTML,
+      size: document.documentElement.outerHTML.length,
+      timestamp: new Date().toISOString()
+    });
+    console.log('%c[AUTO-CAPTURE] Page: ' + filename, 'color: #FF9800');
+
+    // Capture scripts
+    for (const script of document.querySelectorAll('script[src]')) {
+      if (capturedScripts.has(script.src)) continue;
+      capturedScripts.add(script.src);
+      try {
+        const resp = await originalFetch(script.src);
+        const text = await resp.text();
+        sendToServer({
+          type: 'script',
+          filename: safeFilename(script.src) + '.js',
+          url: script.src,
+          content: text,
+          size: text.length
+        });
+        console.log('%c[AUTO-CAPTURE] Script: ' + script.src.split('/').pop(), 'color: #2196F3');
+      } catch (e) {}
+    }
+
+    // Capture inline scripts
+    document.querySelectorAll('script:not([src])').forEach((s, i) => {
+      if (s.textContent.length > 100) {
+        sendToServer({
+          type: 'script',
+          filename: 'inline_' + safeFilename(url) + '_' + i + '.js',
+          url: url + '#inline-' + i,
+          content: s.textContent,
+          size: s.textContent.length
+        });
+      }
+    });
+
+    // Capture styles
+    for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
+      if (capturedStyles.has(link.href)) continue;
+      capturedStyles.add(link.href);
+      try {
+        const resp = await originalFetch(link.href);
+        const text = await resp.text();
+        sendToServer({
+          type: 'style',
+          filename: safeFilename(link.href) + '.css',
+          url: link.href,
+          content: text,
+          size: text.length
+        });
+        console.log('%c[AUTO-CAPTURE] Style: ' + link.href.split('/').pop(), 'color: #9C27B0');
+      } catch (e) {}
+    }
+  }
+
+  // Auto-capture on navigation
+  let lastUrl = location.href;
+  new MutationObserver(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(captureCurrentPage, 1000);
+    }
+  }).observe(document, { subtree: true, childList: true });
+
+  // Also listen for popstate
+  window.addEventListener('popstate', () => setTimeout(captureCurrentPage, 1000));
+
+  // Capture initial page
+  setTimeout(captureCurrentPage, 500);
+
+  console.log('%c╔═══════════════════════════════════════════╗', 'color: #4CAF50');
+  console.log('%c║   🔴 AUTO-CAPTURE ACTIVE                  ║', 'color: #4CAF50');
+  console.log('%c║   Capturing all pages & API calls...      ║', 'color: #4CAF50');
+  console.log('%c║   Just browse normally!                   ║', 'color: #4CAF50');
+  console.log('%c╚═══════════════════════════════════════════╝', 'color: #4CAF50');
+})();
+`;
+}
+
+// Start server
+async function main() {
+  await fs.mkdir(outputDir, { recursive: true });
+
+  server.listen(PORT, () => {
+    printStatus();
+    console.log(`\n\x1b[33mPaste this in your browser console:\x1b[0m`);
+    console.log(`\x1b[36mfetch('http://localhost:${PORT}/script').then(r=>r.text()).then(eval)\x1b[0m\n`);
+  });
+
+  // Handle keyboard input
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', async (key) => {
+      const char = key.toString().toLowerCase();
+
+      if (char === 'p') {
+        await processCaptures();
+      } else if (char === 's') {
+        showDetailedStatus();
+      } else if (char === 'q' || char === '\u0003') {
+        console.log('\n\x1b[33mShutting down...\x1b[0m');
+        process.exit(0);
+      } else {
+        printStatus();
+      }
+    });
+  }
+}
+
+main().catch(console.error);

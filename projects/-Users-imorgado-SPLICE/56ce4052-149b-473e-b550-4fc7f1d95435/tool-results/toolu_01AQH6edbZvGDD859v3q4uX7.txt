@@ -1,0 +1,578 @@
+     1→/**
+     2→ * Detection Routes
+     3→ *
+     4→ * Profanity, repetition, stutter, and filler word detection endpoints
+     5→ */
+     6→
+     7→const express = require('express');
+     8→const fsPromises = require('fs').promises;
+     9→const fs = require('fs');
+    10→const { transcribeWithWords } = require('../services/transcription');
+    11→const {
+    12→  detectProfanity,
+    13→  getProfanityList,
+    14→  getSupportedLanguages,
+    15→  getAvailableBleepSounds,
+    16→  parseWordList,
+    17→  generateBleepsForSegments
+    18→} = require('../services/profanityDetection');
+    19→const {
+    20→  detectStutters,
+    21→  detectAllRepetitions
+    22→} = require('../services/repetitionDetection');
+    23→const { alignToFrameFloor, alignToFrameCeil } = require('../services/cutListGenerator');
+    24→
+    25→// Async file existence check (non-blocking)
+    26→async function fileExists(filePath) {
+    27→  try {
+    28→    await fsPromises.access(filePath, fs.constants.R_OK);
+    29→    return true;
+    30→  } catch {
+    31→    return false;
+    32→  }
+    33→}
+    34→
+    35→/**
+    36→ * Create detection routes
+    37→ * @param {Object} options - Route configuration options
+    38→ * @param {Object} options.middleware - Shared middleware (requireCredits)
+    39→ * @param {Object} options.staticCache - Static response cache
+    40→ * @returns {express.Router}
+    41→ */
+    42→function createDetectionRoutes(options = {}) {
+    43→  const router = express.Router();
+    44→  const { requireCredits } = options.middleware || {};
+    45→  const { staticCache, sendCachedResponse } = options;
+    46→
+    47→  // =============================================================================
+    48→  // Profanity Detection Routes
+    49→  // =============================================================================
+    50→
+    51→  /**
+    52→   * POST /profanity - Detect profanity in audio/transcript
+    53→   *
+    54→   * Transcribes audio (if needed) and detects profanity words.
+    55→   * Returns word-level and segment-level results for muting/bleeping.
+    56→   *
+    57→   * Options:
+    58→   * - wavPath: Path to audio file (required)
+    59→   * - transcript: Pre-existing transcript (optional, skips transcription)
+    60→   * - language: Language code (en, es, fr, de) - default: en
+    61→   * - customBlocklist: Array or comma-separated string of additional words to censor
+    62→   * - customAllowlist: Array or comma-separated string of words to allow
+    63→   * - frameRate: Frame rate for boundary alignment (default: 30)
+    64→   */
+    65→  router.post('/profanity', requireCredits({ endpoint: 'profanity' }), async (req, res) => {
+    66→    const {
+    67→      wavPath,
+    68→      transcript: providedTranscript,
+    69→      language = 'en',
+    70→      customBlocklist = [],
+    71→      customAllowlist = [],
+    72→      frameRate = 30
+    73→    } = req.body;
+    74→
+    75→    if (!wavPath && !providedTranscript) {
+    76→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+    77→    }
+    78→
+    79→    if (wavPath && !(await fileExists(wavPath))) {
+    80→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+    81→    }
+    82→
+    83→    console.log(`[SPLICE] Profanity detection: ${wavPath || 'provided transcript'} (language: ${language})`);
+    84→
+    85→    try {
+    86→      // Get or create transcript with word-level timestamps
+    87→      let transcript = providedTranscript;
+    88→      if (!transcript && wavPath) {
+    89→        // Use transcribeWithWords for word-level timestamps required by profanity detection
+    90→        transcript = await transcribeWithWords(wavPath);
+    91→      }
+    92→
+    93→      // Validate transcript has words
+    94→      if (!transcript || !transcript.words || transcript.words.length === 0) {
+    95→        return res.status(400).json({
+    96→          error: 'Transcript must contain word-level timing data',
+    97→          hint: 'Ensure transcription returns words array with start/end times'
+    98→        });
+    99→      }
+   100→
+   101→      // Parse custom lists
+   102→      const blocklist = parseWordList(customBlocklist);
+   103→      const allowlist = parseWordList(customAllowlist);
+   104→
+   105→      // Detect profanity
+   106→      const result = detectProfanity(transcript, {
+   107→        language,
+   108→        customBlocklist: blocklist,
+   109→        customAllowlist: allowlist,
+   110→        frameRate
+   111→      });
+   112→
+   113→      // Deduct usage based on audio duration
+   114→      const audioDuration = transcript.duration || 0;
+   115→      let balance = null;
+   116→      if (audioDuration > 0 && req.deductUsage) {
+   117→        balance = await req.deductUsage(audioDuration);
+   118→      }
+   119→
+   120→      res.json({
+   121→        success: true,
+   122→        wavPath,
+   123→        ...result,
+   124→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   125→      });
+   126→    } catch (err) {
+   127→      console.error('[SPLICE] Profanity detection error:', err);
+   128→      res.status(500).json({ error: err.message });
+   129→    }
+   130→  });
+   131→
+   132→  /**
+   133→   * GET /profanity/languages - Get supported languages
+   134→   * PERF-FIX: Uses cached response with ETag for conditional GET
+   135→   */
+   136→  router.get('/profanity/languages', (req, res) => {
+   137→    if (sendCachedResponse && staticCache?.profanityLanguages) {
+   138→      return sendCachedResponse(req, res, 'profanityLanguages');
+   139→    }
+   140→    const languages = getSupportedLanguages();
+   141→    res.json({ success: true, languages });
+   142→  });
+   143→
+   144→  /**
+   145→   * GET /profanity/bleeps - Get available bleep sounds
+   146→   * PERF-FIX: Uses cached response with ETag for conditional GET
+   147→   */
+   148→  router.get('/profanity/bleeps', (req, res) => {
+   149→    if (sendCachedResponse && staticCache?.profanityBleeps) {
+   150→      return sendCachedResponse(req, res, 'profanityBleeps');
+   151→    }
+   152→    const sounds = getAvailableBleepSounds();
+   153→    res.json({ success: true, sounds });
+   154→  });
+   155→
+   156→  /**
+   157→   * POST /profanity/generate-bleeps - Generate bleep audio files for profanity segments
+   158→   *
+   159→   * Creates WAV bleep files for each profanity segment that can be inserted into the timeline.
+   160→   *
+   161→   * Body:
+   162→   * - segments: Array of {start, end} profanity segments (required)
+   163→   * - bleepType: Type of bleep sound ('standard', 'tv', 'radio', 'duck', 'mute') (default: 'standard')
+   164→   * - volume: Volume level 0-1 (default: 0.5)
+   165→   *
+   166→   * Returns:
+   167→   * - bleeps: Array of generated bleep file info with paths
+   168→   */
+   169→  router.post('/profanity/generate-bleeps', requireCredits({ endpoint: 'profanity-bleeps' }), async (req, res) => {
+   170→    const { segments, bleepType = 'standard', volume = 0.5 } = req.body;
+   171→
+   172→    if (!segments || !Array.isArray(segments) || segments.length === 0) {
+   173→      return res.status(400).json({ error: 'segments array is required and must not be empty' });
+   174→    }
+   175→
+   176→    // Validate segments have start/end
+   177→    for (let i = 0; i < segments.length; i++) {
+   178→      if (typeof segments[i].start !== 'number' || typeof segments[i].end !== 'number') {
+   179→        return res.status(400).json({ error: `Segment ${i} must have numeric start and end properties` });
+   180→      }
+   181→    }
+   182→
+   183→    console.log(`[SPLICE] Generating ${segments.length} bleep audio files (type: ${bleepType})`);
+   184→
+   185→    try {
+   186→      const bleeps = await generateBleepsForSegments(segments, {
+   187→        bleepType,
+   188→        volume,
+   189→        outputDir: '/tmp'
+   190→      });
+   191→
+   192→      // Calculate total duration for usage tracking
+   193→      const totalDuration = segments.reduce((sum, seg) => sum + (seg.end - seg.start), 0);
+   194→      let balance = null;
+   195→      if (totalDuration > 0 && req.deductUsage) {
+   196→        balance = await req.deductUsage(totalDuration);
+   197→      }
+   198→
+   199→      res.json({
+   200→        success: true,
+   201→        bleepCount: bleeps.length,
+   202→        bleepType,
+   203→        bleeps,
+   204→        totalDuration,
+   205→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   206→      });
+   207→    } catch (err) {
+   208→      console.error('[SPLICE] Error generating bleeps:', err);
+   209→      res.status(500).json({ error: err.message });
+   210→    }
+   211→  });
+   212→
+   213→  /**
+   214→   * GET /profanity/list/:language - Get default profanity list for a language
+   215→   */
+   216→  router.get('/profanity/list/:language', (req, res) => {
+   217→    const { language } = req.params;
+   218→    const list = getProfanityList(language);
+   219→
+   220→    res.json({
+   221→      success: true,
+   222→      language,
+   223→      wordCount: list.length,
+   224→      // Return first 50 words as sample (full list is large)
+   225→      sample: list.slice(0, 50),
+   226→      note: 'Full list available but truncated for response size'
+   227→    });
+   228→  });
+   229→
+   230→  // =============================================================================
+   231→  // Repetition/Stutter Detection Routes
+   232→  // =============================================================================
+   233→
+   234→  /**
+   235→   * POST /repetitions - Detect phrase repetitions and stutters
+   236→   *
+   237→   * Analyzes transcript for repeated phrases and stutters.
+   238→   * Returns segments that can be removed to clean up the edit.
+   239→   *
+   240→   * Options:
+   241→   * - wavPath: Path to audio file (required unless transcript provided)
+   242→   * - transcript: Pre-existing transcript (optional)
+   243→   * - phraseSize: Words per comparison window (default: 5)
+   244→   * - tolerance: Similarity threshold 0-1 (default: 0.7)
+   245→   * - searchRadius: Words to search ahead (default: 100)
+   246→   * - useOpenAI: Use OpenAI for boundary refinement (default: false)
+   247→   * - includeStutters: Also detect single-word stutters (default: true)
+   248→   */
+   249→  router.post('/repetitions', requireCredits({ endpoint: 'repetitions' }), async (req, res) => {
+   250→    const {
+   251→      wavPath,
+   252→      transcript: providedTranscript,
+   253→      phraseSize = 5,
+   254→      tolerance = 0.7,
+   255→      searchRadius = 100,
+   256→      useOpenAI = false,
+   257→      includeStutters = true
+   258→    } = req.body;
+   259→
+   260→    if (!wavPath && !providedTranscript) {
+   261→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+   262→    }
+   263→
+   264→    if (wavPath && !(await fileExists(wavPath))) {
+   265→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   266→    }
+   267→
+   268→    console.log(`[SPLICE] Repetition detection: ${wavPath || 'provided transcript'}`);
+   269→
+   270→    try {
+   271→      // Get or create transcript with word-level timestamps
+   272→      let transcript = providedTranscript;
+   273→      if (!transcript && wavPath) {
+   274→        // Use transcribeWithWords for word-level timestamps required by repetition detection
+   275→        transcript = await transcribeWithWords(wavPath);
+   276→      }
+   277→
+   278→      // Validate transcript has words
+   279→      if (!transcript || !transcript.words || transcript.words.length === 0) {
+   280→        return res.status(400).json({
+   281→          error: 'Transcript must contain word-level timing data'
+   282→        });
+   283→      }
+   284→
+   285→      // Detect all repetitions (phrases + stutters)
+   286→      const result = await detectAllRepetitions(transcript, {
+   287→        phraseSize,
+   288→        tolerance,
+   289→        searchRadius,
+   290→        useOpenAI
+   291→      });
+   292→
+   293→      // Optionally filter out stutters
+   294→      if (!includeStutters) {
+   295→        result.stutters = [];
+   296→        result.removalSegments = result.removalSegments.filter(s => s.type !== 'stutter');
+   297→      }
+   298→
+   299→      // Deduct usage based on audio duration
+   300→      const audioDuration = transcript.duration || 0;
+   301→      let balance = null;
+   302→      if (audioDuration > 0 && req.deductUsage) {
+   303→        balance = await req.deductUsage(audioDuration);
+   304→      }
+   305→
+   306→      res.json({
+   307→        success: true,
+   308→        wavPath,
+   309→        ...result,
+   310→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   311→      });
+   312→    } catch (err) {
+   313→      console.error('[SPLICE] Repetition detection error:', err);
+   314→      res.status(500).json({ error: err.message });
+   315→    }
+   316→  });
+   317→
+   318→  /**
+   319→   * POST /fillers - Detect filler words (um, uh, like, etc.)
+   320→   *
+   321→   * Transcribes audio and identifies filler words with timestamps.
+   322→   * Returns segments that can be cut or reviewed for removal.
+   323→   * Supports frame alignment for precise video editing.
+   324→   *
+   325→   * Options:
+   326→   * - wavPath: Path to audio file (required unless transcript provided)
+   327→   * - transcript: Pre-existing transcript with word-level timing (optional)
+   328→   * - customFillers: Additional filler words to detect (optional)
+   329→   * - frameRate: Frame rate for alignment (0 = no alignment, 24/30/60 etc.)
+   330→   * - paddingMs: Padding in ms around filler words for cleaner cuts (default 50)
+   331→   */
+   332→  router.post('/fillers', requireCredits({ endpoint: 'fillers' }), async (req, res) => {
+   333→    const {
+   334→      wavPath,
+   335→      transcript: providedTranscript,
+   336→      customFillers = [],
+   337→      frameRate = 0, // Optional: align timestamps to frames
+   338→      paddingMs = 50 // Padding around filler words for cleaner cuts
+   339→    } = req.body;
+   340→
+   341→    if (!wavPath && !providedTranscript) {
+   342→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+   343→    }
+   344→
+   345→    if (wavPath && !(await fileExists(wavPath))) {
+   346→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   347→    }
+   348→
+   349→    console.log(`[SPLICE] Filler word detection: ${wavPath || 'provided transcript'}`);
+   350→
+   351→    try {
+   352→      // Get or create transcript with word-level timestamps
+   353→      let transcript = providedTranscript;
+   354→      if (!transcript && wavPath) {
+   355→        transcript = await transcribeWithWords(wavPath);
+   356→      }
+   357→
+   358→      // Validate transcript has words
+   359→      if (!transcript || !transcript.words || transcript.words.length === 0) {
+   360→        return res.status(400).json({
+   361→          error: 'Transcript must contain word-level timing data'
+   362→        });
+   363→      }
+   364→
+   365→      // Default filler words (common in English speech)
+   366→      const defaultFillers = [
+   367→        'um', 'uh', 'ah', 'er', 'eh',           // Hesitation sounds
+   368→        'like', 'so', 'well', 'right',           // Discourse markers
+   369→        'you know', 'i mean', 'basically',       // Filler phrases
+   370→        'actually', 'literally', 'honestly',     // Overused qualifiers
+   371→        'kind of', 'sort of', 'you see'          // Hedging phrases
+   372→      ];
+   373→
+   374→      // Combine default + custom fillers (lowercase for matching)
+   375→      const fillerSet = new Set([
+   376→        ...defaultFillers,
+   377→        ...customFillers.map(f => f.toLowerCase().trim())
+   378→      ]);
+   379→
+   380→      // Detect filler words
+   381→      const fillers = [];
+   382→      const words = transcript.words;
+   383→
+   384→      for (let i = 0; i < words.length; i++) {
+   385→        const word = words[i];
+   386→        const normalizedWord = word.word.toLowerCase().replace(/[.,!?;:'"]/g, '').trim();
+   387→
+   388→        // Check single-word fillers
+   389→        if (fillerSet.has(normalizedWord)) {
+   390→          fillers.push({
+   391→            word: word.word,
+   392→            normalizedWord,
+   393→            start: word.start,
+   394→            end: word.end,
+   395→            duration: word.end - word.start,
+   396→            index: i,
+   397→            type: 'filler'
+   398→          });
+   399→          continue;
+   400→        }
+   401→
+   402→        // Check two-word phrases (e.g., "you know", "kind of")
+   403→        if (i < words.length - 1) {
+   404→          const nextWord = words[i + 1];
+   405→          const twoWordPhrase = `${normalizedWord} ${nextWord.word.toLowerCase().replace(/[.,!?;:'"]/g, '').trim()}`;
+   406→          if (fillerSet.has(twoWordPhrase)) {
+   407→            fillers.push({
+   408→              word: `${word.word} ${nextWord.word}`,
+   409→              normalizedWord: twoWordPhrase,
+   410→              start: word.start,
+   411→              end: nextWord.end,
+   412→              duration: nextWord.end - word.start,
+   413→              index: i,
+   414→              type: 'filler_phrase'
+   415→            });
+   416→            // Skip next word since it's part of this phrase
+   417→            i++;
+   418→          }
+   419→        }
+   420→      }
+   421→
+   422→      // Apply frame alignment if requested
+   423→      const hasFrameAlignment = frameRate > 0;
+   424→      const paddingSec = paddingMs / 1000;
+   425→
+   426→      // Enhance fillers with aligned timestamps and padding
+   427→      const enhancedFillers = fillers.map(f => {
+   428→        // Add padding for cleaner cuts
+   429→        const paddedStart = Math.max(0, f.start - paddingSec);
+   430→        const paddedEnd = f.end + paddingSec;
+   431→
+   432→        // Apply frame alignment if requested
+   433→        let startAligned = paddedStart;
+   434→        let endAligned = paddedEnd;
+   435→        if (hasFrameAlignment) {
+   436→          startAligned = alignToFrameFloor(paddedStart, frameRate);
+   437→          endAligned = alignToFrameCeil(paddedEnd, frameRate);
+   438→        }
+   439→
+   440→        return {
+   441→          ...f,
+   442→          paddedStart,
+   443→          paddedEnd,
+   444→          startAligned: parseFloat(startAligned.toFixed(4)),
+   445→          endAligned: parseFloat(endAligned.toFixed(4)),
+   446→          durationAligned: parseFloat((endAligned - startAligned).toFixed(4))
+   447→        };
+   448→      });
+   449→
+   450→      // Calculate total filler time
+   451→      const totalFillerDuration = fillers.reduce((sum, f) => sum + f.duration, 0);
+   452→      const audioDuration = transcript.duration || (words.length > 0 ? words[words.length - 1].end : 0);
+   453→      const fillerPercentage = audioDuration > 0 ? (totalFillerDuration / audioDuration) * 100 : 0;
+   454→
+   455→      // Deduct usage based on audio duration
+   456→      let balance = null;
+   457→      if (audioDuration > 0 && req.deductUsage) {
+   458→        balance = await req.deductUsage(audioDuration);
+   459→      }
+   460→
+   461→      res.json({
+   462→        success: true,
+   463→        wavPath,
+   464→        fillers: enhancedFillers,
+   465→        metadata: {
+   466→          totalWords: words.length,
+   467→          fillerCount: enhancedFillers.length,
+   468→          totalFillerDuration: parseFloat(totalFillerDuration.toFixed(3)),
+   469→          audioDuration: parseFloat(audioDuration.toFixed(3)),
+   470→          fillerPercentage: parseFloat(fillerPercentage.toFixed(2)),
+   471→          fillersPerMinute: audioDuration > 0 ? parseFloat((enhancedFillers.length / (audioDuration / 60)).toFixed(2)) : 0,
+   472→          frameRate: hasFrameAlignment ? frameRate : null,
+   473→          frameAligned: hasFrameAlignment,
+   474→          paddingMs
+   475→        },
+   476→        removalSegments: enhancedFillers.map(f => ({
+   477→          start: f.startAligned,
+   478→          end: f.endAligned,
+   479→          duration: f.durationAligned,
+   480→          reason: `Filler: "${f.word}"`,
+   481→          type: f.type
+   482→        })),
+   483→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   484→      });
+   485→    } catch (err) {
+   486→      console.error('[SPLICE] Filler detection error:', err);
+   487→      res.status(500).json({ error: err.message });
+   488→    }
+   489→  });
+   490→
+   491→  /**
+   492→   * POST /stutters - Detect single-word stutters only
+   493→   *
+   494→   * Focused detection for word-level stutters (e.g., "I I I think").
+   495→   * Faster than full repetition detection.
+   496→   */
+   497→  router.post('/stutters', requireCredits({ endpoint: 'stutters' }), async (req, res) => {
+   498→    const {
+   499→      wavPath,
+   500→      transcript: providedTranscript,
+   501→      options = {},
+   502→      // Support both top-level and nested options for flexibility
+   503→      minRepeats = options.minRepeats ?? 2,
+   504→      maxGapMs = options.maxGapMs ?? 500,
+   505→      ignoreFillers = options.ignoreFillers ?? true,
+   506→      minWordLength = options.minWordLength ?? 1
+   507→    } = req.body;
+   508→
+   509→    if (!wavPath && !providedTranscript) {
+   510→      return res.status(400).json({ error: 'wavPath or transcript is required' });
+   511→    }
+   512→
+   513→    if (wavPath && !(await fileExists(wavPath))) {
+   514→      return res.status(404).json({ error: `File not found: ${wavPath}` });
+   515→    }
+   516→
+   517→    console.log(`[SPLICE] Stutter detection: ${wavPath || 'provided transcript'}`);
+   518→
+   519→    try {
+   520→      // Get or create transcript with word-level timestamps
+   521→      let transcript = providedTranscript;
+   522→      if (!transcript && wavPath) {
+   523→        // Use transcribeWithWords for word-level timestamps required by stutter detection
+   524→        transcript = await transcribeWithWords(wavPath);
+   525→      }
+   526→
+   527→      // Validate transcript exists and has words array
+   528→      if (!transcript || !transcript.words) {
+   529→        return res.status(400).json({
+   530→          error: 'Transcript must contain word-level timing data'
+   531→        });
+   532→      }
+   533→
+   534→      // Empty transcript returns empty result (not an error)
+   535→      if (transcript.words.length === 0) {
+   536→        return res.json({
+   537→          success: true,
+   538→          stutters: [],
+   539→          metadata: { type: 'stutters', totalWords: 0, stutterCount: 0, totalRepeatedWords: 0 }
+   540→        });
+   541→      }
+   542→
+   543→      // Detect stutters only
+   544→      const result = detectStutters(transcript, {
+   545→        minRepeats,
+   546→        maxGapMs,
+   547→        ignoreFillers,
+   548→        minWordLength
+   549→      });
+   550→
+   551→      // Deduct usage based on audio duration
+   552→      const audioDuration = transcript.duration || 0;
+   553→      let balance = null;
+   554→      if (audioDuration > 0 && req.deductUsage) {
+   555→        balance = await req.deductUsage(audioDuration);
+   556→      }
+   557→
+   558→      res.json({
+   559→        success: true,
+   560→        wavPath,
+   561→        ...result,
+   562→        balance: balance ? { hoursRemaining: balance.hoursRemaining, tier: balance.tier } : undefined
+   563→      });
+   564→    } catch (err) {
+   565→      console.error('[SPLICE] Stutter detection error:', err);
+   566→      res.status(500).json({ error: err.message });
+   567→    }
+   568→  });
+   569→
+   570→  return router;
+   571→}
+   572→
+   573→module.exports = createDetectionRoutes;
+   574→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

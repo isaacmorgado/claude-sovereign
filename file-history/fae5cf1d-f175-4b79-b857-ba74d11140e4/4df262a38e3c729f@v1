@@ -1,0 +1,284 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @fileoverview Tool for retrieving output from background agent tasks.
+ * Similar to Claude Code's TaskOutput tool.
+ */
+
+import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
+import {
+  BaseDeclarativeTool,
+  Kind,
+  type ToolInvocation,
+  type ToolResult,
+  BaseToolInvocation,
+} from '../tools/tools.js';
+import { TASK_OUTPUT_TOOL_NAME } from '../tools/tool-names.js';
+import type { AgentTaskManager, AgentTask } from './task-manager.js';
+import type { MessageBus } from '../confirmation-bus/message-bus.js';
+
+/**
+ * Parameters for the task_output tool.
+ */
+interface TaskOutputParams {
+  /** The task ID to get output from. */
+  task_id: string;
+  /** Whether to block and wait for completion. Default: true. */
+  block?: boolean;
+  /** Maximum time to wait in milliseconds. Default: 30000. */
+  timeout?: number;
+}
+
+/**
+ * Schema for task_output tool parameters.
+ */
+const TaskOutputSchema = z.object({
+  task_id: z.string().describe('The unique ID of the background task to query.'),
+  block: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Whether to wait for the task to complete. Default: true.'),
+  timeout: z
+    .number()
+    .optional()
+    .default(30000)
+    .describe('Maximum time to wait in milliseconds. Default: 30000.'),
+});
+
+/**
+ * Formats an AgentTask for display.
+ */
+function formatTaskForDisplay(task: AgentTask): string {
+  const lines: string[] = [
+    `## Task: ${task.id}`,
+    '',
+    `**Agent**: ${task.agentDisplayName || task.agentName}`,
+    `**Status**: ${task.status}`,
+    `**Created**: ${task.createdAt.toISOString()}`,
+  ];
+
+  if (task.startedAt) {
+    lines.push(`**Started**: ${task.startedAt.toISOString()}`);
+  }
+
+  if (task.completedAt) {
+    lines.push(`**Completed**: ${task.completedAt.toISOString()}`);
+
+    // Calculate duration
+    const startTime = task.startedAt || task.createdAt;
+    const durationMs = task.completedAt.getTime() - startTime.getTime();
+    const durationSec = (durationMs / 1000).toFixed(1);
+    lines.push(`**Duration**: ${durationSec}s`);
+  }
+
+  lines.push('');
+
+  if (task.status === 'completed' && task.result) {
+    lines.push('### Result');
+    lines.push('');
+    lines.push(`**Termination Reason**: ${task.result.terminate_reason}`);
+    lines.push('');
+    lines.push('**Output**:');
+    lines.push('```');
+    lines.push(task.result.result);
+    lines.push('```');
+  } else if (task.status === 'error' && task.error) {
+    lines.push('### Error');
+    lines.push('');
+    lines.push('```');
+    lines.push(task.error);
+    lines.push('```');
+  } else if (task.status === 'cancelled') {
+    lines.push('*Task was cancelled.*');
+  } else if (task.status === 'running' || task.status === 'pending') {
+    lines.push(`*Task is ${task.status}...*`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Formats an AgentTask for LLM consumption.
+ */
+function formatTaskForLLM(task: AgentTask): string {
+  const taskData = {
+    id: task.id,
+    agentName: task.agentName,
+    agentDisplayName: task.agentDisplayName,
+    status: task.status,
+    createdAt: task.createdAt.toISOString(),
+    startedAt: task.startedAt?.toISOString(),
+    completedAt: task.completedAt?.toISOString(),
+    result: task.result,
+    error: task.error,
+  };
+
+  return JSON.stringify(taskData, null, 2);
+}
+
+/**
+ * Invocation for the task_output tool.
+ */
+class TaskOutputInvocation extends BaseToolInvocation<TaskOutputParams, ToolResult> {
+  constructor(
+    params: TaskOutputParams,
+    private readonly taskManager: AgentTaskManager,
+    messageBus?: MessageBus,
+  ) {
+    super(params, messageBus, TASK_OUTPUT_TOOL_NAME);
+  }
+
+  getDescription(): string {
+    return `Getting output for task '${this.params.task_id}'`;
+  }
+
+  async execute(
+    _signal?: AbortSignal,
+    _updateOutput?: (output: string) => void,
+  ): Promise<ToolResult> {
+    try {
+      const task = await this.taskManager.getOutput(this.params.task_id, {
+        block: this.params.block,
+        timeout: this.params.timeout,
+      });
+
+      return {
+        llmContent: [{ text: formatTaskForLLM(task) }],
+        returnDisplay: formatTaskForDisplay(task),
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        llmContent: `Error retrieving task output: ${errorMessage}`,
+        returnDisplay: `**Error**: ${errorMessage}`,
+        error: {
+          message: errorMessage,
+        },
+      };
+    }
+  }
+}
+
+/**
+ * Tool for retrieving output from background agent tasks.
+ */
+export class TaskOutputTool extends BaseDeclarativeTool<TaskOutputParams, ToolResult> {
+  constructor(
+    private readonly taskManager: AgentTaskManager,
+    messageBus?: MessageBus,
+  ) {
+    super(
+      TASK_OUTPUT_TOOL_NAME,
+      'Task Output',
+      `Retrieves output from a running or completed background agent task.
+
+Use this tool to:
+- Check the status of a background task
+- Get the result once a task completes
+- Wait for a task to complete (with optional timeout)
+
+Parameters:
+- task_id: The unique ID returned when the task was spawned
+- block: Set to true (default) to wait for completion, false for immediate status
+- timeout: Maximum wait time in milliseconds (default: 30000)
+
+Returns task status, timing information, and result/error if completed.`,
+      Kind.Think,
+      zodToJsonSchema(TaskOutputSchema),
+      /* isOutputMarkdown */ true,
+      /* canUpdateOutput */ false,
+      messageBus,
+    );
+  }
+
+  protected createInvocation(params: TaskOutputParams): ToolInvocation<TaskOutputParams, ToolResult> {
+    return new TaskOutputInvocation(params, this.taskManager, this.messageBus);
+  }
+}
+
+/**
+ * Tool for listing all background tasks.
+ */
+export class ListTasksTool extends BaseDeclarativeTool<object, ToolResult> {
+  constructor(
+    private readonly taskManager: AgentTaskManager,
+    messageBus?: MessageBus,
+  ) {
+    super(
+      'list_tasks',
+      'List Tasks',
+      `Lists all background agent tasks and their current status.
+
+Returns a summary of all tasks including:
+- Task ID
+- Agent name
+- Status (pending, running, completed, error, cancelled)
+- Creation and completion times`,
+      Kind.Think,
+      { type: 'object', properties: {}, additionalProperties: false },
+      /* isOutputMarkdown */ true,
+      /* canUpdateOutput */ false,
+      messageBus,
+    );
+  }
+
+  protected createInvocation(): ToolInvocation<object, ToolResult> {
+    return new ListTasksInvocation(this.taskManager, this.messageBus);
+  }
+}
+
+/**
+ * Invocation for the list_tasks tool.
+ */
+class ListTasksInvocation extends BaseToolInvocation<object, ToolResult> {
+  constructor(
+    private readonly taskManager: AgentTaskManager,
+    messageBus?: MessageBus,
+  ) {
+    super({}, messageBus, 'list_tasks');
+  }
+
+  getDescription(): string {
+    return 'Listing all background tasks';
+  }
+
+  async execute(): Promise<ToolResult> {
+    const tasks = this.taskManager.listTasks();
+
+    if (tasks.length === 0) {
+      return {
+        llmContent: 'No background tasks found.',
+        returnDisplay: '*No background tasks.*',
+      };
+    }
+
+    // Format for display
+    const displayLines: string[] = ['## Background Tasks', ''];
+
+    for (const task of tasks) {
+      const status = task.status.toUpperCase();
+      const agent = task.agentDisplayName || task.agentName;
+      displayLines.push(`- **${task.id.slice(0, 8)}...** | ${agent} | ${status}`);
+    }
+
+    // Format for LLM
+    const llmData = tasks.map((task) => ({
+      id: task.id,
+      agentName: task.agentName,
+      status: task.status,
+      createdAt: task.createdAt.toISOString(),
+      completedAt: task.completedAt?.toISOString(),
+    }));
+
+    return {
+      llmContent: [{ text: JSON.stringify(llmData, null, 2) }],
+      returnDisplay: displayLines.join('\n'),
+    };
+  }
+}

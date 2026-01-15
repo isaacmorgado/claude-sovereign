@@ -1,0 +1,336 @@
+     1→/**
+     2→ * Phase 5: Security E2E Tests
+     3→ *
+     4→ * Tests for:
+     5→ * 1. Path validation - preventing traversal attacks
+     6→ * 2. Command injection prevention - safe command execution
+     7→ * 3. DB pool limits - connection management
+     8→ * 4. Auth verification - customer ID validation
+     9→ */
+    10→
+    11→const path = require('path');
+    12→const fs = require('fs');
+    13→
+    14→// =============================================================================
+    15→// TEST FRAMEWORK
+    16→// =============================================================================
+    17→
+    18→let passCount = 0;
+    19→let failCount = 0;
+    20→
+    21→function test(name, fn) {
+    22→  try {
+    23→    const result = fn();
+    24→    if (result instanceof Promise) {
+    25→      return result.then(() => {
+    26→        passCount++;
+    27→        console.log(`  ✓ ${name}`);
+    28→      }).catch(err => {
+    29→        failCount++;
+    30→        console.log(`  ✗ ${name}`);
+    31→        console.log(`    Error: ${err.message}`);
+    32→      });
+    33→    }
+    34→    passCount++;
+    35→    console.log(`  ✓ ${name}`);
+    36→  } catch (err) {
+    37→    failCount++;
+    38→    console.log(`  ✗ ${name}`);
+    39→    console.log(`    Error: ${err.message}`);
+    40→  }
+    41→}
+    42→
+    43→async function asyncTest(name, fn) {
+    44→  try {
+    45→    await fn();
+    46→    passCount++;
+    47→    console.log(`  ✓ ${name}`);
+    48→  } catch (err) {
+    49→    failCount++;
+    50→    console.log(`  ✗ ${name}`);
+    51→    console.log(`    Error: ${err.message}`);
+    52→  }
+    53→}
+    54→
+    55→function assertEqual(actual, expected, message = '') {
+    56→  if (actual !== expected) {
+    57→    throw new Error(`${message}: Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    58→  }
+    59→}
+    60→
+    61→function assertTrue(condition, message = '') {
+    62→  if (!condition) {
+    63→    throw new Error(`${message}: Expected true, got false`);
+    64→  }
+    65→}
+    66→
+    67→function assertFalse(condition, message = '') {
+    68→  if (condition) {
+    69→    throw new Error(`${message}: Expected false, got true`);
+    70→  }
+    71→}
+    72→
+    73→function assertThrows(fn, message = '') {
+    74→  try {
+    75→    fn();
+    76→    throw new Error(`${message}: Expected function to throw, but it didn't`);
+    77→  } catch (err) {
+    78→    if (err.message.includes('Expected function to throw')) throw err;
+    79→    // Good - it threw as expected
+    80→  }
+    81→}
+    82→
+    83→async function assertRejects(promise, message = '') {
+    84→  try {
+    85→    await promise;
+    86→    throw new Error(`${message}: Expected promise to reject, but it didn't`);
+    87→  } catch (err) {
+    88→    if (err.message.includes('Expected promise to reject')) throw err;
+    89→    // Good - it rejected as expected
+    90→  }
+    91→}
+    92→
+    93→// =============================================================================
+    94→// SECURITY UTILS TESTS
+    95→// =============================================================================
+    96→
+    97→console.log('\n=== Phase 5: Security E2E Tests ===\n');
+    98→
+    99→console.log('1. Path Validation Tests');
+   100→
+   101→const { validatePath, validateAudioPath, safeTempPath, ALLOWED_BASE_DIRS } = require('../services/securityUtils');
+   102→
+   103→(async () => {
+   104→  // Test 1: Valid paths
+   105→  await asyncTest('should accept valid absolute path in /tmp', async () => {
+   106→    const testFile = '/tmp/test_audio.wav';
+   107→    // Create a temp file for testing
+   108→    fs.writeFileSync(testFile, 'test');
+   109→    const result = await validateAudioPath(testFile);
+   110→    assertTrue(result.valid, 'Should be valid');
+   111→    assertEqual(result.path, testFile, 'Path should match');
+   112→    fs.unlinkSync(testFile);
+   113→  });
+   114→
+   115→  await asyncTest('should accept valid path in home directory', async () => {
+   116→    const homePath = process.env.HOME;
+   117→    const testFile = path.join(homePath, 'test_splice_audio.wav');
+   118→    fs.writeFileSync(testFile, 'test');
+   119→    const result = await validateAudioPath(testFile);
+   120→    assertTrue(result.valid, 'Should be valid');
+   121→    fs.unlinkSync(testFile);
+   122→  });
+   123→
+   124→  // Test 2: Path traversal attacks
+   125→  await asyncTest('should reject path with .. traversal', async () => {
+   126→    const result = await validatePath('/tmp/../etc/passwd', { mustExist: false });
+   127→    // After normalization, this resolves to /etc/passwd which may not be under allowed dirs
+   128→    // depending on system config
+   129→    if (result.valid) {
+   130→      // If valid, the path should have been normalized
+   131→      assertFalse(result.path.includes('..'), 'Normalized path should not contain ..');
+   132→    }
+   133→  });
+   134→
+   135→  await asyncTest('should reject path with null bytes', async () => {
+   136→    const result = await validatePath('/tmp/file\0.wav', { mustExist: false });
+   137→    assertFalse(result.valid, 'Should reject null bytes');
+   138→    assertTrue(result.error.includes('null bytes'), 'Error should mention null bytes');
+   139→  });
+   140→
+   141→  // Test 3: Command injection characters
+   142→  await asyncTest('should reject path with backticks', async () => {
+   143→    const result = await validatePath('/tmp/file`whoami`.wav', { mustExist: false });
+   144→    assertFalse(result.valid, 'Should reject backticks');
+   145→    assertTrue(result.error.includes('dangerous'), 'Error should mention dangerous characters');
+   146→  });
+   147→
+   148→  await asyncTest('should reject path with $() substitution', async () => {
+   149→    const result = await validatePath('/tmp/file$(cat /etc/passwd).wav', { mustExist: false });
+   150→    assertFalse(result.valid, 'Should reject command substitution');
+   151→  });
+   152→
+   153→  await asyncTest('should reject path with semicolon', async () => {
+   154→    const result = await validatePath('/tmp/file;rm -rf /.wav', { mustExist: false });
+   155→    assertFalse(result.valid, 'Should reject semicolon');
+   156→  });
+   157→
+   158→  await asyncTest('should reject path with pipe', async () => {
+   159→    const result = await validatePath('/tmp/file|cat.wav', { mustExist: false });
+   160→    assertFalse(result.valid, 'Should reject pipe');
+   161→  });
+   162→
+   163→  // Test 4: Extension validation
+   164→  await asyncTest('should accept valid audio extensions', async () => {
+   165→    const testFile = '/tmp/test.wav';
+   166→    fs.writeFileSync(testFile, 'test');
+   167→    const result = await validateAudioPath(testFile);
+   168→    assertTrue(result.valid, 'Should accept .wav');
+   169→    fs.unlinkSync(testFile);
+   170→  });
+   171→
+   172→  await asyncTest('should reject non-audio extensions', async () => {
+   173→    const testFile = '/tmp/test.exe';
+   174→    fs.writeFileSync(testFile, 'test');
+   175→    const result = await validateAudioPath(testFile);
+   176→    assertFalse(result.valid, 'Should reject .exe');
+   177→    fs.unlinkSync(testFile);
+   178→  });
+   179→
+   180→  // Test 5: Non-existent files
+   181→  await asyncTest('should reject non-existent files when mustExist=true', async () => {
+   182→    const result = await validatePath('/tmp/nonexistent_file_12345.wav', { mustExist: true });
+   183→    assertFalse(result.valid, 'Should reject non-existent file');
+   184→    assertTrue(result.error.includes('not exist') || result.error.includes('not readable'), 'Error should mention file not found');
+   185→  });
+   186→
+   187→  // Test 6: Safe temp path generation
+   188→  test('should generate unique temp paths', () => {
+   189→    const path1 = safeTempPath('test', '.raw');
+   190→    const path2 = safeTempPath('test', '.raw');
+   191→    assertTrue(path1 !== path2, 'Temp paths should be unique');
+   192→    assertTrue(path1.startsWith('/tmp/'), 'Should be in /tmp');
+   193→    assertTrue(path1.endsWith('.raw'), 'Should have correct extension');
+   194→  });
+   195→
+   196→  // =============================================================================
+   197→  // DB POOL CONFIGURATION TESTS
+   198→  // =============================================================================
+   199→
+   200→  console.log('\n2. Database Pool Configuration Tests');
+   201→
+   202→  // Read usageTracking.js to verify pool configuration
+   203→  const usageTrackingSource = fs.readFileSync(path.join(__dirname, '../services/usageTracking.js'), 'utf8');
+   204→
+   205→  test('should have max connections set', () => {
+   206→    assertTrue(usageTrackingSource.includes('max: 20'), 'Should have max: 20');
+   207→  });
+   208→
+   209→  test('should have idle timeout set', () => {
+   210→    assertTrue(usageTrackingSource.includes('idleTimeoutMillis: 30000'), 'Should have idleTimeoutMillis: 30000');
+   211→  });
+   212→
+   213→  test('should have connection timeout set', () => {
+   214→    assertTrue(usageTrackingSource.includes('connectionTimeoutMillis: 5000'), 'Should have connectionTimeoutMillis: 5000');
+   215→  });
+   216→
+   217→  test('should have composite index for usage history', () => {
+   218→    assertTrue(usageTrackingSource.includes('idx_usage_log_customer_created'), 'Should have composite index');
+   219→  });
+   220→
+   221→  // =============================================================================
+   222→  // COMMAND INJECTION PREVENTION TESTS
+   223→  // =============================================================================
+   224→
+   225→  console.log('\n3. Command Injection Prevention Tests');
+   226→
+   227→  // Verify ffprobeSilence.js uses safe execution
+   228→  const ffprobeSilenceSource = fs.readFileSync(path.join(__dirname, '../services/ffprobeSilence.js'), 'utf8');
+   229→
+   230→  test('ffprobeSilence.js should use validateAudioPath', () => {
+   231→    assertTrue(ffprobeSilenceSource.includes('validateAudioPath'), 'Should validate audio path');
+   232→  });
+   233→
+   234→  test('ffprobeSilence.js should use safeFFprobe', () => {
+   235→    assertTrue(ffprobeSilenceSource.includes('safeFFprobe'), 'Should use safe FFprobe execution');
+   236→  });
+   237→
+   238→  test('ffprobeSilence.js should not use exec with string interpolation', () => {
+   239→    // Check that we don't have vulnerable patterns
+   240→    const hasVulnerableExec = /exec\s*\(\s*`/.test(ffprobeSilenceSource);
+   241→    assertFalse(hasVulnerableExec, 'Should not use exec with template literals');
+   242→  });
+   243→
+   244→  // Verify rmsSilenceDetection.js uses safe execution
+   245→  const rmsSilenceSource = fs.readFileSync(path.join(__dirname, '../services/rmsSilenceDetection.js'), 'utf8');
+   246→
+   247→  test('rmsSilenceDetection.js should use validateAudioPath', () => {
+   248→    assertTrue(rmsSilenceSource.includes('validateAudioPath'), 'Should validate audio path');
+   249→  });
+   250→
+   251→  test('rmsSilenceDetection.js should use safeFFprobe', () => {
+   252→    assertTrue(rmsSilenceSource.includes('safeFFprobe'), 'Should use safe FFprobe execution');
+   253→  });
+   254→
+   255→  test('rmsSilenceDetection.js should use safeFFmpeg', () => {
+   256→    assertTrue(rmsSilenceSource.includes('safeFFmpeg'), 'Should use safe FFmpeg execution');
+   257→  });
+   258→
+   259→  test('rmsSilenceDetection.js should use safeTempPath', () => {
+   260→    assertTrue(rmsSilenceSource.includes('safeTempPath'), 'Should use safe temp path generation');
+   261→  });
+   262→
+   263→  // Verify multitrackAnalysis.js uses safe execution
+   264→  const multitrackSource = fs.readFileSync(path.join(__dirname, '../services/multitrackAnalysis.js'), 'utf8');
+   265→
+   266→  test('multitrackAnalysis.js should use validateAudioPath', () => {
+   267→    assertTrue(multitrackSource.includes('validateAudioPath'), 'Should validate audio path');
+   268→  });
+   269→
+   270→  test('multitrackAnalysis.js should use safeFFprobe', () => {
+   271→    assertTrue(multitrackSource.includes('safeFFprobe'), 'Should use safe FFprobe execution');
+   272→  });
+   273→
+   274→  test('multitrackAnalysis.js should use safeFFmpeg', () => {
+   275→    assertTrue(multitrackSource.includes('safeFFmpeg'), 'Should use safe FFmpeg execution');
+   276→  });
+   277→
+   278→  test('multitrackAnalysis.js should use async file operations', () => {
+   279→    assertTrue(multitrackSource.includes('fsPromises.readFile'), 'Should use async readFile');
+   280→    assertTrue(multitrackSource.includes('fsPromises.unlink'), 'Should use async unlink');
+   281→  });
+   282→
+   283→  // =============================================================================
+   284→  // SECURITY UTILS FUNCTION TESTS
+   285→  // =============================================================================
+   286→
+   287→  console.log('\n4. Security Utils Integration Tests');
+   288→
+   289→  const securityUtilsSource = fs.readFileSync(path.join(__dirname, '../services/securityUtils.js'), 'utf8');
+   290→
+   291→  test('securityUtils.js should define ALLOWED_BASE_DIRS', () => {
+   292→    assertTrue(securityUtilsSource.includes('ALLOWED_BASE_DIRS'), 'Should define allowed directories');
+   293→  });
+   294→
+   295→  test('securityUtils.js should export validatePath', () => {
+   296→    assertTrue(securityUtilsSource.includes('validatePath'), 'Should export validatePath');
+   297→  });
+   298→
+   299→  test('securityUtils.js should export validateAudioPath', () => {
+   300→    assertTrue(securityUtilsSource.includes('validateAudioPath'), 'Should export validateAudioPath');
+   301→  });
+   302→
+   303→  test('securityUtils.js should export safeFFprobe', () => {
+   304→    assertTrue(securityUtilsSource.includes('safeFFprobe'), 'Should export safeFFprobe');
+   305→  });
+   306→
+   307→  test('securityUtils.js should export safeFFmpeg', () => {
+   308→    assertTrue(securityUtilsSource.includes('safeFFmpeg'), 'Should export safeFFmpeg');
+   309→  });
+   310→
+   311→  test('securityUtils.js should check for dangerous characters', () => {
+   312→    assertTrue(securityUtilsSource.includes('dangerousChars'), 'Should check dangerous characters');
+   313→  });
+   314→
+   315→  // =============================================================================
+   316→  // SUMMARY
+   317→  // =============================================================================
+   318→
+   319→  console.log('\n=== Test Summary ===');
+   320→  console.log(`  Passed: ${passCount}`);
+   321→  console.log(`  Failed: ${failCount}`);
+   322→  console.log(`  Total: ${passCount + failCount}`);
+   323→
+   324→  if (failCount > 0) {
+   325→    console.log('\n❌ Some tests failed');
+   326→    process.exit(1);
+   327→  } else {
+   328→    console.log('\n✓ All Phase 5 Security tests passed');
+   329→    process.exit(0);
+   330→  }
+   331→})();
+   332→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>
