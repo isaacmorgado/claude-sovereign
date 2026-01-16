@@ -385,15 +385,18 @@ test_exit_code=$?
 if [[ $test_exit_code -eq 0 ]]; then
     pass "Integration test: Direct checkpoint executes successfully"
 
-    # Verify commit was created
-    if git log --oneline | grep -q "checkpoint"; then
+    # Verify commit was created (check in TEST_DIR where the git repo is)
+    git_log_output=$(cd "$TEST_DIR" && git log --oneline 2>/dev/null)
+    if echo "$git_log_output" | grep -q "checkpoint"; then
         pass "Integration test: Git commit created"
     else
         fail "Integration test: Git commit NOT created"
+        info "Debug: Git log output:"
+        info "$git_log_output"
     fi
 
-    # Verify CLAUDE.md was updated
-    if grep -q "Auto-checkpoint triggered" CLAUDE.md; then
+    # Verify CLAUDE.md was updated (check in TEST_DIR)
+    if grep -q "Auto-checkpoint triggered" "$TEST_DIR/CLAUDE.md"; then
         pass "Integration test: CLAUDE.md updated"
     else
         fail "Integration test: CLAUDE.md NOT updated"
