@@ -34,6 +34,7 @@ import { AutonomousExecutor } from './auto/AutonomousExecutor';
 import { HookIntegration } from './auto/HookIntegration';
 import { SkillInvoker } from './auto/SkillInvoker';
 import { TestingIntegration } from './auto/TestingIntegration';
+import { AgentOrchestrationBridge, type TaskAnalysis, type OrchestrationResult } from '../../core/agents/AgentOrchestrationBridge';
 
 const execAsync = promisify(exec);
 
@@ -53,6 +54,7 @@ export class AutoCommand extends BaseCommand {
   private testingIntegration: TestingIntegration;
   private reCommand: ReCommand;
   private debugOrchestrator: DebugOrchestrator;
+  private agentBridge?: any; // AgentOrchestrationBridge (lazy loaded)
 
   // Track skill invocation state
   private lastCheckpointIteration = 0;
@@ -104,7 +106,7 @@ export class AutoCommand extends BaseCommand {
 
       // Detect task type for prompt selection
       this.currentTaskType = this.detectTaskType(config.goal);
-      
+
       // Initialize
       this.info(`🤖 Autonomous mode activated`);
       this.info(`Goal: ${chalk.bold(config.goal)}`);
@@ -115,6 +117,17 @@ export class AutoCommand extends BaseCommand {
       await this.memory.setTask(config.goal, 'Autonomous mode execution');
       await this.memory.addContext(`Model: ${config.model || 'auto-routed'}`, 9);
       await this.memory.addContext(`Task Type: ${this.currentTaskType}`, 8);
+
+      // Multi-agent orchestration analysis (if task warrants it)
+      const shouldUseMultiAgent = await this.analyzeMultiAgentNeed(config.goal);
+      if (shouldUseMultiAgent) {
+        this.info(`📡 Multi-agent orchestration recommended`);
+        const orchestrationResult = await this.executeWithMultiAgent(context, config);
+        if (orchestrationResult) {
+          return orchestrationResult;
+        }
+        // Fall through to standard execution if orchestration unavailable
+      }
 
       // Execute reverse engineering tools if task type matches
       if (this.currentTaskType === 'reverse-engineering') {
@@ -708,6 +721,102 @@ Provide your reasoning and proposed action.
         regressionsDetected: false,
         message: err.message
       };
+    }
+  }
+
+  /**
+   * Analyze if task warrants multi-agent orchestration
+   */
+  private async analyzeMultiAgentNeed(goal: string): Promise<boolean> {
+    const lowerGoal = goal.toLowerCase();
+
+    // Check for keywords indicating complex/parallel work
+    const parallelIndicators = [
+      'comprehensive', 'all', 'multiple', 'entire', 'system-wide',
+      'across', 'various', 'different', 'each', 'every'
+    ];
+
+    const hasParallelWork = parallelIndicators.some(indicator =>
+      lowerGoal.includes(indicator)
+    );
+
+    // Check for task types that benefit from specialists
+    const specialistTasks = [
+      'security audit', 'performance optimization', 'testing',
+      'documentation', 'refactor', 'implement'
+    ];
+
+    const needsSpecialist = specialistTasks.some(task =>
+      lowerGoal.includes(task)
+    );
+
+    return hasParallelWork || needsSpecialist;
+  }
+
+  /**
+   * Execute with multi-agent orchestration
+   */
+  private async executeWithMultiAgent(
+    context: CommandContext,
+    config: AutoConfig
+  ): Promise<CommandResult | null> {
+    try {
+      // Lazy load agent bridge
+      if (!this.agentBridge) {
+        this.agentBridge = new AgentOrchestrationBridge(10, {
+          enableVision: true
+        });
+      }
+
+      // Analyze task
+      const analysis: TaskAnalysis = await this.agentBridge.analyzeTask(
+        config.goal,
+        config.context || ''
+      );
+
+      this.info(`Task analysis: ${analysis.taskType} (complexity: ${analysis.complexity})`);
+
+      // Execute with orchestration
+      const result: OrchestrationResult = await this.agentBridge.executeWithOrchestration(
+        config.goal,
+        process.cwd(),
+        {
+          context: config.context,
+          useSwarm: analysis.parallelizable,
+          enableDebug: analysis.requiresDebug,
+          enableQuality: analysis.requiresQuality,
+          enableSafety: true
+        }
+      );
+
+      if (!result.success) {
+        this.warn('Multi-agent orchestration failed, falling back to standard execution');
+        this.warn(`Errors: ${result.errors.join(', ')}`);
+        return null;
+      }
+
+      // Report orchestration results
+      if (result.routing) {
+        this.success(`Routed to ${result.routing.selectedAgent} (${result.routing.routingConfidence}% confidence)`);
+      }
+
+      if (result.workflow) {
+        this.info('Multi-agent workflow:');
+        result.workflow.forEach((phase, i) => {
+          const parallelBadge = phase.parallel ? chalk.cyan('[parallel]') : '';
+          console.log(`  ${i + 1}. ${phase.phase}: ${phase.action} ${parallelBadge}`);
+        });
+      }
+
+      if (result.swarmResult) {
+        this.success('Swarm execution initiated');
+        console.log(result.swarmResult.report);
+      }
+
+      return this.createSuccess('Multi-agent orchestration complete');
+    } catch (error) {
+      this.warn(`Multi-agent orchestration error: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
     }
   }
 

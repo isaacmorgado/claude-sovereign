@@ -4,6 +4,13 @@
  *
  * Implements distributed agent swarms for parallel task execution
  * Based on: ax-llm dependency analysis, kubernetes conflict detection
+ *
+ * Phase 3 Integration:
+ * - Vision capture for UI-related swarm tasks
+ * - Debug orchestrator for swarm-level debugging
+ * - Quality judge for swarm output validation
+ * - Constitutional AI for swarm safety checks
+ * - Bounded autonomy for permission management
  */
 
 import { TaskDecomposer, type DecomposedTask } from './Decomposer';
@@ -19,7 +26,17 @@ import { GitIntegration, type IntegrationSummary } from './GitIntegration';
 export { DecomposedTask, SpawnInstructions, SwarmState, AgentResult, MergedResult, IntegrationSummary };
 
 /**
- * Main Swarm Orchestrator
+ * Phase 3 capabilities configuration
+ */
+export interface Phase3Capabilities {
+  enableDebug?: boolean;
+  enableQuality?: boolean;
+  enableSafety?: boolean;
+  enableVision?: boolean;
+}
+
+/**
+ * Main Swarm Orchestrator (with Phase 3 Integration)
  */
 export class SwarmOrchestrator {
   private decomposer: TaskDecomposer;
@@ -27,13 +44,23 @@ export class SwarmOrchestrator {
   private coordinator: SwarmCoordinator;
   private merger: ResultMerger;
   private gitIntegration: GitIntegration;
+  private phase3Capabilities: Phase3Capabilities;
 
-  constructor(maxAgents: number = 10) {
+  constructor(
+    maxAgents: number = 10,
+    phase3Capabilities: Phase3Capabilities = {}
+  ) {
     this.decomposer = new TaskDecomposer();
     this.spawner = new AgentSpawner(maxAgents);
     this.coordinator = new SwarmCoordinator();
     this.merger = new ResultMerger();
     this.gitIntegration = new GitIntegration();
+    this.phase3Capabilities = {
+      enableDebug: phase3Capabilities.enableDebug ?? true,
+      enableQuality: phase3Capabilities.enableQuality ?? true,
+      enableSafety: phase3Capabilities.enableSafety ?? true,
+      enableVision: phase3Capabilities.enableVision ?? false
+    };
   }
 
   /**
