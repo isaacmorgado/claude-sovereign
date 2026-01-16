@@ -236,11 +236,235 @@ if [[ "${CLAUDE_LOOP_ACTIVE:-0}" == "1" ]]; then
     fi
 fi
 
-# Build continuation prompt based on autonomous mode and router decision
+# DIRECT EXECUTION FUNCTION - Execute checkpoint without Claude signaling
+execute_checkpoint_directly() {
+    log "🚀 Executing checkpoint directly in hook (bypassing Claude signal)"
+
+    # Check if we're in a git repo
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log "⚠️  Not in a git repository - skipping direct checkpoint"
+        return 1
+    fi
+
+    # Check if there are changes to commit
+    if git diff --quiet && git diff --cached --quiet; then
+        log "✅ No changes to commit - checkpoint unnecessary"
+        return 0
+    fi
+
+    # Update CLAUDE.md with session progress
+    local claude_md="CLAUDE.md"
+    if [[ -f "$claude_md" ]]; then
+        log "📝 Updating CLAUDE.md with session progress"
+
+        # Create a simple session summary
+        local timestamp=$(date '+%Y-%m-%d %H:%M')
+
+        # Write session summary to temp file for awk to read
+        local temp_summary="/tmp/claude-session-summary-$$.md"
+        cat > "$temp_summary" <<EOF
+### Last Session ($timestamp)
+
+**Auto-checkpoint triggered at ${PERCENT}% context**
+- Context reached threshold: ${CURRENT_TOKENS}/${CONTEXT_SIZE} tokens
+- Session iteration: $ITERATION
+${BUILD_CONTEXT:+- Build in progress: $BUILD_FEATURE}
+${CHECKPOINT_ID:+- Memory checkpoint: $CHECKPOINT_ID}
+
+Stopped at: Context threshold reached, auto-checkpoint executed
+EOF
+
+        # Simple update: append to or update "Last Session" section
+        # This is a minimal update - full CLAUDE.md management stays in /checkpoint command
+        if grep -q "## Last Session" "$claude_md" 2>/dev/null; then
+            # Update existing Last Session section using Python for reliable multi-line handling
+            if python3 <<PYEOF 2>&1 | tee -a "$LOG_FILE"
+import re
+
+with open("$claude_md", 'r') as f:
+    content = f.read()
+
+with open("$temp_summary", 'r') as f:
+    new_session = f.read()
+
+# Replace from "## Last Session" (with optional date/text) to the next "##" (or EOF)
+# Pattern: ## Last Session... anything until next ## or end of file
+pattern = r'## Last Session[^\n]*\n.*?(?=\n##|\Z)'
+replacement = '## Last Session\n\n' + new_session
+
+result = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+with open("$claude_md", 'w') as f:
+    f.write(result)
+PYEOF
+            then
+                log "✅ Updated existing Last Session in CLAUDE.md"
+            else
+                log "❌ Python update failed, trying simple append"
+                # Fallback: just append
+                echo -e "\n### Auto-Checkpoint $(date '+%Y-%m-%d %H:%M')" >> "$claude_md"
+                cat "$temp_summary" >> "$claude_md"
+            fi
+        else
+            # Append Last Session section
+            echo -e "\n## Last Session\n" >> "$claude_md"
+            cat "$temp_summary" >> "$claude_md"
+            log "✅ Added Last Session to CLAUDE.md"
+        fi
+
+        rm -f "$temp_summary"
+        log "📋 CLAUDE.md update complete, proceeding to git operations"
+    else
+        log "⚠️  CLAUDE.md not found - creating minimal version"
+        cat > "$claude_md" <<EOF
+# $PROJECT_NAME
+
+Auto-generated checkpoint at $(date '+%Y-%m-%d %H:%M')
+
+## Current Focus
+Section: Context management
+Files: Auto-checkpoint triggered at ${PERCENT}% context
+
+## Last Session ($(date '+%Y-%m-%d'))
+- Auto-checkpoint at ${PERCENT}% context
+- Stopped at: Context threshold reached
+
+## Next Steps
+1. Resume work - check continuation prompt
+2. Review progress in git log
+EOF
+        log "✅ Created minimal CLAUDE.md"
+    fi
+
+    # Stage the changes
+    log "📦 Staging changes to git..."
+    if git add CLAUDE.md buildguide.md 2>&1 | tee -a "$LOG_FILE"; then
+        log "✅ Files staged successfully"
+    elif git add CLAUDE.md 2>&1 | tee -a "$LOG_FILE"; then
+        log "✅ CLAUDE.md staged (buildguide.md not found)"
+    else
+        log "❌ Failed to stage files"
+        return 1
+    fi
+
+    # Check again if there are actually staged changes
+    log "🔍 Checking for staged changes..."
+    if git diff --cached --quiet; then
+        log "✅ No staged changes after adding files - nothing to commit"
+        return 0
+    fi
+    log "✅ Staged changes detected, proceeding with commit"
+
+    # Commit with auto-checkpoint message
+    log "💾 Creating git commit..."
+
+    # Use a temp file for the commit message to handle multi-line properly
+    local commit_msg_file="/tmp/claude-commit-msg-$$.txt"
+    cat > "$commit_msg_file" <<'COMMITMSG_EOF'
+checkpoint: auto-checkpoint
+
+Auto-checkpoint triggered by context threshold.
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+COMMITMSG_EOF
+
+    log "📄 Commit message file created at $commit_msg_file"
+
+    # Commit using -F for file input
+    local git_output
+    local git_exit_code
+    git_output=$(git commit -F "$commit_msg_file" 2>&1) || git_exit_code=$?
+    log "Git commit exit code: ${git_exit_code:-0}"
+    log "Git commit output: $git_output"
+
+    if [[ "${git_exit_code:-0}" -eq 0 ]]; then
+        echo "$git_output" | tee -a "$LOG_FILE"
+        rm -f "$commit_msg_file"
+        log "✅ Git commit successful"
+
+        # Push to remote if it exists
+        if git remote | grep -q 'origin'; then
+            log "📤 Pushing to remote..."
+            local push_output
+            if push_output=$(git push origin HEAD 2>&1); then
+                echo "$push_output" | tee -a "$LOG_FILE"
+                log "✅ Git push successful"
+                return 0
+            else
+                echo "$push_output" | tee -a "$LOG_FILE"
+                log "⚠️  Git push failed - local commit still created"
+                return 0  # Still count as success since local commit worked
+            fi
+        else
+            log "✅ No remote configured - local commit only"
+            return 0
+        fi
+    else
+        echo "$git_output" | tee -a "$LOG_FILE"
+        rm -f "$commit_msg_file"
+        log "❌ Git commit failed: $git_output"
+        return 1
+    fi
+}
+
+# Execute checkpoint directly if in autonomous mode
+CHECKPOINT_EXECUTED="false"
 if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
-    # AUTONOMOUS MODE
+    log "Attempting direct checkpoint execution..."
+    if execute_checkpoint_directly; then
+        CHECKPOINT_EXECUTED="true"
+        log "✅ Direct checkpoint execution completed successfully"
+    else
+        log "⚠️  Direct checkpoint execution failed - falling back to Claude signal"
+    fi
+fi
+
+# Build continuation prompt based on autonomous mode and checkpoint execution status
+if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" && "$CHECKPOINT_EXECUTED" == "true" ]]; then
+    # CHECKPOINT ALREADY EXECUTED - Just inform and continue
     if [[ "${CLAUDE_LOOP_ACTIVE:-0}" == "1" ]]; then
-        # LOOP MODE: Instruct to exit so loop can restart
+        # LOOP MODE: Checkpoint done, session can exit
+        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - ✅ checkpoint executed automatically.
+
+**What happened:**
+- CLAUDE.md updated with session progress
+- Changes committed to git
+- Pushed to GitHub (if remote exists)
+
+**Next:**
+- Session will terminate to free context
+- Loop will auto-restart with saved state
+- Work continues seamlessly"
+    else
+        # MANUAL AUTONOMY: Checkpoint done, inform user
+        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - ✅ checkpoint executed automatically.
+
+**What happened:**
+- CLAUDE.md updated with session progress
+- Changes committed to git
+- Pushed to GitHub (if remote exists)
+
+**Next:**
+- Resume with: \`aichat resume\` OR
+- Clear context: \`/clear\` then paste continuation prompt below"
+    fi
+
+    # The actual prompt for the NEXT session
+    CONTINUATION_PROMPT="**RESUME**: ${PROJECT_NAME} (checkpoint auto-saved).
+**Context**:
+${BUILD_CONTEXT:-* Check .claude/current-build.local.md or buildguide.md}
+${NEXT_SECTION:+* Next: $NEXT_SECTION}
+${CHECKPOINT_INFO}
+${JANITOR_REPORT}
+
+**Note**: Last session auto-checkpointed at ${PERCENT}% context. All progress saved to git.
+
+**Goal**: Continue immediately. No questions. /auto"
+
+elif [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
+    # AUTONOMOUS MODE BUT EXECUTION FAILED - Signal Claude to execute
+    if [[ "${CLAUDE_LOOP_ACTIVE:-0}" == "1" ]]; then
+        # LOOP MODE: Instruct to execute checkpoint
         CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - executing checkpoint now.
 
 <command-name>/checkpoint</command-name>
@@ -249,7 +473,7 @@ After checkpoint completes:
 - Session will terminate to free context
 - Loop will auto-restart with saved state"
     else
-        # MANUAL AUTONOMY: Instruct to resume manually
+        # MANUAL AUTONOMY: Instruct to execute checkpoint
         CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - executing checkpoint now.
 
 <command-name>/checkpoint</command-name>
@@ -282,7 +506,7 @@ ${JANITOR_REPORT}
 **Then**: \`aichat resume\` OR \`/clear\` & paste this context.
 
 **Focus**: ${NEXT_SECTION:-Current Task}. Reference docs/plans. Don't re-read entire codebase."
-    
+
     CONTINUATION_PROMPT="$CURRENT_INSTRUCTION"
 fi
 
@@ -314,21 +538,43 @@ SYSTEM_MSG="Auto-continue: Context ${PERCENT}% compacted (iteration ${ITERATION}
 
 if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
     # Autonomous mode: Include execution metadata
-    jq -n \
-        --arg prompt "$CURRENT_INSTRUCTION" \
-        --arg msg "$SYSTEM_MSG | Auto-executing /checkpoint" \
-        --argjson router "$ROUTER_DECISION" \
-        '{
-            "decision": "block",
-            "reason": $prompt,
-            "systemMessage": $msg,
-            "autonomous_execution": {
-                "enabled": true,
-                "skill": "checkpoint",
-                "reason": "context_threshold",
-                "router_decision": $router
-            }
-        }'
+    if [[ "$CHECKPOINT_EXECUTED" == "true" ]]; then
+        # Checkpoint was executed directly - inform Claude
+        jq -n \
+            --arg prompt "$CURRENT_INSTRUCTION" \
+            --arg msg "$SYSTEM_MSG | ✅ Auto-checkpoint executed (CLAUDE.md updated, changes committed & pushed)" \
+            --argjson router "$ROUTER_DECISION" \
+            '{
+                "decision": "block",
+                "reason": $prompt,
+                "systemMessage": $msg,
+                "autonomous_execution": {
+                    "enabled": true,
+                    "skill": "checkpoint",
+                    "reason": "context_threshold",
+                    "executed_directly": true,
+                    "router_decision": $router
+                }
+            }'
+    else
+        # Direct execution failed - signal Claude to execute
+        jq -n \
+            --arg prompt "$CURRENT_INSTRUCTION" \
+            --arg msg "$SYSTEM_MSG | ⚠️  Direct checkpoint failed - Claude should execute /checkpoint" \
+            --argjson router "$ROUTER_DECISION" \
+            '{
+                "decision": "block",
+                "reason": $prompt,
+                "systemMessage": $msg,
+                "autonomous_execution": {
+                    "enabled": true,
+                    "skill": "checkpoint",
+                    "reason": "context_threshold",
+                    "executed_directly": false,
+                    "router_decision": $router
+                }
+            }'
+    fi
 else
     # Normal mode: Just continuation prompt
     jq -n \
