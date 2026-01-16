@@ -10,7 +10,7 @@
 # set -e # Disabled to prevent loop exit on Claude error
 PROMPT_FILE="${HOME}/.claude/continuation-prompt.md"
 LOG_FILE="${HOME}/.claude/loop.log"
-MAX_RESTARTS=100  # Safety limit
+MAX_RESTARTS=999999999  # Effectively unlimited - use /auto stop to stop
 export CLAUDE_LOOP_ACTIVE=1  # Signal hooks that we are in a loop
 
 log() {
@@ -27,15 +27,18 @@ USAGE:
     claude-loop.sh --help           # Show this help
 
 ENVIRONMENT:
-    CLAUDE_LOOP_MAX_RESTARTS=100    # Maximum restart iterations
-    CLAUDE_LOOP_DELAY=2             # Seconds between restarts
+    CLAUDE_LOOP_MAX_RESTARTS=999999999  # Maximum restart iterations (default: unlimited)
+    CLAUDE_LOOP_DELAY=2                 # Seconds between restarts
 
 FILES:
     ~/.claude/continuation-prompt.md  # Handoff file from auto-continue.sh
     ~/.claude/loop.log                # Loop activity log
+    ~/.claude/stop-loop               # Create this file to stop (or use /auto stop)
 
 STOP:
-    Press Ctrl+C to stop the loop gracefully.
+    Use /auto stop command (recommended)
+    Or: touch ~/.claude/stop-loop
+    Or: Press Ctrl+C to stop gracefully
 EOF
     exit 0
 }
@@ -61,7 +64,11 @@ command -v claude >/dev/null 2>&1 || {
     exit 1
 }
 
-log "🤖 Starting Claude infinite loop (max $MAX restarts)"
+if [[ $MAX -gt 1000000 ]]; then
+    log "🤖 Starting Claude infinite loop (unlimited restarts - use /auto stop to stop)"
+else
+    log "🤖 Starting Claude infinite loop (max $MAX restarts)"
+fi
 
 while [[ $RESTART_COUNT -lt $MAX ]]; do
     RESTART_COUNT=$((RESTART_COUNT + 1))
