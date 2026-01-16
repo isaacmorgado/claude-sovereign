@@ -8,6 +8,7 @@ CLAUDE_DIR="${HOME}/.claude"
 MEMORY_MANAGER="${CLAUDE_DIR}/hooks/memory-manager.sh"
 LEARNING_ENGINE="${CLAUDE_DIR}/hooks/learning-engine.sh"
 TASK_QUEUE="${CLAUDE_DIR}/hooks/task-queue.sh"
+COORDINATOR="${CLAUDE_DIR}/hooks/coordinator.sh"
 AGENT_LOOP="${CLAUDE_DIR}/hooks/agent-loop.sh"
 PLAN_EXECUTE="${CLAUDE_DIR}/hooks/plan-execute.sh"
 SELF_HEALING="${CLAUDE_DIR}/hooks/self-healing.sh"
@@ -370,32 +371,49 @@ analyze_task() {
 # AUTO-EXECUTION (NEW)
 # =============================================================================
 
-# Start agent loop for a task
+# Start agent loop for a task (via coordinator for full intelligence)
 start_agent_loop() {
     local task="$1"
     local context="${2:-}"
-
-    if [[ ! -x "$AGENT_LOOP" ]]; then
-        log "Agent loop not available"
-        return 1
-    fi
 
     # Check system health first
     if [[ -x "$SELF_HEALING" ]]; then
         local health
         health=$("$SELF_HEALING" health 2>/dev/null || echo "unknown")
         if [[ "$health" == "unhealthy" ]]; then
-            log "System unhealthy, attempting recovery before agent loop"
+            log "System unhealthy, attempting recovery before task"
             "$SELF_HEALING" recover 2>/dev/null || true
         fi
     fi
 
-    # Start agent loop
-    log "Starting agent loop for: $task"
-    local agent_id
-    agent_id=$("$AGENT_LOOP" start "$task" "$context" 2>/dev/null)
+    # Prefer coordinator for full ReAct/Reflexion/Constitutional AI integration
+    if [[ -x "$COORDINATOR" ]]; then
+        log "Starting task via coordinator (full intelligence): $task"
+        local result
+        result=$("$COORDINATOR" coordinate_task "$task" "$context" 2>/dev/null || echo "")
 
-    echo "$agent_id"
+        # Coordinator returns JSON with agent_id
+        local agent_id
+        agent_id=$(echo "$result" | jq -r '.agent_id // empty' 2>/dev/null || echo "")
+
+        if [[ -n "$agent_id" ]]; then
+            echo "$agent_id"
+            return 0
+        else
+            log "⚠️ Coordinator failed, falling back to direct agent-loop"
+        fi
+    fi
+
+    # Fallback to direct agent-loop if coordinator unavailable or failed
+    if [[ -x "$AGENT_LOOP" ]]; then
+        log "Starting agent loop directly (fallback): $task"
+        local agent_id
+        agent_id=$("$AGENT_LOOP" start "$task" "$context" 2>/dev/null)
+        echo "$agent_id"
+    else
+        log "❌ Neither coordinator nor agent-loop available"
+        return 1
+    fi
 }
 
 # Create execution plan for task

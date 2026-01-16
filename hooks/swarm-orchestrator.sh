@@ -119,6 +119,23 @@ log_error() {
     echo "ERROR: $*" >&2
 }
 
+# Git push helper with proper error handling
+git_push_if_remote() {
+    if git remote | grep -q 'origin' 2>/dev/null; then
+        local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if git push origin "$current_branch" 2>/dev/null; then
+            log "✅ Pushed $current_branch to origin"
+            return 0
+        else
+            log "⚠️ Push to origin failed (may need authentication or network issue)"
+            return 1
+        fi
+    else
+        log "ℹ️  No origin remote configured, skipping push"
+        return 0
+    fi
+}
+
 # ============================================================================
 # Task Decomposition
 # ============================================================================
@@ -1086,6 +1103,7 @@ integrate_code_changes() {
                     git commit -m "Agent $i: $subtask" --no-verify 2>/dev/null || true
                     log "Agent $i: Changes committed to $agent_branch"
                     echo "- Changes committed to branch: $agent_branch" >> "$integration_report"
+                    git_push_if_remote
                 fi
             fi
 
@@ -1101,6 +1119,7 @@ integrate_code_changes() {
             log "✅ Agent $i: Clean merge"
             echo "- Result: ✅ Clean merge (no conflicts)" >> "$integration_report"
             git commit -m "Merge agent $i work: $subtask" --no-verify 2>/dev/null || true
+            git_push_if_remote
         else
             # Merge has conflicts - detect them (Lean Prover pattern)
             local conflicted_files=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "")
@@ -1109,6 +1128,7 @@ integrate_code_changes() {
                 log "✅ Agent $i: Merge completed (manual intervention was needed)"
                 echo "- Result: ✅ Completed with manual resolution" >> "$integration_report"
                 git commit -m "Merge agent $i work: $subtask" --no-verify 2>/dev/null || true
+                git_push_if_remote
             else
                 conflicts_found=true
                 log "⚠️  Agent $i: Conflicts detected in $(echo "$conflicted_files" | wc -l) files"
@@ -1161,6 +1181,7 @@ integrate_code_changes() {
                     log "✅ All conflicts auto-resolved for agent $i"
                     echo "- All conflicts successfully auto-resolved" >> "$integration_report"
                     git commit -m "Merge agent $i work (auto-resolved conflicts): $subtask" --no-verify 2>/dev/null || true
+                    git_push_if_remote
                 else
                     log "⚠️  Some conflicts remain unresolved"
                     echo "- ⚠️  Manual resolution required before finalizing" >> "$integration_report"

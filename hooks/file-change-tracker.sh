@@ -39,6 +39,38 @@ record_change() {
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # Use portable locking mechanism (works on macOS and Linux)
+    local lock_file="${TRACKER_FILE}.lock"
+    local lock_timeout=10
+    local lock_acquired=false
+
+    # Clean stale lock (older than 60 seconds)
+    if [[ -d "$lock_file" ]]; then
+        local lock_age=$(($(date +%s) - $(stat -f %m "$lock_file" 2>/dev/null || stat -c %Y "$lock_file" 2>/dev/null || echo 0)))
+        if [[ $lock_age -gt 60 ]]; then
+            log "Removing stale lock (age: ${lock_age}s)"
+            rmdir "$lock_file" 2>/dev/null || true
+        fi
+    fi
+
+    # Try to acquire lock with timeout
+    for ((i=0; i<lock_timeout; i++)); do
+        if mkdir "$lock_file" 2>/dev/null; then
+            lock_acquired=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$lock_acquired" != "true" ]]; then
+        log "Failed to acquire lock after ${lock_timeout}s"
+        echo "ERROR:0"
+        return 1
+    fi
+
+    # Ensure lock is released on exit
+    trap "rmdir '$lock_file' 2>/dev/null || true" EXIT INT TERM
+
     # Check if session just started
     local session_start
     session_start=$(jq -r '.session_start' "$TRACKER_FILE")
@@ -66,6 +98,10 @@ record_change() {
     count=$(jq -r '.change_count' "$TRACKER_FILE")
 
     log "Recorded change: $file_path ($change_type) - Total: $count"
+
+    # Release lock
+    rmdir "$lock_file" 2>/dev/null || true
+    trap - EXIT INT TERM
 
     # Check if threshold reached
     if [[ $count -ge $CHECKPOINT_THRESHOLD ]]; then
@@ -97,6 +133,37 @@ reset_counter() {
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # Use portable locking mechanism (works on macOS and Linux)
+    local lock_file="${TRACKER_FILE}.lock"
+    local lock_timeout=10
+    local lock_acquired=false
+
+    # Clean stale lock (older than 60 seconds)
+    if [[ -d "$lock_file" ]]; then
+        local lock_age=$(($(date +%s) - $(stat -f %m "$lock_file" 2>/dev/null || stat -c %Y "$lock_file" 2>/dev/null || echo 0)))
+        if [[ $lock_age -gt 60 ]]; then
+            log "Removing stale lock (age: ${lock_age}s)"
+            rmdir "$lock_file" 2>/dev/null || true
+        fi
+    fi
+
+    # Try to acquire lock with timeout
+    for ((i=0; i<lock_timeout; i++)); do
+        if mkdir "$lock_file" 2>/dev/null; then
+            lock_acquired=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$lock_acquired" != "true" ]]; then
+        log "Failed to acquire lock after ${lock_timeout}s"
+        return 1
+    fi
+
+    # Ensure lock is released on exit
+    trap "rmdir '$lock_file' 2>/dev/null || true" EXIT INT TERM
+
     local checkpoint_count
     checkpoint_count=$(jq -r '.checkpoint_count' "$TRACKER_FILE")
     checkpoint_count=$((checkpoint_count + 1))
@@ -113,6 +180,10 @@ reset_counter() {
     mv "${TRACKER_FILE}.tmp" "$TRACKER_FILE"
 
     log "Counter reset after checkpoint (checkpoint #${checkpoint_count})"
+
+    # Release lock
+    rmdir "$lock_file" 2>/dev/null || true
+    trap - EXIT INT TERM
 }
 
 # Get status

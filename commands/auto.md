@@ -23,36 +23,69 @@ Parse arguments: $ARGUMENTS
 
 ### If "stop" or user wants to stop:
 
-1. **Deactivate autonomous mode**:
+1. **Stop Claude Loop (if running)**:
+   ```bash
+   if [[ -f ~/.claude/loop.pid ]]; then
+       LOOP_PID=$(cat ~/.claude/loop.pid)
+       if kill -0 "$LOOP_PID" 2>/dev/null; then
+           kill "$LOOP_PID" 2>/dev/null
+           echo "🛑 Claude Loop stopped (PID $LOOP_PID)"
+       fi
+       rm -f ~/.claude/loop.pid
+   fi
+   # Create stop signal for loop
+   touch ~/.claude/stop-loop
+   ```
+
+2. **Deactivate autonomous mode**:
    ```bash
    rm -f ~/.claude/autonomous-mode.active 2>/dev/null
    echo "Autonomous mode deactivated"
    ```
 
-2. **Report to user**:
+3. **Report to user**:
    ```
    ✅ Autonomous mode stopped
 
    Claude is now in normal interactive mode.
    - Will ask for confirmation before major actions
    - Will wait for your instructions
+   - Claude Loop has been stopped
    - Use `/auto` or `/auto start` to re-enable autonomous mode
    ```
 
-3. **Stop working autonomously** - wait for user input from now on.
+4. **Stop working autonomously** - wait for user input from now on.
 
 ### If "status":
 
 1. Check if autonomous mode is active:
    ```bash
    if [[ -f ~/.claude/autonomous-mode.active ]]; then
-     echo "ACTIVE"
+     echo "Autonomous Mode: ACTIVE"
    else
-     echo "INACTIVE"
+     echo "Autonomous Mode: INACTIVE"
    fi
    ```
 
-2. Report status to user.
+2. Check if Claude Loop is running:
+   ```bash
+   if [[ -f ~/.claude/loop.pid ]]; then
+       LOOP_PID=$(cat ~/.claude/loop.pid)
+       if kill -0 "$LOOP_PID" 2>/dev/null; then
+           echo "Claude Loop: RUNNING (PID $LOOP_PID)"
+           echo "  → Auto-resumes sessions at 40% context"
+           echo "  → Log: tail -f ~/.claude/loop.log"
+       else
+           echo "Claude Loop: STOPPED (stale PID file)"
+           rm -f ~/.claude/loop.pid
+       fi
+   else
+       echo "Claude Loop: NOT RUNNING"
+       echo "  → Start with /auto start to enable auto-resume"
+   fi
+   ```
+
+3. Report detailed status to user.
 
 ### If "start" or no argument (default):
 
@@ -61,26 +94,54 @@ Parse arguments: $ARGUMENTS
    echo "$(date +%s)" > ~/.claude/autonomous-mode.active
    ```
 
-2. **Load context and start intelligent coordination**:
+2. **Start Claude Loop (if not already running)**:
+   ```bash
+   # Check if loop is already running
+   LOOP_RUNNING=false
+   if [[ -f ~/.claude/loop.pid ]]; then
+       LOOP_PID=$(cat ~/.claude/loop.pid)
+       if kill -0 "$LOOP_PID" 2>/dev/null; then
+           LOOP_RUNNING=true
+           echo "🔄 Claude Loop already running (PID $LOOP_PID)"
+       else
+           rm -f ~/.claude/loop.pid
+       fi
+   fi
+
+   # Start loop if not running
+   if [[ "$LOOP_RUNNING" == "false" ]]; then
+       rm -f ~/.claude/stop-loop
+       nohup ~/.claude/bin/claude-loop.sh > ~/.claude/loop-output.log 2>&1 &
+       LOOP_PID=$!
+       echo "$LOOP_PID" > ~/.claude/loop.pid
+       echo "🚀 Claude Loop started (PID $LOOP_PID)"
+       echo "   → Sessions will auto-resume at 40% context"
+       echo "   → Monitor: tail -f ~/.claude/loop.log"
+   fi
+   ```
+
+3. **Load context and start intelligent coordination**:
    ```bash
    ~/.claude/hooks/memory-manager.sh get-working
    ~/.claude/hooks/coordinator.sh orchestrate
    ```
 
-3. **Report activation**:
+4. **Report activation**:
    ```
-   🤖 AUTONOMOUS MODE ACTIVATED
+   🤖 AUTONOMOUS MODE ACTIVATED + LOOP RUNNING
 
-   I will now work fully autonomously:
+   Full autonomous operation enabled:
    - Execute tasks without asking for confirmation
    - Auto-checkpoint progress every 10 changes
    - Auto-fix errors (retry up to 3 times)
-   - Continue until task is complete or blocked
+   - Auto-resume sessions when context reaches 40%
+   - Continue indefinitely until task is complete
 
    To stop: Say "stop" or run `/auto stop`
+   Loop status: tail -f ~/.claude/loop.log
    ```
 
-4. **Detect what to do** (in priority order):
+5. **Detect what to do** (in priority order):
 
    **Priority 1 - Continuation Prompt**:
    Check for `.claude/continuation-prompt.md` or `~/.claude/continuation-prompt.md`
@@ -101,7 +162,7 @@ Parse arguments: $ARGUMENTS
    **Priority 5 - User Message**:
    If user provided a task in their message with /auto, execute that task
 
-5. **Start working immediately** - do not ask for confirmation, just begin executing.
+6. **Start working immediately** - do not ask for confirmation, just begin executing.
 
 ## Autonomous Behaviors (While Active)
 

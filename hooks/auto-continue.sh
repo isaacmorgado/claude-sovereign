@@ -73,8 +73,8 @@ MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
 CHECKPOINT_ID=""
 
 if [[ -x "$MEMORY_MANAGER" ]]; then
-    # PHASE 4: Check context budget
-    CONTEXT_USAGE=$("$MEMORY_MANAGER" context-usage 2>/dev/null || echo "{}")
+    # PHASE 4: Check context budget (pass current percentage)
+    CONTEXT_USAGE=$("$MEMORY_MANAGER" context-usage "$PERCENT" 2>/dev/null || echo "{}")
     CONTEXT_STATUS=$(echo "$CONTEXT_USAGE" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
 
     if [[ "$CONTEXT_STATUS" == "critical" || "$CONTEXT_STATUS" == "warning" ]]; then
@@ -241,16 +241,22 @@ if [[ "$SHOULD_EXECUTE_CHECKPOINT" == "true" ]]; then
     # AUTONOMOUS MODE
     if [[ "${CLAUDE_LOOP_ACTIVE:-0}" == "1" ]]; then
         # LOOP MODE: Instruct to exit so loop can restart
-        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full.
-Actions:
-1. **EXECUTE**: \`/checkpoint\` (Save & Push)
-2. **EXECUTE**: \`/exit\` (Terminates session to trigger auto-restart)"
+        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - executing checkpoint now.
+
+<command-name>/checkpoint</command-name>
+
+After checkpoint completes:
+- Session will terminate to free context
+- Loop will auto-restart with saved state"
     else
         # MANUAL AUTONOMY: Instruct to resume manually
-        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full.
-Actions:
-1. **EXECUTE**: \`/checkpoint\` (Save & Push)
-2. **RESUME**: \`aichat resume\` (if installed) OR \`/clear\` then paste usage below."
+        CURRENT_INSTRUCTION="**AUTO-CONTINUE**: Context ${PERCENT}% full - executing checkpoint now.
+
+<command-name>/checkpoint</command-name>
+
+After checkpoint completes:
+- Resume with: \`aichat resume\` OR
+- Clear context: \`/clear\` then paste continuation prompt"
     fi
 
     # The actual prompt for the NEXT session

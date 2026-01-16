@@ -1,7 +1,7 @@
 ---
 description: Save progress to CLAUDE.md AND generate continuation prompt
 argument-hint: "[summary]"
-allowed-tools: ["Read", "Write", "Edit"]
+allowed-tools: ["Read", "Write", "Edit", "Bash"]
 ---
 
 # Session Checkpoint Command

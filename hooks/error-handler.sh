@@ -223,8 +223,9 @@ handle_error() {
     fi
     # ============================================================================
 
-    # NEW: Query memory for known fixes BEFORE deciding to retry
+    # NEW: Query memory for known fixes and attempt to apply them
     local known_fix=""
+    local known_fix_worked=false
     local MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
     if [[ -x "$MEMORY_MANAGER" && "$attempt" -eq 0 ]]; then
         local patterns
@@ -236,21 +237,32 @@ handle_error() {
 
             if [[ -n "$known_fix" && "$known_fix" != "null" ]]; then
                 log "Found known fix in memory: $known_fix"
+                log "Attempting to apply known fix..."
 
-                # Return the fix suggestion
-                jq -n \
-                    --arg classification "$classification" \
-                    --arg fix "$known_fix" \
-                    --arg error "$error_msg" \
-                    '{
-                        classification: $classification,
-                        shouldRetry: false,
-                        hasKnownFix: true,
-                        knownFix: $fix,
-                        recommendation: "Apply known fix from memory",
-                        error: $error
-                    }'
-                return
+                # Try to apply the known fix
+                if eval "$known_fix" 2>/dev/null; then
+                    log "✅ Known fix applied successfully"
+                    known_fix_worked=true
+
+                    # Return success - fix worked
+                    jq -n \
+                        --arg classification "$classification" \
+                        --arg fix "$known_fix" \
+                        --arg error "$error_msg" \
+                        '{
+                            classification: $classification,
+                            shouldRetry: false,
+                            hasKnownFix: true,
+                            knownFix: $fix,
+                            fixApplied: true,
+                            recommendation: "Known fix applied successfully",
+                            error: $error
+                        }'
+                    return
+                else
+                    log "⚠️ Known fix failed, will retry original command"
+                    # Fall through to normal retry logic
+                fi
             fi
         fi
     fi
