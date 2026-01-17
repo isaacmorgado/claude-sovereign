@@ -339,10 +339,17 @@ export CHECKPOINT_FILE_THRESHOLD=15  # After 15 files
 
 ## Documentation
 
-- **[40% Flow Verified](docs/40-PERCENT-FLOW-VERIFIED.md)** - Complete 40% context flow
+### User Guides
 - **[100% Hands-Off Operation](docs/100-PERCENT-HANDS-OFF-OPERATION.md)** - Full autonomous guide
+- **[40% Flow Verified](docs/40-PERCENT-FLOW-VERIFIED.md)** - Complete 40% context flow
 - **[Project Navigator Guide](docs/PROJECT-NAVIGATOR-GUIDE.md)** - Token optimization
 - **[GitHub Push & Navigation](docs/GITHUB-PUSH-AND-NAVIGATION-COMPLETE.md)** - Git integration
+- **[Troubleshooting Guide](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+
+### Technical Reference
+- **[API Reference](docs/API.md)** - Complete CLI reference for all hooks
+- **[System Architecture](docs/ARCHITECTURE.md)** - Component diagrams and data flow
+- **[Release Checklist](docs/RELEASE-CHECKLIST.md)** - QA validation status
 
 ## Benefits
 
