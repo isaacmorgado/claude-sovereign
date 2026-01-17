@@ -1338,11 +1338,22 @@ calculate_context_usage() {
     local critical_tokens
     critical_tokens=$(echo "$total_limit * $critical_threshold" | bc 2>/dev/null || echo "0")
 
-    # Determine status
-    local status="ok"
-    if [[ $(echo "$total_tokens > $critical_tokens" | bc 2>/dev/null) -eq 1 ]]; then
+    # Determine status using proper numeric comparison
+    # Extract integer percentage for bash comparison
+    local usage_pct_num
+    usage_pct_num=$(echo "$usage_pct" | cut -d'.' -f1)
+
+    local warning_pct_num
+    warning_pct_num=$(echo "$warning_threshold * 100" | bc | cut -d'.' -f1)
+
+    local critical_pct_num
+    critical_pct_num=$(echo "$critical_threshold * 100" | bc | cut -d'.' -f1)
+
+    # Determine status: "active" for healthy (not "ok"), "warning" at 80%, "critical" at 90%
+    local status="active"
+    if [[ $usage_pct_num -ge $critical_pct_num ]]; then
         status="critical"
-    elif [[ $(echo "$total_tokens > $warning_tokens" | bc 2>/dev/null) -eq 1 ]]; then
+    elif [[ $usage_pct_num -ge $warning_pct_num ]]; then
         status="warning"
     fi
 
@@ -1397,8 +1408,8 @@ check_context_budget() {
             echo "⚠️  WARNING: Context budget at ${usage_pct}% ($total/$limit tokens)"
             return 1
             ;;
-        ok)
-            echo "✅ OK: Context budget at ${usage_pct}% ($total/$limit tokens)"
+        active)
+            echo "✅ ACTIVE: Context budget at ${usage_pct}% ($total/$limit tokens)"
             return 0
             ;;
     esac
