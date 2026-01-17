@@ -34,7 +34,7 @@ This phase addresses bash compatibility issues and creates comprehensive documen
 
   **Completed 2026-01-17**: Updated 79 scripts from `#!/bin/bash` to `#!/usr/bin/env bash`. All 81 scripts now pass compatibility test (2 already had portable shebangs).
 
-- [ ] Create comprehensive API documentation:
+- [x] Create comprehensive API documentation:
   - Create `/Users/imorgado/Desktop/claude-sovereign/docs/API.md` with front matter:
     ```yaml
     ---
@@ -59,6 +59,16 @@ This phase addresses bash compatibility issues and creates comprehensive documen
     - Examples: common usage patterns
   - Document each command's purpose and usage
   - Document environment variables and their effects
+
+  **Completed 2026-01-17**: Created comprehensive API.md (~500 lines) documenting 6 major hooks:
+  - coordinator.sh: Central orchestration with coordinate/orchestrate commands
+  - agent-loop.sh: Autonomous execution with 25+ commands for lifecycle, tools, memory
+  - swarm-orchestrator.sh: Multi-agent swarms with spawn/collect/status commands
+  - memory-manager.sh: SQLite-backed memory with 30+ commands for Phase 1-4 features
+  - auto-continue.sh: Context management hook with JSON I/O documentation
+  - file-change-tracker.sh: File change tracking with checkpoint triggers
+  - error-handler.sh: Error classification with retry strategies
+  Also documented: all environment variables, exit codes, integration examples.
 
 - [ ] Create architecture documentation with diagrams:
   - Create `/Users/imorgado/Desktop/claude-sovereign/docs/ARCHITECTURE.md` with front matter:
