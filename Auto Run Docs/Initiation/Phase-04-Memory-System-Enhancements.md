@@ -24,18 +24,19 @@ This phase improves the memory system's retrieval accuracy and context managemen
   - Return "active" for healthy state (not "ok" which isn't documented)
   - Verify thresholds match documented values: warning=80%, critical=90%
 
-- [ ] Enhance RRF implementation for true 4-signal ranking:
-  - Locate `reciprocal_rank_fusion_enhanced()` function (around line 776-810)
-  - Verify all 4 signals are properly weighted:
-    - BM25 score (exact term matching)
-    - Relevance score (semantic word overlap)
-    - Recency score (temporal decay)
-    - Importance score (user-defined priority)
-  - Fix the jq query to handle edge cases:
-    - Empty arrays should return empty result, not error
-    - Null scores should default to 0, not cause ranking errors
-    - Ensure stable sort (deterministic ordering for equal scores)
-  - Add debug logging option to trace ranking decisions
+- [x] Enhance RRF implementation for true 4-signal ranking: (COMPLETED 2026-01-17)
+  - Rewrote `remember_hybrid()` function in memory-manager.sh (lines 192-290)
+  - All 4 signals now properly weighted with RRF (k=60):
+    - BM25 score (FTS5 exact term matching via search_context)
+    - Relevance score (vector-embedder semantic search)
+    - Recency score (temporal decay: 1/(1 + 0.1 * days_ago))
+    - Importance score (user-defined confidence from semantic_memory)
+  - Fixed jq query edge cases:
+    - Empty arrays safely handled via `safe_arr` function
+    - Null scores default to 0.5 via `// 0.5` operator
+    - Stable sort using 3-key comparison: `[-.rrf_score, -.signal_count, -.avg_original_score]`
+  - Debug logging enabled via `MEMORY_DEBUG=true` environment variable
+  - Added 7 new tests: 35/35 tests passing
 
 - [ ] Optimize retrieve_hybrid() performance:
   - Locate `retrieve_hybrid()` function (around line 820-943)
