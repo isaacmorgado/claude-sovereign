@@ -80,7 +80,28 @@ EPISODIC_MEMORY="$MEMORY_DIR/episodic.json"
 SEMANTIC_MEMORY="$MEMORY_DIR/semantic.json"
 ACTION_LOG="$MEMORY_DIR/actions.jsonl"
 REFLECTION_LOG="$MEMORY_DIR/reflections.json"
+MEMORY_LOCK_DIR="${MEMORY_DIR}/.memory.lockdir"
 LOG_FILE="${HOME}/.claude/memory-manager.log"
+
+# Cross-platform file locking using mkdir (atomic on all systems)
+acquire_memory_lock() {
+    local max_attempts=50
+    local attempt=0
+    mkdir -p "$MEMORY_DIR" 2>/dev/null || true
+    while ! mkdir "$MEMORY_LOCK_DIR" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        if [[ $attempt -ge $max_attempts ]]; then
+            log "Error: Could not acquire memory lock after $max_attempts attempts"
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
+release_memory_lock() {
+    rmdir "$MEMORY_LOCK_DIR" 2>/dev/null || true
+}
 
 # Memory limits
 MAX_WORKING_ITEMS="${MAX_WORKING_ITEMS:-50}"
@@ -141,6 +162,9 @@ set_task() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local temp_file
     temp_file=$(mktemp)
 
@@ -158,6 +182,8 @@ set_task() {
 
     mv "$temp_file" "$WORKING_MEMORY"
     log "Set task: $task"
+
+    release_memory_lock
 }
 
 # Add to current context
@@ -166,6 +192,9 @@ add_context() {
     local importance="${2:-5}"  # 1-10 scale
 
     init_memory
+
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
 
     local temp_file
     temp_file=$(mktemp)
@@ -188,6 +217,8 @@ add_context() {
 
     mv "$temp_file" "$WORKING_MEMORY"
     log "Added context (importance: $importance)"
+
+    release_memory_lock
 }
 
 # Update scratchpad (quick notes)
@@ -262,6 +293,9 @@ record_episode() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local temp_file
     temp_file=$(mktemp)
 
@@ -305,6 +339,9 @@ record_episode() {
 
     mv "$temp_file" "$EPISODIC_MEMORY"
     log "Recorded episode: $type - $description"
+
+    release_memory_lock
+
     echo "$episode_id"
 }
 
@@ -360,16 +397,27 @@ add_fact() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local temp_file
     temp_file=$(mktemp)
 
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # Escape single quotes for safety (prevents injection attacks)
+    local category_esc
+    category_esc=$(echo "$category" | sed "s/'/''/g")
+    local key_esc
+    key_esc=$(echo "$key" | sed "s/'/''/g")
+    local value_esc
+    value_esc=$(echo "$value" | sed "s/'/''/g")
+
     # Update or insert fact
-    jq --arg cat "$category" \
-       --arg key "$key" \
-       --arg val "$value" \
+    jq --arg cat "$category_esc" \
+       --arg key "$key_esc" \
+       --arg val "$value_esc" \
        --argjson conf "$confidence" \
        --arg ts "$timestamp" \
        '
@@ -385,6 +433,8 @@ add_fact() {
 
     mv "$temp_file" "$SEMANTIC_MEMORY"
     log "Added fact: $category/$key"
+
+    release_memory_lock
 }
 
 # Get a fact
@@ -418,6 +468,9 @@ add_pattern() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local temp_file
     temp_file=$(mktemp)
 
@@ -448,6 +501,9 @@ add_pattern() {
 
     mv "$temp_file" "$SEMANTIC_MEMORY"
     log "Added pattern: $pattern_type"
+
+    release_memory_lock
+
     echo "$pattern_id"
 }
 
@@ -531,6 +587,9 @@ log_action() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -560,6 +619,9 @@ log_action() {
        }' >> "$ACTION_LOG"
 
     log "Logged action: $action_type"
+
+    release_memory_lock
+
     echo "$action_id"
 }
 
@@ -1622,6 +1684,9 @@ checkpoint() {
 
     init_memory
 
+    # Use file locking for concurrent access safety
+    acquire_memory_lock || return 1
+
     local checkpoint_dir="$MEMORY_DIR/checkpoints"
     mkdir -p "$checkpoint_dir"
 
@@ -1632,6 +1697,10 @@ checkpoint() {
     checkpoint_id="ckpt_$(date +%s)"
 
     local checkpoint_path="$checkpoint_dir/$checkpoint_id.json"
+
+    # Escape description to prevent injection attacks
+    local description_esc
+    description_esc=$(echo "$description" | sed "s/'/''/g")
 
     # Capture git metadata
     local git_branch
@@ -1649,7 +1718,7 @@ checkpoint() {
     # Create checkpoint with all memory state
     jq -n \
         --arg id "$checkpoint_id" \
-        --arg desc "$description" \
+        --arg desc "$description_esc" \
         --arg ts "$timestamp" \
         --arg branch "$git_branch" \
         --arg commit "$git_commit" \
@@ -1681,6 +1750,9 @@ checkpoint() {
     fi
 
     log "Created checkpoint: $checkpoint_id - $description"
+
+    release_memory_lock
+
     echo "$checkpoint_id"
 }
 

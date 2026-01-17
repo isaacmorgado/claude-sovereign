@@ -7,8 +7,28 @@ set -e
 CLAUDE_DIR="${HOME}/.claude"
 PROJECT_DIR="${PWD}"
 TRACKER_FILE="${PROJECT_DIR}/.claude/file-changes.json"
+LOCK_DIR="${TRACKER_FILE}.lockdir"
 LOG_FILE="${CLAUDE_DIR}/file-change-tracker.log"
 CHECKPOINT_THRESHOLD=${CHECKPOINT_FILE_THRESHOLD:-10}
+
+# Cross-platform file locking using mkdir (atomic on all systems)
+acquire_lock() {
+    local max_attempts=50
+    local attempt=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        if [[ $attempt -ge $max_attempts ]]; then
+            echo "Error: Could not acquire lock after $max_attempts attempts" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
+release_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -35,6 +55,10 @@ record_change() {
     local change_type="${2:-modified}"  # created, modified, deleted
 
     init_tracker
+
+    # Use file locking for concurrent access safety in swarm mode
+    acquire_lock || return 1
+    trap 'release_lock' EXIT
 
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -67,13 +91,15 @@ record_change() {
 
     log "Recorded change: $file_path ($change_type) - Total: $count"
 
+    release_lock
+    trap - EXIT
+
     # Check if threshold reached
     if [[ $count -ge $CHECKPOINT_THRESHOLD ]]; then
         echo "CHECKPOINT_NEEDED:${count}"
-        return 0
+    else
+        echo "OK:${count}"
     fi
-
-    echo "OK:${count}"
 }
 
 # Check if checkpoint needed
@@ -94,6 +120,10 @@ should_checkpoint() {
 reset_counter() {
     init_tracker
 
+    # Use file locking for concurrent access safety in swarm mode
+    acquire_lock || return 1
+    trap 'release_lock' EXIT
+
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -113,6 +143,9 @@ reset_counter() {
     mv "${TRACKER_FILE}.tmp" "$TRACKER_FILE"
 
     log "Counter reset after checkpoint (checkpoint #${checkpoint_count})"
+
+    release_lock
+    trap - EXIT
 }
 
 # Get status
