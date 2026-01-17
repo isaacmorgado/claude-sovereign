@@ -47,12 +47,63 @@ log() {
 log_failure() {
     local component="$1"
     local action="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  FAILURE: $component $action" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILURE: $component $action" >> "$LOG_FILE"
 }
 
 show_advisory() {
     local message="$1"
-    echo "⚠️  $message" >&2
+    echo "Advisory: $message" >&2
+}
+
+# =============================================================================
+# GRACEFUL DEGRADATION HELPERS
+# Track which features are degraded for final summary
+# =============================================================================
+
+DEGRADED_FEATURES=""
+
+# Safe hook execution with existence check and graceful fallback
+# Usage: safe_call_hook HOOK_PATH HOOK_NAME default_result args...
+safe_call_hook() {
+    local hook_path="$1"
+    local hook_name="$2"
+    local default_result="$3"
+    shift 3
+    local args=("$@")
+
+    if [[ -x "$hook_path" ]]; then
+        local result
+        if result=$("$hook_path" "${args[@]}" 2>/dev/null); then
+            echo "$result"
+            return 0
+        else
+            log_failure "$hook_name" "execution failed"
+            show_advisory "Hook $hook_name failed - continuing with reduced functionality"
+            DEGRADED_FEATURES="${DEGRADED_FEATURES}${hook_name},"
+            echo "$default_result"
+            return 0
+        fi
+    else
+        log "Optional hook $hook_name not available - skipping"
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}${hook_name},"
+        echo "$default_result"
+        return 0
+    fi
+}
+
+# Check if a hook is available (but don't execute it)
+hook_available() {
+    local hook_path="$1"
+    [[ -x "$hook_path" ]]
+}
+
+# Log degraded features summary at end of coordination
+log_degradation_summary() {
+    if [[ -n "$DEGRADED_FEATURES" ]]; then
+        local features="${DEGRADED_FEATURES%,}"  # Remove trailing comma
+        log "Coordination completed with degraded features: $features"
+        show_advisory "Some features were unavailable or failed: $features"
+    fi
 }
 
 init_coordinator() {
@@ -74,14 +125,21 @@ init_coordinator() {
 EOF
     fi
 
-    # Initialize all systems
+    # Initialize all systems with graceful degradation
+    # Reset degraded features tracker
+    DEGRADED_FEATURES=""
+
     if [[ -x "$LEARNING_ENGINE" ]]; then
         if "$LEARNING_ENGINE" init 2>/dev/null; then
             update_system_status "learning" true
         else
             log_failure "learning-engine" "initialization failed"
             show_advisory "Learning engine initialization failed - system may have reduced intelligence"
+            DEGRADED_FEATURES="${DEGRADED_FEATURES}learning-engine,"
         fi
+    else
+        log "Optional hook learning-engine not available - skipping"
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}learning-engine,"
     fi
 
     if [[ -x "$MEMORY_MANAGER" ]]; then
@@ -90,7 +148,11 @@ EOF
         else
             log_failure "memory-manager" "initialization failed"
             show_advisory "Memory manager initialization failed - running stateless"
+            DEGRADED_FEATURES="${DEGRADED_FEATURES}memory-manager,"
         fi
+    else
+        log "Optional hook memory-manager not available - skipping"
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}memory-manager,"
     fi
 
     update_coordinator_status "initialized" true
@@ -708,6 +770,9 @@ coordinate_task() {
             },
             timestamp: (now | todate)
         }'
+
+    # Log degradation summary if any features were unavailable
+    log_degradation_summary
 
     log "Coordination complete for: $task (result: $execution_result, duration: ${duration}s)"
 }

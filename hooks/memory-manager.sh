@@ -148,6 +148,9 @@ EOF
     if [[ ! -f "$ACTION_LOG" ]]; then
         touch "$ACTION_LOG"
     fi
+
+    # Auto-prune old checkpoints during initialization to prevent disk exhaustion
+    auto_prune_old_checkpoints 20 10
 }
 
 # =============================================================================
@@ -1753,6 +1756,9 @@ checkpoint() {
 
     release_memory_lock
 
+    # Auto-prune old checkpoints to prevent disk exhaustion
+    auto_prune_old_checkpoints 20 10
+
     echo "$checkpoint_id"
 }
 
@@ -1849,6 +1855,28 @@ prune_checkpoints() {
 
     log "Pruned $deleted old checkpoints (kept $keep most recent)"
     echo "$deleted"
+}
+
+# Auto-prune checkpoints if count exceeds threshold
+# Called automatically after each checkpoint creation and during init
+auto_prune_old_checkpoints() {
+    local threshold="${1:-20}"  # Trigger pruning when > 20 checkpoints
+    local keep="${2:-10}"       # Keep 10 most recent
+
+    local checkpoint_dir="$MEMORY_DIR/checkpoints"
+
+    if [[ ! -d "$checkpoint_dir" ]]; then
+        return 0
+    fi
+
+    # Count checkpoint files
+    local ckpt_count
+    ckpt_count=$(ls -1 "$checkpoint_dir"/*.json 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ $ckpt_count -gt $threshold ]]; then
+        log "Auto-pruning checkpoints: $ckpt_count > $threshold threshold"
+        prune_checkpoints "$keep"
+    fi
 }
 
 # =============================================================================
@@ -2124,6 +2152,9 @@ case "${1:-help}" in
         ;;
     prune-checkpoints)
         prune_checkpoints "${2:-5}"
+        ;;
+    auto-prune-checkpoints)
+        auto_prune_old_checkpoints "${2:-20}" "${3:-10}"
         ;;
 
     # File Change Detection
