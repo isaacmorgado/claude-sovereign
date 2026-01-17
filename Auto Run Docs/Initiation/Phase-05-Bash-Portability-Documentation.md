@@ -113,7 +113,7 @@ This phase addresses bash compatibility issues and creates comprehensive documen
   - Complete data flow diagram showing intelligence, planning, execution, quality, and learning layers
   - Component catalog listing all 81 hooks organized by category
 
-- [ ] Create troubleshooting guide:
+- [x] Create troubleshooting guide:
   - Create `/Users/imorgado/Desktop/claude-sovereign/docs/TROUBLESHOOTING.md` with front matter:
     ```yaml
     ---
@@ -137,6 +137,19 @@ This phase addresses bash compatibility issues and creates comprehensive documen
     - "Scripts fail on macOS" → Ensure bash 3.2 compatibility
   - Debug logging instructions
   - How to file an issue with proper diagnostics
+
+  **Completed 2026-01-17**: Created comprehensive TROUBLESHOOTING.md (~400 lines) with:
+  - Quick diagnostics section with system health check commands
+  - 10+ common issues with detailed diagnosis steps and solutions:
+    - Checkpoint issues (context threshold, file change triggers)
+    - Git push issues (remote configuration, authentication)
+    - Memory issues (slow retrieval, database locks)
+    - Swarm issues (agent spawning, jq dependency)
+    - Script compatibility issues (macOS bash 3.2, portable shebangs)
+  - Debug logging instructions for: memory manager, error handler, debug orchestrator, self-healing, swarm
+  - Health monitoring section with self-healing system and circuit breakers
+  - Comprehensive issue filing guide with diagnostic commands and templates
+  - Quick reference table for common fixes
 
 - [ ] Update install.sh with compatibility checks:
   - Add bash version check at start:
