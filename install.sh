@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Claude Sovereign Installer
 # Installs the 100% autonomous operation system for Claude Code
 
@@ -9,6 +9,68 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# ============================================================================
+# COMPATIBILITY CHECKS
+# ============================================================================
+
+# Check Bash version (3.2+ required for macOS compatibility)
+BASH_MAJOR="${BASH_VERSION%%.*}"
+BASH_MINOR="${BASH_VERSION#*.}"
+BASH_MINOR="${BASH_MINOR%%.*}"
+
+if [[ -z "$BASH_MAJOR" ]] || [[ "$BASH_MAJOR" -lt 3 ]]; then
+    echo -e "${RED}Error: Bash 3.2+ required (found ${BASH_VERSION:-unknown})${NC}"
+    echo "Please upgrade your bash installation."
+    exit 1
+fi
+
+if [[ "$BASH_MAJOR" -eq 3 ]] && [[ "$BASH_MINOR" -lt 2 ]]; then
+    echo -e "${RED}Error: Bash 3.2+ required (found $BASH_VERSION)${NC}"
+    echo "Please upgrade your bash installation."
+    exit 1
+fi
+
+# Check for jq (required for JSON processing in hooks)
+JQ_AVAILABLE=true
+if ! command -v jq &>/dev/null; then
+    JQ_AVAILABLE=false
+    echo -e "${YELLOW}Warning: jq not found - some features will be limited${NC}"
+    echo "  Memory manager JSON operations will use fallbacks"
+    echo "  Swarm orchestration may have reduced functionality"
+    echo ""
+    echo "  Install with:"
+    echo "    macOS:  brew install jq"
+    echo "    Ubuntu: sudo apt install jq"
+    echo "    Fedora: sudo dnf install jq"
+    echo ""
+fi
+
+# Check git version for worktree support (2.5+ required for swarms)
+GIT_WORKTREE_SUPPORTED=true
+if command -v git &>/dev/null; then
+    GIT_VERSION=$(git --version | sed 's/git version //' | cut -d. -f1-2)
+    GIT_MAJOR=$(echo "$GIT_VERSION" | cut -d. -f1)
+    GIT_MINOR=$(echo "$GIT_VERSION" | cut -d. -f2)
+
+    if [[ "$GIT_MAJOR" -lt 2 ]] || { [[ "$GIT_MAJOR" -eq 2 ]] && [[ "$GIT_MINOR" -lt 5 ]]; }; then
+        GIT_WORKTREE_SUPPORTED=false
+        echo -e "${YELLOW}Warning: Git 2.5+ required for swarm worktrees (found $GIT_VERSION)${NC}"
+        echo "  Multi-agent swarms will run without git worktree isolation"
+        echo "  Upgrade git for full swarm functionality"
+        echo ""
+    fi
+else
+    GIT_WORKTREE_SUPPORTED=false
+    echo -e "${YELLOW}Warning: git not found${NC}"
+    echo "  Version control features will not work"
+    echo "  Install git for full functionality"
+    echo ""
+fi
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
 
 echo -e "${BLUE}"
 cat << "EOF"
@@ -111,6 +173,26 @@ else
     errors=$((errors + 1))
 fi
 
+echo ""
+
+# Show compatibility summary
+echo "======================================================================"
+echo "  Compatibility Summary"
+echo "======================================================================"
+echo ""
+echo -e "  Bash version:    ${GREEN}✓${NC} $BASH_VERSION (3.2+ required)"
+if [[ "$JQ_AVAILABLE" == "true" ]]; then
+    echo -e "  jq:              ${GREEN}✓${NC} installed"
+else
+    echo -e "  jq:              ${YELLOW}○${NC} not found (optional)"
+fi
+if [[ "$GIT_WORKTREE_SUPPORTED" == "true" ]]; then
+    echo -e "  git worktrees:   ${GREEN}✓${NC} supported (git $GIT_VERSION)"
+elif command -v git &>/dev/null; then
+    echo -e "  git worktrees:   ${YELLOW}○${NC} git $GIT_VERSION (2.5+ recommended)"
+else
+    echo -e "  git worktrees:   ${YELLOW}○${NC} git not found"
+fi
 echo ""
 
 if [[ $errors -eq 0 ]]; then

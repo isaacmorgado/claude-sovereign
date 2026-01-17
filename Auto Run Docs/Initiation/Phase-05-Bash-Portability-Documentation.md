@@ -151,7 +151,7 @@ This phase addresses bash compatibility issues and creates comprehensive documen
   - Comprehensive issue filing guide with diagnostic commands and templates
   - Quick reference table for common fixes
 
-- [ ] Update install.sh with compatibility checks:
+- [x] Update install.sh with compatibility checks:
   - Add bash version check at start:
     ```bash
     BASH_MAJOR=$(echo $BASH_VERSION | cut -d. -f1)
@@ -169,6 +169,15 @@ This phase addresses bash compatibility issues and creates comprehensive documen
     ```
   - Add git version check for worktree support (swarms require git 2.5+)
   - Test installer on clean system simulation
+
+  **Completed 2026-01-17**: Updated install.sh with comprehensive compatibility checks:
+  - Changed shebang to `#!/usr/bin/env bash` for portability
+  - Added Bash version check (3.2+ required) with proper major.minor parsing
+  - Added jq check with installation instructions for macOS (brew), Ubuntu (apt), Fedora (dnf)
+  - Added git version check for worktree support (2.5+ required for swarms)
+  - Added compatibility summary section showing all detected versions
+  - Verified syntax passes `bash -n` check
+  - Tested on Bash 3.2.57 (macOS default) - all checks working correctly
 
 - [ ] Run final validation and create release checklist:
   - Execute all test suites from Phase 02
