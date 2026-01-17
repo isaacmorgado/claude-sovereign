@@ -38,19 +38,24 @@ This phase improves the memory system's retrieval accuracy and context managemen
   - Debug logging enabled via `MEMORY_DEBUG=true` environment variable
   - Added 7 new tests: 35/35 tests passing
 
-- [ ] Optimize retrieve_hybrid() performance:
-  - Locate `retrieve_hybrid()` function (around line 820-943)
-  - Current issue: reads entire episodic/semantic memory for every query
-  - Add early termination when top results are clearly best:
-    ```bash
-    # If top result has score > 0.9, skip remaining evaluation
-    local top_score=$(echo "$results" | jq '.[0].retrievalScore // 0')
-    if (( $(echo "$top_score > 0.9" | bc -l) )); then
-        break
-    fi
-    ```
-  - Add caching for BM25 scores within session
-  - Limit pattern scanning to top 50 most recent patterns
+- [x] Optimize retrieve_hybrid() performance: (COMPLETED 2026-01-17)
+  - Implemented BM25 score caching via file-based cache (lines 884-924):
+    - `init_bm25_cache()` creates session-specific cache directory
+    - `get_cached_bm25_score()` caches scores with MD5/SHA256 hash keys
+    - Auto-cleans cache files older than 1 hour
+  - Added early termination when high scores found (lines 999-1004, 1062-1071):
+    - Tracks `found_high_score` flag when score > 5.85 (90% of max)
+    - After scanning half patterns, checks top score against threshold
+    - Configurable via `RETRIEVE_EARLY_THRESHOLD` env var (default 0.9)
+  - Limited pattern scanning to top 50 most recent (lines 1007-1010):
+    - `max_patterns="${RETRIEVE_MAX_PATTERNS:-50}"` configurable limit
+    - Uses jq slice to get only first N patterns
+  - Added 5 new tests in test-memory-manager.sh:
+    - test_retrieve_hybrid_bm25_caching
+    - test_retrieve_hybrid_pattern_limit
+    - test_retrieve_hybrid_early_termination
+    - test_retrieve_hybrid_env_variables
+    - test_bm25_cache_initialization
 
 - [ ] Implement memory compaction triggers in auto-continue:
   - Update `/Users/imorgado/Desktop/claude-sovereign/hooks/auto-continue.sh`

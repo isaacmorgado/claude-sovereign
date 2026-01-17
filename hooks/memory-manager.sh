@@ -881,7 +881,50 @@ reciprocal_rank_fusion() {
     reciprocal_rank_fusion_enhanced "$results_json" "$k"
 }
 
+# BM25 score cache for session (avoids recalculation for same query+content pairs)
+# Format: associative array (bash 4+) or simple file-based cache for portability
+BM25_CACHE_DIR="${MEMORY_DIR}/.bm25_cache"
+BM25_CACHE_SESSION=""
+
+# Initialize BM25 cache for this session
+init_bm25_cache() {
+    if [[ -z "$BM25_CACHE_SESSION" ]]; then
+        BM25_CACHE_SESSION="$(date +%s)_$$"
+        mkdir -p "$BM25_CACHE_DIR"
+        # Clean old cache files (older than 1 hour)
+        find "$BM25_CACHE_DIR" -type f -mmin +60 -delete 2>/dev/null || true
+    fi
+}
+
+# Get cached BM25 score or calculate and cache
+get_cached_bm25_score() {
+    local query="$1"
+    local content="$2"
+    local avgdl="${3:-50}"
+
+    init_bm25_cache
+
+    # Create cache key from query+content hash
+    local cache_key
+    cache_key=$(echo "${query}|${content}" | md5 2>/dev/null || echo "${query}|${content}" | shasum -a 256 2>/dev/null | cut -d' ' -f1 || echo "nocache")
+
+    local cache_file="${BM25_CACHE_DIR}/${BM25_CACHE_SESSION}_${cache_key:0:16}"
+
+    # Check cache
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file"
+        return 0
+    fi
+
+    # Calculate and cache
+    local score
+    score=$(calculate_bm25_score "$query" "$content" "$avgdl")
+    echo "$score" > "$cache_file"
+    echo "$score"
+}
+
 # Hybrid retrieval: combines BM25 (keyword) + word overlap (semantic) scoring
+# OPTIMIZED: Early termination, BM25 caching, limited pattern scanning
 retrieve_hybrid() {
     local query="$1"
     local limit="${2:-10}"
@@ -891,8 +934,12 @@ retrieve_hybrid() {
     local importance_weight="${6:-2.0}"
 
     init_memory
+    init_bm25_cache
 
     local results="[]"
+    local early_termination_threshold="${RETRIEVE_EARLY_THRESHOLD:-0.9}"
+    local max_patterns="${RETRIEVE_MAX_PATTERNS:-50}"
+    local found_high_score="false"
 
     # Calculate average document length for BM25
     local avgdl=50  # Default, could be calculated dynamically
@@ -915,7 +962,7 @@ retrieve_hybrid() {
         local importance
         importance=$(echo "$episode" | jq -r '.importance // 5')
 
-        # Calculate all scores
+        # Calculate all scores (use cached BM25)
         local recency_score
         recency_score=$(calculate_recency_score "$timestamp")
 
@@ -923,7 +970,7 @@ retrieve_hybrid() {
         relevance_score=$(calculate_relevance_score "$query" "$description")
 
         local bm25_score
-        bm25_score=$(calculate_bm25_score "$query" "$description" "$avgdl")
+        bm25_score=$(get_cached_bm25_score "$query" "$description" "$avgdl")
 
         # Normalize importance to 0-1
         local importance_score
@@ -948,12 +995,21 @@ retrieve_hybrid() {
                 importance_score: ($importance | tonumber),
                 source: "episodic"
             })]')
+
+        # OPTIMIZATION: Early termination if we find a very high score
+        # Normalized score range is roughly 0-6.5 (with default weights)
+        # Consider 5.85+ (90% of max) as high enough to trigger early exit check
+        if [[ $(echo "$final_score > 5.85" | bc -l 2>/dev/null) == "1" ]]; then
+            found_high_score="true"
+        fi
     done < <(echo "$episodes" | jq -c '.[]')
 
-    # Score patterns with hybrid approach
+    # OPTIMIZATION: Limit pattern scanning to top 50 most recent
+    # Patterns are already sorted by createdAt, take first N
     local patterns
-    patterns=$(jq '.patterns' "$SEMANTIC_MEMORY")
+    patterns=$(jq --argjson max "$max_patterns" '.patterns | .[0:$max]' "$SEMANTIC_MEMORY")
 
+    local pattern_count=0
     while IFS= read -r pattern; do
         if [[ -z "$pattern" || "$pattern" == "null" ]]; then
             continue
@@ -968,7 +1024,7 @@ retrieve_hybrid() {
         local success_rate
         success_rate=$(echo "$pattern" | jq -r '.successRate // 1.0')
 
-        # Calculate scores
+        # Calculate scores (use cached BM25)
         local recency_score
         recency_score=$(calculate_recency_score "$timestamp")
 
@@ -976,7 +1032,7 @@ retrieve_hybrid() {
         relevance_score=$(calculate_relevance_score "$query" "$trigger")
 
         local bm25_score
-        bm25_score=$(calculate_bm25_score "$query" "$trigger" "$avgdl")
+        bm25_score=$(get_cached_bm25_score "$query" "$trigger" "$avgdl")
 
         # Use success rate as importance
         local importance_score="$success_rate"
@@ -1000,6 +1056,20 @@ retrieve_hybrid() {
                 importance_score: ($importance | tonumber),
                 source: "pattern"
             })]')
+
+        ((pattern_count++))
+
+        # OPTIMIZATION: Early termination - if we have enough high-scoring results
+        # and have scanned at least half the patterns, we can stop
+        if [[ "$found_high_score" == "true" && $pattern_count -ge $((max_patterns / 2)) ]]; then
+            # Check if top result has score > threshold
+            local top_score
+            top_score=$(echo "$results" | jq '[.[] | .retrievalScore] | max // 0')
+            if [[ $(echo "$top_score > $early_termination_threshold" | bc -l 2>/dev/null) == "1" ]]; then
+                # Early termination: we have a great match, skip remaining patterns
+                break
+            fi
+        fi
     done < <(echo "$patterns" | jq -c '.[]')
 
     # Sort by score and return top results
