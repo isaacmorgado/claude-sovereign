@@ -67,13 +67,15 @@ MEMORY_MANAGER="${HOME}/.claude/hooks/memory-manager.sh"
 CHECKPOINT_ID=""
 
 if [[ -x "$MEMORY_MANAGER" ]]; then
-    # PHASE 4: Check context budget
-    CONTEXT_USAGE=$("$MEMORY_MANAGER" context-usage 2>/dev/null || echo "{}")
-    CONTEXT_STATUS=$(echo "$CONTEXT_USAGE" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
-
-    if [[ "$CONTEXT_STATUS" == "critical" || "$CONTEXT_STATUS" == "warning" ]]; then
-        log "⚠️  Memory context budget at warning/critical - compacting memory..."
-        "$MEMORY_MANAGER" context-compact 2>/dev/null || log "⚠️  Memory compact failed"
+    # PHASE 4: Tiered memory compaction based on context percentage
+    # At 60%: warning compact (prune low-importance items)
+    # At 80%: aggressive compact (keep only high-importance)
+    if [[ $PERCENT -ge 80 ]]; then
+        log "⚠️  Context at ${PERCENT}% - triggering AGGRESSIVE memory compact..."
+        "$MEMORY_MANAGER" context-compact aggressive 2>/dev/null || log "⚠️  Aggressive compact failed"
+    elif [[ $PERCENT -ge 60 ]]; then
+        log "⚠️  Context at ${PERCENT}% - triggering WARNING memory compact..."
+        "$MEMORY_MANAGER" context-compact warning 2>/dev/null || log "⚠️  Warning compact failed"
     fi
 
     # PHASE 1: Create checkpoint with context percentage in description
